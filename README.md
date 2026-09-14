@@ -64,8 +64,8 @@ scenario:
 
 [`configs/hvac_baseline.yaml`](configs/hvac_baseline.yaml) 冻结了 HVAC 的一阶 RC 冷却模型、60 s
 采样、3 小时 horizon、15 → 20 → 25 °C reference、控制量方向、结果通道及 `v = r - T` 的场景
-信号适配语义。它只是一份场景契约，不实现 plant、PID 或 simulation runner；完整约定见
-[HVAC 场景契约](docs/hvac_scenario_contract.md)。
+信号适配语义。项目已提供确定性的 HVAC plant、reference 和 signal adapter，但尚未实现 PID 或
+simulation runner；完整约定见 [HVAC 场景契约](docs/hvac_scenario_contract.md)。
 
 仿真产生的大量 CSV 文件与图片应分别写入 `results/csv/` 和 `results/figures/`；这些输出默认
 不会提交到 Git。
