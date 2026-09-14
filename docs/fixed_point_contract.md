@@ -24,6 +24,11 @@ encode(x) = floor(x * 2^ell + 1/2)
 这与 Python 的 `round()` 不同。特别地，`ell=1` 时，`encode(-0.25) == 0`，因为
 `floor(-0.5 + 0.5) == 0`。
 
+Python `int` 和 `fractions.Fraction` 会在不转换为 `float` 的路径上完成缩放与上述
+取整。因此，在声明 payload 范围内的大整数不会因为浮点有效位数有限而静默丢失低位。
+当解码分数位数为零时，`decode` 返回 Python `int`；数组返回 `object` dtype 的 Python
+整数，以同样避免仅为解码而损失大整数精度。其他分数位数仍解码为有限浮点近似值。
+
 ## 模表示与有符号恢复
 
 `to_residue` 将整数以 `% q` 转为 canonical residue。`from_residue` 只接受已规范化的
@@ -41,14 +46,20 @@ encode(x) = floor(x * 2^ell + 1/2)
 `multiply_residues` 仅执行 `Z_q` 模乘法，两个普通尺度输入相乘后仍带有
 `2^(2*ell)` 尺度。它不执行截断，也不会把结果伪装成普通 `2^ell` 数据。
 
-未来截断协议负责将乘积恢复到约定尺度，并须根据已知输入范围证明中间值没有造成
-不可接受的模回绕。`decode_residue` 能拒绝明显超出 `k` 位 payload 范围的代表元，
-但任何局部 API 都无法从一个恰好回绕到合法范围的 residue 推断其历史值；这不是
-全局范围证明的替代品。
+该 API 把输入 residue 恢复为当前上下文声明的 `k` 位 payload，并在取模前计算精确
+Python 整数乘积。若该乘积越出中心化 `Z_q` 区间，API 会以“数学模回绕”错误拒绝，
+而不会返回一个可能被误解为小 payload 的 residue。例如，`q=257` 时，`100 * 100`
+不会静默变成中心化值 `-23`。
+
+未来截断协议负责将乘积恢复到约定尺度。上述检查只能覆盖本次乘法中可见的两个
+operand 和精确乘积；任何局部 API 都无法从一个已经在上游回绕、且恰好落回合法范围的
+residue 推断其历史值。因此，协议集成仍须依据已知输入范围建立全局的无回绕证明。
+`decode_residue` 也会拒绝明显超出 `k` 位 payload 范围的中心化代表元。
 
 ## 输入与 shape
 
 编码、模转换、加法与乘法均接受标量、向量和矩阵。涉及模整数的输出数组使用
-`dtype=object`，其中每个元素均为 Python `int`；解码输出则使用浮点数组。非法参数、
-非有限实数、非 canonical residue、超出 payload 范围或无法安全转为有限浮点数的输入
-都会显式报错。
+`dtype=object`，其中每个元素均为 Python `int`。解码在分数位数非零时使用浮点数组；
+零分数位时使用 Python `int` 或 `object` dtype 数组以保留精度。非法参数、非有限实数、
+非 canonical residue、超出 payload 范围、可检测的乘法数学回绕，或无法安全转为有限
+浮点数的输入都会显式报错。

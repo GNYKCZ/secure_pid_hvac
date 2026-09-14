@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from numbers import Real
+from numbers import Rational, Real
 from typing import Any
 
 import numpy as np
@@ -96,11 +96,16 @@ class FixedPointContext:
         """
         return _map_values(value, self._encode_one)
 
-    def decode(self, payload: Any, *, fractional_bits: int | None = None) -> float | np.ndarray:
-        """将范围已验证的有符号 payload 解码为浮点近似值。
+    def decode(
+        self, payload: Any, *, fractional_bits: int | None = None
+    ) -> int | float | np.ndarray:
+        """将范围已验证的有符号 payload 解码为数值近似值。
 
         默认按照当前 ``ell`` 解码；调用者可显式给出其他分数位数以记录已知尺度。
         在尚未执行截断前，乘法结果不应被误当作普通 ``ell`` 尺度的数据解码。
+
+        当分数位数为零时，结果保留为 Python ``int``（数组使用 ``object`` dtype），
+        避免合法的大 payload 在仅为了解码而转换成浮点数时再次丢失低位。
         """
         bits = (
             self.fractional_bits
@@ -110,9 +115,11 @@ class FixedPointContext:
         if bits < 0:
             raise ValueError("fractional_bits 必须不小于 0。")
 
-        def decode_one(item: Any) -> float:
+        def decode_one(item: Any) -> int | float:
             integer = _require_integer(item, "payload")
             self._validate_payload(integer)
+            if bits == 0:
+                return integer
             try:
                 decoded = integer / (1 << bits)
             except OverflowError as error:
@@ -121,7 +128,11 @@ class FixedPointContext:
                 raise ValueError("payload 无法安全解码为有限浮点数。")
             return decoded
 
-        return self._map_decoded_values(payload, decode_one)
+        return self._map_decoded_values(
+            payload,
+            decode_one,
+            preserve_integer_precision=bits == 0,
+        )
 
     def to_residue(self, payload: Any) -> int | np.ndarray:
         """将任意 Python 整数规范化为 ``[0, q)`` 中的 canonical residue。"""
@@ -137,7 +148,7 @@ class FixedPointContext:
 
     def decode_residue(
         self, residue: Any, *, fractional_bits: int | None = None
-    ) -> float | np.ndarray:
+    ) -> int | float | np.ndarray:
         """从中心化 residue 恢复并解码普通尺度的 payload。
 
         此接口会拒绝超出 ``k`` 位 payload 范围的代表元。它不能在结果恰好回绕到
@@ -152,15 +163,32 @@ class FixedPointContext:
     def multiply_residues(self, left: Any, right: Any) -> int | np.ndarray:
         """在 ``Z_q`` 中逐元素相乘，结果的分数位数为 ``2 * ell``。
 
-        本方法只完成数学模乘法，不包含未来协议所需的截断。调用者必须在解码前明确
-        处理尺度恢复，并基于输入范围判断模回绕是否可接受。
+        本方法只完成数学模乘法，不包含未来协议所需的截断。为避免把可检测的数学
+        回绕伪装成小 payload，它会验证每个输入仍是声明的 ``k`` 位 payload，并拒绝
+        精确乘积越出中心化模区间的情形。该局部检查不能证明上游 residue 从未回绕；
+        完整协议仍须对所有中间量建立全局范围证明。
         """
-        return self._binary_residue_operation(left, right, lambda first, second: first * second)
+        return self._binary_residue_operation(left, right, self._multiply_residue_pair)
 
     def _encode_one(self, item: Any) -> int:
         """执行单个实数的论文取整与 payload 范围检查。"""
         if isinstance(item, (bool, np.bool_)) or not isinstance(item, Real):
             raise TypeError("待编码值必须是有限实数，不能是布尔值。")
+
+        if isinstance(item, (int, np.integer)):
+            # Python 整数没有固定字长；直接缩放可避免合法 payload 经 float 丢失低位。
+            payload = int(item) * self.scale
+            self._validate_payload(payload)
+            return payload
+
+        if isinstance(item, Rational):
+            # 对 Fraction 等精确有理数按 floor(x * 2^ell + 1/2) 计算，避免中间浮点化。
+            numerator = int(item.numerator) * self.scale
+            denominator = int(item.denominator)
+            payload = (2 * numerator + denominator) // (2 * denominator)
+            self._validate_payload(payload)
+            return payload
+
         try:
             real_value = float(item)
             scaled = real_value * self.scale
@@ -225,8 +253,31 @@ class FixedPointContext:
         """仅接受 canonical 输入，防止调用方混淆 payload 与模表示。"""
         return self._from_residue_one(item) % self.modulus
 
-    def _map_decoded_values(self, value: Any, mapper: Callable[[Any], float]) -> float | np.ndarray:
-        """保持输入 shape，将解码结果保存为显式浮点数组。"""
+    def _multiply_residue_pair(self, left: int, right: int) -> int:
+        """计算可追溯的整数乘积，并在取模前拒绝可检测的数学回绕。"""
+        first = self._payload_from_residue(left)
+        second = self._payload_from_residue(right)
+        product = first * second
+
+        # 中心化 Z_q 的唯一整数范围为 [-floor(q/2), floor((q-1)/2)]。
+        if not -(self.modulus // 2) <= product <= (self.modulus - 1) // 2:
+            raise ValueError("精确乘积越出中心化模区间，会发生数学模回绕。")
+        return product
+
+    def _payload_from_residue(self, residue: int) -> int:
+        """恢复普通 payload，并拒绝已超出当前上下文声明范围的 operand。"""
+        payload = self._from_residue_one(residue)
+        self._validate_payload(payload)
+        return payload
+
+    def _map_decoded_values(
+        self,
+        value: Any,
+        mapper: Callable[[Any], int | float],
+        *,
+        preserve_integer_precision: bool,
+    ) -> int | float | np.ndarray:
+        """保持输入 shape；零分数位数组使用 object dtype 以保留任意精度整数。"""
         try:
             array = np.asarray(value, dtype=object)
         except ValueError as error:
@@ -234,7 +285,7 @@ class FixedPointContext:
         if array.ndim == 0:
             return mapper(array.item())
 
-        mapped = np.empty(array.shape, dtype=float)
+        mapped = np.empty(array.shape, dtype=object if preserve_integer_precision else float)
         for index in np.ndindex(array.shape):
             mapped[index] = mapper(array[index])
         return mapped
