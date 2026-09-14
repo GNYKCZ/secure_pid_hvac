@@ -1,0 +1,56 @@
+# HVAC 的第一个可复现实验配置。数值是教学/仿真基线，不声称代表经过标定的真实建筑。
+scenario:
+  name: hvac
+  hvac:
+    timing:
+      sampling_period_seconds: 60
+      horizon_seconds: 10800
+      sample_count: 180
+      terminal_sample_included: false
+      update_order: measure_adapt_control_plant_record
+      output_log_time_index: pre_plant_step
+
+    model:
+      kind: first_order_rc_cooling
+      discretization: zero_order_hold
+      # R 的单位是 °C/kW，C 的单位是 kJ/°C；R*C 的时间常数单位因此为 s。
+      thermal_resistance_celsius_per_kw: 2.0
+      thermal_capacitance_kj_per_celsius: 1200.0
+      cooling_coefficient: 1.0
+      ambient_temperature_celsius: 30.0
+      initial_temperature_celsius: 30.0
+      control:
+        unit: kW_thermal_cooling
+        positive_direction: cooling
+        lower_bound_kw: 0.0
+        upper_bound_kw: 12.0
+
+    reference:
+      unit: degC
+      endpoint_value_celsius: 25.0
+      segments:
+        - start_seconds: 0
+          end_seconds: 3600
+          target_temperature_celsius: 15.0
+        - start_seconds: 3600
+          end_seconds: 7200
+          target_temperature_celsius: 20.0
+        - start_seconds: 7200
+          end_seconds: 10800
+          target_temperature_celsius: 25.0
+
+    signal_adapter:
+      kind: reference_minus_temperature
+      output_unit: degC
+      controller_input_unit: degC
+
+    channels:
+      reference:
+        names: [target_temperature]
+        units: [degC]
+      output:
+        names: [temperature]
+        units: [degC]
+      control:
+        names: [cooling_power]
+        units: [kW_thermal_cooling]
