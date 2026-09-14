@@ -1,6 +1,7 @@
 """定点编码与中心化模表示的边界测试。"""
 
 from collections.abc import Callable
+from fractions import Fraction
 
 import numpy as np
 import pytest
@@ -25,6 +26,62 @@ def test_encode_decode_round_trip_is_bounded_by_half_quantization_step() -> None
     decoded = context.decode(context.encode(values))
 
     assert np.all(np.abs(decoded - values) <= 0.5 / context.scale)
+
+
+def test_large_integer_encoding_preserves_all_legal_payload_bits() -> None:
+    """验证合法域内的 Python 大整数不会在编码前退化为浮点数。"""
+    context = FixedPointContext(
+        modulus=(1 << 128) - 159,
+        integer_bits=127,
+        fractional_bits=0,
+    )
+    value = (1 << 60) + 1
+
+    encoded = context.encode(value)
+    decoded = context.decode(encoded)
+
+    assert encoded == value
+    assert decoded == value
+
+
+def test_exact_rational_encoding_avoids_large_float_intermediate() -> None:
+    """验证精确有理数也遵循论文取整，而不会因浮点中间值丢失半单位。"""
+    context = FixedPointContext(
+        modulus=(1 << 128) - 159,
+        integer_bits=127,
+        fractional_bits=1,
+    )
+    value = Fraction((1 << 60) + 1, 2)
+
+    assert context.encode(value) == (1 << 60) + 1
+
+
+def test_multiplication_rejects_detectable_mathematical_modular_wraparound() -> None:
+    """验证直接乘积越出中心化模区间时提供明确诊断，而非返回伪装的小值。"""
+    context = FixedPointContext(modulus=257, integer_bits=8, fractional_bits=0)
+
+    with pytest.raises(ValueError, match="模回绕"):
+        context.multiply_residues(
+            context.encode_to_residue(100),
+            context.encode_to_residue(100),
+        )
+
+
+def test_nonzero_fractional_multiplication_retains_double_scale_before_truncation() -> None:
+    """验证非零 ell 的乘法结果明确保留 2^(2*ell) 尺度。"""
+    context = FixedPointContext(modulus=65_537, integer_bits=16, fractional_bits=2)
+
+    product = context.multiply_residues(
+        context.encode_to_residue(1.25),
+        context.encode_to_residue(-2.5),
+    )
+
+    assert context.product_fractional_bits == 4
+    assert context.from_residue(product) == -50
+    assert context.decode_residue(
+        product,
+        fractional_bits=context.product_fractional_bits,
+    ) == pytest.approx(-3.125)
 
 
 def test_centered_mapping_covers_even_and_odd_modulus_boundaries() -> None:
