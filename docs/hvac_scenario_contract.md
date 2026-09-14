@@ -1,11 +1,12 @@
 # HVAC 场景与实验配置契约
 
-本文冻结第一个场景的配置语义；它不实现 HVAC plant、reference runtime、SignalAdapter 或 PID。
-所有 HVAC 概念只属于 `secure_control.scenarios.hvac` 及其 YAML、测试和本文档。
+本文冻结第一个场景的配置语义，并说明其 HVAC plant、reference 与 SignalAdapter 实现。它不实现
+PID、通用仿真循环或任何安全协议。所有 HVAC 概念只属于 `secure_control.scenarios.hvac` 及其 YAML、
+测试和本文档。
 
 ## 基线模型与单位
 
-配置 `model.kind: first_order_rc_cooling` 表示一阶 RC 热模型。后续 #3 必须采用：
+配置 `model.kind: first_order_rc_cooling` 表示一阶 RC 热模型；`HvacPlant` 采用：
 
 ```text
 dT/dt = (T_ambient - T) / (R C) - eta * u / C
@@ -51,3 +52,11 @@ HVAC 作为单输入、单输出 scenario，映射通用字段而不创建 `temp
 
 其中 `output_error` 是理想与安全温度输出之差，`control_error` 是理想与安全冷却功率之差；其符号由
 后续通用仿真结果定义，绘图可额外显示绝对值但不得篡改原始结果。
+
+## 已实现的场景组件
+
+- `HvacPlant`：维护独立温度状态，`output()` 返回 `(1,)` 温度数组，`step(u)` 返回更新后的温度。
+  它拒绝超出 YAML 执行器范围的控制量，而不静默裁剪。
+- `HvacStepReference`：按上述边界返回 `(1,)` 目标温度；仅接受 `[0, 10800]` 内的有限时间。
+- `HvacSignalAdapter`：提供通用 `ScenarioAdapter` 所需的 `reference_at` 与 `controller_input`，其中
+  后者仅在 HVAC 场景中计算 `v = r - T`，并提供 YAML 冻结的通道元数据。

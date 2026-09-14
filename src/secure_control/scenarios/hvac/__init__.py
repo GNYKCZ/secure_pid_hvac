@@ -1,5 +1,14 @@
-"""HVAC 场景的配置契约；不包含 plant、reference 或 PID 的运行时实现。"""
+"""HVAC 场景组件：配置契约、plant、reference 和信号适配。"""
 
+from .adapter import HvacSignalAdapter
 from .contract import HvacScenarioContract, load_hvac_scenario_contract
+from .plant import HvacPlant
+from .reference import HvacStepReference
 
-__all__ = ["HvacScenarioContract", "load_hvac_scenario_contract"]
+__all__ = [
+    "HvacPlant",
+    "HvacScenarioContract",
+    "HvacSignalAdapter",
+    "HvacStepReference",
+    "load_hvac_scenario_contract",
+]
