@@ -1,0 +1,26 @@
+# Python-generated files
+__pycache__/
+*.pyc
+*.pyo
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv/
+
+# Test and lint caches
+.pytest_cache/
+.ruff_cache/
+
+# Editors and local configuration
+.vscode/
+.idea/
+.env
+
+# Generated experiment outputs
+results/csv/*
+!results/csv/.gitkeep
+results/figures/*
+!results/figures/.gitkeep
