@@ -1,0 +1,1 @@
+"""Secure-control client placeholder."""
