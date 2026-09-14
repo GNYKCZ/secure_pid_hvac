@@ -56,9 +56,10 @@ class PlaintextStateSpaceRuntime:
     def step(self, v: Array | float) -> Array:
         """计算一个控制步并返回 ``u(k)``。
 
-        ``v`` 可以是单输入控制器的标量，或形状严格为
-        ``(input_dimension,)`` 的向量。不会接受二维列向量或可广播 shape，避免
-        NumPy 广播在不报错的情况下改变矩阵乘法的物理含义。
+        ``v`` 可以是单输入控制器的标量、一维向量 ``(m,)``，或论文矩阵表示中常用的
+        单步列向量 ``(m, 1)``，其中 ``m`` 为输入维数。运行时会将允许的向量表示统一为
+        内部一维数组；返回控制量始终为 ``(p,)``。行向量和批量二维数组没有明确的单步
+        语义，必须拒绝，避免 NumPy 广播在不报错的情况下改变矩阵乘法的物理含义。
         """
         input_vector = self._coerce_input(v)
 
@@ -78,12 +79,21 @@ class PlaintextStateSpaceRuntime:
         return np.array(control, dtype=self._dtype, copy=True)
 
     def _coerce_input(self, value: Array | float) -> Array:
-        """验证输入维度、数值性和有限性，并转换为控制器 dtype。"""
+        """验证单步输入，并将允许的列向量归一化为一维数组。"""
         input_vector = np.asarray(value)
         if input_vector.ndim == 0:
             input_vector = input_vector.reshape(1)
-        if input_vector.ndim != 1:
-            raise ValueError("controller input 必须是标量或一维向量")
+        elif input_vector.ndim == 2 and input_vector.shape == (
+            self._spec.input_dimension,
+            1,
+        ):
+            # 数学上的列向量仅是一个时间步的 m 个输入分量；归一化后保持矩阵运算语义不变。
+            input_vector = input_vector.reshape(self._spec.input_dimension)
+        elif input_vector.ndim != 1:
+            raise ValueError(
+                "controller input 必须是标量、一维向量或形状为 "
+                f"({self._spec.input_dimension}, 1) 的列向量"
+            )
         if input_vector.shape != (self._spec.input_dimension,):
             raise ValueError(
                 "controller input shape 必须为 "

@@ -45,8 +45,10 @@ controller design 负责在进入 runtime 前生成这些矩阵。实际递推�
 
 `PlaintextStateSpaceRuntime` 是第一个运行时实现。对每个输入 `v(k)`，它先计算
 `u(k) = Cx_c(k) + Dv(k)`，再计算 `x_c(k+1) = Ax_c(k) + Bv(k)`；因此控制输出使用更新前
-状态。运行时只接受标量（单输入时）或严格一维的输入向量，并始终返回一维 control vector。
-计算失败不会写入半完成的 controller state。
+状态。运行时接受标量（仅单输入）、一维输入向量 `(m,)`，以及论文中常用的单步列向量
+`(m, 1)`；列向量只会在内部归一化为一维表示。行向量和批量二维输入没有定义为单步接口的
+一部分，必须被拒绝。运行时始终返回一维 control vector `(p,)`，计算失败不会写入半完成的
+controller state。
 
 ## 场景与仿真契约
 

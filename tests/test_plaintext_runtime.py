@@ -42,6 +42,24 @@ def test_vector_input_and_output_follow_matrix_shapes() -> None:
     assert np.array_equal(runtime.state, np.array([2.0, 3.0]))
 
 
+def test_column_vector_input_matches_flat_vector_input() -> None:
+    """论文常用的单步列向量应与一维向量具有相同的控制语义。"""
+    spec = ControllerSpec(
+        A=np.array([[1.0, 2.0], [0.0, 1.0]]),
+        B=np.eye(2),
+        C=np.array([[1.0, 0.0], [0.0, 2.0]]),
+        D=np.zeros((2, 2)),
+        x0=np.array([1.0, -1.0]),
+    )
+    flat_runtime = PlaintextStateSpaceRuntime(spec)
+    column_runtime = PlaintextStateSpaceRuntime(spec)
+
+    # 仅归一化表示形式，不改变 m=2 控制器的矩阵乘法和状态更新语义。
+    assert np.array_equal(flat_runtime.step(np.array([3.0, 4.0])), np.array([1.0, -2.0]))
+    assert np.array_equal(column_runtime.step(np.array([[3.0], [4.0]])), np.array([1.0, -2.0]))
+    assert np.array_equal(column_runtime.state, flat_runtime.state)
+
+
 def test_static_state_feedback_has_no_internal_state() -> None:
     """零维 controller state 时，运行时只执行 D @ v。"""
     runtime = PlaintextStateSpaceRuntime(
@@ -80,7 +98,7 @@ def test_reset_and_runtime_instances_do_not_share_state() -> None:
 @pytest.mark.parametrize(
     ("value", "exception", "message"),
     [
-        (np.array([[1.0]]), ValueError, "一维"),
+        (np.array([[1.0, 2.0]]), ValueError, "列向量"),
         (np.array([1.0, 2.0]), ValueError, "shape"),
         (np.array([np.nan]), FloatingPointError, "NaN"),
         ("not-a-number", TypeError, "实数"),
