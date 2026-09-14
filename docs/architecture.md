@@ -43,6 +43,11 @@ controller design 负责在进入 runtime 前生成这些矩阵。实际递推�
 `A/B/C/D` 的 fractional bits。它只是数值表示元数据；编码、模运算和 truncation 仍由后续
 `crypto` 与 `protocol` 工作实现。
 
+`PlaintextStateSpaceRuntime` 是第一个运行时实现。对每个输入 `v(k)`，它先计算
+`u(k) = Cx_c(k) + Dv(k)`，再计算 `x_c(k+1) = Ax_c(k) + Bv(k)`；因此控制输出使用更新前
+状态。运行时只接受标量（单输入时）或严格一维的输入向量，并始终返回一维 control vector。
+计算失败不会写入半完成的 controller state。
+
 ## 场景与仿真契约
 
 场景通过 `ScenarioAdapter` 提供 reference，并将 reference 与 plant output 映射为 controller input
