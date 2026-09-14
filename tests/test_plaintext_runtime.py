@@ -43,7 +43,7 @@ def test_vector_input_and_output_follow_matrix_shapes() -> None:
 
 
 def test_column_vector_input_matches_flat_vector_input() -> None:
-    """论文常用的单步列向量应与一维向量具有相同的控制语义。"""
+    """论文常用的单步列向量应与扁平数组表示具有相同的控制语义。"""
     spec = ControllerSpec(
         A=np.array([[1.0, 2.0], [0.0, 1.0]]),
         B=np.eye(2),

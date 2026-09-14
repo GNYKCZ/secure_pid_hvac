@@ -17,7 +17,9 @@ class PlaintextStateSpaceRuntime:
 
     给定 ``ControllerSpec`` 中的 ``A/B/C/D/x0``，本类在每次 ``step(v)`` 中
     严格按下列顺序计算：先使用当前 ``x_c(k)`` 得到 ``u(k)``，再计算
-    ``x_c(k+1)``。返回值始终是一维 NumPy 数组；单通道控制量的形状为 ``(1,)``。
+    ``x_c(k+1)``。控制器的状态、输入和输出维数分别由 ``A/B/C/D`` 决定，并不限于一维。
+    为使单步接口的 NumPy shape 稳定，返回值统一使用长度为输出维数 ``p`` 的扁平数组 ``(p,)``；
+    单通道控制量只是其中 ``p=1`` 的特例。
 
     本类只处理明文数值矩阵，不编码定点数、不执行模运算，也不包含任何场景逻辑。
     """
@@ -57,9 +59,10 @@ class PlaintextStateSpaceRuntime:
         """计算一个控制步并返回 ``u(k)``。
 
         ``v`` 可以是单输入控制器的标量、一维向量 ``(m,)``，或论文矩阵表示中常用的
-        单步列向量 ``(m, 1)``，其中 ``m`` 为输入维数。运行时会将允许的向量表示统一为
-        内部一维数组；返回控制量始终为 ``(p,)``。行向量和批量二维数组没有明确的单步
-        语义，必须拒绝，避免 NumPy 广播在不报错的情况下改变矩阵乘法的物理含义。
+        单步列向量 ``(m, 1)``，其中 ``m`` 由 ``ControllerSpec`` 决定，可以大于一。运行时会
+        将允许的向量表示统一为长度为 ``m`` 的扁平数组 ``(m,)``；这只是内部存储约定，不限制
+        控制器维数。返回控制量始终为 ``(p,)``。行向量和批量二维数组没有明确的单步语义，必须
+        拒绝，避免 NumPy 广播在不报错的情况下改变矩阵乘法的物理含义。
         """
         input_vector = self._coerce_input(v)
 
@@ -79,7 +82,7 @@ class PlaintextStateSpaceRuntime:
         return np.array(control, dtype=self._dtype, copy=True)
 
     def _coerce_input(self, value: Array | float) -> Array:
-        """验证单步输入，并将允许的列向量归一化为一维数组。"""
+        """验证单步输入，并归一化为长度 ``m`` 的扁平数组。"""
         input_vector = np.asarray(value)
         if input_vector.ndim == 0:
             input_vector = input_vector.reshape(1)
@@ -87,7 +90,8 @@ class PlaintextStateSpaceRuntime:
             self._spec.input_dimension,
             1,
         ):
-            # 数学上的列向量仅是一个时间步的 m 个输入分量；归一化后保持矩阵运算语义不变。
+            # 数学列向量的 m 个分量属于同一时间步；扁平化只统一 NumPy 存储 shape，
+            # 不会把 m 维控制器降为一维，也不改变矩阵乘法语义。
             input_vector = input_vector.reshape(self._spec.input_dimension)
         elif input_vector.ndim != 1:
             raise ValueError(
