@@ -18,6 +18,13 @@ from secure_control.crypto import (
 
 MODULUS = 2_147_483_647
 SECURITY_PARAMETER = 8
+GATE_CONFIGURATIONS = (
+    (2_147_483_647, 8, 4),
+    (2_147_483_647, 8, 8),
+    (2_147_483_647, 8, 12),
+    (2_147_483_647, 7, 8),
+    (65_537, 2, 4),
+)
 
 
 def centered(residue: int, modulus: int) -> int:
@@ -42,11 +49,27 @@ class GateTrial:
     consumed_masks: int
 
 
-def make_context(ell: int) -> tuple[FixedPointContext, TwoPartySharing, SecureTruncation]:
-    """建立共享同一素模数且满足 Protocol 2 前置条件的组合测试上下文。"""
-    fixed_point = FixedPointContext(modulus=MODULUS, integer_bits=20, fractional_bits=ell)
-    sharing = TwoPartySharing(MODULUS)
-    truncation = SecureTruncation(sharing, ell=ell, security_parameter=SECURITY_PARAMETER)
+def parameter_context(*, modulus: int, ell: int, security_parameter: int) -> str:
+    """生成与具体输入无关的 q、ell、lambda 和尺度诊断字段。"""
+    scale = 1 << ell if isinstance(ell, int) and not isinstance(ell, bool) and ell >= 0 else "n/a"
+    return f"q={modulus} ell={ell} lambda={security_parameter} scale={scale}"
+
+
+def make_context(
+    ell: int,
+    *,
+    modulus: int = MODULUS,
+    security_parameter: int = SECURITY_PARAMETER,
+) -> tuple[FixedPointContext, TwoPartySharing, SecureTruncation]:
+    """建立指定合法参数下共享同一模数的固定点、分享与 Protocol 2 上下文。"""
+    sharing = TwoPartySharing(modulus)
+    truncation = SecureTruncation(sharing, ell=ell, security_parameter=security_parameter)
+    # Z<kappa> 是 Trunc 的消息域；令固定点 payload 覆盖该域，才可测试其精确边界。
+    fixed_point = FixedPointContext(
+        modulus=modulus,
+        integer_bits=truncation.kappa,
+        fractional_bits=ell,
+    )
     return fixed_point, sharing, truncation
 
 
@@ -54,14 +77,17 @@ def case_context(
     *,
     seed: int,
     trial: int,
-    left: float,
-    right: float,
+    left: object,
+    right: object,
     ell: int,
+    modulus: int = MODULUS,
+    security_parameter: int = SECURITY_PARAMETER,
 ) -> str:
     """生成包含复现所需输入、参数和活动尺度的失败诊断前缀。"""
-    return (
-        f"seed={seed} trial={trial} left={left!r} right={right!r} "
-        f"q={MODULUS} ell={ell} lambda={SECURITY_PARAMETER} scale={1 << ell}"
+    return f"seed={seed} trial={trial} left={left!r} right={right!r} " + parameter_context(
+        modulus=modulus,
+        ell=ell,
+        security_parameter=security_parameter,
     )
 
 
@@ -84,6 +110,8 @@ def run_secure_product(
     *,
     seed: int,
     trial: int = 0,
+    modulus: int = MODULUS,
+    security_parameter: int = SECURITY_PARAMETER,
 ) -> GateTrial:
     """执行单个完全隔离的编码、分享、Beaver 与 Protocol 2 组合 trial。
 
@@ -91,12 +119,25 @@ def run_secure_product(
     使用编码 payload 的精确 Python 整数乘积作为 oracle；该 oracle 只存在于测试边界，
     用来阻止 Beaver 的 ``mod q`` 重构结果在发生数学回绕后被误送入截断协议。
     """
-    fixed_point, sharing, truncation = make_context(ell)
-    context = case_context(seed=seed, trial=trial, left=left, right=right, ell=ell)
+    context = case_context(
+        seed=seed,
+        trial=trial,
+        left=left,
+        right=right,
+        ell=ell,
+        modulus=modulus,
+        security_parameter=security_parameter,
+    )
     rng = random.Random(seed)
-    stage = "encode"
+    stage = "context"
 
     try:
+        fixed_point, sharing, truncation = make_context(
+            ell,
+            modulus=modulus,
+            security_parameter=security_parameter,
+        )
+        stage = "encode"
         left_payload = fixed_point.encode(left)
         right_payload = fixed_point.encode(right)
         if not isinstance(left_payload, int) or not isinstance(right_payload, int):
@@ -180,20 +221,46 @@ def run_secure_product(
     )
 
 
-def test_fixed_point_share_reconstruct_decode_preserves_scale_shape_and_dtype() -> None:
-    """验证编码→共享→重构→解码保留 2^ell 尺度、矩阵 shape 和 object residue 容器。"""
-    fixed_point, sharing, _ = make_context(8)
-    values = np.array([[-3.25, 0.0], [1.5, 7.125]])
-    rng = random.Random(101)
+@pytest.mark.parametrize(("modulus", "security_parameter", "ell"), GATE_CONFIGURATIONS)
+def test_fixed_point_share_reconstruct_decode_randomized_parameter_matrix(
+    modulus: int,
+    security_parameter: int,
+    ell: int,
+) -> None:
+    """验证多组合法 q/lambda/ell 下随机矩阵与零值保持编码、共享和解码契约。"""
+    seed = 100_000 + modulus % 1_000 + security_parameter * 100 + ell
+    fixed_point, sharing, _ = make_context(
+        ell,
+        modulus=modulus,
+        security_parameter=security_parameter,
+    )
+    rng = random.Random(seed)
+    values = np.array(
+        [
+            [0.0, rng.uniform(-8.0, 8.0), rng.uniform(-8.0, 8.0)],
+            [rng.uniform(-8.0, 8.0), rng.uniform(-8.0, 8.0), rng.uniform(-8.0, 8.0)],
+        ]
+    )
+    context = case_context(
+        seed=seed,
+        trial=0,
+        left=values.tolist(),
+        right="n/a",
+        ell=ell,
+        modulus=modulus,
+        security_parameter=security_parameter,
+    )
 
     encoded_residues = fixed_point.encode_to_residue(values)
     first, second = sharing.share(encoded_residues, rng=rng)
     reconstructed = sharing.reconstruct(first, second)
     decoded = fixed_point.decode_residue(reconstructed)
 
-    assert reconstructed.dtype == object
-    assert reconstructed.shape == values.shape
-    assert np.all(np.abs(decoded - values) <= 0.5 / fixed_point.scale), "seed=101 stage=decode"
+    assert reconstructed.dtype == object, f"{context} stage=Share/Reconst dtype"
+    assert reconstructed.shape == values.shape, f"{context} stage=Share/Reconst shape"
+    assert np.all(np.abs(decoded - values) <= 0.5 / fixed_point.scale), (
+        f"{context} stage=decode quantization"
+    )
 
 
 def test_known_value_gate_tracks_scale_from_product_to_truncation_and_decode() -> None:
@@ -209,31 +276,41 @@ def test_known_value_gate_tracks_scale_from_product_to_truncation_and_decode() -
     assert result.truncation_output - expected_round in {-1, 0, 1}, f"{context} stage=Trunc"
     assert fixed_point.decode(result.beaver_product, fractional_bits=16) == pytest.approx(
         left * right
-    )
+    ), f"{context} stage=product decode"
     assert fixed_point.decode(result.truncation_output) == pytest.approx(
         left * right,
         abs=1.0 / fixed_point.scale,
-    )
+    ), f"{context} stage=Trunc decode"
     assert (result.created_triples, result.consumed_triples) == (1, 1), f"{context} stage=triple"
     assert (result.created_masks, result.consumed_masks) == (1, 1), f"{context} stage=mask"
 
 
 def test_same_seed_replays_inputs_full_resource_sequence_and_results() -> None:
     """验证同一 trial seed 重放相同输入、triple、掩码与最终数值 transcript。"""
-    first = run_secure_product(8, 1.25, -0.75, seed=202_609, trial=3)
-    second = run_secure_product(8, 1.25, -0.75, seed=202_609, trial=3)
+    left, right, seed, trial = 1.25, -0.75, 202_609, 3
+    context = case_context(seed=seed, trial=trial, left=left, right=right, ell=8)
+    first = run_secure_product(8, left, right, seed=seed, trial=trial)
+    second = run_secure_product(8, left, right, seed=seed, trial=trial)
 
-    assert first == second
-    assert first.triple_sequence == second.triple_sequence
-    assert first.mask_sequence == second.mask_sequence
+    assert first == second, f"{context} stage=full transcript replay"
+    assert first.triple_sequence == second.triple_sequence, f"{context} stage=triple replay"
+    assert first.mask_sequence == second.mask_sequence, f"{context} stage=mask replay"
 
 
-@pytest.mark.parametrize("ell", [4, 8, 12])
-def test_fixed_seed_randomized_gate_trials_reset_all_state_and_replay_resources(ell: int) -> None:
-    """验证每个随机 trial 独立重置 RNG、资源池、计数器和中间份额。"""
-    seed = 91_000 + ell
+@pytest.mark.parametrize(("modulus", "security_parameter", "ell"), GATE_CONFIGURATIONS)
+def test_fixed_seed_randomized_gate_trials_reset_all_state_and_replay_resources(
+    modulus: int,
+    security_parameter: int,
+    ell: int,
+) -> None:
+    """验证合法参数矩阵下每个随机 trial 独立重置所有状态并重放资源。"""
+    seed = 91_000 + modulus % 1_000 + security_parameter * 100 + ell
     input_rng = random.Random(seed)
-    _, _, truncation = make_context(ell)
+    _, _, truncation = make_context(
+        ell,
+        modulus=modulus,
+        security_parameter=security_parameter,
+    )
     magnitude = min(8.0, 0.25 * (truncation.maximum_message**0.5) / (1 << ell))
     cases = [
         (
@@ -253,12 +330,39 @@ def test_fixed_seed_randomized_gate_trials_reset_all_state_and_replay_resources(
         for _ in range(16)
     ]
 
-    assert cases == replayed_cases, f"seed={seed} ell={ell} stage=input replay"
+    assert cases == replayed_cases, (
+        f"{parameter_context(modulus=modulus, ell=ell, security_parameter=security_parameter)} "
+        f"seed={seed} trial=all left=randomized right=randomized stage=input replay"
+    )
 
     for trial, (left, right, trial_seed) in enumerate(cases):
-        context = case_context(seed=trial_seed, trial=trial, left=left, right=right, ell=ell)
-        result = run_secure_product(ell, left, right, seed=trial_seed, trial=trial)
-        replay = run_secure_product(ell, left, right, seed=trial_seed, trial=trial)
+        context = case_context(
+            seed=trial_seed,
+            trial=trial,
+            left=left,
+            right=right,
+            ell=ell,
+            modulus=modulus,
+            security_parameter=security_parameter,
+        )
+        result = run_secure_product(
+            ell,
+            left,
+            right,
+            seed=trial_seed,
+            trial=trial,
+            modulus=modulus,
+            security_parameter=security_parameter,
+        )
+        replay = run_secure_product(
+            ell,
+            left,
+            right,
+            seed=trial_seed,
+            trial=trial,
+            modulus=modulus,
+            security_parameter=security_parameter,
+        )
         expected_round = truncation.paper_round_divide(result.expected_product)
 
         assert result.beaver_product == result.expected_product, f"{context} stage=Beaver"
@@ -276,21 +380,76 @@ def test_large_modulus_path_uses_object_residues_without_machine_integer_wraparo
     fixed_point = FixedPointContext(modulus=modulus, integer_bits=128, fractional_bits=8)
     sharing = TwoPartySharing(modulus)
     values = np.array([-(1 << 50) / 256, (1 << 50) / 256])
+    context = case_context(
+        seed=31,
+        trial=0,
+        left=values.tolist(),
+        right="n/a",
+        ell=8,
+        modulus=modulus,
+        security_parameter=SECURITY_PARAMETER,
+    )
 
     first, second = sharing.share(fixed_point.encode_to_residue(values), rng=random.Random(31))
     reconstructed = sharing.reconstruct(first, second)
 
-    assert reconstructed.dtype == object
-    assert all(isinstance(value, int) for value in reconstructed)
-    assert np.allclose(fixed_point.decode_residue(reconstructed), values)
+    assert reconstructed.dtype == object, f"{context} stage=large-q dtype"
+    assert all(isinstance(value, int) for value in reconstructed), f"{context} stage=large-q type"
+    assert np.allclose(fixed_point.decode_residue(reconstructed), values), (
+        f"{context} stage=large-q decode"
+    )
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "expected_product"),
+    [
+        (0.0, 1.0 / 256, 0),
+        (1.0 / 256, ((1 << 20) - 1) / 256, (1 << 20) - 1),
+        (1.0 / 256, -(1 << 20) / 256, -(1 << 20)),
+    ],
+)
+def test_gate_handles_zero_and_exact_truncation_message_boundaries(
+    left: float,
+    right: float,
+    expected_product: int,
+) -> None:
+    """验证零值与 Z<kappa> 精确上下边界通过完整编码到截断组合路径。"""
+    seed = 202_610 + expected_product % 10
+    _, _, truncation = make_context(8)
+    context = case_context(seed=seed, trial=0, left=left, right=right, ell=8)
+    result = run_secure_product(8, left, right, seed=seed)
+
+    assert result.expected_product == expected_product, f"{context} stage=encoded boundary product"
+    assert result.beaver_product == expected_product, f"{context} stage=Beaver boundary product"
+    assert result.truncation_output - truncation.paper_round_divide(expected_product) in {
+        -1,
+        0,
+        1,
+    }, f"{context} stage=Trunc boundary output"
+    assert (result.created_triples, result.consumed_triples) == (1, 1), f"{context} stage=triple"
+    assert (result.created_masks, result.consumed_masks) == (1, 1), f"{context} stage=mask"
 
 
 def test_gate_rejects_product_outside_truncation_range_before_masking() -> None:
-    """验证直接传入 Protocol 2 的越界 message 会在产生掩码前失败。"""
-    _, _, truncation = make_context(8)
+    """验证完整 Gate 路径在乘积属于 Z_q 但越出 Z<kappa> 时不会创建掩码。"""
+    left, right, seed = 4.0, 4.0, 202_611
 
-    with pytest.raises(ValueError, match="Z<kappa>"):
-        truncation.validate_message(truncation.maximum_message + 1)
+    with pytest.raises(ValueError, match="Z<kappa>") as error:
+        run_secure_product(8, left, right, seed=seed, trial=5)
+
+    detail = str(error.value)
+    for required in (
+        f"seed={seed}",
+        "trial=5",
+        f"left={left!r}",
+        f"right={right!r}",
+        f"q={MODULUS}",
+        "ell=8",
+        f"lambda={SECURITY_PARAMETER}",
+        "scale=256",
+        "stage=Trunc input range",
+    ):
+        assert required in detail, f"{detail}; missing={required}"
 
 
 def test_gate_rejects_real_beaver_product_wraparound_before_truncation() -> None:
@@ -312,4 +471,45 @@ def test_gate_rejects_real_beaver_product_wraparound_before_truncation() -> None
         "scale=256",
         "stage=Beaver product range",
     ):
-        assert required in detail
+        assert required in detail, f"{detail}; missing={required}"
+
+
+@pytest.mark.parametrize(
+    ("modulus", "security_parameter", "ell", "error_text"),
+    [
+        (MODULUS, SECURITY_PARAMETER, 0, "ell 必须是正整数"),
+        (65_535, 2, 4, "素数"),
+        (257, 3, 4, "kappa"),
+        (MODULUS, True, 4, "security_parameter"),
+    ],
+)
+def test_gate_rejects_illegal_parameter_combinations_with_context(
+    modulus: int,
+    security_parameter: int,
+    ell: int,
+    error_text: str,
+) -> None:
+    """验证非法 ell、q 或 lambda 组合在 Gate 上下文创建阶段明确失败。"""
+    seed = 202_612
+    context = case_context(
+        seed=seed,
+        trial=0,
+        left=0.0,
+        right=0.0,
+        ell=ell,
+        modulus=modulus,
+        security_parameter=security_parameter,
+    )
+
+    with pytest.raises(ValueError, match=error_text) as error:
+        run_secure_product(
+            ell,
+            0.0,
+            0.0,
+            seed=seed,
+            modulus=modulus,
+            security_parameter=security_parameter,
+        )
+
+    assert context in str(error.value), f"{context} stage=configuration error context"
+    assert "stage=context" in str(error.value), f"{context} stage=configuration stage"
