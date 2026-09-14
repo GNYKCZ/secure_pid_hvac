@@ -35,8 +35,13 @@ x_c(k+1) = A x_c(k) + B v(k)
 u(k)     = C x_c(k) + D v(k)
 ```
 
-`ControllerSpec` 只保存 `A/B/C/D/x0` 及必要的 shape、dtype、scale 元数据。场景中的控制器设计
-负责在进入 runtime 前生成这些矩阵。实际递推算法不属于当前架构基线。
+`ControllerSpec` 只保存 `A/B/C/D/x0` 及必要的 shape、dtype、scale 元数据。零维 controller state
+是合法的，因此静态状态反馈可直接表示为 `u = Dv`，无需人为引入无意义的内部状态。场景中的
+controller design 负责在进入 runtime 前生成这些矩阵。实际递推算法不属于当前架构基线。
+
+若使用定点表示，`ControllerScaleMetadata` 分别记录 state（亦即 `x0`）、input、output、
+`A/B/C/D` 的 fractional bits。它只是数值表示元数据；编码、模运算和 truncation 仍由后续
+`crypto` 与 `protocol` 工作实现。
 
 ## 场景与仿真契约
 

@@ -30,12 +30,36 @@ def _readonly_numeric_array(name: str, value: Array) -> Array:
 
 
 @dataclass(frozen=True, slots=True)
+class ControllerScaleMetadata:
+    """Fractional-bit metadata for an encoded controller representation.
+
+    ``x0`` uses ``state`` scale. The metadata describes values only; it does
+    not encode, truncate, or perform modular arithmetic.
+    """
+
+    state: int = 0
+    input: int = 0
+    output: int = 0
+    A: int = 0
+    B: int = 0
+    C: int = 0
+    D: int = 0
+
+    def __post_init__(self) -> None:
+        for name in ("state", "input", "output", "A", "B", "C", "D"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
+                raise ValueError(f"{name} scale must be a non-negative integer")
+
+
+@dataclass(frozen=True, slots=True)
 class ControllerSpec:
     """Immutable shape and scale contract for a discrete state-space controller.
 
     The contract represents ``x_next = A @ x + B @ v`` and
     ``u = C @ x + D @ v``. It contains no execution algorithm or
-    scenario-specific controller design parameters.
+    scenario-specific controller design parameters. A zero-dimensional
+    controller state represents a static controller ``u = D @ v``.
     """
 
     A: Array
@@ -43,14 +67,14 @@ class ControllerSpec:
     C: Array
     D: Array
     x0: Array
-    fractional_bits: int | None = None
+    scale_metadata: ControllerScaleMetadata | None = None
 
     def __post_init__(self) -> None:
         for name in ("A", "B", "C", "D", "x0"):
             object.__setattr__(self, name, _readonly_numeric_array(name, getattr(self, name)))
 
-        if self.A.ndim != 2 or self.A.shape[0] == 0 or self.A.shape[0] != self.A.shape[1]:
-            raise ValueError("A must be a non-empty square matrix")
+        if self.A.ndim != 2 or self.A.shape[0] != self.A.shape[1]:
+            raise ValueError("A must be a square matrix")
         if self.B.ndim != 2 or self.B.shape[0] != self.A.shape[0] or self.B.shape[1] == 0:
             raise ValueError("B must have shape (state_dimension, input_dimension)")
         if self.C.ndim != 2 or self.C.shape[1] != self.A.shape[0] or self.C.shape[0] == 0:
@@ -64,12 +88,10 @@ class ControllerSpec:
         if len(dtypes) != 1:
             raise TypeError("A, B, C, D, and x0 must use the same dtype")
 
-        if self.fractional_bits is not None and (
-            isinstance(self.fractional_bits, bool)
-            or not isinstance(self.fractional_bits, Integral)
-            or self.fractional_bits < 0
+        if self.scale_metadata is not None and not isinstance(
+            self.scale_metadata, ControllerScaleMetadata
         ):
-            raise ValueError("fractional_bits must be a non-negative integer or None")
+            raise TypeError("scale_metadata must be ControllerScaleMetadata or None")
 
     @property
     def state_dimension(self) -> int:

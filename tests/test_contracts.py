@@ -5,7 +5,7 @@ from dataclasses import FrozenInstanceError
 import numpy as np
 import pytest
 
-from secure_control.core import ControllerSpec
+from secure_control.core import ControllerScaleMetadata, ControllerSpec
 from secure_control.execution import ControllerRuntime
 from secure_control.simulation import (
     ChannelMetadata,
@@ -34,7 +34,7 @@ def test_controller_spec_validates_dimensions_and_is_immutable() -> None:
     with pytest.raises(ValueError, match="read-only"):
         spec.A[0, 0] = 2.0
     with pytest.raises(FrozenInstanceError):
-        spec.fractional_bits = 8  # type: ignore[misc]
+        spec.scale_metadata = None  # type: ignore[misc]
 
 
 def test_controller_spec_rejects_incompatible_shapes() -> None:
@@ -56,7 +56,15 @@ def test_controller_spec_accepts_large_integer_objects_but_rejects_non_finite_va
         C=np.array([[large]], dtype=object),
         D=np.array([[large]], dtype=object),
         x0=np.array([large], dtype=object),
-        fractional_bits=32,
+        scale_metadata=ControllerScaleMetadata(
+            state=32,
+            input=16,
+            output=16,
+            A=0,
+            B=0,
+            C=16,
+            D=16,
+        ),
     )
 
     assert spec.A[0, 0] == large
@@ -68,6 +76,28 @@ def test_controller_spec_accepts_large_integer_objects_but_rejects_non_finite_va
             D=np.array([[0.0]], dtype=object),
             x0=np.array([0.0], dtype=object),
         )
+
+
+def test_controller_spec_supports_static_state_feedback() -> None:
+    spec = ControllerSpec(
+        A=np.empty((0, 0)),
+        B=np.empty((0, 2)),
+        C=np.empty((1, 0)),
+        D=np.array([[-1.5, -0.25]]),
+        x0=np.empty(0),
+    )
+
+    assert (spec.state_dimension, spec.input_dimension, spec.output_dimension) == (0, 2, 1)
+    assert np.array_equal(spec.D, np.array([[-1.5, -0.25]]))
+
+
+def test_controller_scale_metadata_is_per_signal_and_matrix() -> None:
+    metadata = ControllerScaleMetadata(state=0, input=4, output=7, A=0, B=2, C=7, D=3)
+
+    assert metadata.state == 0
+    assert metadata.B == 2
+    with pytest.raises(ValueError, match="non-negative"):
+        ControllerScaleMetadata(D=-1)
 
 
 def test_runtime_and_scenario_contracts_are_structural() -> None:
