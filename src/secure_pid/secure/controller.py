@@ -1,1 +1,0 @@
-"""Secure PID controller placeholder."""

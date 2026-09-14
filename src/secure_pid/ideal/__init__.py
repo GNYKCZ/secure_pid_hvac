@@ -1,1 +1,0 @@
-"""Plaintext control branch."""
