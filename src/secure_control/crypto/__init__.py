@@ -8,6 +8,13 @@ from .beaver import (
 )
 from .fixed_point import FixedPointContext
 from .secret_sharing import AdditiveShare, TwoPartySharing
+from .truncation import (
+    MaskedTruncationShare,
+    P1MaskedValue,
+    P2MaskedMessage,
+    SecureTruncation,
+    TruncationAuxiliaryShare,
+)
 
 __all__ = [
     "AdditiveShare",
@@ -15,6 +22,11 @@ __all__ = [
     "BeaverTripleShare",
     "FixedPointContext",
     "MaskedDifferenceShare",
+    "MaskedTruncationShare",
+    "P1MaskedValue",
+    "P2MaskedMessage",
     "PublicMaskedDifferences",
+    "SecureTruncation",
+    "TruncationAuxiliaryShare",
     "TwoPartySharing",
 ]
