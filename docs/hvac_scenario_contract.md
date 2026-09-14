@@ -1,8 +1,8 @@
 # HVAC 场景与实验配置契约
 
-本文冻结第一个场景的配置语义，并说明其 HVAC plant、reference 与 SignalAdapter 实现。它不实现
-PID、通用仿真循环或任何安全协议。所有 HVAC 概念只属于 `secure_control.scenarios.hvac` 及其 YAML、
-测试和本文档。
+本文冻结第一个场景的配置语义，并说明其 HVAC plant、reference 与 SignalAdapter 实现。PID 设计和
+场景级明文闭环基线见 [HVAC PID 设计](hvac_pid_design.md)；通用仿真循环和任何安全协议仍未实现。
+所有 HVAC 概念只属于 `secure_control.scenarios.hvac` 及其 YAML、测试和本文档。
 
 ## 基线模型与单位
 
