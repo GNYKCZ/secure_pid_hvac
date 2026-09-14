@@ -1,1 +1,0 @@
-"""Secure truncation protocol placeholder."""
