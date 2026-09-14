@@ -400,34 +400,66 @@ def test_large_modulus_path_uses_object_residues_without_machine_integer_wraparo
     )
 
 
-@pytest.mark.parametrize(
-    ("left", "right", "expected_product"),
-    [
-        (0.0, 1.0 / 256, 0),
-        (1.0 / 256, ((1 << 20) - 1) / 256, (1 << 20) - 1),
-        (1.0 / 256, -(1 << 20) / 256, -(1 << 20)),
-    ],
-)
-def test_gate_handles_zero_and_exact_truncation_message_boundaries(
-    left: float,
-    right: float,
-    expected_product: int,
+@pytest.mark.parametrize(("modulus", "security_parameter", "ell"), GATE_CONFIGURATIONS)
+def test_gate_handles_zero_and_exact_truncation_message_boundaries_for_every_configuration(
+    modulus: int,
+    security_parameter: int,
+    ell: int,
 ) -> None:
-    """验证零值与 Z<kappa> 精确上下边界通过完整编码到截断组合路径。"""
-    seed = 202_610 + expected_product % 10
-    _, _, truncation = make_context(8)
-    context = case_context(seed=seed, trial=0, left=left, right=right, ell=8)
-    result = run_secure_product(8, left, right, seed=seed)
+    """验证每组合法参数的零值与 Z<kappa> 精确上下边界通过完整组合路径。"""
+    fixed_point, _, truncation = make_context(
+        ell,
+        modulus=modulus,
+        security_parameter=security_parameter,
+    )
+    boundary_cases = (
+        (0.0, 1.0 / fixed_point.scale, 0),
+        (
+            1.0 / fixed_point.scale,
+            truncation.maximum_message / fixed_point.scale,
+            truncation.maximum_message,
+        ),
+        (
+            1.0 / fixed_point.scale,
+            truncation.minimum_message / fixed_point.scale,
+            truncation.minimum_message,
+        ),
+    )
 
-    assert result.expected_product == expected_product, f"{context} stage=encoded boundary product"
-    assert result.beaver_product == expected_product, f"{context} stage=Beaver boundary product"
-    assert result.truncation_output - truncation.paper_round_divide(expected_product) in {
-        -1,
-        0,
-        1,
-    }, f"{context} stage=Trunc boundary output"
-    assert (result.created_triples, result.consumed_triples) == (1, 1), f"{context} stage=triple"
-    assert (result.created_masks, result.consumed_masks) == (1, 1), f"{context} stage=mask"
+    for trial, (left, right, expected_product) in enumerate(boundary_cases):
+        seed = 202_610 + ell * 100 + security_parameter * 10 + trial
+        context = case_context(
+            seed=seed,
+            trial=trial,
+            left=left,
+            right=right,
+            ell=ell,
+            modulus=modulus,
+            security_parameter=security_parameter,
+        )
+        result = run_secure_product(
+            ell,
+            left,
+            right,
+            seed=seed,
+            trial=trial,
+            modulus=modulus,
+            security_parameter=security_parameter,
+        )
+
+        assert result.expected_product == expected_product, (
+            f"{context} stage=encoded boundary product"
+        )
+        assert result.beaver_product == expected_product, f"{context} stage=Beaver boundary product"
+        assert result.truncation_output - truncation.paper_round_divide(expected_product) in {
+            -1,
+            0,
+            1,
+        }, f"{context} stage=Trunc boundary output"
+        assert (result.created_triples, result.consumed_triples) == (1, 1), (
+            f"{context} stage=triple"
+        )
+        assert (result.created_masks, result.consumed_masks) == (1, 1), f"{context} stage=mask"
 
 
 def test_gate_rejects_product_outside_truncation_range_before_masking() -> None:

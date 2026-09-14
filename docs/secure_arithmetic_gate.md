@@ -39,8 +39,9 @@ oracle 不属于任何生产 Server API，也不改变 Beaver 或 Trunc 的协�
   包含零值，审计量化误差、shape 与 `dtype=object`。
 - 随机门禁：5 个合法参数组合各 16 次，共 80 个独立 case；每个 case 都以同一 trial
   seed 重放一次，因而总共执行 160 次成功随机协议运行。
-- 精确边界：在 `q=2147483647`、`lambda=8`、`ell=8` 下通过完整组合路径验证乘积为
-  `0`、`2^20-1` 与 `-2^20` 的零值和 `Z<kappa>` 上下界。
+- 精确边界：每个合法参数组合均通过完整组合路径验证乘积为 `0`、该组
+  `maximum_message=2^(kappa-1)-1` 与 `minimum_message=-2^(kappa-1)`；这覆盖零值及每组
+  `Z<kappa>` 的精确上下界。
 - 非法参数矩阵：Gate 明确拒绝 `ell=0`、合数 `q=65535`、不满足 `kappa > ell` 的
   `(q=257, lambda=3, ell=4)`，以及布尔 `lambda`。
 - 每个 trial 使用自己的 seed，并重新创建 RNG、`BeaverMultiplier`、`SecureTruncation`、
