@@ -9,6 +9,8 @@ from numpy.typing import NDArray
 
 from secure_control.core import ControllerSpec
 
+from ._inputs import normalize_step_input
+
 Array = NDArray[Any]
 
 
@@ -78,43 +80,23 @@ class PlaintextStateSpaceRuntime:
         self._require_finite("下一控制器状态", next_state)
 
         # 两个结果均通过检查后才改变状态；失败时保留上一个有效状态，便于重试或诊断。
-        self._state = np.array(next_state, dtype=self._dtype, copy=True)
-        return np.array(control, dtype=self._dtype, copy=True)
+        self._state = np.array(next_state, copy=True)
+        return np.array(control, copy=True)
 
     def _coerce_input(self, value: Array | float) -> Array:
         """验证单步输入，并归一化为长度 ``m`` 的扁平数组。"""
-        input_vector = np.asarray(value)
-        if input_vector.ndim == 0:
-            input_vector = input_vector.reshape(1)
-        elif input_vector.ndim == 2 and input_vector.shape == (
-            self._spec.input_dimension,
-            1,
-        ):
-            # 数学列向量的 m 个分量属于同一时间步；扁平化只统一 NumPy 存储 shape，
-            # 不会把 m 维控制器降为一维，也不改变矩阵乘法语义。
-            input_vector = input_vector.reshape(self._spec.input_dimension)
-        elif input_vector.ndim != 1:
-            raise ValueError(
-                "controller input 必须是标量、一维向量或形状为 "
-                f"({self._spec.input_dimension}, 1) 的列向量"
-            )
-        if input_vector.shape != (self._spec.input_dimension,):
-            raise ValueError(
-                "controller input shape 必须为 "
-                f"({self._spec.input_dimension},)，实际为 {input_vector.shape}"
-            )
-        if input_vector.dtype.kind not in "iuf":
-            raise TypeError("controller input 必须包含实数数值")
-        self._require_finite("controller input", input_vector)
+        input_vector = normalize_step_input(value, self._spec.input_dimension)
 
-        # 对整数控制器拒绝带小数的输入，避免 astype 静默截断而产生错误控制量。
+        # 矩阵的整数存储 dtype 不限定 v 的实数语义；小数输入必须提升运算精度，
+        # 否则 astype 会静默截断 input，或在下一状态提交时再次丢失小数。
         if (
             self._dtype.kind in "iu"
             and input_vector.dtype.kind == "f"
             and not np.equal(input_vector, np.trunc(input_vector)).all()
         ):
-            raise ValueError("整数 dtype 的 ControllerSpec 不接受含小数的输入")
-        converted = np.array(input_vector, dtype=self._dtype, copy=True)
+            converted = np.array(input_vector, dtype=np.float64, copy=True)
+        else:
+            converted = np.array(input_vector, dtype=self._dtype, copy=True)
         self._require_finite("转换后的 controller input", converted)
         return converted
 

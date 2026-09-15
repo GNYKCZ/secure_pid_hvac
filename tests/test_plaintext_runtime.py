@@ -123,20 +123,25 @@ def test_invalid_inputs_fail_without_state_mutation(
     assert np.array_equal(runtime.state, np.array([5.0]))
 
 
-def test_integer_controller_rejects_fractional_input() -> None:
-    """整数矩阵不允许通过隐式类型转换截断带小数的输入。"""
+def test_integer_controller_preserves_fractional_input_without_truncation() -> None:
+    """整数矩阵也应按实数输入计算，不能通过隐式类型转换截断小数。"""
     runtime = PlaintextStateSpaceRuntime(
         ControllerSpec(
             A=np.array([[1]], dtype=np.int64),
             B=np.array([[1]], dtype=np.int64),
-            C=np.array([[1]], dtype=np.int64),
+            C=np.array([[0]], dtype=np.int64),
             D=np.array([[0]], dtype=np.int64),
             x0=np.array([0], dtype=np.int64),
         )
     )
 
-    with pytest.raises(ValueError, match="含小数"):
-        runtime.step(1.5)
+    np.testing.assert_array_equal(runtime.step(1.5), np.array([0.0]))
+    np.testing.assert_array_equal(runtime.state, np.array([1.5]))
+    runtime.reset()
+    np.testing.assert_array_equal(runtime.state, np.array([0], dtype=np.int64))
+    # 原先已接受的整数输入继续保持整数结果与状态 dtype，不因新增小数路径被改写。
+    np.testing.assert_array_equal(runtime.step(2), np.array([0], dtype=np.int64))
+    assert runtime.state.dtype == np.dtype("int64")
 
 
 def test_runtime_implements_shared_execution_protocol() -> None:

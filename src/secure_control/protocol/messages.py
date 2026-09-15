@@ -19,13 +19,74 @@ PartyIndex = Literal[0, 1]
 
 
 @dataclass(frozen=True, slots=True)
+class ControllerScaleLedger:
+    """冻结一次控制递推中各 operand、accumulator、Trunc 与输出的公开尺度。
+
+    首版协议要求 state/input 使用同一基础 ``ell``。state accumulator 只能保持原尺度
+    或比 state 多 ``ell`` 位；前者无需 Trunc，后者恰好执行一次 Protocol 2。output
+    不执行截断，因此 Cx 与 Dv 必须直接具有声明的 output 尺度。
+    """
+
+    state: int
+    input: int
+    A: int
+    B: int
+    C: int
+    D: int
+    state_accumulator: int
+    state_truncation_bits: int
+    output_accumulator: int
+    output: int
+
+    def __post_init__(self) -> None:
+        """在任何分享或资源创建前拒绝负尺度和不相容的乘积账本。"""
+        names = (
+            "state",
+            "input",
+            "A",
+            "B",
+            "C",
+            "D",
+            "state_accumulator",
+            "state_truncation_bits",
+            "output_accumulator",
+            "output",
+        )
+        for name in names:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
+                raise ValueError(f"{name} scale 必须是非负整数。")
+
+        if self.state != self.input:
+            raise ValueError("首版 scale ledger 要求 state/input 使用同一基础 ell。")
+        if self.A + self.state != self.B + self.input:
+            raise ValueError("A*x 与 B*v 的 state products 必须具有相同 accumulator scale。")
+        if self.state_accumulator != self.A + self.state:
+            raise ValueError("state accumulator scale 与 A*x/B*v 乘积尺度不一致。")
+        if self.state_accumulator - self.state != self.state_truncation_bits:
+            raise ValueError("state Trunc shift 必须等于 accumulator 与 state 的尺度差。")
+        if self.state_truncation_bits not in {0, self.state}:
+            raise ValueError("首版 state Trunc shift 只支持 0 或基础 ell。")
+
+        if self.C + self.state != self.D + self.input:
+            raise ValueError("C*x 与 D*v 的 output accumulator scale 必须一致。")
+        if self.output_accumulator != self.C + self.state or self.output != self.output_accumulator:
+            raise ValueError("声明的 output 必须等于未经截断的 output accumulator scale。")
+
+
+@dataclass(frozen=True, slots=True)
 class ControllerLayout:
-    """描述共享控制器的公开维度与统一 ``Q<ell>`` 定点尺度。"""
+    """描述共享控制器的公开维度与完整尺度账本。"""
 
     state_dimension: int
     input_dimension: int
     output_dimension: int
-    fractional_bits: int
+    scale_ledger: ControllerScaleLedger
+
+    @property
+    def fractional_bits(self) -> int:
+        """返回兼容 #10 API 的基础 state/input ``ell``。"""
+        return self.scale_ledger.state
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,7 +172,8 @@ class ResourceMetadata:
     term: Literal["A", "B", "C", "D", "state"]
     index: tuple[int, ...]
     shape: tuple[int, ...]
-    input_fractional_bits: int
+    left_fractional_bits: int
+    right_fractional_bits: int | None
     output_fractional_bits: int
 
 
@@ -125,9 +187,14 @@ class StepResourcePlan:
     state_shape: tuple[int]
     input_shape: tuple[int]
     output_shape: tuple[int]
-    fractional_bits: int
+    scale_ledger: ControllerScaleLedger
     product_resources: tuple[ResourceMetadata, ...]
     state_truncation_resources: tuple[ResourceMetadata, ...]
+
+    @property
+    def fractional_bits(self) -> int:
+        """返回兼容 #10 API 的基础 state/input ``ell``。"""
+        return self.scale_ledger.state
 
     @property
     def triple_count(self) -> int:
@@ -167,7 +234,7 @@ class _ResourceLifecycle:
 
 @dataclass(frozen=True, slots=True)
 class ProductResourceShare:
-    """一个 Server 的单项 Beaver triple share；结果保持 ``2^(2ell)`` 尺度。"""
+    """一个 Server 的单项 Beaver triple share；结果尺度由公开 ledger 决定。"""
 
     owner: PartyIndex
     metadata: ResourceMetadata
@@ -177,7 +244,7 @@ class ProductResourceShare:
 
 @dataclass(frozen=True, slots=True)
 class StateTruncationResourceShare:
-    """一个 Server 的 state 行截断随机量 share；只用于聚合后的双尺度状态和。"""
+    """一个 Server 的 state 行截断随机量 share；只用于需要缩放的聚合状态和。"""
 
     owner: PartyIndex
     metadata: ResourceMetadata
@@ -260,7 +327,7 @@ class TruncationMaskedMessage:
 
 @dataclass(frozen=True, slots=True)
 class ControlShareMessage:
-    """一个 Server 返回给 Client 的双尺度 control share，绑定同一 session/round。"""
+    """一个 Server 返回给 Client 的 ledger 输出尺度 share，绑定同一 session/round。"""
 
     sender: PartyIndex
     session_id: str

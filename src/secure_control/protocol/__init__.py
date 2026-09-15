@@ -4,6 +4,7 @@ from .coordinator import SingleProcessCoordinator
 from .messages import (
     ControllerLayout,
     ControllerRangeContract,
+    ControllerScaleLedger,
     ControllerShare,
     ControlShareMessage,
     InputShareMessage,
@@ -28,6 +29,7 @@ __all__ = [
     "ControlShareMessage",
     "ControllerLayout",
     "ControllerRangeContract",
+    "ControllerScaleLedger",
     "ControllerShare",
     "InputShareMessage",
     "MaskedExchangeMessage",

@@ -13,7 +13,7 @@ Array = NDArray[Any]
 class ControllerRuntime(Protocol):
     """供领域无关仿真引擎消费的最小控制器运行接口。"""
 
-    def step(self, v: Array) -> Array:
+    def step(self, v: Array | float) -> Array:
         """推进一个离散控制步，并返回当前控制输出向量。"""
         ...
 

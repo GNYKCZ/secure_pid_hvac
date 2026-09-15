@@ -15,6 +15,7 @@ from secure_control.protocol import (
     P2,
     Client,
     ControllerRangeContract,
+    ControllerScaleLedger,
     OfflineDistribution,
     OnlineRound,
     SingleProcessCoordinator,
@@ -74,6 +75,40 @@ def test_protocol_three_keeps_output_at_double_scale_and_truncates_once_per_stat
     )
     assert online.p1_resources.plan.triple_count == 9
     assert online.p1_resources.plan.truncation_count == 2
+    assert distribution.p1.layout.scale_ledger == ControllerScaleLedger(
+        state=8,
+        input=8,
+        A=8,
+        B=8,
+        C=8,
+        D=8,
+        state_accumulator=16,
+        state_truncation_bits=8,
+        output_accumulator=16,
+        output=16,
+    )
+    assert {
+        (
+            resource.term,
+            resource.left_fractional_bits,
+            resource.right_fractional_bits,
+            resource.output_fractional_bits,
+        )
+        for resource in online.p1_resources.plan.product_resources
+    } == {
+        ("A", 8, 8, 16),
+        ("B", 8, 8, 16),
+        ("C", 8, 8, 16),
+        ("D", 8, 8, 16),
+    }
+    assert {
+        (
+            resource.left_fractional_bits,
+            resource.right_fractional_bits,
+            resource.output_fractional_bits,
+        )
+        for resource in online.p1_resources.plan.state_truncation_resources
+    } == {(16, None, 8)}
     assert online.p1_resources.consumed_count == online.p2_resources.consumed_count == 11
     assert (client.multiplier.created_triples, client.multiplier.consumed_triples) == (9, 9)
     assert (client.truncation.created_masks, client.truncation.consumed_masks) == (2, 2)
@@ -472,8 +507,8 @@ def test_fixed_seed_replays_material_only_for_isolated_client_transcripts() -> N
     assert share_values(first_output[1].value) == share_values(second_output[1].value)
 
 
-def test_protocol_rejects_non_uniform_controller_scale_metadata() -> None:
-    """验证混合尺度被显式拒绝，而不是静默错配 Protocol 3 的乘法尺度。"""
+def test_protocol_rejects_incompatible_controller_scale_metadata() -> None:
+    """验证不相容乘积尺度被显式拒绝，而不是在模环中直接相加。"""
     fixed_point = FixedPointContext(2_147_483_647, integer_bits=20, fractional_bits=8)
     client = Client(fixed_point, TwoPartySharing(fixed_point.modulus), security_parameter=8)
     spec = ControllerSpec(
@@ -485,9 +520,182 @@ def test_protocol_rejects_non_uniform_controller_scale_metadata() -> None:
         scale_metadata=ControllerScaleMetadata(state=8, input=8, output=8, A=8, B=8, C=7, D=8),
     )
 
-    with pytest.raises(ValueError, match="output 为 2\\*ell"):
+    with pytest.raises(ValueError, match="output accumulator"):
         client.distribute_controller(
             spec,
             ControllerRangeContract(state_payload_bounds=(1,), input_payload_bounds=(0,)),
             rng=random.Random(50),
+        )
+
+
+def test_integer_a_b_scale_uses_no_state_truncation_and_field_specific_payloads() -> None:
+    """验证显式整数 A/B 按零分数位编码，并保持 state 尺度而不创建 Trunc 资源。"""
+    fixed_point = FixedPointContext(2_147_483_647, integer_bits=20, fractional_bits=8)
+    sharing = TwoPartySharing(fixed_point.modulus)
+    client = Client(fixed_point, sharing, security_parameter=8)
+    spec = ControllerSpec(
+        A=np.array([[0.0]]),
+        B=np.array([[1.0]]),
+        C=np.array([[1.0]]),
+        D=np.array([[-1.0]]),
+        x0=np.array([0.5]),
+        scale_metadata=ControllerScaleMetadata(
+            state=8,
+            input=8,
+            output=8,
+            A=0,
+            B=0,
+            C=0,
+            D=0,
+        ),
+    )
+    distribution = client.distribute_controller(
+        spec,
+        ControllerRangeContract(state_payload_bounds=(128,), input_payload_bounds=(64,)),
+        rng=random.Random(60),
+    )
+    p1, p2 = P1(distribution.p1), P2(distribution.p2)
+    online = client.prepare_online(distribution, [0.25], step=0, rng=random.Random(61))
+
+    encoded_b = fixed_point.from_residue(
+        sharing.reconstruct(distribution.p1.controller.B, distribution.p2.controller.B)
+    )
+    encoded_state = fixed_point.from_residue(
+        sharing.reconstruct(distribution.p1.initial_state, distribution.p2.initial_state)
+    )
+    output = SingleProcessCoordinator(sharing, client.multiplier, client.truncation).execute(
+        p1, p2, online
+    )
+
+    assert np.asarray(encoded_b, dtype=object).tolist() == [[1]]
+    assert np.asarray(encoded_state, dtype=object).tolist() == [128]
+    assert distribution.p1.layout.scale_ledger.state_truncation_bits == 0
+    assert online.p1_resources.plan.triple_count == 4
+    assert online.p1_resources.plan.truncation_count == 0
+    assert client.truncation.created_masks == client.truncation.consumed_masks == 0
+    assert output[0].fractional_bits == 8
+    assert {
+        (
+            resource.term,
+            resource.left_fractional_bits,
+            resource.right_fractional_bits,
+            resource.output_fractional_bits,
+        )
+        for resource in online.p1_resources.plan.product_resources
+    } == {
+        ("A", 0, 8, 8),
+        ("B", 0, 8, 8),
+        ("C", 0, 8, 8),
+        ("D", 0, 8, 8),
+    }
+    np.testing.assert_allclose(client.reconstruct_control(*output), np.array([0.25]))
+    np.testing.assert_allclose(
+        fixed_point.decode_residue(sharing.reconstruct(p1.state_share, p2.state_share)),
+        np.array([0.25]),
+    )
+
+
+def test_integer_valued_a_b_still_truncate_when_metadata_declares_fixed_point() -> None:
+    """验证 Trunc 决策只读取公开 metadata，不通过矩阵数值看起来像整数来猜测。"""
+    fixed_point = FixedPointContext(2_147_483_647, integer_bits=20, fractional_bits=8)
+    client = Client(fixed_point, TwoPartySharing(fixed_point.modulus), security_parameter=8)
+    spec = ControllerSpec(
+        A=np.array([[0.0]]),
+        B=np.array([[0.0]]),
+        C=np.array([[0.0]]),
+        D=np.array([[0.0]]),
+        x0=np.array([0.0]),
+        scale_metadata=ControllerScaleMetadata(
+            state=8,
+            input=8,
+            output=16,
+            A=8,
+            B=8,
+            C=8,
+            D=8,
+        ),
+    )
+    distribution = client.distribute_controller(
+        spec,
+        ControllerRangeContract(state_payload_bounds=(1,), input_payload_bounds=(0,)),
+        rng=random.Random(64),
+    )
+
+    online = client.prepare_online(distribution, [0.0], step=0, rng=random.Random(65))
+
+    assert distribution.p1.layout.scale_ledger.state_truncation_bits == 8
+    assert online.p1_resources.plan.truncation_count == 1
+
+
+@pytest.mark.parametrize(
+    ("metadata", "message"),
+    [
+        (
+            ControllerScaleMetadata(state=8, input=8, output=16, A=0, B=8, C=8, D=8),
+            "state products",
+        ),
+        (
+            ControllerScaleMetadata(state=8, input=8, output=16, A=4, B=4, C=8, D=8),
+            "Trunc shift",
+        ),
+        (
+            ControllerScaleMetadata(state=8, input=8, output=15, A=8, B=8, C=8, D=8),
+            "output accumulator",
+        ),
+        (
+            ControllerScaleMetadata(state=7, input=8, output=15, A=8, B=7, C=8, D=7),
+            "state/input",
+        ),
+    ],
+)
+def test_scale_ledger_rejects_unsupported_combinations_before_sharing(
+    metadata: ControllerScaleMetadata, message: str
+) -> None:
+    """验证不支持的尺度组合在生成参数 share 和在线资源前 fail closed。"""
+    fixed_point = FixedPointContext(2_147_483_647, integer_bits=20, fractional_bits=8)
+    client = Client(fixed_point, TwoPartySharing(fixed_point.modulus), security_parameter=8)
+    spec = ControllerSpec(
+        A=np.array([[0.0]]),
+        B=np.array([[0.0]]),
+        C=np.array([[0.0]]),
+        D=np.array([[0.0]]),
+        x0=np.array([0.0]),
+        scale_metadata=metadata,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        client.distribute_controller(
+            spec,
+            ControllerRangeContract(state_payload_bounds=(1,), input_payload_bounds=(1,)),
+            rng=random.Random(62),
+        )
+    assert (client.multiplier.created_triples, client.truncation.created_masks) == (0, 0)
+
+
+def test_zero_fractional_bits_reject_non_integer_matrix_before_sharing() -> None:
+    """验证声明为整数尺度的 A/B 不会把小数静默取整为错误控制器。"""
+    fixed_point = FixedPointContext(2_147_483_647, integer_bits=20, fractional_bits=8)
+    client = Client(fixed_point, TwoPartySharing(fixed_point.modulus), security_parameter=8)
+    spec = ControllerSpec(
+        A=np.array([[0.5]]),
+        B=np.array([[0.0]]),
+        C=np.array([[1.0]]),
+        D=np.array([[0.0]]),
+        x0=np.array([0.0]),
+        scale_metadata=ControllerScaleMetadata(
+            state=8,
+            input=8,
+            output=8,
+            A=0,
+            B=0,
+            C=0,
+            D=0,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="整数"):
+        client.distribute_controller(
+            spec,
+            ControllerRangeContract(state_payload_bounds=(1,), input_payload_bounds=(1,)),
+            rng=random.Random(63),
         )

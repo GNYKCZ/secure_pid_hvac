@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterator
 from secure_control.crypto import AdditiveShare, BeaverMultiplier, SecureTruncation, TwoPartySharing
 
 from .messages import (
+    ControllerScaleLedger,
     ControlShareMessage,
     MaskedExchangeMessage,
     OnlineRound,
@@ -19,7 +20,7 @@ from .roles import P1, P2, _Server, _vector_from_scalars
 
 
 class SingleProcessCoordinator:
-    """协调本地消息投递与公开 masked 值；输出始终是同一 round 的双尺度 control shares。
+    """协调本地消息投递与公开 masked 值；输出尺度由同一 round 的 ledger 决定。
 
     该类只是当前 transport/协调选择。它只能暂态配对 Beaver 遮蔽差值而得到允许公开
     的 ``d/e``，从不重构参数、state、input 或 control output；明文重构仅在 Client
@@ -41,11 +42,11 @@ class SingleProcessCoordinator:
     def execute(
         self, p1: P1, p2: P2, online: OnlineRound
     ) -> tuple[ControlShareMessage, ControlShareMessage]:
-        """按 Protocol 3 执行 ``u=Cx+Dv`` 与 ``x_next=Trunc(Ax+Bv)``。
+        """按 Protocol 3 执行 ``u=Cx+Dv`` 与 metadata 驱动的 state rescale。
 
-        所有标量乘积先保持 ``2^(2ell)`` 尺度并完成行内加法；只有聚合 state 行使用一
-        对 Trunc 随机量。输出不截断，保持双尺度直到 Client 解码。任意失败均废弃本轮
-        未完成资源且不提交新 state。
+        所有标量乘积按 ledger 声明的尺度完成行内加法；只有 state accumulator 比 state
+        多 ``ell`` 位时，聚合后的每一行才使用一对 Trunc 随机量。输出不截断，保持 ledger
+        的 output scale 直到 Client 解码。任意失败均废弃本轮未完成资源且不提交新 state。
         """
         try:
             self._validate_round(p1, p2, online)
@@ -101,7 +102,7 @@ class SingleProcessCoordinator:
                     online.session_id,
                     online.round_id,
                     online.step,
-                    2 * p1.layout.fractional_bits,
+                    p1.layout.scale_ledger.output,
                     output[0],
                 ),
                 ControlShareMessage(
@@ -109,7 +110,7 @@ class SingleProcessCoordinator:
                     online.session_id,
                     online.round_id,
                     online.step,
-                    2 * p2.layout.fractional_bits,
+                    p2.layout.scale_ledger.output,
                     output[1],
                 ),
             )
@@ -126,7 +127,7 @@ class SingleProcessCoordinator:
         second_right: Callable[[int], AdditiveShare],
         products: Iterator[tuple[ProductResourceShare, ProductResourceShare]],
     ) -> tuple[AdditiveShare, AdditiveShare]:
-        """以逐标量 Beaver 乘法形成双尺度矩阵/向量积，绝不在此处截断。"""
+        """以逐标量 Beaver 乘法形成 ledger 尺度的矩阵/向量积，绝不逐项截断。"""
         rows, columns = self._term_shape(term, p1)
         first_values: list[AdditiveShare] = []
         second_values: list[AdditiveShare] = []
@@ -135,7 +136,13 @@ class SingleProcessCoordinator:
             second_sum = AdditiveShare(0)
             for column in range(columns):
                 first_resource, second_resource = next(products)
-                self._validate_product_pair(first_resource, second_resource, term, (row, column))
+                self._validate_product_pair(
+                    first_resource,
+                    second_resource,
+                    term,
+                    (row, column),
+                    p1.layout.scale_ledger,
+                )
                 product = self._scalar_product(
                     p1.matrix_value(term, row, column),
                     first_right(column),
@@ -163,7 +170,7 @@ class SingleProcessCoordinator:
         first_resource: ProductResourceShare,
         second_resource: ProductResourceShare,
     ) -> tuple[AdditiveShare, AdditiveShare]:
-        """执行一个双尺度 Beaver 乘法，并模拟绑定 session/round 的双向遮蔽消息。"""
+        """执行一个 ledger 尺度 Beaver 乘法，并模拟绑定 session/round 的双向遮蔽消息。"""
         first_masked = p1.start_product(self._multiplier, first_left, first_right, first_resource)
         second_masked = p2.start_product(
             self._multiplier, second_left, second_right, second_resource
@@ -208,7 +215,9 @@ class SingleProcessCoordinator:
         raw_state: tuple[AdditiveShare, AdditiveShare],
         online: OnlineRound,
     ) -> tuple[AdditiveShare, AdditiveShare]:
-        """对每个聚合 state 行恰好调用一次 Protocol 2，并保持单个 ``w`` 误差语义。"""
+        """按 ledger 对聚合 state 行不截断，或恰好调用一次 Protocol 2。"""
+        if online.p1_resources.plan.scale_ledger.state_truncation_bits == 0:
+            return raw_state
         first_values: list[AdditiveShare] = []
         second_values: list[AdditiveShare] = []
         for row, (first_resource, second_resource) in enumerate(
@@ -218,7 +227,12 @@ class SingleProcessCoordinator:
                 strict=True,
             )
         ):
-            self._validate_truncation_pair(first_resource, second_resource, row)
+            self._validate_truncation_pair(
+                first_resource,
+                second_resource,
+                row,
+                online.p1_resources.plan.scale_ledger,
+            )
             first_raw = AdditiveShare(raw_state[0].value[row])
             second_raw = AdditiveShare(raw_state[1].value[row])
             first_masked = p1.mask_truncation(self._truncation, first_raw, first_resource)
@@ -325,7 +339,7 @@ class SingleProcessCoordinator:
             (p1.layout.state_dimension,),
             (p1.layout.input_dimension,),
             (p1.layout.output_dimension,),
-        ) or plan.fractional_bits != p1.layout.fractional_bits:
+        ) or plan.scale_ledger != p1.layout.scale_ledger:
             raise ValueError("资源计划的公开 shape 或 fractional bits 与控制器不匹配。")
         self._validate_resource_collection(
             online.p1_resources.product_resources,
@@ -361,9 +375,13 @@ class SingleProcessCoordinator:
         second: ProductResourceShare,
         term: str,
         index: tuple[int, int],
+        ledger: ControllerScaleLedger,
     ) -> None:
-        """确认当前 triple pair 正好属于指定矩阵元素并保持 ``ell→2ell`` 尺度。"""
+        """确认当前 triple pair 属于指定矩阵元素并符合 ledger operand/result 尺度。"""
         metadata = first.metadata
+        # 资源 metadata 自身携带两侧 operand；期望值由当前 term 与 server layout 唯一确定。
+        right_scale = ledger.state if term in {"A", "C"} else ledger.input
+        left_scale = getattr(ledger, term)
         if (
             first.owner != 0
             or second.owner != 1
@@ -372,16 +390,24 @@ class SingleProcessCoordinator:
             or metadata.kind != "multiplication"
             or metadata.term != term
             or metadata.index != index
-            or (metadata.input_fractional_bits, metadata.output_fractional_bits)
-            != (self._truncation.ell, 2 * self._truncation.ell)
+            or (
+                metadata.left_fractional_bits,
+                metadata.right_fractional_bits,
+                metadata.output_fractional_bits,
+            )
+            != (left_scale, right_scale, left_scale + right_scale)
             or first._lifecycle.status != "prepared"
         ):
             raise ValueError("矩阵项不能使用错配、错误尺度或已消费的乘法资源。")
 
     def _validate_truncation_pair(
-        self, first: StateTruncationResourceShare, second: StateTruncationResourceShare, row: int
+        self,
+        first: StateTruncationResourceShare,
+        second: StateTruncationResourceShare,
+        row: int,
+        ledger: ControllerScaleLedger,
     ) -> None:
-        """确认截断资源只对应聚合 state 第 row 行，并恢复 ``2ell→ell`` 尺度。"""
+        """确认截断资源对应聚合 state 第 row 行，并恢复 ledger 的 state 尺度。"""
         metadata = first.metadata
         if (
             first.owner != 0
@@ -391,8 +417,12 @@ class SingleProcessCoordinator:
             or metadata.kind != "state_truncation"
             or metadata.term != "state"
             or metadata.index != (row,)
-            or (metadata.input_fractional_bits, metadata.output_fractional_bits)
-            != (2 * self._truncation.ell, self._truncation.ell)
+            or (
+                metadata.left_fractional_bits,
+                metadata.right_fractional_bits,
+                metadata.output_fractional_bits,
+            )
+            != (ledger.state_accumulator, None, ledger.state)
             or first._lifecycle.status != "prepared"
         ):
             raise ValueError("state 行不能使用错配、错误尺度或已消费的截断资源。")
