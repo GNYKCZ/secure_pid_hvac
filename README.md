@@ -8,8 +8,8 @@ GitHub 仓库和发行包继续使用 `secure_pid_hvac` / `secure-pid-hvac`，Py
 `secure_control`。HVAC 是第一个场景，不是核心领域；它的模型、参考轨迹、PID 设计、信号适配、
 单位和指标应集中在 `secure_control.scenarios.hvac`。
 
-当前已完成架构基础、HVAC 明文基线，以及安全算术原语与组合验证门。尚未实现通用安全控制器
-运行时、Client/P1/P2 完整编排、HVAC 安全闭环、multiprocessing 或网络通信。
+当前已完成架构基础、HVAC 明文基线、安全算术原语与组合验证门，以及通用 Client/P1/P2 的
+单进程协议核心。尚未实现统一安全控制器运行时、HVAC 安全闭环、multiprocessing 或网络通信。
 
 ## 架构边界
 
@@ -96,8 +96,21 @@ uv run pytest tests/test_secure_arithmetic_gate.py -k randomized -q
 ```
 
 安全算术当前只实现 scalar-first 的 Beaver 与截断路径。它验证本地协议算术与消息语义，并不等同于
-主机隔离、网络安全或完整的生产级安全证明。安全 PID、Client/P1/P2 编排和 HVAC 安全闭环将在后续
-Issue 中建立在该 Gate 之上。
+主机隔离、网络安全或完整的生产级安全证明。安全闭环、进程隔离与网络通信仍属于后续工作。
+
+## 通用两方协议核心
+
+`secure_control.protocol` 现已提供领域无关的 `Client`、`P1`、`P2`、显式消息/资源对象与
+`SingleProcessCoordinator`。Client 分别分发通用 `ControllerSpec(A, B, C, D, x0)` 的份额；每个
+在线 step 对 `C/D/A/B` 的每个标量矩阵项消耗一份独立 Beaver triple，聚合 state 的每一行才
+消耗一对截断随机量；output 保持双尺度并只在 Client 边界解码。P1/P2 不保存第二份参数、输入、
+state 或资源 share。
+
+当前 Protocol 3 路径要求 `A/B/C/D/x0/v` 使用 `Q<ell>` 尺度，控制输出使用
+`Q<2ell>` 尺度；带有不符合该规则的 `ControllerScaleMetadata` 的控制器会被拒绝。Client 还要求公开的编码 payload 范围契约，以证明
+state 截断输入位于 `Z<kappa>`、输出位于中心化 `Z_q`。单进程路径仅验证协议消息流与算术语义，
+不是进程或网络隔离声明。角色可见数据、资源计数、失败清理和安全声明见
+[通用两方协议契约](docs/two_party_protocol_contract.md)。
 
 仿真产生的大量 CSV 文件与图片应分别写入 `results/csv/` 和 `results/figures/`；这些输出默认
 不会提交到 Git。
