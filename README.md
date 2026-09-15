@@ -8,8 +8,9 @@ GitHub 仓库和发行包继续使用 `secure_pid_hvac` / `secure-pid-hvac`，Py
 `secure_control`。HVAC 是第一个场景，不是核心领域；它的模型、参考轨迹、PID 设计、信号适配、
 单位和指标应集中在 `secure_control.scenarios.hvac`。
 
-当前已完成架构基础、HVAC 明文基线、安全算术原语与组合验证门，以及通用 Client/P1/P2 的
-单进程协议核心。尚未实现统一安全控制器运行时、HVAC 安全闭环、multiprocessing 或网络通信。
+当前已完成架构基础、HVAC 明文基线、安全算术原语与组合验证门、通用 Client/P1/P2 单进程协议
+核心，以及与明文接口兼容的通用安全状态空间运行时。尚未实现 HVAC 安全闭环、multiprocessing
+或网络通信。
 
 ## 架构边界
 
@@ -102,15 +103,20 @@ uv run pytest tests/test_secure_arithmetic_gate.py -k randomized -q
 
 `secure_control.protocol` 现已提供领域无关的 `Client`、`P1`、`P2`、显式消息/资源对象与
 `SingleProcessCoordinator`。Client 分别分发通用 `ControllerSpec(A, B, C, D, x0)` 的份额；每个
-在线 step 对 `C/D/A/B` 的每个标量矩阵项消耗一份独立 Beaver triple，聚合 state 的每一行才
-消耗一对截断随机量；output 保持双尺度并只在 Client 边界解码。P1/P2 不保存第二份参数、输入、
-state 或资源 share。
+在线 step 对 `C/D/A/B` 的每个标量矩阵项消耗一份独立 Beaver triple；只有 scale ledger 要求
+state rescale 时，聚合 state 的每一行才消耗一对截断随机量。output 保持 ledger 声明尺度并只在
+Client 边界解码。P1/P2 不保存第二份参数、输入、state 或资源 share。
 
-当前 Protocol 3 路径要求 `A/B/C/D/x0/v` 使用 `Q<ell>` 尺度，控制输出使用
-`Q<2ell>` 尺度；带有不符合该规则的 `ControllerScaleMetadata` 的控制器会被拒绝。Client 还要求公开的编码 payload 范围契约，以证明
-state 截断输入位于 `Z<kappa>`、输出位于中心化 `Z_q`。单进程路径仅验证协议消息流与算术语义，
-不是进程或网络隔离声明。角色可见数据、资源计数、失败清理和安全声明见
+Protocol 3 以 `ControllerScaleLedger` 明确每类 operand、accumulator、Trunc 和输出尺度。首版
+支持固定点 A/B 的逐 state 行 Trunc，以及 metadata 声明的整数 A/B no-Trunc 路径；Client 还
+要求公开编码 payload 范围契约，以证明 state 与 output 不发生不可解释的模回绕。单进程路径仅
+验证协议消息流与算术语义，不是进程或网络隔离声明。角色可见数据、资源计数、失败清理见
 [通用两方协议契约](docs/two_party_protocol_contract.md)。
+
+`SecureStateSpaceRuntime` 将上述协议封装为 `step(v) -> u` 与 `reset()`，上层不接触
+Client/P1/P2、share 或一次性资源。输入 shape、更新顺序和输出 shape 与明文 runtime 对齐；
+尺度、事务式失败语义、数值容差和当前 backend 限制见
+[通用安全状态空间运行时契约](docs/secure_runtime_contract.md)。
 
 仿真产生的大量 CSV 文件与图片应分别写入 `results/csv/` 和 `results/figures/`；这些输出默认
 不会提交到 Git。

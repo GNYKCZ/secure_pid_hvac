@@ -20,7 +20,11 @@ FORBIDDEN_IMPORTS = {
     ),
     "protocol": ("secure_control.scenarios", "secure_control.simulation"),
     "execution": ("secure_control.scenarios",),
-    "simulation": ("secure_control.scenarios",),
+    "simulation": (
+        "secure_control.crypto",
+        "secure_control.protocol",
+        "secure_control.scenarios",
+    ),
 }
 
 

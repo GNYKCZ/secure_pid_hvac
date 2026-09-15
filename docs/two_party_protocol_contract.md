@@ -16,8 +16,8 @@ u(k)     = C x_c(k) + D v(k)
 | 角色 | 离线可见数据 | 在线可见数据 | 不能持有的数据 |
 | --- | --- | --- | --- |
 | Client | `A/B/C/D/x0` 明文、公开 layout/scale/range contract | `v` 明文、两份输入 share、两方资源包、两份输出 share | 无需持有 Server 的可变 state |
-| P1 | `A_1/B_1/C_1/D_1/x0_1`、controller session | 同一 round 的 `v_1`、triple/mask 第 1 份、公开 Beaver `d/e`、P2 的 Protocol 2 masked 消息、双尺度 `u_1` | 第二份参数/state/input/resource share，任何 controller state 明文 |
-| P2 | `A_2/B_2/C_2/D_2/x0_2`、controller session | 同一 round 的 `v_2`、triple/mask 第 2 份、公开 Beaver `d/e`、双尺度 `u_2` | 第一份参数/state/input/resource share，P1 的 Protocol 2 消息或 controller state 明文 |
+| P1 | `A_1/B_1/C_1/D_1/x0_1`、controller session | 同一 round 的 `v_1`、triple/mask 第 1 份、公开 Beaver `d/e`、P2 的 Protocol 2 masked 消息、ledger 尺度 `u_1` | 第二份参数/state/input/resource share，任何 controller state 明文 |
+| P2 | `A_2/B_2/C_2/D_2/x0_2`、controller session | 同一 round 的 `v_2`、triple/mask 第 2 份、公开 Beaver `d/e`、ledger 尺度 `u_2` | 第一份参数/state/input/resource share，P1 的 Protocol 2 消息或 controller state 明文 |
 | 单进程协调器 | 算术原语和暂态 masked 消息 | 两条 Beaver 遮蔽差值及公开 `d/e` | 参数、state、input 或 output 的明文重构结果 |
 
 每次离线分发都有由独立安全随机源生成的唯一 `session_id`，每个在线请求有同样生成的唯一
@@ -37,15 +37,18 @@ distribution/round 及其 output dimension，在输出重构前拒绝外来、�
 2. Client 编码并分享 `A/B/C/D/x0`，然后以同一 `session_id` 分别发送 `OfflineControllerMessage`
    给 P1、P2。每个在线 step 先验证实际 `v` 没有超出公开 input bound。
 3. 每个 `A/B/C/D` 标量矩阵项消耗一个独立 Beaver triple。`StepResourcePlan` 因而需要
-   `p*n + p*m + n*n + n*m` 个 triples；每个 state 元素只消耗一对独立 truncation masks，共 `n`
-   对，而不是每个矩阵项一对。
-4. 协调器先计算双尺度 `C*x(k)+D*v(k)`，不截断并返回给 Client；Client 按 `2^(-2ell)` 解码。
-   随后协调器计算双尺度 `A*x(k)+B*v(k)`，对每个聚合 state 行恰好截断一次并提交下一 state
-   shares。因此 `u(k)` 使用的是 `x(k)`，每个 state 元素仅有一个 Protocol 2 的 `w∈{-1,0,1}`。
+   `p*n + p*m + n*n + n*m` 个 triples。general fixed-point A/B 路径每个 state 元素消耗一对
+   独立 truncation masks，共 `n` 对；metadata 声明的 integer A/B 路径为 0 对。
+4. 协调器先计算 ledger 同尺度的 `C*x(k)+D*v(k)`，不截断并按 ledger.output 返回给 Client。
+   随后计算 `A*x(k)+B*v(k)`：若 accumulator 比 state 多 `ell` 位，对每个聚合 state 行恰好
+   截断一次；若尺度已经等于 state，则直接提交 shares。因此 `u(k)` 使用 `x(k)`。
 
-当前 crypto 截断原语每个实例只有一个 `ell`，所以该协议路径要求 `A/B/C/D/x0/v` 使用同一
-`Q<ell>` 尺度；未经截断的 output 则明确使用 `Q<2ell>`。若 `ControllerScaleMetadata` 声明
-混合输入尺度，Client 会在离线阶段拒绝分发，而不是静默错配乘积尺度。
+`ControllerScaleLedger` 冻结 state/input、A/B/C/D、两类 accumulator、Trunc shift 与 output
+尺度。首版要求 state/input 为基础 `ell`，并支持 A/B 为 `ell`（state accumulator 为 `2ell`，
+Trunc `ell`）或 A/B 为 0（state accumulator 为 `ell`，不 Trunc）。C/D 的乘积尺度必须相同并
+直接等于 output；每个字段按自身尺度编码，零尺度字段必须是数学整数。未知 Trunc shift 或任何
+待相加乘积的尺度不一致都会在分享和资源创建前被拒绝。未提供 metadata 时保持 #10 的全
+`Q<ell>` operands、`Q<2ell>` output 行为。
 
 每个 `ProductResourceShare` 或 `StateTruncationResourceShare` 只能被其所属角色使用一次。两个
 角色均完成对应 Protocol 1 或 Protocol 2 后，资源标记为 `consumed`；任意校验或协议失败会把
@@ -66,5 +69,5 @@ input share、triple 或 mask；不同 Client 的首轮仍可重复测试。`rng
 算术语义。它不声明进程隔离、主机隔离、网络安全、认证、抗恶意参与方或生产级端到端安全。
 单进程协调路径不会把明文提供给 Server，但同一 Python 进程本身不构成隔离边界。
 
-本 Issue 也不提供运行时 `step(v)` 包装、仿真集成、多进程或网络 transport。这些属于后续
-执行层/集成工作，不能由本协议数据模型隐式替代。
+Issue #11 已在 execution 层提供运行时 `step(v)` 包装，但仿真集成、多进程和网络 transport
+仍不属于本协议数据模型。运行时契约见 [通用安全状态空间运行时](secure_runtime_contract.md)。

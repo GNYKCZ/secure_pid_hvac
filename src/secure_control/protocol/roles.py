@@ -28,6 +28,7 @@ from secure_control.crypto import (
 from .messages import (
     ControllerLayout,
     ControllerRangeContract,
+    ControllerScaleLedger,
     ControllerShare,
     ControlShareMessage,
     InputShareMessage,
@@ -110,8 +111,20 @@ class Client:
             raise TypeError("range_contract 必须是 ControllerRangeContract。")
         layout = self._layout_from_spec(spec)
         range_contract.validate_layout(layout)
+        if spec.scale_metadata is not None:
+            self._validate_zero_scale_fields(spec, layout.scale_ledger)
+        field_scales = {
+            "A": layout.scale_ledger.A,
+            "B": layout.scale_ledger.B,
+            "C": layout.scale_ledger.C,
+            "D": layout.scale_ledger.D,
+            "x0": layout.scale_ledger.state,
+        }
         payloads = {
-            name: np.asarray(self.fixed_point.encode(getattr(spec, name)), dtype=object)
+            name: np.asarray(
+                self._fixed_point_at_scale(field_scales[name]).encode(getattr(spec, name)),
+                dtype=object,
+            )
             for name in ("A", "B", "C", "D", "x0")
         }
         self._validate_range_contract(payloads, layout, range_contract)
@@ -145,7 +158,9 @@ class Client:
             raise ValueError("离线分发不属于当前 Client 签发的 controller session。")
         step = _require_step(step)
         input_values = self._normalize_input(v, layout)
-        input_payload = np.asarray(self.fixed_point.encode(input_values), dtype=object)
+        input_payload = np.asarray(
+            self._fixed_point_at_scale(layout.scale_ledger.input).encode(input_values), dtype=object
+        )
         self._validate_input_bound(input_payload, distribution.range_contract)
         round_id = self._identifier("round")
         identity = (distribution.session_id, round_id, step)
@@ -190,7 +205,7 @@ class Client:
     def reconstruct_control(
         self, first: ControlShareMessage, second: ControlShareMessage
     ) -> np.ndarray:
-        """在 Client 边界对已签发 round 的正确 shape 双尺度 control shares 重构一次。"""
+        """在 Client 边界对已签发 round 的正确 shape/ledger scale control shares 重构一次。"""
         if not isinstance(first, ControlShareMessage) or not isinstance(
             second, ControlShareMessage
         ):
@@ -201,13 +216,14 @@ class Client:
             or first.round_id != second.round_id
             or first.step != second.step
             or first.fractional_bits != second.fractional_bits
-            or first.fractional_bits != 2 * self.fixed_point.fractional_bits
         ):
-            raise ValueError("控制输出必须是同一 session/round 的双尺度 P1、P2 shares。")
+            raise ValueError("控制输出必须是同一 session/round、同尺度的 P1、P2 shares。")
         identity = (first.session_id, first.round_id, first.step)
         layout = self._issued_rounds.get(identity)
         if layout is None:
             raise ValueError("控制输出不属于当前 Client 签发的 round，或该 round 已完成重构。")
+        if first.fractional_bits != layout.scale_ledger.output:
+            raise ValueError("控制输出 fractional bits 与当前 round 的 scale ledger 不一致。")
         expected_shape = (layout.output_dimension,)
         if (
             np.asarray(first.value.value, dtype=object).shape != expected_shape
@@ -223,32 +239,82 @@ class Client:
         for index in np.ndindex(signed.shape):
             value = int(signed[index]) / scale
             if not math.isfinite(value):
-                raise ValueError("双尺度 control output 无法安全解码为有限浮点数。")
+                raise ValueError("ledger scale control output 无法安全解码为有限浮点数。")
             result[index] = value
         # 成功解码后关闭 capability，防止上层误把同一 round 的 control 重复应用。
         del self._issued_rounds[identity]
         return result
 
+    def abort_round(self, online: OnlineRound) -> None:
+        """关闭当前 Client 已签发但未成功重构的 round capability。
+
+        该操作不接收、更不重构任何 share。执行阶段失败时资源由 coordinator 永久废弃；
+        输出重构失败时资源已经消费，因此这里只负责阻止失败输出被再次应用。
+        """
+        if not isinstance(online, OnlineRound):
+            raise TypeError("online 必须是 Client.prepare_online 返回的 OnlineRound。")
+        identity = (online.session_id, online.round_id, online.step)
+        if online.session_id not in self._issued_sessions or identity not in self._issued_rounds:
+            raise ValueError("只能关闭当前 Client 尚未完成的 round capability。")
+        del self._issued_rounds[identity]
+
     def _layout_from_spec(self, spec: ControllerSpec) -> ControllerLayout:
-        """检查当前 scalar-first Protocol 3 路径可承载的统一尺度并提取公开维度。"""
+        """由 metadata 建立首版支持的尺度账本，并提取公开 controller 维度。"""
         scale = self.fixed_point.fractional_bits
-        if spec.scale_metadata is not None:
-            metadata = spec.scale_metadata
-            operand_scales = (
-                metadata.state,
-                metadata.input,
-                metadata.A,
-                metadata.B,
-                metadata.C,
-                metadata.D,
-            )
-            if any(value != scale for value in operand_scales) or metadata.output != 2 * scale:
+        metadata = spec.scale_metadata
+        if metadata is None:
+            state = input_scale = A = B = C = D = scale
+            output = 2 * scale
+        else:
+            if metadata.state != scale or metadata.input != scale:
                 raise ValueError(
-                    "当前 Protocol 3 要求 A/B/C/D/x0/v 为 ell，且 output 为 2*ell fractional bits。"
+                    "首版协议要求 state/input scale 等于 FixedPointContext 的基础 ell。"
                 )
-        return ControllerLayout(
-            spec.state_dimension, spec.input_dimension, spec.output_dimension, scale
+            state, input_scale = metadata.state, metadata.input
+            A, B, C, D, output = metadata.A, metadata.B, metadata.C, metadata.D, metadata.output
+        state_accumulator = A + state
+        output_accumulator = C + state
+        ledger = ControllerScaleLedger(
+            state,
+            input_scale,
+            A,
+            B,
+            C,
+            D,
+            state_accumulator,
+            state_accumulator - state if state_accumulator >= state else -1,
+            output_accumulator,
+            output,
         )
+        return ControllerLayout(
+            spec.state_dimension, spec.input_dimension, spec.output_dimension, ledger
+        )
+
+    def _fixed_point_at_scale(self, fractional_bits: int) -> FixedPointContext:
+        """复用相同 q/payload 位宽，只改变字段编码所需的公开 fractional bits。"""
+        return FixedPointContext(
+            self.fixed_point.modulus,
+            integer_bits=self.fixed_point.integer_bits,
+            fractional_bits=fractional_bits,
+        )
+
+    def _validate_zero_scale_fields(
+        self, spec: ControllerSpec, ledger: ControllerScaleLedger
+    ) -> None:
+        """拒绝把非整数值声明为零分数位，避免论文取整静默改变控制器。"""
+        scales = {
+            "A": ledger.A,
+            "B": ledger.B,
+            "C": ledger.C,
+            "D": ledger.D,
+            "x0": ledger.state,
+        }
+        for name, scale in scales.items():
+            if scale != 0:
+                continue
+            for value in np.asarray(getattr(spec, name), dtype=object).flat:
+                if not isinstance(value, Integral) and value != int(value):
+                    raise ValueError(f"{name} 声明为零 fractional bits 时必须只包含数学整数。")
 
     def _distribution_layout(self, distribution: OfflineDistribution) -> ControllerLayout:
         """验证两条离线消息由同一次 Client 分发产生，拒绝同 shape 的跨 session 拼接。"""
@@ -290,6 +356,10 @@ class Client:
             raise ValueError(
                 "state_payload_bounds 不能超出 FixedPointContext 的可表示 payload 范围。"
             )
+        if any(value > self.fixed_point.maximum_payload for value in input_bounds):
+            raise ValueError(
+                "input_payload_bounds 不能超出 FixedPointContext 的可表示 payload 范围。"
+            )
         for index, value in enumerate(payloads["x0"]):
             if abs(int(value)) > state_bounds[index]:
                 raise ValueError("x0 payload 超出公开 state_payload_bounds。")
@@ -297,20 +367,27 @@ class Client:
         state_raw_bounds = self._row_bounds(
             payloads["A"], state_bounds, payloads["B"], input_bounds
         )
+        ledger = layout.scale_ledger
         maximum_truncation_message = self.truncation.maximum_message
+        centered_limit = (self.sharing.modulus - 1) // 2
         for index, raw_bound in enumerate(state_raw_bounds):
-            if raw_bound > maximum_truncation_message:
-                raise ValueError("state 聚合乘积超出 Protocol 2 的 Z<kappa> 范围。")
-            # Protocol 2 的 paper rounding 后还可能有一个 w∈{-1,0,1}，故不变集需预留 1。
-            next_bound = (raw_bound + self.fixed_point.scale - 1) // self.fixed_point.scale + 1
+            if ledger.state_truncation_bits:
+                if raw_bound > maximum_truncation_message:
+                    raise ValueError("state 聚合乘积超出 Protocol 2 的 Z<kappa> 范围。")
+                # Protocol 2 paper rounding 后还可能有 w∈{-1,0,1}，不变集需预留 1。
+                truncation_scale = 1 << ledger.state_truncation_bits
+                next_bound = (raw_bound + truncation_scale - 1) // truncation_scale + 1
+            else:
+                if raw_bound > centered_limit:
+                    raise ValueError("无需 Trunc 的 state 聚合乘积可能越出 centered Z_q 范围。")
+                next_bound = raw_bound
             if next_bound > state_bounds[index]:
                 raise ValueError("state_payload_bounds 不是给定输入范围下的不变安全范围。")
 
         output_raw_bounds = self._row_bounds(
             payloads["C"], state_bounds, payloads["D"], input_bounds
         )
-        centered_output_limit = (self.sharing.modulus - 1) // 2
-        if any(value > centered_output_limit for value in output_raw_bounds):
+        if any(value > centered_limit for value in output_raw_bounds):
             raise ValueError("control output 聚合乘积可能越出 centered Z_q 范围。")
         if len(state_raw_bounds) != layout.state_dimension:
             raise AssertionError("state 范围验证的行数与 controller layout 不一致。")
@@ -328,7 +405,7 @@ class Client:
         second: np.ndarray,
         second_bounds: tuple[int, ...],
     ) -> list[int]:
-        """以三角不等式计算每行双尺度聚合值的公开绝对上界，不读取 secret shares。"""
+        """以三角不等式计算每行 ledger accumulator 的公开绝对上界，不读取 shares。"""
         bounds: list[int] = []
         for row in range(first.shape[0]):
             bound = sum(
@@ -345,7 +422,7 @@ class Client:
     def _resource_plan(
         self, layout: ControllerLayout, session_id: str, round_id: str, step: int
     ) -> StepResourcePlan:
-        """按 Protocol 3 分配所有乘法 triple 与每个 state 元素恰好一次的 Trunc mask。"""
+        """按 ledger 分配所有乘法 triple，以及零份或逐 state 行一份 Trunc mask。"""
         shapes = {
             "A": (layout.state_dimension, layout.state_dimension),
             "B": (layout.state_dimension, layout.input_dimension),
@@ -353,8 +430,11 @@ class Client:
             "D": (layout.output_dimension, layout.input_dimension),
         }
         products: list[ResourceMetadata] = []
+        ledger = layout.scale_ledger
         for term in ("C", "D", "A", "B"):
             rows, columns = shapes[term]
+            right_scale = ledger.state if term in {"A", "C"} else ledger.input
+            left_scale = getattr(ledger, term)
             for row in range(rows):
                 for column in range(columns):
                     products.append(
@@ -367,24 +447,30 @@ class Client:
                             term,  # type: ignore[arg-type]
                             (row, column),
                             shapes[term],
-                            layout.fractional_bits,
-                            2 * layout.fractional_bits,
+                            left_scale,
+                            right_scale,
+                            left_scale + right_scale,
                         )
                     )
-        truncations = tuple(
-            ResourceMetadata(
-                f"{round_id}:state[{row}]",
-                session_id,
-                round_id,
-                step,
-                "state_truncation",
-                "state",
-                (row,),
-                (layout.state_dimension,),
-                2 * layout.fractional_bits,
-                layout.fractional_bits,
+        truncations = (
+            tuple(
+                ResourceMetadata(
+                    f"{round_id}:state[{row}]",
+                    session_id,
+                    round_id,
+                    step,
+                    "state_truncation",
+                    "state",
+                    (row,),
+                    (layout.state_dimension,),
+                    ledger.state_accumulator,
+                    None,
+                    ledger.state,
+                )
+                for row in range(layout.state_dimension)
             )
-            for row in range(layout.state_dimension)
+            if ledger.state_truncation_bits
+            else ()
         )
         return StepResourcePlan(
             session_id,
@@ -393,7 +479,7 @@ class Client:
             (layout.state_dimension,),
             (layout.input_dimension,),
             (layout.output_dimension,),
-            layout.fractional_bits,
+            ledger,
             tuple(products),
             truncations,
         )
@@ -488,7 +574,7 @@ class _Server:
         right: AdditiveShare,
         resource: ProductResourceShare,
     ) -> MaskedDifferenceShare:
-        """以本地 operands/triple share 生成 Beaver 遮蔽差值，乘积仍是双尺度 share。"""
+        """以本地 operands/triple share 生成 Beaver 遮蔽差值，乘积保持 ledger 结果尺度。"""
         self._validate_product_resource(resource)
         resource._lifecycle.claim(self._party)
         return multiplier.mask_inputs(left, right, resource.triple)
@@ -499,7 +585,7 @@ class _Server:
         resource: ProductResourceShare,
         opened: PublicMaskedDifferences,
     ) -> AdditiveShare:
-        """使用公开 d/e 和本方 triple share 完成双尺度乘法输出 share。"""
+        """使用公开 d/e 和本方 triple share 完成 ledger 结果尺度的乘法 share。"""
         self._validate_product_resource(resource)
         return multiplier.finish(resource.triple, opened)
 

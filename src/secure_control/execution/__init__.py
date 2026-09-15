@@ -2,5 +2,6 @@
 
 from secure_control.execution.contracts import ControllerRuntime
 from secure_control.execution.runtime import PlaintextStateSpaceRuntime
+from secure_control.execution.secure_runtime import SecureStateSpaceRuntime
 
-__all__ = ["ControllerRuntime", "PlaintextStateSpaceRuntime"]
+__all__ = ["ControllerRuntime", "PlaintextStateSpaceRuntime", "SecureStateSpaceRuntime"]

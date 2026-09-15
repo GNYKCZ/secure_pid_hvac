@@ -37,7 +37,7 @@ u(k)     = C x_c(k) + D v(k)
 
 `ControllerSpec` 只保存 `A/B/C/D/x0` 及必要的 shape、dtype、scale 元数据。零维 controller state
 是合法的，因此静态状态反馈可直接表示为 `u = Dv`，无需人为引入无意义的内部状态。场景中的
-controller design 负责在进入 runtime 前生成这些矩阵。实际递推算法不属于当前架构基线。
+controller design 负责在进入 runtime 前生成这些矩阵。
 
 若使用定点表示，`ControllerScaleMetadata` 分别记录 state（亦即 `x0`）、input、output、
 `A/B/C/D` 的 fractional bits。它只是数值表示元数据；编码、模运算和 truncation 仍由后续
@@ -50,6 +50,12 @@ controller design 负责在进入 runtime 前生成这些矩阵。实际递推�
 `(m, 1)`；列向量只会在内部归一化为 `(m,)`，这只是 NumPy 单步表示约定，不改变控制器维数。
 行向量和批量二维输入没有定义为单步接口的一部分，必须被拒绝。运行时始终返回长度为 `p` 的
 扁平 control vector `(p,)`，计算失败不会写入半完成的 controller state。
+
+`SecureStateSpaceRuntime` 实现相同的 `ControllerRuntime` 契约，内部封装 Client/P1/P2、
+一次性 Beaver/Trunc 资源与当前单进程 coordinator。它依据公开 scale metadata 选择 general
+fixed-point A/B 的逐聚合 state 行 Trunc，或 integer A/B 的 no-Trunc 路径；选择不依赖场景或
+控制器类型。失败 step 回滚 state share 且不推进 step，reset 通过新建 session 恢复 x0。
+具体尺度、资源和安全边界见[安全运行时契约](secure_runtime_contract.md)。
 
 ## 场景与仿真契约
 
