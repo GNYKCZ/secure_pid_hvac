@@ -241,6 +241,54 @@ def test_reseeded_test_rng_domain_separates_each_online_round_material() -> None
     )
 
 
+def test_explicit_system_random_is_not_downgraded_to_test_prng(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证调用方显式提供 OS 安全随机源时，协议不会改用测试用 Mersenne Twister。"""
+    client, _, _, _, distribution = make_stack()
+    secure_rng = random.SystemRandom()
+    share_sources: list[random.Random | None] = []
+    triple_sources: list[random.Random | None] = []
+    mask_sources: list[random.Random | None] = []
+    sharing_type = type(client.sharing)
+    multiplier_type = type(client.multiplier)
+    truncation_type = type(client.truncation)
+    original_share = sharing_type.share
+    original_triple = multiplier_type.create_triple
+    original_mask = truncation_type.create_auxiliary
+
+    def capture_share(
+        sharing: TwoPartySharing, value: object, *, rng: random.Random | None = None
+    ) -> tuple[AdditiveShare, AdditiveShare]:
+        """记录实际用于 input/triple/mask 分享的随机源，再执行既有共享实现。"""
+        share_sources.append(rng)
+        return original_share(sharing, value, rng=rng)
+
+    def capture_triple(
+        multiplier: object, *, rng: random.Random | None = None
+    ) -> tuple[object, object]:
+        """记录创建 Beaver 材料的随机源，避免只检查 helper 而遗漏调用路径。"""
+        triple_sources.append(rng)
+        return original_triple(multiplier, rng=rng)
+
+    def capture_mask(
+        truncation: object, *, rng: random.Random | None = None
+    ) -> tuple[object, object]:
+        """记录创建 Protocol 2 辅助材料的随机源，确保不会静默降级。"""
+        mask_sources.append(rng)
+        return original_mask(truncation, rng=rng)
+
+    monkeypatch.setattr(sharing_type, "share", capture_share)
+    monkeypatch.setattr(multiplier_type, "create_triple", capture_triple)
+    monkeypatch.setattr(truncation_type, "create_auxiliary", capture_mask)
+
+    assert client._online_material_rng(secure_rng) is secure_rng
+    client.prepare_online(distribution, [0.25], step=0, rng=secure_rng)
+    assert share_sources and all(source is secure_rng for source in share_sources)
+    assert triple_sources and all(source is secure_rng for source in triple_sources)
+    assert mask_sources and all(source is secure_rng for source in mask_sources)
+
+
 def test_failed_resource_pairing_aborts_all_reserved_material_without_committing_state() -> None:
     """验证 P1 已开始乘法后发现 P2 triple 错配，整轮资源废弃且 state 不提交。"""
     client, p1, p2, coordinator, distribution = make_stack()

@@ -393,12 +393,12 @@ class Client:
     def _online_material_rng(self, rng: random.Random | None) -> random.Random | None:
         """为每轮测试材料作确定性域分离，避免相同 seed 重播时复用 Beaver/Trunc 随机量。
 
-        未传入 ``rng`` 时沿用各 crypto primitive 的安全随机源。测试路径先取调用者流的
-        固定宽度种子，再与此 Client 的单调 epoch 哈希；不同 Client 的首轮仍可复现，
-        同一 Client 的后续 round 则必定进入不同随机域。
+        未传入 ``rng`` 或显式传入 ``SystemRandom`` 时，沿用各 crypto primitive 的安全随机源。
+        只有普通可重放测试 RNG 会先取固定宽度种子，再与此 Client 的单调 epoch 哈希；不同
+        Client 的首轮仍可复现，同一 Client 的后续 round 则必定进入不同随机域。
         """
-        if rng is None:
-            return None
+        if rng is None or isinstance(rng, random.SystemRandom):
+            return rng
         source_seed = rng.getrandbits(256).to_bytes(32, "big")
         epoch = self._test_material_epoch
         self._test_material_epoch += 1

@@ -51,8 +51,9 @@ u(k)     = C x_c(k) + D v(k)
 本轮尚未完成的资源标记为
 `aborted`，不能在另一轮重放。固定 `random.Random(seed)` 仅用于测试：Client 会将其与本 Client
 的单调 online-material epoch 作哈希域分离，所以同一 Client 重新播种同一个 seed 的多轮也不会复用
-input share、triple 或 mask；不同 Client 的首轮仍可重复测试。session/round identity 始终使用独立
-安全随机源，正常调用不传 `rng` 时 crypto 层同样使用安全随机源。
+input share、triple 或 mask；不同 Client 的首轮仍可重复测试。`rng=None` 与显式传入的
+`random.SystemRandom()` 都会原样交给 crypto 层，绝不会被测试用伪随机源替换；session/round identity
+始终使用独立安全随机源。
 
 ## 声明边界与威胁模型
 
