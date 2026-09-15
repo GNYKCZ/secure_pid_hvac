@@ -104,6 +104,47 @@ def test_integer_a_b_sequence_uses_metadata_selected_no_trunc_path() -> None:
     np.testing.assert_allclose(actual, expected, atol=1.0 / 256.0)
 
 
+def test_integer_dtype_spec_accepts_fractional_input_in_both_runtimes() -> None:
+    """RV-11-001：输入尺度允许小数时，矩阵存储 dtype 不应使明文与安全运行时分叉。"""
+    spec = ControllerSpec(
+        A=np.array([[0]], dtype=np.int64),
+        B=np.array([[1]], dtype=np.int64),
+        C=np.array([[1]], dtype=np.int64),
+        D=np.array([[1]], dtype=np.int64),
+        x0=np.array([0], dtype=np.int64),
+        scale_metadata=ControllerScaleMetadata(state=8, input=8, output=8, A=0, B=0, C=0, D=0),
+    )
+    plaintext = PlaintextStateSpaceRuntime(spec)
+    secure = make_secure_runtime(spec, seed=101, bound=64)
+
+    # 第一轮直接输出输入，第二轮还须读取由小数输入更新的 state；reset 后重现第一轮。
+    for value, expected in ((0.25, 0.25), (-0.125, 0.125)):
+        plain_output = plaintext.step(value)
+        secure_output = secure.step(value)
+        np.testing.assert_allclose(plain_output, np.array([expected]), atol=1.0 / 256.0)
+        np.testing.assert_allclose(secure_output, plain_output, atol=1.0 / 256.0)
+    plaintext.reset()
+    secure.reset()
+    np.testing.assert_allclose(secure.step(0.25), plaintext.step(0.25), atol=1.0 / 256.0)
+
+
+def test_review_report_feedthrough_trigger_matches_between_runtimes() -> None:
+    """复现 RV-11-001 报告中的零状态递推整数规格，不让矩阵 dtype 限制 input=8。"""
+    spec = ControllerSpec(
+        A=np.array([[0]], dtype=np.int64),
+        B=np.array([[0]], dtype=np.int64),
+        C=np.array([[0]], dtype=np.int64),
+        D=np.array([[1]], dtype=np.int64),
+        x0=np.array([0], dtype=np.int64),
+        scale_metadata=ControllerScaleMetadata(state=8, input=8, output=8, A=0, B=0, C=0, D=0),
+    )
+    plaintext = PlaintextStateSpaceRuntime(spec)
+    secure = make_secure_runtime(spec, seed=102, bound=0)
+
+    np.testing.assert_array_equal(plaintext.step(0.25), np.array([0.25]))
+    np.testing.assert_array_equal(secure.step(0.25), np.array([0.25]))
+
+
 def test_column_and_flat_inputs_are_interchangeable_between_runtimes() -> None:
     """验证明文与安全 runtime 接受相同的单步列向量并统一返回 ``(p,)``。"""
     spec = ControllerSpec(
@@ -115,14 +156,32 @@ def test_column_and_flat_inputs_are_interchangeable_between_runtimes() -> None:
     )
     contract = ControllerRangeContract(state_payload_bounds=(128,), input_payload_bounds=(64, 64))
     context = FixedPointContext(2_147_483_647, integer_bits=20, fractional_bits=8)
-    flat = SecureStateSpaceRuntime(spec, context, contract, security_parameter=8, test_seed=110)
-    column = SecureStateSpaceRuntime(spec, context, contract, security_parameter=8, test_seed=110)
+    plain_flat = PlaintextStateSpaceRuntime(spec)
+    plain_column = PlaintextStateSpaceRuntime(spec)
+    secure_flat = SecureStateSpaceRuntime(
+        spec, context, contract, security_parameter=8, test_seed=110
+    )
+    secure_column = SecureStateSpaceRuntime(
+        spec, context, contract, security_parameter=8, test_seed=110
+    )
 
-    flat_output = flat.step(np.array([0.25, -0.125]))
-    column_output = column.step(np.array([[0.25], [-0.125]]))
+    flat_input = np.array([0.25, -0.125])
+    column_input = np.array([[0.25], [-0.125]])
+    plain_flat_output = plain_flat.step(flat_input)
+    plain_column_output = plain_column.step(column_input)
+    secure_flat_output = secure_flat.step(flat_input)
+    secure_column_output = secure_column.step(column_input)
 
-    assert flat_output.shape == column_output.shape == (2,)
-    np.testing.assert_array_equal(flat_output, column_output)
+    assert (
+        plain_flat_output.shape
+        == plain_column_output.shape
+        == secure_flat_output.shape
+        == secure_column_output.shape
+        == (2,)
+    )
+    np.testing.assert_array_equal(plain_flat_output, plain_column_output)
+    np.testing.assert_array_equal(secure_flat_output, secure_column_output)
+    np.testing.assert_allclose(secure_flat_output, plain_flat_output, atol=1.0 / 256.0)
 
 
 def test_zero_state_runtime_executes_static_d_path() -> None:

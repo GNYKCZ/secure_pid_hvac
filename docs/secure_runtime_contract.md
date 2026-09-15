@@ -30,6 +30,9 @@ runtime.scale_ledger -> ControllerScaleLedger
 
 `step` 接受单输入标量、`(m,)` 扁平向量或 `(m, 1)` 单步列向量，与明文 runtime
 共用同一个输入规范化函数。行向量、批量二维输入、非实数和非有限值在进入分享前被拒绝。
+在符合公开范围契约的前提下，有限实数中的小数输入也合法，不由 `ControllerSpec` 的矩阵
+存储 dtype 决定。明文运行时遇到整数矩阵与小数输入时保留实数运算，不把输入或更新后的
+state 静默转回整数；安全运行时按 scale ledger 的 input fractional bits 编码。
 输出是新建的有限 `float ndarray(p,)`。上层看不到 Client/P1/P2、share、Beaver、Trunc、
 coordinator 或 controller state 明文。
 
