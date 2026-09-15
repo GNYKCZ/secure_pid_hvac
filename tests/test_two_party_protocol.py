@@ -79,6 +79,37 @@ def test_protocol_three_keeps_output_at_double_scale_and_truncates_once_per_stat
     assert (client.truncation.created_masks, client.truncation.consumed_masks) == (2, 2)
 
 
+def test_zero_state_static_controller_uses_only_d_products() -> None:
+    """验证零维 state 的通用静态控制器只计算 ``D*v``，无需虚构 state 或 Trunc 资源。"""
+    fixed_point = FixedPointContext(2_147_483_647, integer_bits=20, fractional_bits=8)
+    sharing = TwoPartySharing(fixed_point.modulus)
+    client = Client(fixed_point, sharing, security_parameter=8)
+    spec = ControllerSpec(
+        A=np.empty((0, 0)),
+        B=np.empty((0, 2)),
+        C=np.empty((1, 0)),
+        D=np.array([[-1.5, -0.25]]),
+        x0=np.empty(0),
+    )
+    distribution = client.distribute_controller(
+        spec,
+        ControllerRangeContract(state_payload_bounds=(), input_payload_bounds=(128, 64)),
+        rng=random.Random(3),
+    )
+    p1, p2 = P1(distribution.p1), P2(distribution.p2)
+    online = client.prepare_online(distribution, [0.5, -0.25], step=0, rng=random.Random(4))
+
+    output = SingleProcessCoordinator(sharing, client.multiplier, client.truncation).execute(
+        p1, p2, online
+    )
+
+    np.testing.assert_allclose(client.reconstruct_control(*output), np.array([-0.6875]))
+    assert online.p1_resources.plan.triple_count == 2
+    assert online.p1_resources.plan.truncation_count == 0
+    assert np.asarray(p1.state_share.value, dtype=object).shape == (0,)
+    assert np.asarray(p2.state_share.value, dtype=object).shape == (0,)
+
+
 def test_aggregate_state_row_has_one_truncation_error_not_one_error_per_product() -> None:
     """验证多项 state 行先聚合，结果只允许单个 Protocol 2 ``w∈{-1,0,1}`` 误差。"""
     fixed_point = FixedPointContext(2_147_483_647, integer_bits=20, fractional_bits=8)
@@ -400,8 +431,27 @@ def test_client_rejects_complete_output_pair_from_another_client() -> None:
         client.reconstruct_control(*foreign_output)
 
 
-def test_fixed_seed_replays_crypto_material_but_not_session_round_identities() -> None:
-    """验证固定 seed 仅重放密码材料与输出 share，绝不重放身份标识。"""
+def test_client_validates_output_shape_and_reconstructs_each_round_once() -> None:
+    """验证 Client 不接受错误输出 shape，且成功重构后会关闭该 round capability。"""
+    client, p1, p2, coordinator, distribution = make_stack(seed=44)
+    output = coordinator.execute(
+        p1, p2, client.prepare_online(distribution, [0.25], step=0, rng=random.Random(45))
+    )
+    malformed = client.sharing.share(np.array([0, 0], dtype=object), rng=random.Random(46))
+
+    with pytest.raises(ValueError, match="output dimension"):
+        client.reconstruct_control(
+            replace(output[0], value=malformed[0]),
+            replace(output[1], value=malformed[1]),
+        )
+
+    np.testing.assert_allclose(client.reconstruct_control(*output), np.array([0.625]))
+    with pytest.raises(ValueError, match="已完成"):
+        client.reconstruct_control(*output)
+
+
+def test_fixed_seed_replays_material_only_for_isolated_client_transcripts() -> None:
+    """验证隔离 Client transcript 可重放测试材料，而 session/round 身份保持独立。"""
     first_client, first_p1, first_p2, first_coordinator, first_distribution = make_stack(seed=30)
     second_client, second_p1, second_p2, second_coordinator, second_distribution = make_stack(
         seed=30

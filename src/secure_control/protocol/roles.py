@@ -92,7 +92,7 @@ class Client:
         )
         # 身份不从可重放的离线/在线材料 RNG 派生；Client 以此登记其签发能力。
         self._issued_sessions: set[str] = set()
-        self._issued_rounds: set[tuple[str, str, int]] = set()
+        self._issued_rounds: dict[tuple[str, str, int], ControllerLayout] = {}
         # 测试 RNG 每次 online 预处理都分配不同域，避免重新播种导致辅助材料复用。
         self._test_material_epoch = 0
 
@@ -151,7 +151,6 @@ class Client:
         identity = (distribution.session_id, round_id, step)
         if identity in self._issued_rounds:
             raise ValueError("同一 controller session 内的 round_id 不能复用。")
-        self._issued_rounds.add(identity)
         material_rng = self._online_material_rng(rng)
         input_shares = self.sharing.share(
             self.fixed_point.to_residue(input_payload), rng=material_rng
@@ -175,7 +174,7 @@ class Client:
             second_truncations.append(
                 StateTruncationResourceShare(1, metadata, auxiliary[1], lifecycle)
             )
-        return OnlineRound(
+        online = OnlineRound(
             distribution.session_id,
             round_id,
             step,
@@ -184,11 +183,14 @@ class Client:
             PartyResources(0, plan, tuple(first_products), tuple(first_truncations)),
             PartyResources(1, plan, tuple(second_products), tuple(second_truncations)),
         )
+        # 只有整轮 input 与资源全部准备成功后才签发输出 capability。
+        self._issued_rounds[identity] = layout
+        return online
 
     def reconstruct_control(
         self, first: ControlShareMessage, second: ControlShareMessage
     ) -> np.ndarray:
-        """仅在 Client 边界重构同一 session/round 的双尺度 control shares。"""
+        """在 Client 边界对已签发 round 的正确 shape 双尺度 control shares 重构一次。"""
         if not isinstance(first, ControlShareMessage) or not isinstance(
             second, ControlShareMessage
         ):
@@ -202,8 +204,16 @@ class Client:
             or first.fractional_bits != 2 * self.fixed_point.fractional_bits
         ):
             raise ValueError("控制输出必须是同一 session/round 的双尺度 P1、P2 shares。")
-        if (first.session_id, first.round_id, first.step) not in self._issued_rounds:
-            raise ValueError("控制输出不属于当前 Client 签发的 online round。")
+        identity = (first.session_id, first.round_id, first.step)
+        layout = self._issued_rounds.get(identity)
+        if layout is None:
+            raise ValueError("控制输出不属于当前 Client 签发的 round，或该 round 已完成重构。")
+        expected_shape = (layout.output_dimension,)
+        if (
+            np.asarray(first.value.value, dtype=object).shape != expected_shape
+            or np.asarray(second.value.value, dtype=object).shape != expected_shape
+        ):
+            raise ValueError(f"控制输出 share 必须具有 output dimension shape {expected_shape}。")
         signed = np.asarray(
             self.fixed_point.from_residue(self.sharing.reconstruct(first.value, second.value)),
             dtype=object,
@@ -215,6 +225,8 @@ class Client:
             if not math.isfinite(value):
                 raise ValueError("双尺度 control output 无法安全解码为有限浮点数。")
             result[index] = value
+        # 成功解码后关闭 capability，防止上层误把同一 round 的 control 重复应用。
+        del self._issued_rounds[identity]
         return result
 
     def _layout_from_spec(self, spec: ControllerSpec) -> ControllerLayout:

@@ -22,8 +22,9 @@ u(k)     = C x_c(k) + D v(k)
 
 每次离线分发都有由独立安全随机源生成的唯一 `session_id`，每个在线请求有同样生成的唯一
 `round_id`；它们绝不从可重放的密码材料 RNG 派生。输入、资源计划、遮蔽消息和输出 shares 都绑定
-两者。协调器会在资源 claim 前拒绝跨 session/round 拼接；Client 还登记自己签发的 distribution/round，
-在输出重构前拒绝外来或未签发的完整输出对。
+两者。协调器会在资源 claim 前拒绝跨 session/round 拼接；Client 还登记自己成功准备的
+distribution/round 及其 output dimension，在输出重构前拒绝外来、未签发或 shape 错误的完整输出对。
+每个 round 只允许成功重构一次；失败的 shape/身份校验不会提前消费合法 round capability。
 `MaskedExchangeMessage` 明确记录 P1→P2 与 P2→P1 的发送方、接收方、身份、step 和 resource id；
 `TruncationMaskedMessage` 仅允许 P2→P1。这些对象描述协议数学消息，而单进程协调器只负责本地
 投递；它不是未来网络 API 的一部分。
@@ -54,6 +55,10 @@ u(k)     = C x_c(k) + D v(k)
 input share、triple 或 mask；不同 Client 的首轮仍可重复测试。`rng=None` 与显式传入的
 `random.SystemRandom()` 都会原样交给 crypto 层，绝不会被测试用伪随机源替换；session/round identity
 始终使用独立安全随机源。
+
+普通 `random.Random(seed)` 路径只用于隔离的确定性单元测试，不属于协议安全声明。不同 Client
+若用相同 seed 创建首轮材料，必须保证 transcript 彼此隔离；任何需要沿用本页安全声明的运行都应
+使用 `rng=None` 或 `random.SystemRandom()`，以保证跨 Client 的材料新鲜性。
 
 ## 声明边界与威胁模型
 
