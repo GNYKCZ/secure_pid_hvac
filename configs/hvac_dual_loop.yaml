@@ -1,0 +1,8 @@
+# Issue #12 双闭环仅引用既有 HVAC/PID 配置，不复制或改变 plant/controller 参数。
+baseline_config: hvac_pid_baseline.yaml
+security:
+  modulus: 2305843009213693951
+  integer_bits: 48
+  fractional_bits: 20
+  security_parameter: 8
+  horizon_steps: 180

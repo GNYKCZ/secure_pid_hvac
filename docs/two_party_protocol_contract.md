@@ -31,9 +31,10 @@ distribution/round 及其 output dimension，在输出重构前拒绝外来、�
 
 ## 离线、在线与资源
 
-1. Client 先用 `ControllerRangeContract` 声明编码 state/input payload 的绝对上界。它验证 `x0`
-   在界内、该界对任意有界输入保持不变、每个 `A*x+B*v` 聚合行属于 `Z<kappa>`，且
-   `C*x+D*v` 属于中心化 `Z_q`。无法证明这些前提的控制器在离线阶段被拒绝。
+1. Client 先用 `ControllerRangeContract` 声明编码 state/input payload 的绝对上界。默认模式
+   验证 `x0` 在界内、该界对任意有界输入保持不变、每个需 Trunc 的 `A*x+B*v` 聚合行属于
+   `Z<kappa>`，且 `C*x+D*v` 属于中心化 `Z_q`。显式 `horizon_steps` 模式则从编码 `x0`
+   逐步证明有限时域内的相同前提；无法证明时均在离线阶段拒绝。
 2. Client 编码并分享 `A/B/C/D/x0`，然后以同一 `session_id` 分别发送 `OfflineControllerMessage`
    给 P1、P2。每个在线 step 先验证实际 `v` 没有超出公开 input bound。
 3. 每个 `A/B/C/D` 标量矩阵项消耗一个独立 Beaver triple。`StepResourcePlan` 因而需要
@@ -49,6 +50,21 @@ Trunc `ell`）或 A/B 为 0（state accumulator 为 `ell`，不 Trunc）。C/D �
 直接等于 output；每个字段按自身尺度编码，零尺度字段必须是数学整数。未知 Trunc shift 或任何
 待相加乘积的尺度不一致都会在分享和资源创建前被拒绝。未提供 metadata 时保持 #10 的全
 `Q<ell>` operands、`Q<2ell>` output 行为。
+
+### 有限时间范围契约（Issue #12）
+
+`ControllerRangeContract(state_payload_bounds, input_payload_bounds, horizon_steps=None)` 的
+`None` 保留 #10/#11 的无限时域不变界行为；正整数 `horizon_steps=h` 启用有限时间模式。
+Client 用 Python 精确整数从每通道 `s_0=|Encode(x0)|` 递推 `k=0…h-1`：在更新前的
+`s_k` 下检查 output accumulator 的中心化 `Z_q` 上界，再检查 state accumulator 的
+中心化 `Z_q` 或 Protocol 2 `Z<kappa>` 前提，依据 ledger Trunc shift 推得 `s_(k+1)`，
+并检查每一步 state 未越过公开 payload 界。终点 `s_h` 也被检查，但不额外运行第 `h+1`
+步。在线先拒绝 `step>=h` 和超出公开范围的实际输入，再创建任何 share/triple/mask。
+有限模式只声明已证明的输入界与步数内的编码安全，不声明无限时域有界或稳定性。
+该有限证书还要求公开 `step` 与实际 state 迭代顺序一致；当前
+`SecureStateSpaceRuntime` 用内部单调 step index、失败回滚和 reset 新 session 保证该
+执行前提。直接组合 Client/coordinator 的调用方若重复或乱序提交 step，不能把此证书
+误当作对那些额外 state 更新的保证。
 
 每个 `ProductResourceShare` 或 `StateTruncationResourceShare` 只能被其所属角色使用一次。两个
 角色均完成对应 Protocol 1 或 Protocol 2 后，资源标记为 `consumed`；任意校验或协议失败会把
@@ -69,5 +85,6 @@ input share、triple 或 mask；不同 Client 的首轮仍可重复测试。`rng
 算术语义。它不声明进程隔离、主机隔离、网络安全、认证、抗恶意参与方或生产级端到端安全。
 单进程协调路径不会把明文提供给 Server，但同一 Python 进程本身不构成隔离边界。
 
-Issue #11 已在 execution 层提供运行时 `step(v)` 包装，但仿真集成、多进程和网络 transport
-仍不属于本协议数据模型。运行时契约见 [通用安全状态空间运行时](secure_runtime_contract.md)。
+Issue #11 已在 execution 层提供运行时 `step(v)` 包装；Issue #12 的 HVAC 仿真集成只使用
+公开有限时间范围契约，不改变本协议消息算法。多进程和网络 transport 仍不属于本协议
+数据模型。运行时契约见 [通用安全状态空间运行时](secure_runtime_contract.md)。

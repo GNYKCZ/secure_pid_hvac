@@ -81,8 +81,11 @@ triple_count = p*n + p*m + n*n + n*m
 ```
 
 general fixed-point 路径对每个聚合 state 行使用一对 Trunc 辅助随机量，共 `n` 对；integer
-A/B 路径为 0 对。no-Trunc 仍执行 centered `Z_q` 范围与无限时域 state 不变界验证，仅不需要
-Protocol 2 的 `Z<kappa>` 前提。output accumulator 在两条路径中都必须位于 centered `Z_q`。
+A/B 路径为 0 对。no-Trunc 仍执行 centered `Z_q` 范围验证，仅不需要 Protocol 2 的
+`Z<kappa>` 前提。公开 `ControllerRangeContract` 默认要求无限时域不变界；Issue #12 可显式
+选择正整数 `horizon_steps`，使 Client 在离线阶段逐步证明有限时域 state/output 范围，并在
+在线资源创建前拒绝 `step>=horizon_steps`。reset 创建的新 session 保留同一 horizon 契约。
+output accumulator 在两条路径中都必须位于 centered `Z_q`。
 
 ## 数值证据与容差
 
@@ -99,4 +102,5 @@ session/round identity 始终由独立安全随机源生成。
 
 当前 backend 固定为 `SingleProcessCoordinator`。这验证协议消息流、资源生命周期与算术语义，
 不声明进程/主机隔离、网络认证、抗恶意安全或生产级端到端安全。multiprocessing、socket、
-transport abstraction、双 plant simulation 和任何场景集成都不属于 Issue #11。
+transport abstraction、双 plant simulation 和任何场景集成都不属于 Issue #11；Issue #12
+仅通过场景层装配完成 HVAC 双闭环，不让本 runtime 依赖 HVAC。

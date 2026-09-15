@@ -1,0 +1,214 @@
+"""HVAC 双闭环装配、有限时间物理输入证书和场景指标。"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+from math import ceil, isfinite
+from numbers import Integral
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import yaml
+
+from secure_control.core import ControllerScaleMetadata, ControllerSpec
+from secure_control.crypto import FixedPointContext
+from secure_control.execution import PlaintextStateSpaceRuntime, SecureStateSpaceRuntime
+from secure_control.protocol import ControllerRangeContract
+from secure_control.simulation import SimulationBranch, SimulationPlan, SimulationResult, run
+
+from .adapter import HvacSignalAdapter
+from .baseline import HvacSegmentMetric, _segment_metrics
+from .contract import load_hvac_scenario_contract
+from .pid import load_hvac_pid_design
+from .plant import HvacPlant
+
+
+@dataclass(frozen=True, slots=True)
+class HvacSafetyCertificate:
+    """记录本配置/时域下事前推出的 plant、input 与编码 state 公开范围。"""
+
+    temperature_bounds_celsius: tuple[float, float]
+    input_abs_bound_celsius: float
+    input_payload_bound: int
+    state_payload_bounds: tuple[int, int]
+    horizon_steps: int
+
+
+@dataclass(frozen=True, slots=True)
+class HvacComparison:
+    """通用八字段结果及仅属于 HVAC 场景的两支区段指标和范围证书。"""
+
+    result: SimulationResult
+    segment_metrics_ideal: tuple[HvacSegmentMetric, ...]
+    segment_metrics_secure: tuple[HvacSegmentMetric, ...]
+    safety_certificate: HvacSafetyCertificate
+
+
+class HvacScenario:
+    """以现有 HVAC/PID 配置装配两支独立闭环，交给通用 runner 执行。"""
+
+    def __init__(self, config_path: str | Path, *, test_seed: int | None = None) -> None:
+        """只读取双闭环配置及其引用的基线；build_plan 才创建运行时。"""
+        path = Path(config_path)
+        try:
+            loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except OSError as error:
+            raise ValueError(f"无法读取 HVAC 双闭环配置：{path}") from error
+        if not isinstance(loaded, Mapping):
+            raise TypeError("HVAC 双闭环配置根节点必须是映射。")
+        baseline_name = loaded.get("baseline_config")
+        if not isinstance(baseline_name, str) or not baseline_name.strip():
+            raise TypeError("baseline_config 必须是非空路径字符串。")
+        baseline_path = path.parent / baseline_name
+        security = loaded.get("security")
+        if not isinstance(security, Mapping):
+            raise TypeError("security 必须是映射。")
+        if test_seed is not None and (
+            isinstance(test_seed, bool) or not isinstance(test_seed, int)
+        ):
+            raise TypeError("test_seed 必须是整数或 None。")
+
+        self._contract = load_hvac_scenario_contract(baseline_path)
+        self._design = load_hvac_pid_design(baseline_path, self._contract)
+        self._fixed_point = FixedPointContext(
+            _positive_integer(security, "modulus"),
+            integer_bits=_positive_integer(security, "integer_bits"),
+            fractional_bits=_positive_integer(security, "fractional_bits"),
+        )
+        self._security_parameter = _positive_integer(security, "security_parameter")
+        self._horizon_steps = _positive_integer(security, "horizon_steps")
+        self._test_seed = test_seed
+        if self._contract.timing.terminal_sample_included:
+            raise ValueError("当前双闭环仅支持 terminal_sample_included=false。")
+        if self._horizon_steps != self._contract.timing.sample_count:
+            raise ValueError("horizon_steps 必须等于 HVAC sample_count。")
+        self.safety_certificate = self._derive_safety_certificate()
+
+    def build_plan(self) -> SimulationPlan:
+        """先由场景推物理界，再由 Client 离线证明编码控制器界，成功后返回双支计划。"""
+        design = self._design
+        contract = self._contract
+        plain_spec = design.to_controller_spec()
+        ell = self._fixed_point.fractional_bits
+        secure_spec = ControllerSpec(
+            A=plain_spec.A,
+            B=plain_spec.B,
+            C=plain_spec.C,
+            D=plain_spec.D,
+            x0=plain_spec.x0,
+            scale_metadata=ControllerScaleMetadata(
+                state=ell, input=ell, output=2 * ell, A=0, B=0, C=ell, D=ell
+            ),
+        )
+        range_contract = ControllerRangeContract(
+            state_payload_bounds=self.safety_certificate.state_payload_bounds,
+            input_payload_bounds=(self.safety_certificate.input_payload_bound,),
+            horizon_steps=self._horizon_steps,
+        )
+        # 两支只共享不可变配置值；plant、adapter、runtime 和安全 session 均重新构造。
+        ideal = SimulationBranch(
+            HvacPlant(contract), HvacSignalAdapter(contract), PlaintextStateSpaceRuntime(plain_spec)
+        )
+        secure = SimulationBranch(
+            HvacPlant(contract),
+            HvacSignalAdapter(contract),
+            SecureStateSpaceRuntime(
+                secure_spec,
+                self._fixed_point,
+                range_contract,
+                security_parameter=self._security_parameter,
+                test_seed=self._test_seed,
+            ),
+        )
+        return SimulationPlan(
+            metadata=contract.metadata,
+            sample_times=np.array(contract.timing.sample_times_seconds, dtype=float),
+            ideal=ideal,
+            secure=secure,
+        )
+
+    def metrics(self, result: SimulationResult) -> HvacComparison:
+        """从已运行的八字段结果计算场景指标，且核对每支物理范围。"""
+        low, high = self.safety_certificate.temperature_bounds_celsius
+        for name in ("output_ideal", "output_secure"):
+            output = getattr(result, name)
+            if not np.all((low - 1e-10 <= output) & (output <= high + 1e-10)):
+                raise ValueError(f"{name} 超出事前证明的 HVAC plant 温度范围。")
+        model = self._contract.model
+        for name in ("control_ideal", "control_secure"):
+            applied = getattr(result, name)
+            if not np.all(
+                (model.lower_control_bound_kw <= applied)
+                & (applied <= model.upper_control_bound_kw)
+            ):
+                raise ValueError(f"{name} 超出 HVAC actuator 范围。")
+        return HvacComparison(
+            result,
+            _segment_metrics(self._contract, self._design, result.output_ideal),
+            _segment_metrics(self._contract, self._design, result.output_secure),
+            self.safety_certificate,
+        )
+
+    def _derive_safety_certificate(self) -> HvacSafetyCertificate:
+        """由 RC 凸组合及 actuator 界事前推出温度和 |r-T| 界，不读取仿真轨迹。
+
+        ZOH 温度递推可写成 ``T_next=aT+(1-a)(T_ambient-eta R u)``，其中
+        ``0<a<1`` 且 ``u`` 在配置区间内；初温与两个极端平衡温度的包络因此
+        对全部步数不变。reference 的极端值再给出 controller input 的绝对界。
+        """
+        model = self._contract.model
+        cooling_equilibrium = lambda control: (
+            model.ambient_temperature_celsius
+            - model.cooling_coefficient * model.thermal_resistance_celsius_per_kw * control
+        )
+        low = min(
+            model.initial_temperature_celsius,
+            cooling_equilibrium(model.upper_control_bound_kw),
+        )
+        high = max(
+            model.initial_temperature_celsius,
+            cooling_equilibrium(model.lower_control_bound_kw),
+        )
+        reference_values = [
+            segment.target_temperature_celsius for segment in self._contract.reference_segments
+        ]
+        input_abs_bound = max(
+            abs(reference - temperature)
+            for reference in reference_values
+            for temperature in (low, high)
+        )
+        if not all(isfinite(value) for value in (low, high, input_abs_bound)):
+            raise ValueError("HVAC 物理范围证明产生非有限值。")
+        # 论文编码 floor(x*2^ell+1/2)；额外一 payload 覆盖边界取整。
+        input_payload_bound = ceil(input_abs_bound * self._fixed_point.scale + 1)
+        if input_payload_bound > self._fixed_point.maximum_payload:
+            raise ValueError("HVAC input payload bound 超出 fixed-point 可表示范围。")
+        initial = self._design.to_controller_spec().x0
+        initial_payload = np.asarray(self._fixed_point.encode(initial), dtype=object)
+        integral_bound = abs(int(initial_payload[0])) + (
+            self._horizon_steps * self._design.sample_period_seconds * input_payload_bound
+        )
+        previous_bound = max(abs(int(initial_payload[1])), input_payload_bound)
+        return HvacSafetyCertificate(
+            (low, high),
+            input_abs_bound,
+            input_payload_bound,
+            (integral_bound, previous_bound),
+            self._horizon_steps,
+        )
+
+
+def _positive_integer(source: Mapping[str, Any], name: str) -> int:
+    """读取配置整数并拒绝 bool/零值，防止安全参数被静默解释。"""
+    value = source.get(name)
+    if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
+        raise ValueError(f"security.{name} 必须是正整数。")
+    return int(value)
+
+
+def run_hvac_dual_loop(config_path: str | Path, *, test_seed: int | None = None) -> HvacComparison:
+    """从场景 CLI/config 装配并运行 180 步双闭环，返回无持久化的结果和证书。"""
+    scenario = HvacScenario(config_path, test_seed=test_seed)
+    return scenario.metrics(run(scenario))

@@ -129,6 +129,9 @@ def test_runtime_and_scenario_contracts_are_structural() -> None:
         def controller_input(self, reference: np.ndarray, output: np.ndarray) -> np.ndarray:
             return np.concatenate((reference, output))
 
+        def apply_control(self, raw_control: np.ndarray) -> np.ndarray:
+            return raw_control.copy()
+
     assert isinstance(RuntimeFixture(), ControllerRuntime)
     assert isinstance(PlantFixture(), Plant)
     assert isinstance(ScenarioFixture(), ScenarioAdapter)

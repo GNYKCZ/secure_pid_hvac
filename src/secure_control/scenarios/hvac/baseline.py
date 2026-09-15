@@ -95,7 +95,7 @@ def run_plaintext_hvac_baseline(
         output_value = plant.output()
         controller_input = adapter.controller_input(reference_value, output_value)
         raw_control = runtime.step(controller_input)
-        applied_control = _saturate_for_hvac_plant(raw_control, contract)
+        applied_control = adapter.apply_control(raw_control)
 
         reference[index] = reference_value
         output_ideal[index] = output_value
@@ -111,18 +111,6 @@ def run_plaintext_hvac_baseline(
         raw_control_ideal=raw_control_ideal,
         segment_metrics=_segment_metrics(contract, design, output_ideal),
     )
-
-
-def _saturate_for_hvac_plant(control: Array, contract: HvacScenarioContract) -> Array:
-    """在场景层将线性 runtime 的原始控制量限制为 plant 的物理输入范围。"""
-    if control.shape != (1,) or not np.isfinite(control).all():
-        raise FloatingPointError("明文 runtime 必须返回有限的 HVAC 单通道控制量")
-    model = contract.model
-    return np.clip(
-        control,
-        model.lower_control_bound_kw,
-        model.upper_control_bound_kw,
-    ).astype(float, copy=False)
 
 
 def _segment_metrics(

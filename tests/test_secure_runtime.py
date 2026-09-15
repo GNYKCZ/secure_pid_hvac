@@ -204,6 +204,38 @@ def test_zero_state_runtime_executes_static_d_path() -> None:
     np.testing.assert_allclose(runtime.step([0.5, -0.25]), np.array([-0.6875]))
 
 
+def test_finite_horizon_runtime_reset_restores_three_step_capability() -> None:
+    """有限时间协议第 4 步必须失败且不推进资源；reset 用新 session 恢复可执行步数。"""
+    spec = ControllerSpec(
+        A=np.array([[1.0]]),
+        B=np.array([[1.0]]),
+        C=np.array([[1.0]]),
+        D=np.array([[0.0]]),
+        x0=np.array([0.0]),
+        scale_metadata=ControllerScaleMetadata(state=8, input=8, output=8, A=0, B=0, C=0, D=0),
+    )
+    runtime = SecureStateSpaceRuntime(
+        spec,
+        FixedPointContext(2_147_483_647, integer_bits=20, fractional_bits=8),
+        ControllerRangeContract(
+            state_payload_bounds=(768,), input_payload_bounds=(256,), horizon_steps=3
+        ),
+        security_parameter=8,
+        test_seed=180,
+    )
+    np.testing.assert_array_equal(
+        [runtime.step(value) for value in (0.5, -0.25, 0.25)],
+        np.array([[0.0], [0.5], [0.25]]),
+    )
+    created_before = runtime._client.multiplier.created_triples
+    with pytest.raises(ValueError, match="horizon"):
+        runtime.step(0.0)
+    assert runtime._client.multiplier.created_triples == created_before
+
+    runtime.reset()
+    np.testing.assert_array_equal(runtime.step(0.5), np.array([0.0]))
+
+
 @pytest.mark.parametrize(
     ("value", "exception", "message"),
     [

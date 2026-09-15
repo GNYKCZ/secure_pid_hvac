@@ -91,10 +91,15 @@ class ControllerLayout:
 
 @dataclass(frozen=True, slots=True)
 class ControllerRangeContract:
-    """以编码 payload 的绝对值声明输入与 state 的公开无限时域范围。"""
+    """以编码 payload 的绝对值声明输入与 state 的公开范围。
+
+    默认要求无限时域不变界；显式给出 ``horizon_steps`` 时，仅证明该有限步数
+    内的状态、乘积和输出，并在在线阶段拒绝超出已证明时域的 round。
+    """
 
     state_payload_bounds: tuple[int, ...]
     input_payload_bounds: tuple[int, ...]
+    horizon_steps: int | None = None
 
     def __post_init__(self) -> None:
         """拒绝负数、布尔值和非整数范围，避免将实数界误作编码 payload。"""
@@ -108,6 +113,14 @@ class ControllerRangeContract:
                     raise ValueError(f"{name} 必须只包含非负整数 payload 上界。")
                 normalized.append(int(value))
             object.__setattr__(self, name, tuple(normalized))
+        if self.horizon_steps is not None:
+            if (
+                isinstance(self.horizon_steps, bool)
+                or not isinstance(self.horizon_steps, Integral)
+                or self.horizon_steps <= 0
+            ):
+                raise ValueError("horizon_steps 必须是正整数或 None。")
+            object.__setattr__(self, "horizon_steps", int(self.horizon_steps))
 
     def validate_layout(self, layout: ControllerLayout) -> None:
         """确认公开范围长度覆盖已安装控制器的 state 与 input channel。"""
