@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import random
 import secrets
@@ -92,6 +93,8 @@ class Client:
         # 身份不从可重放的离线/在线材料 RNG 派生；Client 以此登记其签发能力。
         self._issued_sessions: set[str] = set()
         self._issued_rounds: set[tuple[str, str, int]] = set()
+        # 测试 RNG 每次 online 预处理都分配不同域，避免重新播种导致辅助材料复用。
+        self._test_material_epoch = 0
 
     def distribute_controller(
         self,
@@ -149,19 +152,22 @@ class Client:
         if identity in self._issued_rounds:
             raise ValueError("同一 controller session 内的 round_id 不能复用。")
         self._issued_rounds.add(identity)
-        input_shares = self.sharing.share(self.fixed_point.to_residue(input_payload), rng=rng)
+        material_rng = self._online_material_rng(rng)
+        input_shares = self.sharing.share(
+            self.fixed_point.to_residue(input_payload), rng=material_rng
+        )
         plan = self._resource_plan(layout, distribution.session_id, round_id, step)
         first_products: list[ProductResourceShare] = []
         second_products: list[ProductResourceShare] = []
         for metadata in plan.product_resources:
-            triple = self.multiplier.create_triple(rng=rng)
+            triple = self.multiplier.create_triple(rng=material_rng)
             lifecycle = _ResourceLifecycle()
             first_products.append(ProductResourceShare(0, metadata, triple[0], lifecycle))
             second_products.append(ProductResourceShare(1, metadata, triple[1], lifecycle))
         first_truncations: list[StateTruncationResourceShare] = []
         second_truncations: list[StateTruncationResourceShare] = []
         for metadata in plan.state_truncation_resources:
-            auxiliary = self.truncation.create_auxiliary(rng=rng)
+            auxiliary = self.truncation.create_auxiliary(rng=material_rng)
             lifecycle = _ResourceLifecycle()
             first_truncations.append(
                 StateTruncationResourceShare(0, metadata, auxiliary[0], lifecycle)
@@ -383,6 +389,22 @@ class Client:
     def _identifier(self, prefix: str) -> str:
         """从独立安全随机源生成身份，避免固定材料 seed 造成 session/round 碰撞。"""
         return f"{prefix}-{secrets.token_hex(16)}"
+
+    def _online_material_rng(self, rng: random.Random | None) -> random.Random | None:
+        """为每轮测试材料作确定性域分离，避免相同 seed 重播时复用 Beaver/Trunc 随机量。
+
+        未传入 ``rng`` 时沿用各 crypto primitive 的安全随机源。测试路径先取调用者流的
+        固定宽度种子，再与此 Client 的单调 epoch 哈希；不同 Client 的首轮仍可复现，
+        同一 Client 的后续 round 则必定进入不同随机域。
+        """
+        if rng is None:
+            return None
+        source_seed = rng.getrandbits(256).to_bytes(32, "big")
+        epoch = self._test_material_epoch
+        self._test_material_epoch += 1
+        domain = epoch.to_bytes(16, "big")
+        seed = hashlib.sha256(b"secure_control.protocol.online_material.v1" + domain + source_seed)
+        return random.Random(int.from_bytes(seed.digest(), "big"))
 
 
 @dataclass(slots=True)

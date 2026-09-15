@@ -180,6 +180,67 @@ def test_resource_pair_cannot_be_reused_after_a_successful_step() -> None:
     assert online.p1_resources.aborted_count == 0
 
 
+def test_reseeded_test_rng_domain_separates_each_online_round_material() -> None:
+    """验证同一 Client 重新播种测试 RNG 时，各 round 的 triple 与 mask 仍不重复。"""
+    client, _, _, _, distribution = make_stack()
+    first = client.prepare_online(distribution, [0.0], step=0, rng=random.Random(20))
+    second = client.prepare_online(distribution, [0.25], step=1, rng=random.Random(20))
+
+    first_triples = [
+        client.sharing.reconstruct(first_item.triple.b, second_item.triple.b)
+        for first_item, second_item in zip(
+            first.p1_resources.product_resources,
+            first.p2_resources.product_resources,
+            strict=True,
+        )
+    ]
+    second_triples = [
+        client.sharing.reconstruct(first_item.triple.b, second_item.triple.b)
+        for first_item, second_item in zip(
+            second.p1_resources.product_resources,
+            second.p2_resources.product_resources,
+            strict=True,
+        )
+    ]
+    first_masks = [
+        (
+            client.sharing.reconstruct(first_item.truncation.r, second_item.truncation.r),
+            client.sharing.reconstruct(
+                first_item.truncation.r_prime, second_item.truncation.r_prime
+            ),
+        )
+        for first_item, second_item in zip(
+            first.p1_resources.state_truncation_resources,
+            first.p2_resources.state_truncation_resources,
+            strict=True,
+        )
+    ]
+    second_masks = [
+        (
+            client.sharing.reconstruct(first_item.truncation.r, second_item.truncation.r),
+            client.sharing.reconstruct(
+                first_item.truncation.r_prime, second_item.truncation.r_prime
+            ),
+        )
+        for first_item, second_item in zip(
+            second.p1_resources.state_truncation_resources,
+            second.p2_resources.state_truncation_resources,
+            strict=True,
+        )
+    ]
+
+    assert first.round_id != second.round_id
+    # 每个公开 e 都减去其对应 triple 的 b；逐项不同才不会暴露跨轮 input 差值。
+    assert all(
+        first_value != second_value
+        for first_value, second_value in zip(first_triples, second_triples, strict=True)
+    )
+    assert all(
+        first_value != second_value
+        for first_value, second_value in zip(first_masks, second_masks, strict=True)
+    )
+
+
 def test_failed_resource_pairing_aborts_all_reserved_material_without_committing_state() -> None:
     """验证 P1 已开始乘法后发现 P2 triple 错配，整轮资源废弃且 state 不提交。"""
     client, p1, p2, coordinator, distribution = make_stack()

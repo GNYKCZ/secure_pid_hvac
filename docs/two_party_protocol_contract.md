@@ -49,9 +49,10 @@ u(k)     = C x_c(k) + D v(k)
 每个 `ProductResourceShare` 或 `StateTruncationResourceShare` 只能被其所属角色使用一次。两个
 角色均完成对应 Protocol 1 或 Protocol 2 后，资源标记为 `consumed`；任意校验或协议失败会把
 本轮尚未完成的资源标记为
-`aborted`，不能在另一轮重放。固定 `random.Random(seed)` 仅用于重放 share、triple 和 mask 等密码
-材料；session/round identity 始终使用独立安全随机源，正常调用不传 `rng` 时 crypto 层同样使用安全
-随机源。
+`aborted`，不能在另一轮重放。固定 `random.Random(seed)` 仅用于测试：Client 会将其与本 Client
+的单调 online-material epoch 作哈希域分离，所以同一 Client 重新播种同一个 seed 的多轮也不会复用
+input share、triple 或 mask；不同 Client 的首轮仍可重复测试。session/round identity 始终使用独立
+安全随机源，正常调用不传 `rng` 时 crypto 层同样使用安全随机源。
 
 ## 声明边界与威胁模型
 
