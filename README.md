@@ -102,12 +102,14 @@ uv run pytest tests/test_secure_arithmetic_gate.py -k randomized -q
 
 `secure_control.protocol` 现已提供领域无关的 `Client`、`P1`、`P2`、显式消息/资源对象与
 `SingleProcessCoordinator`。Client 分别分发通用 `ControllerSpec(A, B, C, D, x0)` 的份额；每个
-在线 step 对 `C/D/A/B` 的每个标量矩阵项消耗一份独立 Beaver triple 和截断随机量，并且只在
-Client 边界重构最终 control output。P1/P2 不保存第二份参数、输入、state 或资源 share。
+在线 step 对 `C/D/A/B` 的每个标量矩阵项消耗一份独立 Beaver triple，聚合 state 的每一行才
+消耗一对截断随机量；output 保持双尺度并只在 Client 边界解码。P1/P2 不保存第二份参数、输入、
+state 或资源 share。
 
-当前标量截断路径要求所有控制器量使用同一 `Q<ell>` 尺度；带有不一致
-`ControllerScaleMetadata` 的控制器会被拒绝。单进程路径仅验证协议消息流与算术语义，不是进程
-或网络隔离声明。角色可见数据、资源计数、失败清理和安全声明见
+当前 Protocol 3 路径要求 `A/B/C/D/x0/v` 使用 `Q<ell>` 尺度，控制输出使用
+`Q<2ell>` 尺度；带有不符合该规则的 `ControllerScaleMetadata` 的控制器会被拒绝。Client 还要求公开的编码 payload 范围契约，以证明
+state 截断输入位于 `Z<kappa>`、输出位于中心化 `Z_q`。单进程路径仅验证协议消息流与算术语义，
+不是进程或网络隔离声明。角色可见数据、资源计数、失败清理和安全声明见
 [通用两方协议契约](docs/two_party_protocol_contract.md)。
 
 仿真产生的大量 CSV 文件与图片应分别写入 `results/csv/` 和 `results/figures/`；这些输出默认

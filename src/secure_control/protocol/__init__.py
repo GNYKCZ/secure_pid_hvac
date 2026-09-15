@@ -3,6 +3,7 @@
 from .coordinator import SingleProcessCoordinator
 from .messages import (
     ControllerLayout,
+    ControllerRangeContract,
     ControllerShare,
     ControlShareMessage,
     InputShareMessage,
@@ -12,8 +13,9 @@ from .messages import (
     OnlineRound,
     OpenedMaskedMessage,
     PartyResources,
+    ProductResourceShare,
     ResourceMetadata,
-    ScalarResourceShare,
+    StateTruncationResourceShare,
     StepResourcePlan,
     TruncationMaskedMessage,
 )
@@ -25,6 +27,7 @@ __all__ = [
     "Client",
     "ControlShareMessage",
     "ControllerLayout",
+    "ControllerRangeContract",
     "ControllerShare",
     "InputShareMessage",
     "MaskedExchangeMessage",
@@ -33,9 +36,10 @@ __all__ = [
     "OnlineRound",
     "OpenedMaskedMessage",
     "PartyResources",
+    "ProductResourceShare",
     "ResourceMetadata",
-    "ScalarResourceShare",
     "SingleProcessCoordinator",
+    "StateTruncationResourceShare",
     "StepResourcePlan",
     "TruncationMaskedMessage",
 ]

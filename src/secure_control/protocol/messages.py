@@ -1,8 +1,9 @@
-"""领域无关两方控制协议的消息、份额与一次性资源契约。"""
+"""领域无关两方控制协议的消息、公开范围契约与一次性资源模型。"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from numbers import Integral
 from typing import Literal
 
 from secure_control.crypto import (
@@ -19,17 +20,40 @@ PartyIndex = Literal[0, 1]
 
 @dataclass(frozen=True, slots=True)
 class ControllerLayout:
-    """描述共享控制器的公开维度与统一定点尺度。
-
-    当前 crypto 原语的截断实例只支持一个 ``ell``，所以本协议核心要求状态、输入、
-    输出和全部矩阵在同一个 ``Q<ell>`` 尺度中编码。该限制会在 Client 离线阶段
-    显式检查，避免把不同 fractional bits 的乘积悄悄相加。
-    """
+    """描述共享控制器的公开维度与统一 ``Q<ell>`` 定点尺度。"""
 
     state_dimension: int
     input_dimension: int
     output_dimension: int
     fractional_bits: int
+
+
+@dataclass(frozen=True, slots=True)
+class ControllerRangeContract:
+    """以编码 payload 的绝对值声明输入与 state 的公开无限时域范围。"""
+
+    state_payload_bounds: tuple[int, ...]
+    input_payload_bounds: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        """拒绝负数、布尔值和非整数范围，避免将实数界误作编码 payload。"""
+        for name in ("state_payload_bounds", "input_payload_bounds"):
+            values = getattr(self, name)
+            if not isinstance(values, tuple):
+                raise TypeError(f"{name} 必须是整数 tuple。")
+            normalized: list[int] = []
+            for value in values:
+                if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
+                    raise ValueError(f"{name} 必须只包含非负整数 payload 上界。")
+                normalized.append(int(value))
+            object.__setattr__(self, name, tuple(normalized))
+
+    def validate_layout(self, layout: ControllerLayout) -> None:
+        """确认公开范围长度覆盖已安装控制器的 state 与 input channel。"""
+        if len(self.state_payload_bounds) != layout.state_dimension:
+            raise ValueError("state_payload_bounds 的长度必须等于 state dimension。")
+        if len(self.input_payload_bounds) != layout.input_dimension:
+            raise ValueError("input_payload_bounds 的长度必须等于 input dimension。")
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,119 +68,151 @@ class ControllerShare:
 
 @dataclass(frozen=True, slots=True)
 class OfflineControllerMessage:
-    """Client 离线分发给单个 P1 或 P2 的参数和初态消息。"""
+    """Client 离线分发给单个参与方的参数、初态和 controller session 标识。"""
 
     recipient: PartyIndex
+    session_id: str
     controller: ControllerShare
     initial_state: AdditiveShare
     layout: ControllerLayout
+    range_contract: ControllerRangeContract
 
 
 @dataclass(frozen=True, slots=True)
 class OfflineDistribution:
-    """Client 保留的离线分发结果；两个 Server 只能各自接收其中一条消息。"""
+    """Client 保留的一次离线分发；两个 Server 只能接收同一 session 的各自消息。"""
 
+    session_id: str
+    range_contract: ControllerRangeContract
     p1: OfflineControllerMessage
     p2: OfflineControllerMessage
 
 
 @dataclass(frozen=True, slots=True)
 class InputShareMessage:
-    """Client 在线发送给一个参与方的 controller input ``v`` 本地份额。"""
+    """Client 在线发送给单个参与方的 input share，绑定 controller session 与唯一 round。"""
 
     recipient: PartyIndex
+    session_id: str
+    round_id: str
     step: int
     value: AdditiveShare
 
 
 @dataclass(frozen=True, slots=True)
 class ResourceMetadata:
-    """标记一个标量乘法资源属于哪一矩阵项及其公开 shape/scale 语义。"""
+    """标记一次乘法或 state 截断资源的公开索引、shape、scale 与会话身份。"""
 
     resource_id: str
+    session_id: str
+    round_id: str
     step: int
-    term: Literal["A", "B", "C", "D"]
-    index: tuple[int, int]
-    matrix_shape: tuple[int, int]
-    fractional_bits: int
+    kind: Literal["multiplication", "state_truncation"]
+    term: Literal["A", "B", "C", "D", "state"]
+    index: tuple[int, ...]
+    shape: tuple[int, ...]
+    input_fractional_bits: int
+    output_fractional_bits: int
 
 
 @dataclass(frozen=True, slots=True)
 class StepResourcePlan:
-    """列出一个通用状态空间 step 所需资源，供 Client 在离线预处理时计数。"""
+    """列出一个 Protocol 3 step 的 triples 与每个 state 行的一次截断资源。"""
 
+    session_id: str
+    round_id: str
     step: int
     state_shape: tuple[int]
     input_shape: tuple[int]
     output_shape: tuple[int]
     fractional_bits: int
-    resources: tuple[ResourceMetadata, ...]
+    product_resources: tuple[ResourceMetadata, ...]
+    state_truncation_resources: tuple[ResourceMetadata, ...]
 
     @property
-    def resource_count(self) -> int:
-        """返回本 step 的标量 Beaver triple/Trunc mask 对数量。"""
-        return len(self.resources)
+    def triple_count(self) -> int:
+        """返回 A/B/C/D 所有标量乘法各自所需的 Beaver triple 数量。"""
+        return len(self.product_resources)
+
+    @property
+    def truncation_count(self) -> int:
+        """返回 state 向量逐元素截断所需的新鲜 ``r/r'`` 对数量。"""
+        return len(self.state_truncation_resources)
 
 
 class _ResourceLifecycle:
-    """在协调器中绑定同一资源的两份本地材料，阻止重放或失败后再次使用。"""
+    """绑定同一逻辑资源的两份局部材料，阻止跨会话、跨轮次或失败后的重放。"""
 
     def __init__(self) -> None:
         self.claimed_by: set[int] = set()
         self.status = "prepared"
 
     def claim(self, party: PartyIndex) -> None:
-        """登记参与方开始使用资源；只有一轮的两个对应角色可各登记一次。"""
+        """登记某一角色开始使用资源；每轮仅允许 P1/P2 各一次。"""
         if self.status != "prepared" or party in self.claimed_by:
             raise ValueError("协议资源已经使用、完成或因失败失效，不能复用。")
         self.claimed_by.add(party)
 
     def complete(self) -> None:
-        """只在双方均完成该标量协议后将资源永久标记为已消费。"""
+        """仅在双方均完成对应子协议后永久消费资源。"""
         if self.status != "prepared" or self.claimed_by != {0, 1}:
             raise ValueError("协议资源必须由 P1 与 P2 各使用一次后才能完成。")
         self.status = "consumed"
 
     def abort(self) -> None:
-        """使尚未完成的预处理材料失效，防止失败轮次被重试或拼接。"""
+        """废弃未完成资源，使失败 round 无法拼接或重试。"""
         if self.status == "prepared":
             self.status = "aborted"
 
 
 @dataclass(frozen=True, slots=True)
-class ScalarResourceShare:
-    """一个 Server 的单项 triple 与 truncation mask；同一资源没有对方的数值份额。"""
+class ProductResourceShare:
+    """一个 Server 的单项 Beaver triple share；结果保持 ``2^(2ell)`` 尺度。"""
 
     owner: PartyIndex
     metadata: ResourceMetadata
     triple: BeaverTripleShare
+    _lifecycle: _ResourceLifecycle = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class StateTruncationResourceShare:
+    """一个 Server 的 state 行截断随机量 share；只用于聚合后的双尺度状态和。"""
+
+    owner: PartyIndex
+    metadata: ResourceMetadata
     truncation: TruncationAuxiliaryShare
     _lifecycle: _ResourceLifecycle = field(repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
 class PartyResources:
-    """Client 为一个 Server 准备的一轮一次性资源包。"""
+    """Client 为单个参与方准备的一轮 triples 与 state truncation resources。"""
 
     recipient: PartyIndex
     plan: StepResourcePlan
-    resources: tuple[ScalarResourceShare, ...]
+    product_resources: tuple[ProductResourceShare, ...]
+    state_truncation_resources: tuple[StateTruncationResourceShare, ...]
 
     @property
     def consumed_count(self) -> int:
-        """返回已经由双方完整消费的逻辑资源数量。"""
-        return sum(resource._lifecycle.status == "consumed" for resource in self.resources)
+        """返回已由双方完整消费的所有逻辑资源数量。"""
+        resources = (*self.product_resources, *self.state_truncation_resources)
+        return sum(resource._lifecycle.status == "consumed" for resource in resources)
 
     @property
     def aborted_count(self) -> int:
-        """返回因轮次失败而被不可恢复地废弃的逻辑资源数量。"""
-        return sum(resource._lifecycle.status == "aborted" for resource in self.resources)
+        """返回因当前 round 失败而不可恢复地废弃的资源数量。"""
+        resources = (*self.product_resources, *self.state_truncation_resources)
+        return sum(resource._lifecycle.status == "aborted" for resource in resources)
 
 
 @dataclass(frozen=True, slots=True)
 class OnlineRound:
-    """Client 持有的一次在线输入和资源分发结果，不应整体交给任一 Server。"""
+    """Client 准备的唯一在线 round；不得整体交给任一 Server。"""
 
+    session_id: str
+    round_id: str
     step: int
     p1_input: InputShareMessage
     p2_input: InputShareMessage
@@ -166,10 +222,12 @@ class OnlineRound:
 
 @dataclass(frozen=True, slots=True)
 class MaskedExchangeMessage:
-    """模拟 P1↔P2 的 Beaver 遮蔽差值发送，保留发送、接收、step 与资源标识。"""
+    """模拟 P1↔P2 的 Beaver 遮蔽差值发送，绑定 session、round、step 与资源。"""
 
     sender: PartyIndex
     recipient: PartyIndex
+    session_id: str
+    round_id: str
     step: int
     resource_id: str
     value: MaskedDifferenceShare
@@ -177,9 +235,11 @@ class MaskedExchangeMessage:
 
 @dataclass(frozen=True, slots=True)
 class OpenedMaskedMessage:
-    """协调器由两条遮蔽消息得到的公开 ``d/e``，不包含原始输入或状态明文。"""
+    """协调器由两条遮蔽消息得到的公开 ``d/e``；不包含原始输入或 state 明文。"""
 
     recipients: tuple[PartyIndex, PartyIndex]
+    session_id: str
+    round_id: str
     step: int
     resource_id: str
     value: PublicMaskedDifferences
@@ -187,10 +247,12 @@ class OpenedMaskedMessage:
 
 @dataclass(frozen=True, slots=True)
 class TruncationMaskedMessage:
-    """Protocol 2 中 P2 发给 P1 的唯一 masked-value 消息及其路由元数据。"""
+    """Protocol 2 中 P2 发给 P1 的唯一 masked-value 消息及其 session/round 路由。"""
 
     sender: Literal[1]
     recipient: Literal[0]
+    session_id: str
+    round_id: str
     step: int
     resource_id: str
     value: P2MaskedMessage
@@ -198,8 +260,11 @@ class TruncationMaskedMessage:
 
 @dataclass(frozen=True, slots=True)
 class ControlShareMessage:
-    """一个 Server 返回给 Client 的 control output 本地份额。"""
+    """一个 Server 返回给 Client 的双尺度 control share，绑定同一 session/round。"""
 
     sender: PartyIndex
+    session_id: str
+    round_id: str
     step: int
+    fractional_bits: int
     value: AdditiveShare
