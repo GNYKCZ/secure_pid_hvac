@@ -244,8 +244,55 @@ def test_client_rejects_cross_session_control_output_shares() -> None:
         client.reconstruct_control(first[0], second[1])
 
 
-def test_fixed_seed_replays_session_round_resources_and_output_shares() -> None:
-    """验证相同 seed 重放 session、round、triples、masks 与双尺度 output shares。"""
+def test_fixed_resource_seed_cannot_collide_controller_sessions_or_mix_servers() -> None:
+    """验证资源随机源可重放时，身份仍唯一且跨 controller 组合会在 claim 前拒绝。"""
+    first_client, first_p1, _, first_coordinator, first_distribution = make_stack(seed=10)
+    fixed_point = FixedPointContext(2_147_483_647, integer_bits=20, fractional_bits=8)
+    second_client = Client(fixed_point, TwoPartySharing(fixed_point.modulus), security_parameter=8)
+    second_spec = ControllerSpec(
+        A=np.array([[0.5, 0.0], [0.0, 0.5]]),
+        B=np.array([[0.25], [-0.25]]),
+        C=np.array([[2.0, 2.0]]),
+        D=np.array([[0.5]]),
+        x0=np.array([0.5, 0.0]),
+        scale_metadata=ControllerScaleMetadata(state=8, input=8, output=16, A=8, B=8, C=8, D=8),
+    )
+    second_distribution = second_client.distribute_controller(
+        second_spec,
+        ControllerRangeContract(state_payload_bounds=(256, 256), input_payload_bounds=(64,)),
+        rng=random.Random(10),
+    )
+    online = first_client.prepare_online(first_distribution, [0.25], step=0, rng=random.Random(20))
+    initial_state = share_values(first_p1.state_share)
+
+    assert first_distribution.session_id != second_distribution.session_id
+    with pytest.raises(ValueError, match="session"):
+        first_coordinator.execute(first_p1, P2(second_distribution.p2), online)
+    assert share_values(first_p1.state_share) == initial_state
+    assert online.p1_resources.aborted_count == 11
+
+
+def test_client_rejects_complete_output_pair_from_another_client() -> None:
+    """验证两条彼此匹配的外来输出也不能绕过 Client 的已签发 round 登记。"""
+    client, _, _, _, _ = make_stack(seed=40)
+    foreign_client, foreign_p1, foreign_p2, foreign_coordinator, foreign_distribution = make_stack(
+        seed=42
+    )
+    with pytest.raises(ValueError, match="当前 Client"):
+        client.prepare_online(foreign_distribution, [0.25], step=0, rng=random.Random(43))
+    assert (client.multiplier.created_triples, client.truncation.created_masks) == (0, 0)
+    foreign_output = foreign_coordinator.execute(
+        foreign_p1,
+        foreign_p2,
+        foreign_client.prepare_online(foreign_distribution, [0.25], step=0, rng=random.Random(43)),
+    )
+
+    with pytest.raises(ValueError, match="当前 Client"):
+        client.reconstruct_control(*foreign_output)
+
+
+def test_fixed_seed_replays_crypto_material_but_not_session_round_identities() -> None:
+    """验证固定 seed 仅重放密码材料与输出 share，绝不重放身份标识。"""
     first_client, first_p1, first_p2, first_coordinator, first_distribution = make_stack(seed=30)
     second_client, second_p1, second_p2, second_coordinator, second_distribution = make_stack(
         seed=30
@@ -260,8 +307,8 @@ def test_fixed_seed_replays_session_round_resources_and_output_shares() -> None:
     first_output = first_coordinator.execute(first_p1, first_p2, first_online)
     second_output = second_coordinator.execute(second_p1, second_p2, second_online)
 
-    assert first_online.session_id == second_online.session_id
-    assert first_online.round_id == second_online.round_id
+    assert first_online.session_id != second_online.session_id
+    assert first_online.round_id != second_online.round_id
     assert share_values(first_output[0].value) == share_values(second_output[0].value)
     assert share_values(first_output[1].value) == share_values(second_output[1].value)
 

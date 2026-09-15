@@ -20,8 +20,10 @@ u(k)     = C x_c(k) + D v(k)
 | P2 | `A_2/B_2/C_2/D_2/x0_2`、controller session | 同一 round 的 `v_2`、triple/mask 第 2 份、公开 Beaver `d/e`、双尺度 `u_2` | 第一份参数/state/input/resource share，P1 的 Protocol 2 消息或 controller state 明文 |
 | 单进程协调器 | 算术原语和暂态 masked 消息 | 两条 Beaver 遮蔽差值及公开 `d/e` | 参数、state、input 或 output 的明文重构结果 |
 
-每次离线分发都有唯一 `session_id`，每个在线请求有唯一 `round_id`；输入、资源计划、遮蔽消息和
-输出 shares 都绑定两者。协调器与 Client 会在资源 claim 或输出重构前拒绝跨 session/round 拼接。
+每次离线分发都有由独立安全随机源生成的唯一 `session_id`，每个在线请求有同样生成的唯一
+`round_id`；它们绝不从可重放的密码材料 RNG 派生。输入、资源计划、遮蔽消息和输出 shares 都绑定
+两者。协调器会在资源 claim 前拒绝跨 session/round 拼接；Client 还登记自己签发的 distribution/round，
+在输出重构前拒绝外来或未签发的完整输出对。
 `MaskedExchangeMessage` 明确记录 P1→P2 与 P2→P1 的发送方、接收方、身份、step 和 resource id；
 `TruncationMaskedMessage` 仅允许 P2→P1。这些对象描述协议数学消息，而单进程协调器只负责本地
 投递；它不是未来网络 API 的一部分。
@@ -47,8 +49,9 @@ u(k)     = C x_c(k) + D v(k)
 每个 `ProductResourceShare` 或 `StateTruncationResourceShare` 只能被其所属角色使用一次。两个
 角色均完成对应 Protocol 1 或 Protocol 2 后，资源标记为 `consumed`；任意校验或协议失败会把
 本轮尚未完成的资源标记为
-`aborted`，不能在另一轮重放。固定 `random.Random(seed)` 仅用于可重复测试，正常调用不传
-`rng` 时沿用 crypto 层的安全随机源。
+`aborted`，不能在另一轮重放。固定 `random.Random(seed)` 仅用于重放 share、triple 和 mask 等密码
+材料；session/round identity 始终使用独立安全随机源，正常调用不传 `rng` 时 crypto 层同样使用安全
+随机源。
 
 ## 声明边界与威胁模型
 

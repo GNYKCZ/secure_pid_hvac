@@ -89,7 +89,9 @@ class Client:
             ell=fixed_point.fractional_bits,
             security_parameter=security_parameter,
         )
-        self._issued_rounds: set[tuple[str, str]] = set()
+        # 身份不从可重放的离线/在线材料 RNG 派生；Client 以此登记其签发能力。
+        self._issued_sessions: set[str] = set()
+        self._issued_rounds: set[tuple[str, str, int]] = set()
 
     def distribute_controller(
         self,
@@ -114,7 +116,8 @@ class Client:
             name: self.sharing.share(self.fixed_point.to_residue(value), rng=rng)
             for name, value in payloads.items()
         }
-        session_id = self._identifier("controller", rng)
+        session_id = self._identifier("controller")
+        self._issued_sessions.add(session_id)
         first = ControllerShare(shares["A"][0], shares["B"][0], shares["C"][0], shares["D"][0])
         second = ControllerShare(shares["A"][1], shares["B"][1], shares["C"][1], shares["D"][1])
         first_message = OfflineControllerMessage(
@@ -135,12 +138,14 @@ class Client:
     ) -> OnlineRound:
         """验证 input payload 范围，并创建绑定 session/round 的 triples 与 state masks。"""
         layout = self._distribution_layout(distribution)
+        if distribution.session_id not in self._issued_sessions:
+            raise ValueError("离线分发不属于当前 Client 签发的 controller session。")
         step = _require_step(step)
         input_values = self._normalize_input(v, layout)
         input_payload = np.asarray(self.fixed_point.encode(input_values), dtype=object)
         self._validate_input_bound(input_payload, distribution.range_contract)
-        round_id = self._identifier("round", rng)
-        identity = (distribution.session_id, round_id)
+        round_id = self._identifier("round")
+        identity = (distribution.session_id, round_id, step)
         if identity in self._issued_rounds:
             raise ValueError("同一 controller session 内的 round_id 不能复用。")
         self._issued_rounds.add(identity)
@@ -191,6 +196,8 @@ class Client:
             or first.fractional_bits != 2 * self.fixed_point.fractional_bits
         ):
             raise ValueError("控制输出必须是同一 session/round 的双尺度 P1、P2 shares。")
+        if (first.session_id, first.round_id, first.step) not in self._issued_rounds:
+            raise ValueError("控制输出不属于当前 Client 签发的 online round。")
         signed = np.asarray(
             self.fixed_point.from_residue(self.sharing.reconstruct(first.value, second.value)),
             dtype=object,
@@ -373,10 +380,9 @@ class Client:
             truncations,
         )
 
-    def _identifier(self, prefix: str, rng: random.Random | None) -> str:
-        """为 session/round 生成可在固定 seed 测试中重放、正常运行时不可预测的标识。"""
-        entropy = secrets.token_hex(16) if rng is None else f"{rng.getrandbits(128):032x}"
-        return f"{prefix}-{entropy}"
+    def _identifier(self, prefix: str) -> str:
+        """从独立安全随机源生成身份，避免固定材料 seed 造成 session/round 碰撞。"""
+        return f"{prefix}-{secrets.token_hex(16)}"
 
 
 @dataclass(slots=True)
