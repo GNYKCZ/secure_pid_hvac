@@ -58,4 +58,5 @@ anti-windup。通用 runtime 和 core 不包含这些 HVAC actuator 语义。
 三项均低于预设的 1.0 °C 门槛。应用到 plant 的 `control_ideal` 位于
 `[0.492426, 12.0] kW`；第一步的原始 PID 输出为 12.5 kW，场景按已冻结的位置裁剪为 12.0 kW。
 
-本场景函数是 #4 的临时场景级组合，避免抢先实现 #12 的通用 simulation engine。
+本场景函数保留为 #4 明文基线 oracle。Issue #12 的双闭环使用同一场景 adapter 的 actuator
+hook 和通用 simulation engine，因此既有 PID gains、饱和位置和指标定义保持不变。

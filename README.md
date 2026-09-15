@@ -9,8 +9,8 @@ GitHub 仓库和发行包继续使用 `secure_pid_hvac` / `secure-pid-hvac`，Py
 单位和指标应集中在 `secure_control.scenarios.hvac`。
 
 当前已完成架构基础、HVAC 明文基线、安全算术原语与组合验证门、通用 Client/P1/P2 单进程协议
-核心，以及与明文接口兼容的通用安全状态空间运行时。尚未实现 HVAC 安全闭环、multiprocessing
-或网络通信。
+核心、与明文接口兼容的通用安全状态空间运行时，以及领域无关 simulation engine 和
+180 步 HVAC 明文/安全双闭环。尚未实现 multiprocessing 或网络通信。
 
 ## 架构边界
 
@@ -18,7 +18,7 @@ GitHub 仓库和发行包继续使用 `secure_pid_hvac` / `secure-pid-hvac`，Py
 - `crypto`：领域无关的定点数、模运算和安全算术；不得依赖场景。
 - `protocol`：Client/P1/P2 协议编排；只处理通用控制器数据和 shares。
 - `execution`：统一的控制器运行接口 `step(v) -> u`。
-- `simulation`：领域无关的 plant、scenario adapter 和结果契约。
+- `simulation`：领域无关的 scenario plan、时间循环、runner 和八字段结果契约。
 - `scenarios`：plant、reference、controller design、信号适配及单位等领域逻辑。
 
 仿真引擎不得自行计算 `reference - measurement`。scenario adapter 根据 reference 和 plant output
@@ -66,14 +66,22 @@ scenario:
   name: hvac
 ```
 
-当前阶段仅冻结该配置边界，尚未提供通用 simulation runner。
+通用 `simulation.runner.run(scenario)` 不根据 YAML 选择场景；具体 HVAC 装配位于场景层。
 
 ## HVAC 场景基线
 
 [`configs/hvac_baseline.yaml`](configs/hvac_baseline.yaml) 冻结了 HVAC 的一阶 RC 冷却模型、60 s
 采样、3 小时 horizon、15 → 20 → 25 °C reference、控制量方向、结果通道及 `v = r - T` 的场景
 信号适配语义。项目已提供确定性的 HVAC plant、reference、signal adapter、PID 到通用状态空间
-矩阵的转换，以及场景级明文闭环基线；通用 simulation runner 仍未实现。详细设计见
+矩阵的转换、场景级明文闭环基线，以及复用通用 engine 的 180 步安全双闭环。运行双闭环：
+
+```powershell
+uv run python -m secure_control.scenarios.hvac.runner --config configs/hvac_dual_loop.yaml --seed 12
+```
+
+`--seed` 仅用于隔离测试复现；省略时使用安全随机材料源。CLI 只输出摘要，不保存 #13 的
+正式结果文件。配置、时间索引、范围证书与公平比较见
+[HVAC 双闭环集成](docs/simulation_hvac_integration.md)。详细 PID 设计见
 [HVAC PID 设计](docs/hvac_pid_design.md)；完整场景约定见
 [HVAC 场景契约](docs/hvac_scenario_contract.md)。
 
@@ -97,7 +105,7 @@ uv run pytest tests/test_secure_arithmetic_gate.py -k randomized -q
 ```
 
 安全算术当前只实现 scalar-first 的 Beaver 与截断路径。它验证本地协议算术与消息语义，并不等同于
-主机隔离、网络安全或完整的生产级安全证明。安全闭环、进程隔离与网络通信仍属于后续工作。
+主机隔离、网络安全或完整的生产级安全证明。进程隔离与网络通信仍属于后续工作。
 
 ## 通用两方协议核心
 

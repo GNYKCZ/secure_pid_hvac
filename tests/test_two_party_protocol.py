@@ -699,3 +699,80 @@ def test_zero_fractional_bits_reject_non_integer_matrix_before_sharing() -> None
             ControllerRangeContract(state_payload_bounds=(1,), input_payload_bounds=(1,)),
             rng=random.Random(63),
         )
+
+
+def test_integrator_needs_proven_finite_horizon_and_rejects_overrun_before_resources() -> None:
+    """积分态不满足无限不变界；有限时间证明与在线步数必须先于分享/资源创建。"""
+    fixed_point = FixedPointContext(2_147_483_647, integer_bits=20, fractional_bits=8)
+    client = Client(fixed_point, TwoPartySharing(fixed_point.modulus), security_parameter=8)
+    spec = ControllerSpec(
+        A=np.array([[1.0]]),
+        B=np.array([[1.0]]),
+        C=np.array([[1.0]]),
+        D=np.array([[0.0]]),
+        x0=np.array([0.0]),
+        scale_metadata=ControllerScaleMetadata(state=8, input=8, output=8, A=0, B=0, C=0, D=0),
+    )
+
+    with pytest.raises(ValueError, match="不变安全范围"):
+        client.distribute_controller(
+            spec,
+            ControllerRangeContract(state_payload_bounds=(768,), input_payload_bounds=(256,)),
+        )
+    with pytest.raises(ValueError, match="state_payload_bounds"):
+        client.distribute_controller(
+            spec,
+            ControllerRangeContract(
+                state_payload_bounds=(511,), input_payload_bounds=(256,), horizon_steps=3
+            ),
+        )
+    distribution = client.distribute_controller(
+        spec,
+        ControllerRangeContract(
+            state_payload_bounds=(768,), input_payload_bounds=(256,), horizon_steps=3
+        ),
+    )
+
+    with pytest.raises(ValueError, match="horizon"):
+        client.prepare_online(distribution, [0.25], step=3)
+    with pytest.raises(ValueError, match="input_payload_bounds"):
+        client.prepare_online(distribution, [2.0], step=0)
+    assert (client.multiplier.created_triples, client.truncation.created_masks) == (0, 0)
+
+
+@pytest.mark.parametrize("horizon", [0, -1, True, 1.5])
+def test_finite_horizon_requires_positive_integer(horizon: object) -> None:
+    """拒绝零、负值、布尔和非整数时域，避免证明循环被静默跳过。"""
+    with pytest.raises(ValueError, match="horizon_steps"):
+        ControllerRangeContract(
+            state_payload_bounds=(1,), input_payload_bounds=(1,), horizon_steps=horizon
+        )
+
+
+def test_finite_horizon_proves_general_trunc_path_with_rounding_margin() -> None:
+    """通用固定点 A/B 的有限时域上界须逐步保留 Protocol 2 的 ±1 误差。"""
+    fixed_point = FixedPointContext(2_147_483_647, integer_bits=20, fractional_bits=8)
+    client = Client(fixed_point, TwoPartySharing(fixed_point.modulus), security_parameter=8)
+    spec = ControllerSpec(
+        A=np.array([[1.0]]),
+        B=np.array([[1.0]]),
+        C=np.array([[1.0]]),
+        D=np.array([[0.0]]),
+        x0=np.array([0.0]),
+        scale_metadata=ControllerScaleMetadata(state=8, input=8, output=16, A=8, B=8, C=8, D=8),
+    )
+    with pytest.raises(ValueError, match="state_payload_bounds"):
+        client.distribute_controller(
+            spec,
+            ControllerRangeContract(
+                state_payload_bounds=(194,), input_payload_bounds=(64,), horizon_steps=3
+            ),
+        )
+    distribution = client.distribute_controller(
+        spec,
+        ControllerRangeContract(
+            state_payload_bounds=(195,), input_payload_bounds=(64,), horizon_steps=3
+        ),
+    )
+    online = client.prepare_online(distribution, [0.25], step=0)
+    assert online.p1_resources.plan.truncation_count == 1

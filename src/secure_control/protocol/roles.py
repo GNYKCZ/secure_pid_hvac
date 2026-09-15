@@ -157,6 +157,9 @@ class Client:
         if distribution.session_id not in self._issued_sessions:
             raise ValueError("离线分发不属于当前 Client 签发的 controller session。")
         step = _require_step(step)
+        horizon = distribution.range_contract.horizon_steps
+        if horizon is not None and step >= horizon:
+            raise ValueError("step 超出已证明的 finite horizon，不能创建在线资源。")
         input_values = self._normalize_input(v, layout)
         input_payload = np.asarray(
             self._fixed_point_at_scale(layout.scale_ledger.input).encode(input_values), dtype=object
@@ -364,6 +367,10 @@ class Client:
             if abs(int(value)) > state_bounds[index]:
                 raise ValueError("x0 payload 超出公开 state_payload_bounds。")
 
+        if contract.horizon_steps is not None:
+            self._validate_finite_horizon(payloads, layout, contract)
+            return
+
         state_raw_bounds = self._row_bounds(
             payloads["A"], state_bounds, payloads["B"], input_bounds
         )
@@ -391,6 +398,59 @@ class Client:
             raise ValueError("control output 聚合乘积可能越出 centered Z_q 范围。")
         if len(state_raw_bounds) != layout.state_dimension:
             raise AssertionError("state 范围验证的行数与 controller layout 不一致。")
+
+    def _validate_finite_horizon(
+        self,
+        payloads: dict[str, np.ndarray],
+        layout: ControllerLayout,
+        contract: ControllerRangeContract,
+    ) -> None:
+        """以 Python 精确整数从编码 x0 逐步证明有限 horizon 的范围前提。
+
+        ``s_k`` 是各 state payload 的公开绝对上界。每个可执行 k 先用 ``s_k``
+        检查更新前输出，再检查 state accumulator 与 Trunc 前提，推得 ``s_(k+1)``；
+        终点 state 也须在声明界内，但不虚构终点的额外 controller step。
+        """
+        current = [abs(int(value)) for value in payloads["x0"]]
+        input_bounds = contract.input_payload_bounds
+        state_bounds = contract.state_payload_bounds
+        ledger = layout.scale_ledger
+        centered_limit = (self.sharing.modulus - 1) // 2
+        maximum_truncation_message = self.truncation.maximum_message
+        assert contract.horizon_steps is not None
+
+        for step in range(contract.horizon_steps):
+            output_raw_bounds = self._row_bounds(
+                payloads["C"], tuple(current), payloads["D"], input_bounds
+            )
+            if any(value > centered_limit for value in output_raw_bounds):
+                raise ValueError(f"finite horizon 第 {step} 步 output 超出 centered Z_q 范围。")
+
+            state_raw_bounds = self._row_bounds(
+                payloads["A"], tuple(current), payloads["B"], input_bounds
+            )
+            next_bounds: list[int] = []
+            for raw_bound in state_raw_bounds:
+                if ledger.state_truncation_bits:
+                    if raw_bound > maximum_truncation_message:
+                        raise ValueError(
+                            f"finite horizon 第 {step} 步 state 超出 Protocol 2 的 Z<kappa> 范围。"
+                        )
+                    truncation_scale = 1 << ledger.state_truncation_bits
+                    # Protocol 2 的 rounding 与 w∈{-1,0,1} 需要额外保留 1 payload。
+                    next_bound = (raw_bound + truncation_scale - 1) // truncation_scale + 1
+                else:
+                    if raw_bound > centered_limit:
+                        raise ValueError(
+                            f"finite horizon 第 {step} 步 state 超出 centered Z_q 范围。"
+                        )
+                    next_bound = raw_bound
+                next_bounds.append(next_bound)
+            if any(value > bound for value, bound in zip(next_bounds, state_bounds)):
+                raise ValueError(
+                    f"finite horizon 第 {step + 1} 步 state 超出 state_payload_bounds。"
+                )
+            current = next_bounds
 
     def _validate_input_bound(self, payload: np.ndarray, contract: ControllerRangeContract) -> None:
         """在 Client 分享前检查每个实际 input payload 未超出公开范围。"""

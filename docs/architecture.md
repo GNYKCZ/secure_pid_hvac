@@ -59,8 +59,18 @@ fixed-point A/B 的逐聚合 state 行 Trunc，或 integer A/B 的 no-Trunc 路�
 
 ## 场景与仿真契约
 
-场景通过 `ScenarioAdapter` 提供 reference，并将 reference 与 plant output 映射为 controller input
-`v`。仿真引擎不得假设 `v` 一定是两个信号的差值。
+场景通过 `Scenario.build_plan()` 事前装配通用 `SimulationPlan(metadata, sample_times,
+ideal, secure)`，两支 `SimulationBranch` 各持有独立 plant/adapter/runtime。场景自己的
+`ScenarioAdapter` 提供 reference，将本支 plant output 映射为 controller input `v`，并将
+raw controller output 映射为实际送给 plant 的 applied control。仿真引擎不得假设 `v`
+一定是两个信号的差值，也不得在通用层解释 actuator 单位。
+
+`simulation.runner.run(scenario)` 只取得计划并调用 `engine.compare_closed_loops`，不选择
+HVAC 或导入任何场景/协议实现。每支按 reference→更新前 output→adapter 的 `v`→
+runtime 的 raw control→场景 actuator→plant.step 顺序执行；记录的 output 对应更新前
+时刻，control 对应 applied control。两支完成后逐时刻计算有符号 `ideal-secure` 误差。
+时间必须有限且严格递增；共享可变 plant/adapter/runtime、非有限信号、通道错位或任一
+分支失败均不返回部分 `SimulationResult`。
 
 结果统一记录：
 
@@ -85,4 +95,4 @@ scenario:
   name: <scenario-name>
 ```
 
-本文件只冻结职责边界，不实现具体场景、控制器、安全算术或协议。
+HVAC 的装配与 180 步物理/编码范围条件见 [仿真与双闭环集成](simulation_hvac_integration.md)。

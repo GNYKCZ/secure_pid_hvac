@@ -24,6 +24,7 @@ class HvacSignalAdapter:
         if not isinstance(contract, HvacScenarioContract):
             raise TypeError("contract 必须是 HvacScenarioContract")
         self.metadata: ScenarioMetadata = contract.metadata
+        self._contract = contract
         self._reference = HvacStepReference(contract)
 
     def reference_at(self, time: float) -> Array:
@@ -36,6 +37,22 @@ class HvacSignalAdapter:
         measured_temperature = self._coerce_temperature_signal(output, "output")
         # 该减法只存在于 HVAC scenario；通用 simulation engine 不得假定任意场景都有该公式。
         return np.array([reference_temperature - measured_temperature], dtype=float)
+
+    def apply_control(self, raw_control: Array) -> Array:
+        """按 HVAC actuator 配置在 plant 前裁剪 raw control，不改变 PID 内部递推。"""
+        value = np.asarray(raw_control)
+        if value.shape != (1,):
+            raise ValueError("HVAC raw control 必须是 shape 为 (1,) 的单通道数组")
+        if value.dtype.kind not in "iuf":
+            raise TypeError("HVAC raw control 必须包含实数")
+        if not np.isfinite(value).all():
+            raise FloatingPointError("HVAC raw control 包含 NaN 或无穷大")
+        model = self._contract.model
+        return np.clip(
+            value.astype(float),
+            model.lower_control_bound_kw,
+            model.upper_control_bound_kw,
+        )
 
     @staticmethod
     def _coerce_temperature_signal(value: Array, name: str) -> float:

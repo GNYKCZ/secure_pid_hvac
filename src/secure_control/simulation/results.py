@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import pairwise
 from typing import Any
 
 import numpy as np
@@ -42,6 +43,8 @@ class SimulationResult:
             raise ValueError("time must be a non-empty one-dimensional array")
         if time.dtype.kind not in "iuf" or not np.isfinite(time).all():
             raise ValueError("time must contain finite real numeric values")
+        if any(later <= earlier for earlier, later in pairwise(time)):
+            raise ValueError("time must be strictly increasing")
         time.setflags(write=False)
         object.__setattr__(self, "time", time)
 
