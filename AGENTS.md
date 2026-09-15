@@ -465,6 +465,39 @@ git ls-files --others --exclude-standard
 
 “文件多”不等于架构好；边界清晰、职责稳定、可测试才是目标。
 
+### 2C.13 Existing File Editing Discipline
+
+修改已有文件时，默认必须进行最小范围的原位修改（minimal in-place patch）。
+
+禁止仅为了编辑方便而：
+
+- 删除已有文件后重新创建同名文件；
+- 整文件重写一个只需要局部修改的模块；
+- 通过 recreate 文件的方式完成普通 refactor；
+- 因格式化、换行符或编码变化制造与当前 Issue 无关的大面积 diff；
+- 为了“代码更整洁”而重排与当前任务无关的代码、注释或 import。
+
+只有以下情况允许完整替换已有文件：
+
+1. 当前 Issue 明确要求重写该模块；
+2. 现有文件结构已经无法合理承载所需修改；
+3. 完整替换比局部修改更安全且理由明确；
+4. 文件属于自动生成文件，并且生成流程本身属于当前任务。
+
+如果确实需要完整替换已有文件，必须：
+
+- 保持原有编码和换行约定；
+- 保留仍然有效的注释和文档；
+- 不改变与当前 Issue 无关的行为；
+- 在最终报告中说明为什么不能使用局部 patch。
+
+AI 应以“最小可审查 diff”为目标，而不是“最少编辑操作”为目标。
+
+完成修改后必须检查：
+
+```powershell
+git diff -- <modified-file>
+```
 
 ## 3. Python 与环境
 
@@ -1153,6 +1186,100 @@ AI 容易根据名称补全不存在的事实。
 
 除非实际通过 Git/GitHub 工具确认。
 
+## 14B. Review Finding 修复工作流
+
+当独立 Review Agent 将 Finding 写入当前 Issue、PR 或其他持久化评论区后，后续实现 Agent 必须把这些 Finding 视为“需要重新验证的缺陷报告”，而不是无需验证的修改指令。
+
+### 14B.1 修复前必须重新验证 Finding
+
+处理每个 Finding 前必须：
+
+1. 阅读 Finding 的 Trigger、Evidence、Impact、Suggested direction、Constraints 和 Acceptance check；
+2. 检查当前 branch / HEAD 是否仍然包含该问题；
+3. 阅读 Finding 涉及的实际实现、调用方、测试和相关配置；
+4. 确认 Finding 的触发路径真实存在；
+5. 确认问题仍属于当前 Issue 范围。
+
+禁止因为 Review Agent 给出了修改建议就直接机械修改代码。
+
+如果重新验证后发现 Finding 不成立、已经被其他修改解决，或建立在错误假设上，应记录证据并将其标记为：
+
+* Rejected；
+* Already resolved；
+* Superseded；
+
+而不是为了迎合 Review 结果强行修改代码。
+
+### 14B.2 Suggested direction 不是强制实现方案
+
+Review Finding 中的 Suggested direction 用于说明推荐的修复方向和架构约束，但默认不是精确 patch specification。
+
+修复 Agent仍必须：
+
+* 优先寻找现有 canonical implementation；
+* 保持现有 ownership 和架构边界；
+* 选择满足 Finding Acceptance check 的最小正确修改；
+* 不因为 Review 建议创建额外 abstraction、文件或依赖；
+* 不扩大原 Issue scope。
+
+如果 Review 建议本身与项目架构、论文语义、本文件规则或当前代码证据冲突，应说明原因，不得盲从。
+
+### 14B.3 Finding 状态
+
+每个 Finding 最终只能进入以下状态之一：
+
+* `Fixed`：问题已修复，并有验证证据；
+* `Rejected`：重新验证证明 Finding 不成立；
+* `Already resolved`：当前代码已经不存在该问题；
+* `Superseded`：后续设计或修改使原 Finding 不再适用；
+* `Follow-up required`：问题真实，但修复超出当前 Issue 范围，需要独立 Issue / planning decision；
+* `Blocked`：问题真实，但受外部依赖或前置条件阻塞。
+
+不得仅因为修改了相关代码就标记为 `Fixed`。
+
+### 14B.4 修复后的验证
+
+每个 Fixed Finding 至少需要：
+
+1. 执行与该 Finding 直接相关的 targeted validation；
+2. 若属于 bug fix，优先增加或保留能够防止该问题再次出现的 regression test；
+3. 执行本文件要求的完整验证；
+4. 检查修复没有产生新的无关 diff；
+5. 保留 Finding ID 与验证结果的对应关系。
+
+例如：
+
+`RV-002 — Fixed — uv run pytest tests/test_x.py::test_y passed`
+
+### 14B.5 Issue / PR 评论回复
+
+修复完成后，应在 Finding 所在 Issue / PR 评论中记录：
+
+* Finding ID；
+* 最终状态；
+* 实际修复内容的简要说明；
+* 实际运行的验证命令及结果；
+* 对应 commit（若已创建）；
+* 尚未解决的限制或 follow-up（若存在）。
+
+不得只回复：
+
+`fixed`
+
+或仅 resolve review thread 而不提供可验证结果。
+
+### 14B.6 Re-review
+
+修复完成并通过验证后，应由独立 Review 会话重新检查相关改动。
+
+Re-review 应重点确认：
+
+* 原 Finding 是否真正消失；
+* 修复是否引入新的回归；
+* 是否出现新的重复实现、架构旁路或范围扩张；
+* 测试是否真实验证修复而没有被弱化。
+
+Re-review 通过后，Finding 才可视为完成闭环。
 
 ## 15. PR 要求
 
@@ -1223,6 +1350,7 @@ uv run python --version
 - [ ] 中间 CSV/图片/日志/benchmark 等临时产物未进入 staged changes
 - [ ] `.gitignore` 没有使用会误伤正式源码、配置或测试数据的过宽规则
 - [ ] staging 前后已检查未跟踪文件和 cached diff
+- [ ] 已有文件均采用必要的最小修改；没有通过删除并重建同名文件制造无关大面积 diff
 
 ## 18. 最终报告格式
 
@@ -1295,5 +1423,6 @@ uv run python --version
 23. 把临时测试、debug 脚本、中间 CSV/图片通过 `git add .` 带进 PR。
 24. 为隐藏生成文件添加过宽 `.gitignore`，导致正式 fixture/config 也被忽略。
 25. 把可重复生成的大量实验 artifact 当作源码长期提交。
+26. 为了编辑方便删除并重新创建已有文件，导致局部需求变成整文件 rewrite 或出现无关 diff。
 
 发现任一项，应在提交前修复或明确报告为阻塞。
