@@ -8,6 +8,7 @@
 ## 模块职责与依赖
 
 ```text
+experiments ─→ scenarios / simulation
 scenarios ──→ simulation / execution / core
 simulation ─→ execution / core
 execution ──→ protocol / core
@@ -22,6 +23,8 @@ core ───────→ 标准库和基础数组类型
 - `execution` 向上提供统一的 `step(v) -> u` 接口，具体 transport 不改变该接口。
 - `simulation` 只协调 reference、plant output、scenario adapter、runtime 和结果记录。
 - `scenarios` 拥有 plant、reference、controller design、信号适配、单位和场景指标。
+- `experiments` 是独立 I/O/composition root：显式场景选择、通用结果产物与公开 provenance；
+  它不参与 engine 的控制循环，也不把场景算法加入通用 writer。
 
 低层模块不得反向导入 `scenarios`。具体场景名称、单位或控制器调参字段不得进入
 `core`、`crypto`、`protocol`、`execution` 或 `simulation`。
@@ -96,3 +99,4 @@ scenario:
 ```
 
 HVAC 的装配与 180 步物理/编码范围条件见 [仿真与双闭环集成](simulation_hvac_integration.md)。
+正式场景选择、schema v1 与无覆盖发布见 [实验产物约定](experiment_schema.md)。
