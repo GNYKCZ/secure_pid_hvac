@@ -10,14 +10,25 @@ from typing import Any
 import pytest
 import yaml
 
-from secure_control.scenarios.hvac import load_hvac_scenario_contract
+from secure_control.scenarios.hvac import (
+    Hvac2R2CModelContract,
+    load_hvac_scenario_contract,
+)
 
 BASELINE_CONFIG_PATH = Path(__file__).parents[1] / "configs" / "hvac_baseline.yaml"
+TWO_R_TWO_C_CONFIG_PATH = Path(__file__).parents[1] / "configs" / "hvac_2r2c_plant.yaml"
 
 
 def _baseline_mapping() -> dict[str, Any]:
     """读取受版本管理的基线 YAML；测试修改其副本而不污染正式配置。"""
     loaded = yaml.safe_load(BASELINE_CONFIG_PATH.read_text(encoding="utf-8"))
+    assert isinstance(loaded, dict)
+    return loaded
+
+
+def _two_r_two_c_mapping() -> dict[str, Any]:
+    """读取 2R2C 正式配置的副本，供 fail-closed 参数化测试修改。"""
+    loaded = yaml.safe_load(TWO_R_TWO_C_CONFIG_PATH.read_text(encoding="utf-8"))
     assert isinstance(loaded, dict)
     return loaded
 
@@ -57,6 +68,136 @@ def test_baseline_contract_freezes_model_timing_channels_and_reference_boundarie
     assert contract.metadata.reference.names == ("target_temperature",)
     assert contract.metadata.output.names == ("temperature",)
     assert contract.metadata.control.names == ("cooling_power",)
+
+
+def test_2r2c_contract_parses_all_parameters_and_auditable_provenance() -> None:
+    """2R2C 配置必须保留归一化参数及逐项来源，不能只依赖 YAML 注释。"""
+    contract = load_hvac_scenario_contract(TWO_R_TWO_C_CONFIG_PATH)
+
+    assert isinstance(contract.model, Hvac2R2CModelContract)
+    assert contract.model.air_wall_thermal_resistance_celsius_per_kw == 2.78
+    assert contract.model.wall_outdoor_thermal_resistance_celsius_per_kw == 7.05
+    assert contract.model.air_thermal_capacitance_kj_per_celsius == 400.0
+    assert contract.model.wall_thermal_capacitance_kj_per_celsius == 48800.0
+    assert contract.model.cooling_coefficient == 1.0
+    assert contract.model.initial_air_temperature_celsius == 30.0
+    assert contract.model.initial_wall_temperature_celsius == 30.0
+    assert contract.metadata.output.names == ("air_temperature",)
+    assert len(contract.model.parameter_provenance) == 10
+    assert {item.source_kind for item in contract.model.parameter_provenance} == {
+        "literature",
+        "project_assumption",
+    }
+
+
+@pytest.mark.parametrize(
+    ("mutate", "exception", "message"),
+    [
+        (
+            lambda model: model.__setitem__("air_wall_thermal_resistance_celsius_per_kw", 0.0),
+            ValueError,
+            "air_wall_thermal_resistance",
+        ),
+        (
+            lambda model: model.__setitem__(
+                "wall_thermal_capacitance_kj_per_celsius", float("inf")
+            ),
+            ValueError,
+            "wall_thermal_capacitance",
+        ),
+        (
+            lambda model: model.pop("wall_outdoor_thermal_resistance_celsius_per_kw"),
+            ValueError,
+            "wall_outdoor_thermal_resistance",
+        ),
+        (
+            lambda model: model.__setitem__("cooling_coefficient", 0.0),
+            ValueError,
+            "cooling_coefficient",
+        ),
+        (
+            lambda model: model.__setitem__("continuous_model_version", ""),
+            ValueError,
+            "continuous_model_version",
+        ),
+        (
+            lambda model: model.__setitem__("discretization", "explicit_euler"),
+            ValueError,
+            "exact_zero_order_hold",
+        ),
+        (
+            lambda model: model["control"].__setitem__("unit", "kW"),
+            ValueError,
+            "kW_thermal_cooling",
+        ),
+        (
+            lambda model: model["control"].__setitem__("lower_bound_kw", -0.1),
+            ValueError,
+            "下限",
+        ),
+        (
+            lambda model: model["control"].__setitem__("upper_bound_kw", 0.0),
+            ValueError,
+            "上限",
+        ),
+        (
+            lambda model: model["parameter_provenance"].pop(),
+            ValueError,
+            "provenance",
+        ),
+        (
+            lambda model: model["parameter_provenance"].append(
+                deepcopy(model["parameter_provenance"][0])
+            ),
+            ValueError,
+            "provenance",
+        ),
+        (
+            lambda model: model["parameter_provenance"][0].__setitem__(
+                "parameter_name", "unknown_parameter"
+            ),
+            ValueError,
+            "provenance",
+        ),
+        (
+            lambda model: model["parameter_provenance"][0].__setitem__("reference", ""),
+            ValueError,
+            "reference",
+        ),
+        (
+            lambda model: model["parameter_provenance"][0].__setitem__("source_kind", "unverified"),
+            ValueError,
+            "source_kind",
+        ),
+        (
+            lambda model: model["parameter_provenance"][0].__setitem__("configured_value", 999.0),
+            ValueError,
+            "configured_value",
+        ),
+    ],
+)
+def test_invalid_2r2c_model_or_provenance_fails_closed(
+    tmp_path: Path,
+    mutate: Callable[[dict[str, Any]], None],
+    exception: type[Exception],
+    message: str,
+) -> None:
+    """2R2C 数值、单位、离散化与来源不完整时必须在配置边界拒绝。"""
+    invalid_config = _two_r_two_c_mapping()
+    model = invalid_config["scenario"]["hvac"]["model"]
+    mutate(model)
+
+    with pytest.raises(exception, match=message):
+        load_hvac_scenario_contract(_write_mapping(tmp_path, invalid_config))
+
+
+def test_unknown_hvac_model_kind_is_not_guessed(tmp_path: Path) -> None:
+    """loader 只接受已实现的两种显式 kind，不把未知类型回退为一阶模型。"""
+    invalid_config = _two_r_two_c_mapping()
+    invalid_config["scenario"]["hvac"]["model"]["kind"] = "other_thermal_model"
+
+    with pytest.raises(ValueError, match="model.kind"):
+        load_hvac_scenario_contract(_write_mapping(tmp_path, invalid_config))
 
 
 ConfigMutation = Callable[[dict[str, Any]], None]

@@ -85,5 +85,16 @@ def test_experiment_io_boundary_imports_only_generic_contracts() -> None:
     assert "secure_control.scenarios.hvac.pid" not in selector_imports
 
 
+def test_2r2c_types_remain_owned_by_hvac_scenario() -> None:
+    """通用层与实验 I/O 不得感知 HVAC 的二维内部状态或具体模型类型。"""
+    violations: list[str] = []
+    for layer in (*GENERIC_LAYERS, "experiments"):
+        for path in python_files(layer):
+            source = path.read_text(encoding="utf-8")
+            if "Hvac2R2C" in source or "second_order_2r2c_cooling" in source:
+                violations.append(str(path.relative_to(PACKAGE_ROOT)))
+    assert violations == []
+
+
 def test_legacy_source_package_does_not_exist() -> None:
     assert not (PACKAGE_ROOT.parent / "secure_pid").exists()
