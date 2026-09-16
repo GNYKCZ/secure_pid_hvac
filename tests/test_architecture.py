@@ -96,5 +96,17 @@ def test_2r2c_types_remain_owned_by_hvac_scenario() -> None:
     assert violations == []
 
 
+def test_hvac_tuning_is_plaintext_only_and_has_no_secure_protocol_dependency() -> None:
+    """调参模块不能导入安全运行时、协议或密码层，防止 secure 结果参与选参。"""
+    tuning = PACKAGE_ROOT / "scenarios" / "hvac" / "tuning.py"
+    modules = imported_modules(tuning)
+    assert not any(
+        module.startswith(
+            ("secure_control.crypto", "secure_control.protocol", "secure_control.execution")
+        )
+        for module in modules
+    )
+
+
 def test_legacy_source_package_does_not_exist() -> None:
     assert not (PACKAGE_ROOT.parent / "secure_pid").exists()

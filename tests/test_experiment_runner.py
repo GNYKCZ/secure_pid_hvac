@@ -20,6 +20,11 @@ from secure_control.experiments.runner import (
     run_experiment,
     select_scenario,
 )
+from secure_control.scenarios.hvac import (
+    evaluate_hvac_comparison_metrics,
+    load_hvac_pid_tuning_contract,
+    load_hvac_scenario_contract,
+)
 from secure_control.scenarios.hvac.integration import HvacScenario
 from secure_control.simulation import (
     ChannelMetadata,
@@ -31,6 +36,9 @@ from secure_control.simulation import (
 PROJECT_ROOT = Path(__file__).parents[1]
 CONFIG_PATH = PROJECT_ROOT / "configs" / "hvac_dual_loop.yaml"
 BASELINE_PATH = PROJECT_ROOT / "configs" / "hvac_pid_baseline.yaml"
+CONFIG_2R2C_PATH = PROJECT_ROOT / "configs" / "hvac_2r2c_dual_loop.yaml"
+BASELINE_2R2C_PATH = PROJECT_ROOT / "configs" / "hvac_2r2c_pid_baseline.yaml"
+PLANT_2R2C_PATH = PROJECT_ROOT / "configs" / "hvac_2r2c_plant.yaml"
 
 
 def test_selector_accepts_only_explicit_hvac_and_rejects_unimplemented_names(
@@ -180,6 +188,44 @@ def test_effective_snapshot_and_provenance_record_actual_public_inputs(tmp_path:
     assert str(PROJECT_ROOT) not in serialized
     assert "private_key" not in serialized
     assert "triple_share" not in serialized
+
+
+def test_2r2c_saved_run_has_three_source_hashes_and_reader_recomputes_same_metrics(
+    tmp_path: Path,
+) -> None:
+    """正式 reader 读回同一 run 后可重算通过的指标，且快照绑定三份源配置。"""
+    published = run_experiment(
+        CONFIG_2R2C_PATH, test_seed=42, output_root=tmp_path / "2R2C results"
+    )
+    record = load_artifacts(published.run_dir)
+    sources = record.effective_config["sources"]
+    assert sources == {
+        "wrapper": {
+            "filename": CONFIG_2R2C_PATH.name,
+            "sha256": sha256(CONFIG_2R2C_PATH.read_bytes()).hexdigest(),
+        },
+        "baseline": {
+            "filename": BASELINE_2R2C_PATH.name,
+            "sha256": sha256(BASELINE_2R2C_PATH.read_bytes()).hexdigest(),
+        },
+        "plant": {
+            "filename": PLANT_2R2C_PATH.name,
+            "sha256": sha256(PLANT_2R2C_PATH.read_bytes()).hexdigest(),
+        },
+    }
+    contract = load_hvac_scenario_contract(PLANT_2R2C_PATH)
+    _, _, quality = load_hvac_pid_tuning_contract(BASELINE_2R2C_PATH, contract)
+    metrics = evaluate_hvac_comparison_metrics(record.result, contract, quality)
+    assert metrics.passed
+    assert metrics.max_control_error_kw == pytest.approx(
+        np.max(np.abs(record.result.control_error))
+    )
+    assert metrics.max_temperature_error_celsius == pytest.approx(
+        np.max(np.abs(record.result.output_error))
+    )
+    assert record.effective_config["hvac"]["tuning"]["evaluated_candidate_count"] == 10179
+    assert record.effective_config["hvac"]["tuning"]["feasible_candidate_count"] == 679
+    assert record.effective_config["finite_horizon_certificate"]["state_truncation_bits"] == 0
 
 
 def test_default_randomness_is_recorded_without_inventing_seed(tmp_path: Path) -> None:

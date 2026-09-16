@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -10,7 +10,9 @@ import pytest
 
 from secure_control.execution import PlaintextStateSpaceRuntime, SecureStateSpaceRuntime
 from secure_control.scenarios.hvac import (
+    Hvac2R2CPlant,
     load_hvac_pid_design,
+    load_hvac_pid_tuning_contract,
     load_hvac_scenario_contract,
     run_plaintext_hvac_baseline,
 )
@@ -19,6 +21,9 @@ from secure_control.simulation import SimulationPlan, run
 
 CONFIG_PATH = Path(__file__).parents[1] / "configs" / "hvac_dual_loop.yaml"
 BASELINE_PATH = Path(__file__).parents[1] / "configs" / "hvac_pid_baseline.yaml"
+CONFIG_2R2C_PATH = Path(__file__).parents[1] / "configs" / "hvac_2r2c_dual_loop.yaml"
+BASELINE_2R2C_PATH = Path(__file__).parents[1] / "configs" / "hvac_2r2c_pid_baseline.yaml"
+PLANT_2R2C_PATH = Path(__file__).parents[1] / "configs" / "hvac_2r2c_plant.yaml"
 
 
 @dataclass(frozen=True)
@@ -177,3 +182,184 @@ def test_seeded_rerun_and_explicit_reset_restore_both_closed_loops() -> None:
     after = run(_FixedHvacPlan(plan))
     for name in before.__dataclass_fields__:
         np.testing.assert_array_equal(getattr(before, name), getattr(after, name))
+
+
+def test_2r2c_dual_loop_matches_plaintext_oracle_and_all_quality_thresholds() -> None:
+    """2R2C 两支各 180 步，ideal 与调参 oracle 一致且完整指标通过。"""
+    comparison = run_hvac_dual_loop(CONFIG_2R2C_PATH, test_seed=42)
+    result = comparison.result
+    contract = load_hvac_scenario_contract(PLANT_2R2C_PATH)
+    selected, _, _ = load_hvac_pid_tuning_contract(BASELINE_2R2C_PATH, contract)
+    baseline = run_plaintext_hvac_baseline(contract, selected)
+
+    np.testing.assert_array_equal(result.time, np.arange(180) * 60.0)
+    np.testing.assert_array_equal(result.reference[[59, 60, 119, 120], 0], [15, 20, 20, 25])
+    np.testing.assert_array_equal(result.output_ideal, baseline.output_ideal)
+    np.testing.assert_array_equal(result.control_ideal, baseline.control_ideal)
+    assert comparison.comparison_metrics is not None
+    assert comparison.comparison_metrics.passed
+    assert comparison.comparison_metrics.max_control_error_kw < 0.01
+    assert comparison.comparison_metrics.mean_control_error_kw < 0.005
+    assert comparison.comparison_metrics.rms_control_error_kw < 0.005
+    assert comparison.comparison_metrics.max_temperature_error_celsius < 0.01
+    assert comparison.comparison_metrics.mean_temperature_error_celsius < 0.005
+    assert comparison.comparison_metrics.rms_temperature_error_celsius < 0.005
+    assert all(metric.passed for metric in comparison.segment_metrics_ideal)
+    assert all(metric.passed for metric in comparison.segment_metrics_secure)
+
+
+def test_2r2c_plan_and_certificate_cover_independent_internal_states_and_protocol_bounds() -> None:
+    """二维状态只留在各 plant 内部，证书与协议 preflight 覆盖 180 步且无 Trunc。"""
+    scenario = HvacScenario(CONFIG_2R2C_PATH, test_seed=43)
+    certificate = scenario.safety_certificate
+    plan = scenario.build_plan()
+
+    assert isinstance(plan.ideal.plant, Hvac2R2CPlant)
+    assert isinstance(plan.secure.plant, Hvac2R2CPlant)
+    assert plan.ideal.plant is not plan.secure.plant
+    assert plan.ideal.adapter is not plan.secure.adapter
+    assert plan.ideal.runtime is not plan.secure.runtime
+    assert certificate.horizon_steps == 180
+    assert certificate.plant_state_names == ("air_temperature", "wall_temperature")
+    assert len(certificate.plant_state_bounds_celsius) == 2
+    assert certificate.controller_state_names == ("integral_error", "previous_error")
+    assert len(certificate.controller_state_bounds) == 2
+    np.testing.assert_allclose(
+        certificate.plant_state_bounds_celsius,
+        ((-5.425488018369845, 30.0), (27.66807773378152, 30.0)),
+    )
+    assert certificate.controller_input_bounds_celsius == pytest.approx((-15.0, 30.41110807097034))
+    np.testing.assert_allclose(
+        certificate.controller_state_bounds,
+        ((-108000.0, 223328.75232158735), (-15.0, 30.41110807097034)),
+    )
+    assert certificate.raw_control_bounds_kw == pytest.approx(
+        (-181.19739451371325, 79.93497266600528)
+    )
+    assert certificate.applied_control_bounds_kw == (0.0, 12.0)
+    assert certificate.input_payload_bounds == (31888360,)
+    assert certificate.state_payload_bounds == (344394288000, 31888360)
+    assert certificate.maximum_state_accumulator_bounds == (344394288000, 31888360)
+    assert certificate.maximum_output_accumulator_bounds == (280360101381360,)
+    assert certificate.centered_modulus_limit == 1152921504606846975
+    assert certificate.state_truncation_bits == 0
+    assert all(
+        value <= certificate.centered_modulus_limit
+        for value in certificate.maximum_state_accumulator_bounds
+    )
+    assert all(
+        value <= certificate.centered_modulus_limit
+        for value in certificate.maximum_output_accumulator_bounds
+    )
+    assert plan.secure.runtime._range_contract.horizon_steps == 180
+    assert (
+        plan.secure.runtime._range_contract.state_payload_bounds == certificate.state_payload_bounds
+    )
+    assert (
+        plan.secure.runtime._range_contract.input_payload_bounds == certificate.input_payload_bounds
+    )
+    assert plan.metadata.output.names == ("air_temperature",)
+
+
+def test_2r2c_certificate_rejects_every_undersized_bound_before_plan_build() -> None:
+    """缩小任一物理、控制器或协议边界都必须在运行闭环前 fail closed。"""
+    scenario = HvacScenario(CONFIG_2R2C_PATH, test_seed=44)
+    certificate = scenario.safety_certificate
+    smaller_certificates = (
+        (
+            "plant_state_bounds_celsius",
+            replace(
+                certificate,
+                plant_state_bounds_celsius=(
+                    (
+                        certificate.plant_state_bounds_celsius[0][0] + 1e-6,
+                        certificate.plant_state_bounds_celsius[0][1],
+                    ),
+                    certificate.plant_state_bounds_celsius[1],
+                ),
+            ),
+        ),
+        (
+            "controller_input_bounds_celsius",
+            replace(
+                certificate,
+                controller_input_bounds_celsius=(
+                    certificate.controller_input_bounds_celsius[0] + 1e-6,
+                    certificate.controller_input_bounds_celsius[1],
+                ),
+            ),
+        ),
+        (
+            "controller_state_bounds",
+            replace(
+                certificate,
+                controller_state_bounds=(
+                    (
+                        certificate.controller_state_bounds[0][0] + 1e-6,
+                        certificate.controller_state_bounds[0][1],
+                    ),
+                    certificate.controller_state_bounds[1],
+                ),
+            ),
+        ),
+        (
+            "raw_control_bounds_kw",
+            replace(
+                certificate,
+                raw_control_bounds_kw=(
+                    certificate.raw_control_bounds_kw[0] + 1e-6,
+                    certificate.raw_control_bounds_kw[1],
+                ),
+            ),
+        ),
+        (
+            "input_payload_bounds",
+            replace(
+                certificate,
+                input_payload_bounds=(certificate.input_payload_bounds[0] - 1,),
+            ),
+        ),
+        (
+            "state_payload_bounds",
+            replace(
+                certificate,
+                state_payload_bounds=(
+                    certificate.state_payload_bounds[0] - 1,
+                    certificate.state_payload_bounds[1],
+                ),
+            ),
+        ),
+        (
+            "maximum_state_accumulator_bounds",
+            replace(
+                certificate,
+                maximum_state_accumulator_bounds=(
+                    certificate.maximum_state_accumulator_bounds[0] - 1,
+                    certificate.maximum_state_accumulator_bounds[1],
+                ),
+            ),
+        ),
+        (
+            "maximum_output_accumulator_bounds",
+            replace(
+                certificate,
+                maximum_output_accumulator_bounds=(
+                    certificate.maximum_output_accumulator_bounds[0] - 1,
+                ),
+            ),
+        ),
+    )
+
+    for field_name, smaller in smaller_certificates:
+        scenario.safety_certificate = smaller
+        with pytest.raises(ValueError, match=field_name):
+            scenario.build_plan()
+
+
+def test_2r2c_secure_runtime_rejects_step_beyond_certified_horizon() -> None:
+    """第 181 次 controller step 必须 fail closed，不能把有限证书扩称无限时域。"""
+    plan = HvacScenario(CONFIG_2R2C_PATH, test_seed=44).build_plan()
+    for _ in range(180):
+        plan.secure.runtime.step(np.array([0.0]))
+    with pytest.raises(ValueError, match="horizon"):
+        plan.secure.runtime.step(np.array([0.0]))

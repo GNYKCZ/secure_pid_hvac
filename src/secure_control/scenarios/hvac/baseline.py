@@ -14,7 +14,7 @@ from secure_control.execution import PlaintextStateSpaceRuntime
 from .adapter import HvacSignalAdapter
 from .contract import HvacScenarioContract
 from .pid import HvacPidDesign
-from .plant import HvacPlant
+from .plant import build_hvac_plant
 
 Array = NDArray[Any]
 
@@ -30,12 +30,129 @@ def _readonly_trajectory(name: str, value: Array, shape: tuple[int, ...]) -> Arr
 
 @dataclass(frozen=True, slots=True)
 class HvacSegmentMetric:
-    """一个 reference 区段末尾固定窗口上的未过滤温度 MAE。"""
+    """一个 reference 区段的完整控制品质指标与门槛判定。"""
 
     start_seconds: int
     end_seconds: int
     target_temperature_celsius: float
+    mae_celsius: float
     tail_mae_celsius: float
+    max_abs_error_celsius: float
+    settling_time_seconds: float | None
+    max_signed_deviation_celsius: float
+    min_signed_deviation_celsius: float
+    saturation_fraction: float
+    max_abs_applied_control_kw: float
+    passed: bool
+    violations: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class HvacSegmentQualityContract:
+    """冻结单个 reference 区段的控制品质门槛。"""
+
+    start_seconds: int
+    end_seconds: int
+    target_temperature_celsius: float
+    max_mae_celsius: float
+    max_tail_mae_celsius: float
+    max_abs_error_celsius: float
+    max_settling_time_seconds: float
+    max_signed_deviation_celsius: float
+    min_signed_deviation_celsius: float
+
+    def __post_init__(self) -> None:
+        """拒绝空区段、非有限值和不能形成有效门槛的配置。"""
+        if self.start_seconds < 0 or self.end_seconds <= self.start_seconds:
+            raise ValueError("quality 区段必须满足 0 <= start < end")
+        values = (
+            self.target_temperature_celsius,
+            self.max_mae_celsius,
+            self.max_tail_mae_celsius,
+            self.max_abs_error_celsius,
+            self.max_settling_time_seconds,
+            self.max_signed_deviation_celsius,
+            self.min_signed_deviation_celsius,
+        )
+        if not all(isfinite(value) for value in values):
+            raise ValueError("quality 区段门槛必须是有限数")
+        if any(value < 0 for value in values[1:5]):
+            raise ValueError("MAE、最大误差和调节时间门槛不得为负数")
+        if self.min_signed_deviation_celsius > self.max_signed_deviation_celsius:
+            raise ValueError("有符号偏差门槛上下界反转")
+
+
+@dataclass(frozen=True, slots=True)
+class HvacControlQualityContract:
+    """冻结 branch 指标、执行器和安全/明文差异的验收阈值。"""
+
+    tail_window_seconds: int
+    settling_band_celsius: float
+    saturation_tolerance_kw: float
+    max_segment_saturation_fraction: float
+    max_segment_applied_control_kw: float
+    segments: tuple[HvacSegmentQualityContract, ...]
+    max_control_error_kw: float
+    mean_control_error_kw: float
+    rms_control_error_kw: float
+    max_temperature_error_celsius: float
+    mean_temperature_error_celsius: float
+    rms_temperature_error_celsius: float
+
+    def __post_init__(self) -> None:
+        """校验全局品质阈值、比较阈值及不可变区段集合。"""
+        if (
+            isinstance(self.tail_window_seconds, bool)
+            or not isinstance(self.tail_window_seconds, int)
+            or self.tail_window_seconds <= 0
+        ):
+            raise ValueError("tail_window_seconds 必须是正整数")
+        nonnegative = (
+            self.settling_band_celsius,
+            self.saturation_tolerance_kw,
+            self.max_segment_saturation_fraction,
+            self.max_segment_applied_control_kw,
+            self.max_control_error_kw,
+            self.mean_control_error_kw,
+            self.rms_control_error_kw,
+            self.max_temperature_error_celsius,
+            self.mean_temperature_error_celsius,
+            self.rms_temperature_error_celsius,
+        )
+        if not all(isfinite(value) and value >= 0 for value in nonnegative):
+            raise ValueError("quality 全局门槛必须是有限非负数")
+        if self.settling_band_celsius == 0 or self.max_segment_applied_control_kw == 0:
+            raise ValueError("settling band 和 applied control 门槛必须为正数")
+        if self.max_segment_saturation_fraction > 1:
+            raise ValueError("saturation fraction 门槛不得超过 1")
+        if not isinstance(self.segments, tuple) or not self.segments:
+            raise ValueError("quality.segments 必须是非空 tuple")
+
+
+@dataclass(frozen=True, slots=True)
+class HvacBranchMetrics:
+    """汇总一支闭环的区段指标与全局观测值。"""
+
+    segments: tuple[HvacSegmentMetric, ...]
+    global_max_abs_error_celsius: float
+    global_saturation_fraction: float
+    global_max_abs_applied_control_kw: float
+    passed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class HvacComparisonMetrics:
+    """汇总明文/安全两支品质与逐样本差异指标。"""
+
+    ideal: HvacBranchMetrics
+    secure: HvacBranchMetrics
+    max_control_error_kw: float
+    mean_control_error_kw: float
+    rms_control_error_kw: float
+    max_temperature_error_celsius: float
+    mean_temperature_error_celsius: float
+    rms_temperature_error_celsius: float
+    passed: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,8 +175,8 @@ class HvacPlaintextBaseline:
                 name,
                 _readonly_trajectory(name, getattr(self, name), (sample_count, 1)),
             )
-        if len(self.segment_metrics) != 3:
-            raise ValueError("HVAC 基线必须包含三个 reference 区段的指标")
+        if not self.segment_metrics:
+            raise ValueError("HVAC 基线必须包含 reference 区段指标")
         if any(not isfinite(metric.tail_mae_celsius) for metric in self.segment_metrics):
             raise ValueError("HVAC 区段指标必须是有限数值")
 
@@ -80,7 +197,7 @@ def run_plaintext_hvac_baseline(
     if design.sample_period_seconds != contract.timing.sampling_period_seconds:
         raise ValueError("PID 采样周期必须与 HVAC 场景契约一致")
 
-    plant = HvacPlant(contract)
+    plant = build_hvac_plant(contract)
     adapter = HvacSignalAdapter(contract)
     runtime = PlaintextStateSpaceRuntime(design.to_controller_spec())
     sample_times = contract.timing.sample_times_seconds
@@ -109,27 +226,280 @@ def run_plaintext_hvac_baseline(
         output_ideal=output_ideal,
         control_ideal=control_ideal,
         raw_control_ideal=raw_control_ideal,
-        segment_metrics=_segment_metrics(contract, design, output_ideal),
+        segment_metrics=_legacy_segment_metrics(contract, design, output_ideal, control_ideal),
     )
 
 
-def _segment_metrics(
-    contract: HvacScenarioContract, design: HvacPidDesign, output_ideal: Array
+def _legacy_segment_metrics(
+    contract: HvacScenarioContract,
+    design: HvacPidDesign,
+    output_ideal: Array,
+    control_ideal: Array,
 ) -> tuple[HvacSegmentMetric, ...]:
-    """从未过滤的记录温度计算每个 reference 区段尾部窗口 MAE。"""
-    sample_period = contract.timing.sampling_period_seconds
+    """为旧一阶配置提供兼容指标，不引入新的验收门槛。"""
+    unbounded = 1e300
+    quality = HvacControlQualityContract(
+        tail_window_seconds=design.tail_window_seconds,
+        settling_band_celsius=unbounded,
+        saturation_tolerance_kw=1e-9,
+        max_segment_saturation_fraction=1.0,
+        max_segment_applied_control_kw=contract.model.upper_control_bound_kw,
+        segments=tuple(
+            HvacSegmentQualityContract(
+                segment.start_seconds,
+                segment.end_seconds,
+                segment.target_temperature_celsius,
+                unbounded,
+                design.max_tail_mae_celsius,
+                unbounded,
+                unbounded,
+                unbounded,
+                -unbounded,
+            )
+            for segment in contract.reference_segments
+        ),
+        max_control_error_kw=unbounded,
+        mean_control_error_kw=unbounded,
+        rms_control_error_kw=unbounded,
+        max_temperature_error_celsius=unbounded,
+        mean_temperature_error_celsius=unbounded,
+        rms_temperature_error_celsius=unbounded,
+    )
+    time = np.asarray(contract.timing.sample_times_seconds, dtype=float)
+    reference = np.array(
+        [
+            next(
+                segment.target_temperature_celsius
+                for segment in contract.reference_segments
+                if segment.start_seconds <= value < segment.end_seconds
+            )
+            for value in time
+        ],
+        dtype=float,
+    ).reshape(-1, 1)
+    return evaluate_hvac_branch_metrics(
+        time=time,
+        reference=reference,
+        air_temperature=output_ideal,
+        applied_control=control_ideal,
+        contract=contract,
+        quality_contract=quality,
+    ).segments
+
+
+def evaluate_hvac_branch_metrics(
+    *,
+    time: Array,
+    reference: Array,
+    air_temperature: Array,
+    applied_control: Array,
+    contract: HvacScenarioContract,
+    quality_contract: HvacControlQualityContract,
+) -> HvacBranchMetrics:
+    """按冻结公式计算一支闭环的区段与全局指标。"""
+    sample_count = contract.timing.sample_count
+    time_values = np.asarray(time, dtype=float)
+    reference_values = np.asarray(reference, dtype=float)
+    temperature_values = np.asarray(air_temperature, dtype=float)
+    control_values = np.asarray(applied_control, dtype=float)
+    if time_values.shape != (sample_count,):
+        raise ValueError("time shape 与 HVAC sample_count 不一致")
+    for name, values in (
+        ("reference", reference_values),
+        ("air_temperature", temperature_values),
+        ("applied_control", control_values),
+    ):
+        if values.shape != (sample_count, 1):
+            raise ValueError(f"{name} 必须是 shape ({sample_count}, 1)")
+    if not all(
+        np.isfinite(values).all()
+        for values in (time_values, reference_values, temperature_values, control_values)
+    ):
+        raise FloatingPointError("HVAC 指标输入包含 NaN 或无穷大")
+    expected_time = np.asarray(contract.timing.sample_times_seconds, dtype=float)
+    if not np.array_equal(time_values, expected_time) or np.any(np.diff(time_values) <= 0):
+        raise ValueError("time 必须与 HVAC 契约的严格递增采样网格一致")
+    if len(quality_contract.segments) != len(contract.reference_segments):
+        raise ValueError("quality 区段数必须与 reference 区段数一致")
+    low = contract.model.lower_control_bound_kw
+    high = contract.model.upper_control_bound_kw
+    tolerance = quality_contract.saturation_tolerance_kw
+    if np.any(control_values < low - tolerance) or np.any(control_values > high + tolerance):
+        raise ValueError("applied_control 超出 HVAC actuator 范围")
+
     metrics: list[HvacSegmentMetric] = []
-    for segment in contract.reference_segments:
-        end_index = segment.end_seconds // sample_period
-        tail_start = end_index - design.tail_window_samples
-        temperatures = output_ideal[tail_start:end_index, 0]
-        tail_mae = float(np.mean(np.abs(temperatures - segment.target_temperature_celsius)))
+    all_errors: list[np.ndarray] = []
+    for segment, threshold in zip(contract.reference_segments, quality_contract.segments):
+        if (
+            threshold.start_seconds != segment.start_seconds
+            or threshold.end_seconds != segment.end_seconds
+            or threshold.target_temperature_celsius != segment.target_temperature_celsius
+        ):
+            raise ValueError("quality 区段与 reference 区段不一致")
+        mask = (time_values >= segment.start_seconds) & (time_values < segment.end_seconds)
+        if not np.any(mask):
+            raise ValueError("reference 区段没有采样点")
+        expected_reference = segment.target_temperature_celsius
+        if not np.all(reference_values[mask, 0] == expected_reference):
+            raise ValueError("reference 轨迹与 HVAC 契约不一致")
+        signed = temperature_values[mask, 0] - expected_reference
+        absolute = np.abs(signed)
+        all_errors.append(absolute)
+        tail_mask = mask & (
+            time_values >= segment.end_seconds - quality_contract.tail_window_seconds
+        )
+        if (
+            np.count_nonzero(tail_mask) * contract.timing.sampling_period_seconds
+            < quality_contract.tail_window_seconds
+        ):
+            raise ValueError("reference 区段的 tail window 样本不足")
+        tail = np.abs(temperature_values[tail_mask, 0] - expected_reference)
+        settled_index: int | None = None
+        within = absolute <= quality_contract.settling_band_celsius
+        for index in range(within.size):
+            if bool(np.all(within[index:])):
+                settled_index = index
+                break
+        settling_time = (
+            None
+            if settled_index is None
+            else float(settled_index * contract.timing.sampling_period_seconds)
+        )
+        segment_control = control_values[mask, 0]
+        saturated = (np.abs(segment_control - low) <= tolerance) | (
+            np.abs(segment_control - high) <= tolerance
+        )
+        mae = float(np.mean(absolute))
+        tail_mae = float(np.mean(tail))
+        max_abs = float(np.max(absolute))
+        max_signed = float(np.max(signed))
+        min_signed = float(np.min(signed))
+        saturation_fraction = float(np.mean(saturated))
+        max_control = float(np.max(np.abs(segment_control)))
+        violations: list[str] = []
+        checks = (
+            (mae <= threshold.max_mae_celsius, "mae_celsius"),
+            (tail_mae <= threshold.max_tail_mae_celsius, "tail_mae_celsius"),
+            (max_abs <= threshold.max_abs_error_celsius, "max_abs_error_celsius"),
+            (
+                settling_time is not None and settling_time <= threshold.max_settling_time_seconds,
+                "settling_time_seconds",
+            ),
+            (
+                max_signed <= threshold.max_signed_deviation_celsius,
+                "max_signed_deviation_celsius",
+            ),
+            (
+                min_signed >= threshold.min_signed_deviation_celsius,
+                "min_signed_deviation_celsius",
+            ),
+            (
+                saturation_fraction <= quality_contract.max_segment_saturation_fraction,
+                "saturation_fraction",
+            ),
+            (
+                max_control <= quality_contract.max_segment_applied_control_kw,
+                "max_abs_applied_control_kw",
+            ),
+        )
+        violations.extend(name for passed, name in checks if not passed)
         metrics.append(
             HvacSegmentMetric(
-                start_seconds=segment.start_seconds,
-                end_seconds=segment.end_seconds,
-                target_temperature_celsius=segment.target_temperature_celsius,
-                tail_mae_celsius=tail_mae,
+                segment.start_seconds,
+                segment.end_seconds,
+                expected_reference,
+                mae,
+                tail_mae,
+                max_abs,
+                settling_time,
+                max_signed,
+                min_signed,
+                saturation_fraction,
+                max_control,
+                not violations,
+                tuple(violations),
             )
         )
-    return tuple(metrics)
+    global_absolute = np.concatenate(all_errors)
+    all_control = control_values[:, 0]
+    all_saturated = (np.abs(all_control - low) <= tolerance) | (
+        np.abs(all_control - high) <= tolerance
+    )
+    return HvacBranchMetrics(
+        tuple(metrics),
+        float(np.max(global_absolute)),
+        float(np.mean(all_saturated)),
+        float(np.max(np.abs(all_control))),
+        all(metric.passed for metric in metrics),
+    )
+
+
+def evaluate_hvac_comparison_metrics(
+    result: Any,
+    contract: HvacScenarioContract,
+    quality_contract: HvacControlQualityContract,
+) -> HvacComparisonMetrics:
+    """从正式八字段结果计算两支品质，并严格核对冗余差值字段。"""
+    expected_control_difference = np.asarray(result.control_ideal, dtype=float) - np.asarray(
+        result.control_secure, dtype=float
+    )
+    expected_temperature_difference = np.asarray(result.output_ideal, dtype=float) - np.asarray(
+        result.output_secure, dtype=float
+    )
+    saved_control_difference = np.asarray(result.control_error, dtype=float)
+    saved_temperature_difference = np.asarray(result.output_error, dtype=float)
+    for name, saved, expected in (
+        ("control_error", saved_control_difference, expected_control_difference),
+        ("output_error", saved_temperature_difference, expected_temperature_difference),
+    ):
+        if saved.shape != expected.shape:
+            raise ValueError(f"{name} shape 必须与对应 ideal/secure 轨迹差值一致")
+        if not np.isfinite(saved).all() or not np.isfinite(expected).all():
+            raise FloatingPointError(f"{name} 或对应轨迹差值包含 NaN 或无穷大")
+        # error 是通用结果中的冗余派生字段；逐值核对后仍以原始两支轨迹差值为指标唯一来源。
+        if not np.array_equal(saved, expected):
+            raise ValueError(f"{name} 必须逐值等于对应 ideal/secure 轨迹差值")
+    ideal = evaluate_hvac_branch_metrics(
+        time=result.time,
+        reference=result.reference,
+        air_temperature=result.output_ideal,
+        applied_control=result.control_ideal,
+        contract=contract,
+        quality_contract=quality_contract,
+    )
+    secure = evaluate_hvac_branch_metrics(
+        time=result.time,
+        reference=result.reference,
+        air_temperature=result.output_secure,
+        applied_control=result.control_secure,
+        contract=contract,
+        quality_contract=quality_contract,
+    )
+    control_difference = expected_control_difference
+    temperature_difference = expected_temperature_difference
+    control_abs = np.abs(control_difference)
+    temperature_abs = np.abs(temperature_difference)
+    values = (
+        float(np.max(control_abs)),
+        float(np.mean(control_abs)),
+        float(np.sqrt(np.mean(np.square(control_difference)))),
+        float(np.max(temperature_abs)),
+        float(np.mean(temperature_abs)),
+        float(np.sqrt(np.mean(np.square(temperature_difference)))),
+    )
+    limits = (
+        quality_contract.max_control_error_kw,
+        quality_contract.mean_control_error_kw,
+        quality_contract.rms_control_error_kw,
+        quality_contract.max_temperature_error_celsius,
+        quality_contract.mean_temperature_error_celsius,
+        quality_contract.rms_temperature_error_celsius,
+    )
+    return HvacComparisonMetrics(
+        ideal,
+        secure,
+        *values,
+        ideal.passed
+        and secure.passed
+        and all(value <= limit for value, limit in zip(values, limits)),
+    )

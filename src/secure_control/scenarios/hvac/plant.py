@@ -256,6 +256,17 @@ class Hvac2R2CPlant:
         return self.output()
 
 
+def build_hvac_plant(contract: HvacScenarioContract) -> HvacPlant | Hvac2R2CPlant:
+    """在 HVAC 场景层按已校验模型契约构造对应 plant。"""
+    if not isinstance(contract, HvacScenarioContract):
+        raise TypeError("contract 必须是 HvacScenarioContract")
+    if isinstance(contract.model, HvacModelContract):
+        return HvacPlant(contract)
+    if isinstance(contract.model, Hvac2R2CModelContract):
+        return Hvac2R2CPlant(contract)
+    raise TypeError("未知 HVAC model contract，拒绝构造 plant")
+
+
 def _coerce_control(control: Array | float, model: HvacPlantModelContract) -> float:
     """校验两种 HVAC plant 共用的 SISO 控制 shape、有限性和配置范围。"""
     value = np.asarray(control)
