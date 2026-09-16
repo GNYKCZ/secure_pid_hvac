@@ -229,6 +229,18 @@ def test_2r2c_state_space_rejects_invalid_shape_and_non_finite_values() -> None:
         Hvac2R2CStateSpace(**{**valid, "G": np.array([[np.inf], [0.0]])})
 
 
+def test_2r2c_state_space_snapshot_cannot_mutate_plant_dynamics() -> None:
+    """即使恢复快照写权限并改写矩阵，plant 后续动力学也必须保持冻结。"""
+    plant = Hvac2R2CPlant(_two_r_two_c_contract())
+    exposed = plant.state_space
+    exposed.A_p.setflags(write=True)
+    exposed.A_p.fill(0.0)
+
+    assert np.all(exposed.A_p == 0.0)
+    assert not np.all(plant.state_space.A_p == 0.0)
+    np.testing.assert_allclose(plant.step(0.0), [30.0], rtol=0.0, atol=1e-13)
+
+
 @pytest.mark.parametrize(
     ("sample_period", "exception"),
     [(True, TypeError), (60.0, TypeError), (0, ValueError)],

@@ -199,8 +199,17 @@ class Hvac2R2CPlant:
 
     @property
     def state_space(self) -> Hvac2R2CStateSpace:
-        """返回只含只读矩阵的连续/离散状态空间记录。"""
-        return self._state_space
+        """返回只读矩阵快照，外部修改不能反向改变 plant 动力学。"""
+        # 每次复制记录，避免调用方通过 setflags(write=True) 改写 plant 内部矩阵。
+        return Hvac2R2CStateSpace(
+            F=self._state_space.F,
+            G=self._state_space.G,
+            H=self._state_space.H,
+            A_p=self._state_space.A_p,
+            B_p=self._state_space.B_p,
+            E_p=self._state_space.E_p,
+            C_p=self._state_space.C_p,
+        )
 
     @property
     def state_celsius(self) -> Array:
