@@ -211,9 +211,7 @@ def test_reader_rejects_empty_scenario_version_even_when_artifacts_agree(tmp_pat
     manifest = json.loads(published.metadata_path.read_text(encoding="utf-8"))
     manifest["scenario"]["version"] = ""
     manifest["provenance"]["scenario_version"] = ""
-    manifest["files_sha256"]["config.json"] = sha256(
-        published.config_path.read_bytes()
-    ).hexdigest()
+    manifest["files_sha256"]["config.json"] = sha256(published.config_path.read_bytes()).hexdigest()
     published.metadata_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(ValueError, match="scenario version"):
