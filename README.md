@@ -99,6 +99,21 @@ uv run python -m secure_control.experiments.runner --config configs/hvac_dual_lo
 通道单位、有效配置快照、公开 provenance、失败与读取语义见
 [实验产物约定](docs/experiment_schema.md)。普通生成产物默认不提交 Git。
 
+从上述完整成功 run 读取数据生成 HVAC 四类对比图（tracking、applied control、
+control error、output error），不重新运行双闭环：
+
+```powershell
+uv run python -m secure_control.experiments.figure_runner --run-dir results/csv/<run_id> --control-error-scale log
+```
+
+把 `<run_id>` 换成实际已发布目录名。默认单通道 HVAC 使用小时轴并输出四张 PNG
+到 `results/figures/<run_id>/<render_id>/`；向量通道必须显式提供可重复的
+`--tracking output:reference` 与 `--control-channel index`，也可选择 linear/log 和
+PNG/PDF。无同单位 reference 的输出误差可用可重复的 `--output-error-channel index`
+独立选择；省略时沿用 tracking 的输出通道。图只修改渲染副本，不反写原始数据；
+路径、单位、log 零值与追溯清单见
+[已保存结果绘图契约](docs/figure_contract.md)。普通生成图片默认不提交 Git。
+
 ## 安全算术基线
 
 `secure_control.crypto` 现已提供与场景无关的定点编码、2-out-of-2 加法秘密共享、标量 Beaver

@@ -64,12 +64,18 @@ def test_dependency_direction_has_no_scenario_back_imports() -> None:
 
 
 def test_experiment_io_boundary_imports_only_generic_contracts() -> None:
-    """实验 writer/provenance 不导入场景算法；selector 只能导入 HVAC 装配入口。"""
+    """通用 writer/provenance/plotting 不导入场景算法；薄 CLI 只调用已保存数据。"""
     experiments = PACKAGE_ROOT / "experiments"
-    for name in ("artifacts.py", "provenance.py"):
+    for name in ("artifacts.py", "provenance.py", "plotting.py"):
         source = experiments / name
         assert "secure_control.scenarios" not in imported_modules(source)
         assert FORBIDDEN_DOMAIN_TERMS.search(source.read_text(encoding="utf-8")) is None
+    plotting_imports = imported_modules(experiments / "plotting.py")
+    assert "secure_control.simulation.runner" not in plotting_imports
+    assert "secure_control.experiments.runner" not in plotting_imports
+    figure_imports = imported_modules(experiments / "figure_runner.py")
+    assert "secure_control.scenarios" not in figure_imports
+    assert "secure_control.simulation.runner" not in figure_imports
     selector_imports = imported_modules(experiments / "runner.py")
     scenario_imports = {
         module for module in selector_imports if module.startswith("secure_control.scenarios")
