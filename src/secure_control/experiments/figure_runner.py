@@ -46,6 +46,9 @@ def _selection(
         args.control_error_scale,
         time_unit,
         args.format,
+        output_error_channels=(
+            tuple(args.output_error_channel) if args.output_error_channel is not None else None
+        ),
     )
     display = PlotDisplay(
         time_unit, "HVAC" if record.metadata.name == "hvac" else record.metadata.name
@@ -68,6 +71,12 @@ def main() -> None:
         action="append",
         type=_channel_index,
         help="applied control channel index; repeatable",
+    )
+    parser.add_argument(
+        "--output-error-channel",
+        action="append",
+        type=_channel_index,
+        help="output error channel index independent of tracking; repeatable",
     )
     parser.add_argument("--control-error-scale", choices=("linear", "log"), default="linear")
     parser.add_argument("--time-unit", choices=("s", "h"), default=None)

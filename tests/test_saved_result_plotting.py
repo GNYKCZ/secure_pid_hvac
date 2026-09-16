@@ -196,6 +196,11 @@ def test_render_batch_paths_manifest_hashes_and_no_simulation(
         "control_error",
         "output_error",
     }
+    assert [
+        item["channels"]["output"]["index"]
+        for item in manifest["figures"]
+        if item["category"] == "output_error"
+    ] == [1 if vector else 0]
     assert [item["filename"] for item in manifest["figures"]] == [
         path.name for path in rendered.figure_paths
     ]
@@ -211,6 +216,48 @@ def test_render_batch_paths_manifest_hashes_and_no_simulation(
     assert not list(rendered.manifest_path.parents[1].glob(".incomplete-*"))
 
 
+def test_vector_output_error_selection_does_not_require_tracking_unit_match(tmp_path: Path) -> None:
+    """独立请求 pressure/kPa 的 output error，不放松 tracking 的共轴单位校验。"""
+    published = _published(tmp_path, vector=True)
+    selection = plotting.PlotSelection(((1, 1),), (0,), output_error_channels=(1, 2))
+    rendered = plotting.render_saved_run(published.run_dir, selection, output_root=tmp_path / "图")
+    manifest = json.loads(rendered.manifest_path.read_text(encoding="utf-8"))
+    tracking = [item for item in manifest["figures"] if item["category"] == "tracking"]
+    errors = [item for item in manifest["figures"] if item["category"] == "output_error"]
+    assert [item["channels"]["output"]["index"] for item in tracking] == [1]
+    assert [item["channels"]["output"]["index"] for item in errors] == [1, 2]
+    assert errors[1]["channels"]["output"] == {
+        "index": 2,
+        "name": "pressure",
+        "unit": "kPa",
+    }
+    assert (rendered.manifest_path.parent / "output_error-2.png").is_file()
+
+
+def test_source_change_after_reader_before_first_hash_cannot_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """reader 返回后的确定性损坏窗口必须拒绝，而不能为坏 CSV 签出图清单。"""
+    published = _published(tmp_path, vector=False)
+    original_csv_hash = sha256(published.trajectory_path.read_bytes()).hexdigest()
+    real_load = plotting.load_artifacts
+
+    def load_then_tamper(run_dir: Path) -> ExperimentRecord:
+        """模拟外部操作恰在 reader 返回后、首次 source hash 前改坏 CSV。"""
+        record = real_load(run_dir)
+        published.trajectory_path.write_text("tampered", encoding="utf-8")
+        return record
+
+    monkeypatch.setattr(plotting, "load_artifacts", load_then_tamper)
+    root = tmp_path / "变化源不发布"
+    with pytest.raises(ValueError, match="source run.*变化"):
+        plotting.render_saved_run(
+            published.run_dir, plotting.PlotSelection(((0, 0),), (0,)), output_root=root
+        )
+    assert sha256(published.trajectory_path.read_bytes()).hexdigest() != original_csv_hash
+    assert not root.exists()
+
+
 def test_selection_and_public_helpers_reject_invalid_channel_shape_or_scale(tmp_path: Path) -> None:
     """重复、越界、单位不匹配及人工错 metadata 不生成成功图。"""
     published = _published(tmp_path, vector=True)
@@ -220,12 +267,15 @@ def test_selection_and_public_helpers_reject_invalid_channel_shape_or_scale(tmp_
         plotting.PlotSelection(((0, 0), (0, 0)), (0,))
     with pytest.raises(ValueError, match="非负"):
         plotting.PlotSelection(((0, -1),), (0,))
+    with pytest.raises(ValueError, match="重复"):
+        plotting.PlotSelection(((0, 0),), (0,), output_error_channels=(2, 2))
     with pytest.raises(ValueError, match="scale"):
         plotting.plot_control_error(record, 0, scale="unsupported", display=plotting.PlotDisplay())
     for selection, message in (
         (plotting.PlotSelection(((9, 0),), (0,)), "越界"),
         (plotting.PlotSelection(((2, 0),), (0,)), "单位不一致"),
         (plotting.PlotSelection(((0, 0),), (9,)), "越界"),
+        (plotting.PlotSelection(((0, 0),), (0,), output_error_channels=(9,)), "越界"),
     ):
         with pytest.raises(ValueError, match=message):
             plotting.render_saved_run(published.run_dir, selection, output_root=root)

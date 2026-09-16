@@ -30,13 +30,14 @@ _RENDER_ID_PATTERN = re.compile(r"\A\d{8}T\d{12}Z-[0-9a-f]{12}\Z")
 
 @dataclass(frozen=True, slots=True)
 class PlotSelection:
-    """冻结四类图的通道配对、控制通道、误差尺度和输出格式。"""
+    """冻结通道/尺度/格式；未指定 output error 时保留由 tracking 推导的旧行为。"""
 
     tracking_pairs: tuple[tuple[int, int], ...]
     control_channels: tuple[int, ...]
     control_error_scale: ErrorScale = "linear"
     time_unit: TimeUnit = "s"
     format: FigureFormat = "png"
+    output_error_channels: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         """拒绝自动配对、重复或歧义选择；越界和单位由 source metadata 判定。"""
@@ -60,6 +61,15 @@ class PlotSelection:
             set(self.control_channels)
         ) != len(self.control_channels):
             raise ValueError("重复的 tracking/control channel 选择无效。")
+        if self.output_error_channels is not None:
+            if (
+                not isinstance(self.output_error_channels, tuple)
+                or not self.output_error_channels
+                or any(type(index) is not int or index < 0 for index in self.output_error_channels)
+            ):
+                raise ValueError("output error channel 必须是非空的非负整数 tuple。")
+            if len(set(self.output_error_channels)) != len(self.output_error_channels):
+                raise ValueError("重复的 output error channel 选择无效。")
         if self.control_error_scale not in ("linear", "log"):
             raise ValueError("control error scale 必须是 linear 或 log。")
         if self.time_unit not in ("s", "h") or self.format not in ("png", "pdf"):
@@ -259,7 +269,19 @@ def render_saved_run(
     if not isinstance(selection, PlotSelection):
         raise TypeError("selection 必须是 PlotSelection。")
     source = Path(run_dir)
+    try:
+        # 摘要先于 reader：reader 返回后的变化不能成为清单声称的“已验证源”。
+        source_hashes = {
+            name: _digest(source / name)
+            for name in ("trajectory.csv", "metadata.json", "config.json")
+        }
+    except OSError:
+        # 缺失/错误目录仍由 #13 canonical reader 给出原有异常类型与说明。
+        load_artifacts(source)
+        raise
     record = load_artifacts(source)
+    if source_hashes != {name: _digest(source / name) for name in source_hashes}:
+        raise ValueError("source run 在读取期间发生变化。")
     display = display or PlotDisplay(selection.time_unit)
     if display.time_unit != selection.time_unit:
         raise ValueError("selection 与 display 的时间单位不一致。")
@@ -275,13 +297,11 @@ def render_saved_run(
     for control_index in selection.control_channels:
         for field in ("control_ideal", "control_secure", "control_error"):
             _series(record, field, record.metadata.control, control_index)
-    output_indices = tuple(dict.fromkeys(pair[0] for pair in selection.tracking_pairs))
+    output_indices = selection.output_error_channels
+    if output_indices is None:
+        output_indices = tuple(dict.fromkeys(pair[0] for pair in selection.tracking_pairs))
     for output_index in output_indices:
         _series(record, "output_error", record.metadata.output, output_index)
-
-    source_hashes = {
-        name: _digest(source / name) for name in ("trajectory.csv", "metadata.json", "config.json")
-    }
     parent = Path(output_root) / record.run_id
     parent.mkdir(parents=True, exist_ok=True)
     render_id = _new_render_id()

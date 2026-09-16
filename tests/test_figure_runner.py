@@ -21,11 +21,11 @@ HVAC_CONFIG = PROJECT_ROOT / "configs" / "hvac_dual_loop.yaml"
 def _vector_run(tmp_path: Path) -> RunArtifacts:
     """用既有 writer 生成两组独立通道，避免 CLI 测试依赖另一测试模块。"""
     reference = ChannelMetadata(("setpoint_a", "setpoint_b"), ("unit_a", "unit_b"))
-    output = ChannelMetadata(("output_a", "output_b"), ("unit_a", "unit_b"))
+    output = ChannelMetadata(("output_a", "output_b", "pressure"), ("unit_a", "unit_b", "kPa"))
     control = ChannelMetadata(("applied_a", "applied_b"), ("power_a", "power_b"))
     metadata = ScenarioMetadata("toy", reference, output, control)
-    ideal_output = np.array([[3.0, 4.0], [4.0, 6.0]])
-    secure_output = np.array([[2.0, 4.0], [5.0, 5.0]])
+    ideal_output = np.array([[3.0, 4.0, 100.0], [4.0, 6.0, 101.0]])
+    secure_output = np.array([[2.0, 4.0, 99.0], [5.0, 5.0, 102.0]])
     ideal_control = np.array([[1.0, 2.0], [2.0, 3.0]])
     secure_control = np.array([[1.0, 1.0], [2.0, 4.0]])
     result = SimulationResult(
@@ -146,9 +146,51 @@ def test_vector_cli_repeated_channel_pairs_and_pdf_output(tmp_path: Path) -> Non
     assert manifest["figures"][1]["channels"]["reference"]["unit"] == "unit_b"
 
 
+def test_vector_cli_selects_unmatched_output_error_channel(tmp_path: Path) -> None:
+    """CLI 可画无同单位 reference 的 pressure error，tracking 仍只配合法通道。"""
+    published = _vector_run(tmp_path)
+    root = tmp_path / "pressure 图"
+    result = _cli(
+        published.run_dir,
+        root,
+        "--tracking",
+        "0:0",
+        "--control-channel",
+        "0",
+        "--output-error-channel",
+        "2",
+    )
+    assert result.returncode == 0, result.stderr
+    summary = json.loads(result.stdout)
+    manifest = json.loads(Path(summary["manifest"]).read_text(encoding="utf-8"))
+    errors = [item for item in manifest["figures"] if item["category"] == "output_error"]
+    assert len(errors) == 1
+    assert errors[0]["channels"]["output"] == {
+        "index": 2,
+        "name": "pressure",
+        "unit": "kPa",
+    }
+    assert Path(summary["manifest"]).parent.joinpath("output_error-2.png").is_file()
+
+
 @pytest.mark.parametrize(
     "extra",
-    [(), ("--tracking", "bad"), ("--tracking", "9:0", "--control-channel", "0")],
+    [
+        (),
+        ("--tracking", "bad"),
+        ("--tracking", "9:0", "--control-channel", "0"),
+        ("--tracking", "0:0", "--control-channel", "0", "--output-error-channel", "9"),
+        (
+            "--tracking",
+            "0:0",
+            "--control-channel",
+            "0",
+            "--output-error-channel",
+            "2",
+            "--output-error-channel",
+            "2",
+        ),
+    ],
 )
 def test_cli_rejects_missing_or_invalid_vector_selection_without_figures(
     tmp_path: Path, extra: tuple[str, ...]

@@ -13,16 +13,20 @@ uv run python -m secure_control.experiments.figure_runner --run-dir results/csv/
 
 默认单通道 HVAC 使用 `output 0 → reference 0`、control 0、小时轴，生成四张 PNG。
 非单通道 HVAC 和其他场景必须显式指定至少一组 tracking 配对及 control 通道；
-两个选项都可重复：
+两个选项都可重复；若输出通道没有可共轴的 reference，`--output-error-channel`
+可独立、重复指定仅画该通道的有符号 error：
 
 ```powershell
-uv run python -m secure_control.experiments.figure_runner --run-dir results/csv/<run_id> --tracking 0:1 --tracking 2:0 --control-channel 0 --control-channel 1 --time-unit s --format pdf
+uv run python -m secure_control.experiments.figure_runner --run-dir results/csv/<run_id> --tracking 0:1 --control-channel 0 --control-channel 1 --output-error-channel 2 --time-unit s --format pdf
 ```
 
 tracking 配对顺序为 `output_index:reference_index`，不能自动把向量同号通道配对。
 共轴前要求 reference/output 单位完全相同；通道 index 越界、重复选择、单位错配
 都会失败。图例的通道名及 y 轴单位来自保存的 `ScenarioMetadata`，通用绘图层不定义
 `temperature_*`、PID 或 HVAC schema。
+省略 `--output-error-channel` 时，output-error 图仍按既有规则取 tracking 中出现的
+输出通道；显式指定时只按给出的输出索引绘制，不要求它与 reference 单位相同，
+也不放宽 tracking 图本身的共轴校验。
 
 ## 四类曲线和时间语义
 
@@ -48,6 +52,8 @@ tracking 配对顺序为 `output_index:reference_index`，不能自动把向量�
 时间+随机 nonce 身份，不覆盖同 ID 已有目录。所有图与 `figures_manifest.json`
 先写入同父目录私有 `.incomplete-<render_id>` staging，全部保存成功后同盘发布。
 失败仅清理本调用拥有的 staging；已有成功图、未知用户目录和源 run 始终保留。
+清单源文件摘要在正式 reader 调用前取得，并在其返回后及发布前再次比对；
+读取或绘图期间若源 CSV/metadata/config 改变，拒绝发布与旧记录不一致的清单。
 
 文件名含通道/配对与 error 尺度，例如：
 
