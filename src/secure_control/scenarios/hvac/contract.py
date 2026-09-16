@@ -90,6 +90,110 @@ class HvacModelContract:
             raise ValueError("冷却功率上限必须大于下限")
 
 
+_HVAC_PROVENANCE_SOURCE_KINDS = frozenset(
+    {"literature", "project_assumption", "synthetic_benchmark"}
+)
+_HVAC_2R2C_PARAMETER_NAMES = (
+    "air_wall_thermal_resistance_celsius_per_kw",
+    "wall_outdoor_thermal_resistance_celsius_per_kw",
+    "air_thermal_capacitance_kj_per_celsius",
+    "wall_thermal_capacitance_kj_per_celsius",
+    "cooling_coefficient",
+    "ambient_temperature_celsius",
+    "initial_air_temperature_celsius",
+    "initial_wall_temperature_celsius",
+    "lower_control_bound_kw",
+    "upper_control_bound_kw",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class HvacParameterProvenance:
+    """记录一个 HVAC 物理或场景参数从原始来源到配置单位的换算。"""
+
+    parameter_name: str
+    source_kind: str
+    reference: str
+    source_version: str
+    original_value: float
+    original_unit: str
+    configured_value: float
+    conversion_note: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "parameter_name",
+            "source_kind",
+            "reference",
+            "source_version",
+            "original_unit",
+            "conversion_note",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} 必须是非空字符串")
+        if self.source_kind not in _HVAC_PROVENANCE_SOURCE_KINDS:
+            raise ValueError(
+                "source_kind 必须为 literature、project_assumption 或 synthetic_benchmark"
+            )
+        for name in ("original_value", "configured_value"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, Real) or not isfinite(float(value)):
+                raise ValueError(f"{name} 必须是有限实数")
+
+
+@dataclass(frozen=True, slots=True)
+class Hvac2R2CModelContract:
+    """冻结二阶 2R2C 冷却模型、二状态初值、执行器范围和参数来源。"""
+
+    air_wall_thermal_resistance_celsius_per_kw: float
+    wall_outdoor_thermal_resistance_celsius_per_kw: float
+    air_thermal_capacitance_kj_per_celsius: float
+    wall_thermal_capacitance_kj_per_celsius: float
+    cooling_coefficient: float
+    ambient_temperature_celsius: float
+    initial_air_temperature_celsius: float
+    initial_wall_temperature_celsius: float
+    lower_control_bound_kw: float
+    upper_control_bound_kw: float
+    parameter_provenance: tuple[HvacParameterProvenance, ...]
+
+    def __post_init__(self) -> None:
+        for name in _HVAC_2R2C_PARAMETER_NAMES:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, Real) or not isfinite(float(value)):
+                raise ValueError(f"{name} 必须是有限实数")
+        for name in (
+            "air_wall_thermal_resistance_celsius_per_kw",
+            "wall_outdoor_thermal_resistance_celsius_per_kw",
+            "air_thermal_capacitance_kj_per_celsius",
+            "wall_thermal_capacitance_kj_per_celsius",
+            "cooling_coefficient",
+        ):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} 必须为正数")
+        if self.lower_control_bound_kw < 0:
+            raise ValueError("冷却功率下限不得为负数")
+        if self.lower_control_bound_kw >= self.upper_control_bound_kw:
+            raise ValueError("冷却功率上限必须大于下限")
+        if not isinstance(self.parameter_provenance, tuple) or any(
+            not isinstance(item, HvacParameterProvenance) for item in self.parameter_provenance
+        ):
+            raise TypeError("parameter_provenance 必须是 HvacParameterProvenance 元组")
+
+        provenance_by_name = {item.parameter_name: item for item in self.parameter_provenance}
+        if len(provenance_by_name) != len(self.parameter_provenance) or set(
+            provenance_by_name
+        ) != set(_HVAC_2R2C_PARAMETER_NAMES):
+            raise ValueError("2R2C provenance 必须与全部配置参数一一对应且不得重复")
+        for name in _HVAC_2R2C_PARAMETER_NAMES:
+            if provenance_by_name[name].configured_value != getattr(self, name):
+                raise ValueError(f"{name} 的 provenance configured_value 与配置值不一致")
+
+
+HvacPlantModelContract = HvacModelContract | Hvac2R2CModelContract
+
+
 @dataclass(frozen=True, slots=True)
 class HvacReferenceSegment:
     """表示左闭右开的恒温参考区间 ``[start_seconds, end_seconds)``。"""
@@ -110,7 +214,7 @@ class HvacScenarioContract:
     """HVAC 配置、时序、模型、参考和通用结果通道之间的唯一契约。"""
 
     timing: HvacTimingContract
-    model: HvacModelContract
+    model: HvacPlantModelContract
     reference_segments: tuple[HvacReferenceSegment, ...]
     endpoint_reference_celsius: float
     metadata: ScenarioMetadata
@@ -174,17 +278,31 @@ def load_hvac_scenario_contract(path: str | Path) -> HvacScenarioContract:
     )
 
 
-def _parse_model(model: ConfigMapping) -> HvacModelContract:
-    """校验方程形式和执行器语义；实际离散递推由后续 plant Issue 实现。"""
-    if _string(model, "kind") != "first_order_rc_cooling":
-        raise ValueError("model.kind 必须为 first_order_rc_cooling")
-    if _string(model, "discretization") != "zero_order_hold":
-        raise ValueError("model.discretization 必须为 zero_order_hold")
+def _parse_model(model: ConfigMapping) -> HvacPlantModelContract:
+    """只在 HVAC 层按显式 kind 分派模型，未知类型不得猜测或降级。"""
+    kind = _string(model, "kind")
+    if kind == "first_order_rc_cooling":
+        return _parse_first_order_model(model)
+    if kind == "second_order_2r2c_cooling":
+        return _parse_2r2c_model(model)
+    raise ValueError("model.kind 必须为 first_order_rc_cooling 或 second_order_2r2c_cooling")
+
+
+def _validate_control(model: ConfigMapping) -> ConfigMapping:
+    """校验两种 HVAC plant 共用的热功率单位、正方向与 control 映射。"""
     control = _mapping(model, "control")
     if _string(control, "unit") != "kW_thermal_cooling":
         raise ValueError("HVAC control.unit 必须为 kW_thermal_cooling")
     if _string(control, "positive_direction") != "cooling":
         raise ValueError("HVAC 正控制量必须约定为 cooling")
+    return control
+
+
+def _parse_first_order_model(model: ConfigMapping) -> HvacModelContract:
+    """保持既有一阶 RC 配置语义和离散化标识不变。"""
+    if _string(model, "discretization") != "zero_order_hold":
+        raise ValueError("model.discretization 必须为 zero_order_hold")
+    control = _validate_control(model)
 
     return HvacModelContract(
         thermal_resistance_celsius_per_kw=_number(model, "thermal_resistance_celsius_per_kw"),
@@ -194,6 +312,59 @@ def _parse_model(model: ConfigMapping) -> HvacModelContract:
         initial_temperature_celsius=_number(model, "initial_temperature_celsius"),
         lower_control_bound_kw=_number(control, "lower_bound_kw"),
         upper_control_bound_kw=_number(control, "upper_bound_kw"),
+    )
+
+
+def _parse_2r2c_model(model: ConfigMapping) -> Hvac2R2CModelContract:
+    """解析无内部热源的 2R2C 连续模型及 exact-ZOH 配置。"""
+    if _string(model, "continuous_model_version") != "hvac_2r2c_no_internal_gains_v1":
+        raise ValueError("continuous_model_version 必须为 hvac_2r2c_no_internal_gains_v1")
+    if _string(model, "discretization") != "exact_zero_order_hold":
+        raise ValueError("2R2C model.discretization 必须为 exact_zero_order_hold")
+    control = _validate_control(model)
+    provenance = _parse_parameter_provenance(model)
+    return Hvac2R2CModelContract(
+        air_wall_thermal_resistance_celsius_per_kw=_number(
+            model, "air_wall_thermal_resistance_celsius_per_kw"
+        ),
+        wall_outdoor_thermal_resistance_celsius_per_kw=_number(
+            model, "wall_outdoor_thermal_resistance_celsius_per_kw"
+        ),
+        air_thermal_capacitance_kj_per_celsius=_number(
+            model, "air_thermal_capacitance_kj_per_celsius"
+        ),
+        wall_thermal_capacitance_kj_per_celsius=_number(
+            model, "wall_thermal_capacitance_kj_per_celsius"
+        ),
+        cooling_coefficient=_number(model, "cooling_coefficient"),
+        ambient_temperature_celsius=_number(model, "ambient_temperature_celsius"),
+        initial_air_temperature_celsius=_number(model, "initial_air_temperature_celsius"),
+        initial_wall_temperature_celsius=_number(model, "initial_wall_temperature_celsius"),
+        lower_control_bound_kw=_number(control, "lower_bound_kw"),
+        upper_control_bound_kw=_number(control, "upper_bound_kw"),
+        parameter_provenance=provenance,
+    )
+
+
+def _parse_parameter_provenance(
+    model: ConfigMapping,
+) -> tuple[HvacParameterProvenance, ...]:
+    """把 YAML 来源列表提升为可审计契约，而不是把来源仅留在注释中。"""
+    raw_provenance = model.get("parameter_provenance")
+    if not isinstance(raw_provenance, list):
+        raise TypeError("parameter_provenance 必须是列表")
+    return tuple(
+        HvacParameterProvenance(
+            parameter_name=_string(item_mapping, "parameter_name"),
+            source_kind=_string(item_mapping, "source_kind"),
+            reference=_string(item_mapping, "reference"),
+            source_version=_string(item_mapping, "source_version"),
+            original_value=_number(item_mapping, "original_value"),
+            original_unit=_string(item_mapping, "original_unit"),
+            configured_value=_number(item_mapping, "configured_value"),
+            conversion_note=_string(item_mapping, "conversion_note"),
+        )
+        for item_mapping in (_item_mapping(item, "parameter provenance") for item in raw_provenance)
     )
 
 

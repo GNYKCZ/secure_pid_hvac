@@ -27,7 +27,7 @@ from secure_control.simulation import (
 
 from .adapter import HvacSignalAdapter
 from .baseline import HvacSegmentMetric, _segment_metrics
-from .contract import load_hvac_scenario_contract
+from .contract import Hvac2R2CModelContract, load_hvac_scenario_contract
 from .pid import load_hvac_pid_design
 from .plant import HvacPlant
 
@@ -88,6 +88,12 @@ class HvacScenario:
             raise TypeError("test_seed 必须是整数或 None。")
 
         self._contract = load_hvac_scenario_contract(baseline_path)
+        if isinstance(self._contract.model, Hvac2R2CModelContract):
+            # 该模型类型本身合法，但不属于当前一阶双闭环入口允许的配置值。
+            raise ValueError(  # noqa: TRY004
+                "当前 HvacScenario 的双闭环范围证书仅支持一阶 RC；"
+                "2R2C PID 与双闭环接入属于 Issue #42。"
+            )
         self._design = load_hvac_pid_design(baseline_path, self._contract)
         # 两个旧 loader 会再次读取基线；若解析期间文件变化，来源 hash 便不能代表实际配置。
         if path.read_bytes() != wrapper_source or baseline_path.read_bytes() != baseline_source:
