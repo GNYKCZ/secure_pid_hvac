@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from hashlib import sha256
 from math import ceil, isfinite
 from numbers import Integral
 from pathlib import Path
@@ -16,7 +17,13 @@ from secure_control.core import ControllerScaleMetadata, ControllerSpec
 from secure_control.crypto import FixedPointContext
 from secure_control.execution import PlaintextStateSpaceRuntime, SecureStateSpaceRuntime
 from secure_control.protocol import ControllerRangeContract
-from secure_control.simulation import SimulationBranch, SimulationPlan, SimulationResult, run
+from secure_control.simulation import (
+    ScenarioMetadata,
+    SimulationBranch,
+    SimulationPlan,
+    SimulationResult,
+    run,
+)
 
 from .adapter import HvacSignalAdapter
 from .baseline import HvacSegmentMetric, _segment_metrics
@@ -49,19 +56,29 @@ class HvacComparison:
 class HvacScenario:
     """以现有 HVAC/PID 配置装配两支独立闭环，交给通用 runner 执行。"""
 
+    scenario_version = "1"
+
     def __init__(self, config_path: str | Path, *, test_seed: int | None = None) -> None:
         """只读取双闭环配置及其引用的基线；build_plan 才创建运行时。"""
         path = Path(config_path)
         try:
-            loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+            wrapper_source = path.read_bytes()
+            loaded = yaml.safe_load(wrapper_source.decode("utf-8"))
         except OSError as error:
             raise ValueError(f"无法读取 HVAC 双闭环配置：{path}") from error
         if not isinstance(loaded, Mapping):
             raise TypeError("HVAC 双闭环配置根节点必须是映射。")
+        selector = loaded.get("scenario")
+        if not isinstance(selector, Mapping) or selector.get("name") != "hvac":
+            raise ValueError("HVAC 双闭环外壳 scenario.name 必须为 hvac。")
         baseline_name = loaded.get("baseline_config")
         if not isinstance(baseline_name, str) or not baseline_name.strip():
             raise TypeError("baseline_config 必须是非空路径字符串。")
         baseline_path = path.parent / baseline_name
+        try:
+            baseline_source = baseline_path.read_bytes()
+        except OSError as error:
+            raise ValueError(f"无法读取 HVAC PID 基线配置：{baseline_path}") from error
         security = loaded.get("security")
         if not isinstance(security, Mapping):
             raise TypeError("security 必须是映射。")
@@ -72,6 +89,13 @@ class HvacScenario:
 
         self._contract = load_hvac_scenario_contract(baseline_path)
         self._design = load_hvac_pid_design(baseline_path, self._contract)
+        # 两个旧 loader 会再次读取基线；若解析期间文件变化，来源 hash 便不能代表实际配置。
+        if path.read_bytes() != wrapper_source or baseline_path.read_bytes() != baseline_source:
+            raise ValueError("HVAC 配置在解析期间发生变化，拒绝生成不可信快照。")
+        self._wrapper_source_hash = sha256(wrapper_source).hexdigest()
+        self._baseline_source_hash = sha256(baseline_source).hexdigest()
+        self._wrapper_filename = path.name
+        self._baseline_filename = baseline_path.name
         self._fixed_point = FixedPointContext(
             _positive_integer(security, "modulus"),
             integer_bits=_positive_integer(security, "integer_bits"),
@@ -85,6 +109,78 @@ class HvacScenario:
         if self._horizon_steps != self._contract.timing.sample_count:
             raise ValueError("horizon_steps 必须等于 HVAC sample_count。")
         self.safety_certificate = self._derive_safety_certificate()
+
+    @property
+    def metadata(self) -> ScenarioMetadata:
+        """直接返回已解析的通道元数据，不为产物读取再创建安全 session。"""
+        return self._contract.metadata
+
+    def effective_config_snapshot(self) -> dict[str, Any]:
+        """只快照已校验且实际参与装配的值、执行 seed 和两个源文件摘要。
+
+        路径仅保留文件名而非机器绝对路径；固定策略字段是旧配置 loader 已强制
+        验证的语义，不把任意未知 YAML 字段误称为生效控制参数。
+        """
+        contract = self._contract
+        return {
+            "scenario": {"name": "hvac", "version": self.scenario_version},
+            "sources": {
+                "wrapper": {
+                    "filename": self._wrapper_filename,
+                    "sha256": self._wrapper_source_hash,
+                },
+                "baseline": {
+                    "filename": self._baseline_filename,
+                    "sha256": self._baseline_source_hash,
+                },
+            },
+            "wrapper": {
+                "baseline_config": self._baseline_filename,
+                "security": {
+                    "modulus": self._fixed_point.modulus,
+                    "integer_bits": self._fixed_point.integer_bits,
+                    "fractional_bits": self._fixed_point.fractional_bits,
+                    "security_parameter": self._security_parameter,
+                    "horizon_steps": self._horizon_steps,
+                },
+            },
+            "hvac": {
+                "timing": asdict(contract.timing),
+                "model": asdict(contract.model),
+                "model_semantics": {
+                    "kind": "first_order_rc_cooling",
+                    "discretization": "zero_order_hold",
+                    "positive_control": "cooling",
+                    "control_unit": "kW_thermal_cooling",
+                },
+                "reference_segments": [asdict(item) for item in contract.reference_segments],
+                "endpoint_reference_celsius": contract.endpoint_reference_celsius,
+                "channels": {
+                    "reference": asdict(contract.metadata.reference),
+                    "output": asdict(contract.metadata.output),
+                    "control": asdict(contract.metadata.control),
+                },
+                "signal_adapter": {
+                    "kind": "reference_minus_temperature",
+                    "output_unit": "degC",
+                    "controller_input_unit": "degC",
+                },
+                "pid": asdict(self._design),
+                "pid_strategies": {
+                    "kind": "positional_pid_error_derivative",
+                    "derivative_filter": "none",
+                    "anti_windup": "disabled",
+                    "output_saturation": "scenario_before_plant",
+                },
+            },
+            "execution": {
+                "secure_material_test_seed": self._test_seed,
+                "secure_material_randomness": (
+                    "deterministic_test" if self._test_seed is not None else "secure_random"
+                ),
+            },
+            "finite_horizon_certificate": asdict(self.safety_certificate),
+        }
 
     def build_plan(self) -> SimulationPlan:
         """先由场景推物理界，再由 Client 离线证明编码控制器界，成功后返回双支计划。"""

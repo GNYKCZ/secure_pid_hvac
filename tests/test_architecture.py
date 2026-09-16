@@ -63,5 +63,21 @@ def test_dependency_direction_has_no_scenario_back_imports() -> None:
     assert violations == []
 
 
+def test_experiment_io_boundary_imports_only_generic_contracts() -> None:
+    """实验 writer/provenance 不导入场景算法；selector 只能导入 HVAC 装配入口。"""
+    experiments = PACKAGE_ROOT / "experiments"
+    for name in ("artifacts.py", "provenance.py"):
+        source = experiments / name
+        assert "secure_control.scenarios" not in imported_modules(source)
+        assert FORBIDDEN_DOMAIN_TERMS.search(source.read_text(encoding="utf-8")) is None
+    selector_imports = imported_modules(experiments / "runner.py")
+    scenario_imports = {
+        module for module in selector_imports if module.startswith("secure_control.scenarios")
+    }
+    assert scenario_imports == {"secure_control.scenarios.hvac.integration"}
+    assert "secure_control.scenarios.hvac.plant" not in selector_imports
+    assert "secure_control.scenarios.hvac.pid" not in selector_imports
+
+
 def test_legacy_source_package_does_not_exist() -> None:
     assert not (PACKAGE_ROOT.parent / "secure_pid").exists()

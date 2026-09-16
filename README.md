@@ -11,6 +11,7 @@ GitHub 仓库和发行包继续使用 `secure_pid_hvac` / `secure-pid-hvac`，Py
 当前已完成架构基础、HVAC 明文基线、安全算术原语与组合验证门、通用 Client/P1/P2 单进程协议
 核心、与明文接口兼容的通用安全状态空间运行时，以及领域无关 simulation engine 和
 180 步 HVAC 明文/安全双闭环。尚未实现 multiprocessing 或网络通信。
+现已提供显式场景选择的实验入口与通用 CSV/metadata/config 产物。
 
 ## 架构边界
 
@@ -20,6 +21,7 @@ GitHub 仓库和发行包继续使用 `secure_pid_hvac` / `secure-pid-hvac`，Py
 - `execution`：统一的控制器运行接口 `step(v) -> u`。
 - `simulation`：领域无关的 scenario plan、时间循环、runner 和八字段结果契约。
 - `scenarios`：plant、reference、controller design、信号适配及单位等领域逻辑。
+- `experiments`：显式选择已实现的场景、记录 provenance，并发布/读取通用结果产物。
 
 仿真引擎不得自行计算 `reference - measurement`。scenario adapter 根据 reference 和 plant output
 构造 controller input `v`，因此未来场景可以传入完整 state、state error 或 observer output。
@@ -59,7 +61,7 @@ uv run python path\to\script.py
 uv run python -c "import secure_control; print(secure_control.__version__)"
 ```
 
-未来配置统一使用场景选择外壳：
+实验配置使用场景选择外壳：
 
 ```yaml
 scenario:
@@ -67,6 +69,7 @@ scenario:
 ```
 
 通用 `simulation.runner.run(scenario)` 不根据 YAML 选择场景；具体 HVAC 装配位于场景层。
+实验入口只显式支持 `hvac`；未实现的场景名会明确失败。
 
 ## HVAC 场景基线
 
@@ -84,6 +87,17 @@ uv run python -m secure_control.scenarios.hvac.runner --config configs/hvac_dual
 [HVAC 双闭环集成](docs/simulation_hvac_integration.md)。详细 PID 设计见
 [HVAC PID 设计](docs/hvac_pid_design.md)；完整场景约定见
 [HVAC 场景契约](docs/hvac_scenario_contract.md)。
+
+保存正式八字段实验产物使用独立入口，不改变上面的场景级摘要 CLI：
+
+```powershell
+uv run python -m secure_control.experiments.runner --config configs/hvac_dual_loop.yaml --seed 12
+```
+
+每次运行创建独立的 `results/csv/<run_id>/trajectory.csv`、`metadata.json` 和
+`config.json`；固定测试 seed 可重跑相同数值内容，已存在 run 不覆盖。schema、
+通道单位、有效配置快照、公开 provenance、失败与读取语义见
+[实验产物约定](docs/experiment_schema.md)。普通生成产物默认不提交 Git。
 
 ## 安全算术基线
 
