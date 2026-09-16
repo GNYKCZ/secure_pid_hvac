@@ -201,6 +201,25 @@ def test_reader_rejects_malformed_csv_even_when_manifest_hash_is_updated(
         artifacts.load_artifacts(published.run_dir)
 
 
+def test_reader_rejects_empty_scenario_version_even_when_artifacts_agree(tmp_path: Path) -> None:
+    """即使三个版本字段一致且配置摘要已更新，空版本也不是有效成功产物。"""
+    published = _write(tmp_path)
+    config = json.loads(published.config_path.read_text(encoding="utf-8"))
+    config["scenario"]["version"] = ""
+    published.config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    manifest = json.loads(published.metadata_path.read_text(encoding="utf-8"))
+    manifest["scenario"]["version"] = ""
+    manifest["provenance"]["scenario_version"] = ""
+    manifest["files_sha256"]["config.json"] = sha256(
+        published.config_path.read_bytes()
+    ).hexdigest()
+    published.metadata_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="scenario version"):
+        artifacts.load_artifacts(published.run_dir)
+
+
 def test_writer_rejects_channel_or_error_mismatch_before_creating_root(tmp_path: Path) -> None:
     """错 shape 或错误公式不能生成一个看似完整的成功产物。"""
     result, metadata = _record(1)

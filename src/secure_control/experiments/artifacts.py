@@ -338,6 +338,8 @@ def _read_record(run_dir: Path, *, allow_staging: bool) -> ExperimentRecord:
         or not isinstance(channels, dict)
     ):
         raise TypeError("scenario/channel metadata 缺失或无效。")
+    if not scenario["version"]:
+        raise ValueError("scenario version 不能为空。")
     metadata = ScenarioMetadata(
         scenario["name"],
         _parse_channels(channels.get("reference"), "reference"),
