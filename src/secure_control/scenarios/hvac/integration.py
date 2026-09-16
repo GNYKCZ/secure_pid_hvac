@@ -196,7 +196,8 @@ class HvacScenario:
             raise ValueError("当前双闭环仅支持 terminal_sample_included=false。")
         if self._horizon_steps != self._contract.timing.sample_count:
             raise ValueError("horizon_steps 必须等于 HVAC sample_count。")
-        self.safety_certificate = self._derive_safety_certificate()
+        self._required_safety_certificate = self._derive_safety_certificate()
+        self.safety_certificate = self._required_safety_certificate
 
     @property
     def metadata(self) -> ScenarioMetadata:
@@ -205,6 +206,7 @@ class HvacScenario:
 
     def effective_config_snapshot(self) -> dict[str, Any]:
         """快照实际参与装配的三源配置、调参、品质和范围证书。"""
+        self._validate_safety_certificate()
         contract = self._contract
         sources: dict[str, Any] = {
             "wrapper": {"filename": self._wrapper_filename, "sha256": self._wrapper_source_hash},
@@ -295,6 +297,7 @@ class HvacScenario:
 
     def build_plan(self) -> SimulationPlan:
         """以范围证书构造独立 plant/adapter/runtime 和安全会话。"""
+        self._validate_safety_certificate()
         plain_spec, secure_spec = self._controller_specs()
         range_contract = ControllerRangeContract(
             state_payload_bounds=self.safety_certificate.state_payload_bounds,
@@ -327,6 +330,7 @@ class HvacScenario:
 
     def metrics(self, result: SimulationResult) -> HvacComparison:
         """纯粹从正式八字段结果核对物理界并计算 HVAC 指标。"""
+        self._validate_safety_certificate()
         air_low, air_high = self.safety_certificate.plant_state_bounds_celsius[0]
         for name in ("output_ideal", "output_secure"):
             output = getattr(result, name)
@@ -477,6 +481,68 @@ class HvacScenario:
             0,
         )
 
+    def _validate_safety_certificate(self) -> None:
+        """拒绝任何小于先验传播结果的物理或编码范围声明。"""
+        certificate = self.safety_certificate
+        required = self._required_safety_certificate
+        if not isinstance(certificate, HvacSafetyCertificate):
+            raise TypeError("safety_certificate 必须是 HvacSafetyCertificate")
+        if (
+            certificate.horizon_steps != required.horizon_steps
+            or certificate.plant_state_names != required.plant_state_names
+            or certificate.controller_state_names != required.controller_state_names
+            or certificate.state_truncation_bits != required.state_truncation_bits
+        ):
+            raise ValueError("HVAC certificate 的 horizon、state 名称或 Trunc 语义不一致")
+        _require_enclosing_bounds(
+            "plant_state_bounds_celsius",
+            certificate.plant_state_bounds_celsius,
+            required.plant_state_bounds_celsius,
+        )
+        _require_enclosing_bounds(
+            "controller_input_bounds_celsius",
+            (certificate.controller_input_bounds_celsius,),
+            (required.controller_input_bounds_celsius,),
+        )
+        _require_enclosing_bounds(
+            "controller_state_bounds",
+            certificate.controller_state_bounds,
+            required.controller_state_bounds,
+        )
+        _require_enclosing_bounds(
+            "raw_control_bounds_kw",
+            (certificate.raw_control_bounds_kw,),
+            (required.raw_control_bounds_kw,),
+        )
+        _require_enclosing_bounds(
+            "applied_control_bounds_kw",
+            (certificate.applied_control_bounds_kw,),
+            (required.applied_control_bounds_kw,),
+        )
+        for name in (
+            "input_payload_bounds",
+            "state_payload_bounds",
+            "maximum_state_accumulator_bounds",
+            "maximum_output_accumulator_bounds",
+        ):
+            claimed = getattr(certificate, name)
+            minimum = getattr(required, name)
+            if len(claimed) != len(minimum) or any(
+                value < required_value for value, required_value in zip(claimed, minimum)
+            ):
+                raise ValueError(f"HVAC certificate 的 {name} 小于先验所需范围")
+        expected_centered_limit = (self._fixed_point.modulus - 1) // 2
+        if certificate.centered_modulus_limit != expected_centered_limit:
+            raise ValueError("HVAC certificate 的 centered modulus limit 与 fixed-point 配置不一致")
+        if any(
+            value > certificate.centered_modulus_limit
+            for value in (
+                *certificate.maximum_state_accumulator_bounds,
+                *certificate.maximum_output_accumulator_bounds,
+            )
+        ):
+            raise ValueError("HVAC certificate 的 accumulator 超出 centered modulus limit")
+
     def _plant_interval_bounds(
         self,
     ) -> tuple[tuple[str, ...], tuple[tuple[tuple[float, float], ...], ...]]:
@@ -536,6 +602,24 @@ def _affine_interval(
                 upper += max(products)
         result.append((lower, upper))
     return result
+
+
+def _require_enclosing_bounds(
+    name: str,
+    claimed: tuple[tuple[float, float], ...],
+    required: tuple[tuple[float, float], ...],
+) -> None:
+    """验证公开盒区间逐维包含先验传播结果，不接受反转或非有限边界。"""
+    if len(claimed) != len(required):
+        raise ValueError(f"HVAC certificate 的 {name} 维数不一致")
+    for interval, minimum in zip(claimed, required):
+        if (
+            len(interval) != 2
+            or not all(isfinite(value) for value in interval)
+            or interval[0] > minimum[0]
+            or interval[1] < minimum[1]
+        ):
+            raise ValueError(f"HVAC certificate 的 {name} 小于先验所需范围")
 
 
 def _integer_row_bounds(

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -224,7 +224,24 @@ def test_2r2c_plan_and_certificate_cover_independent_internal_states_and_protoco
     assert len(certificate.plant_state_bounds_celsius) == 2
     assert certificate.controller_state_names == ("integral_error", "previous_error")
     assert len(certificate.controller_state_bounds) == 2
+    np.testing.assert_allclose(
+        certificate.plant_state_bounds_celsius,
+        ((-5.425488018369845, 30.0), (27.66807773378152, 30.0)),
+    )
+    assert certificate.controller_input_bounds_celsius == pytest.approx((-15.0, 30.41110807097034))
+    np.testing.assert_allclose(
+        certificate.controller_state_bounds,
+        ((-108000.0, 223328.75232158735), (-15.0, 30.41110807097034)),
+    )
+    assert certificate.raw_control_bounds_kw == pytest.approx(
+        (-181.19739451371325, 79.93497266600528)
+    )
     assert certificate.applied_control_bounds_kw == (0.0, 12.0)
+    assert certificate.input_payload_bounds == (31888360,)
+    assert certificate.state_payload_bounds == (344394288000, 31888360)
+    assert certificate.maximum_state_accumulator_bounds == (344394288000, 31888360)
+    assert certificate.maximum_output_accumulator_bounds == (280360101381360,)
+    assert certificate.centered_modulus_limit == 1152921504606846975
     assert certificate.state_truncation_bits == 0
     assert all(
         value <= certificate.centered_modulus_limit
@@ -242,6 +259,101 @@ def test_2r2c_plan_and_certificate_cover_independent_internal_states_and_protoco
         plan.secure.runtime._range_contract.input_payload_bounds == certificate.input_payload_bounds
     )
     assert plan.metadata.output.names == ("air_temperature",)
+
+
+def test_2r2c_certificate_rejects_every_undersized_bound_before_plan_build() -> None:
+    """缩小任一物理、控制器或协议边界都必须在运行闭环前 fail closed。"""
+    scenario = HvacScenario(CONFIG_2R2C_PATH, test_seed=44)
+    certificate = scenario.safety_certificate
+    smaller_certificates = (
+        (
+            "plant_state_bounds_celsius",
+            replace(
+                certificate,
+                plant_state_bounds_celsius=(
+                    (
+                        certificate.plant_state_bounds_celsius[0][0] + 1e-6,
+                        certificate.plant_state_bounds_celsius[0][1],
+                    ),
+                    certificate.plant_state_bounds_celsius[1],
+                ),
+            ),
+        ),
+        (
+            "controller_input_bounds_celsius",
+            replace(
+                certificate,
+                controller_input_bounds_celsius=(
+                    certificate.controller_input_bounds_celsius[0] + 1e-6,
+                    certificate.controller_input_bounds_celsius[1],
+                ),
+            ),
+        ),
+        (
+            "controller_state_bounds",
+            replace(
+                certificate,
+                controller_state_bounds=(
+                    (
+                        certificate.controller_state_bounds[0][0] + 1e-6,
+                        certificate.controller_state_bounds[0][1],
+                    ),
+                    certificate.controller_state_bounds[1],
+                ),
+            ),
+        ),
+        (
+            "raw_control_bounds_kw",
+            replace(
+                certificate,
+                raw_control_bounds_kw=(
+                    certificate.raw_control_bounds_kw[0] + 1e-6,
+                    certificate.raw_control_bounds_kw[1],
+                ),
+            ),
+        ),
+        (
+            "input_payload_bounds",
+            replace(
+                certificate,
+                input_payload_bounds=(certificate.input_payload_bounds[0] - 1,),
+            ),
+        ),
+        (
+            "state_payload_bounds",
+            replace(
+                certificate,
+                state_payload_bounds=(
+                    certificate.state_payload_bounds[0] - 1,
+                    certificate.state_payload_bounds[1],
+                ),
+            ),
+        ),
+        (
+            "maximum_state_accumulator_bounds",
+            replace(
+                certificate,
+                maximum_state_accumulator_bounds=(
+                    certificate.maximum_state_accumulator_bounds[0] - 1,
+                    certificate.maximum_state_accumulator_bounds[1],
+                ),
+            ),
+        ),
+        (
+            "maximum_output_accumulator_bounds",
+            replace(
+                certificate,
+                maximum_output_accumulator_bounds=(
+                    certificate.maximum_output_accumulator_bounds[0] - 1,
+                ),
+            ),
+        ),
+    )
+
+    for field_name, smaller in smaller_certificates:
+        scenario.safety_certificate = smaller
+        with pytest.raises(ValueError, match=field_name):
+            scenario.build_plan()
 
 
 def test_2r2c_secure_runtime_rejects_step_beyond_certified_horizon() -> None:

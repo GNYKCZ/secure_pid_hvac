@@ -439,7 +439,26 @@ def evaluate_hvac_comparison_metrics(
     contract: HvacScenarioContract,
     quality_contract: HvacControlQualityContract,
 ) -> HvacComparisonMetrics:
-    """从正式八字段结果计算两支品质与明文/安全差异。"""
+    """从正式八字段结果计算两支品质，并严格核对冗余差值字段。"""
+    expected_control_difference = np.asarray(result.control_ideal, dtype=float) - np.asarray(
+        result.control_secure, dtype=float
+    )
+    expected_temperature_difference = np.asarray(result.output_ideal, dtype=float) - np.asarray(
+        result.output_secure, dtype=float
+    )
+    saved_control_difference = np.asarray(result.control_error, dtype=float)
+    saved_temperature_difference = np.asarray(result.output_error, dtype=float)
+    for name, saved, expected in (
+        ("control_error", saved_control_difference, expected_control_difference),
+        ("output_error", saved_temperature_difference, expected_temperature_difference),
+    ):
+        if saved.shape != expected.shape:
+            raise ValueError(f"{name} shape 必须与对应 ideal/secure 轨迹差值一致")
+        if not np.isfinite(saved).all() or not np.isfinite(expected).all():
+            raise FloatingPointError(f"{name} 或对应轨迹差值包含 NaN 或无穷大")
+        # error 是通用结果中的冗余派生字段；逐值核对后仍以原始两支轨迹差值为指标唯一来源。
+        if not np.array_equal(saved, expected):
+            raise ValueError(f"{name} 必须逐值等于对应 ideal/secure 轨迹差值")
     ideal = evaluate_hvac_branch_metrics(
         time=result.time,
         reference=result.reference,
@@ -456,10 +475,8 @@ def evaluate_hvac_comparison_metrics(
         contract=contract,
         quality_contract=quality_contract,
     )
-    control_difference = np.asarray(result.control_error, dtype=float)
-    temperature_difference = np.asarray(result.output_error, dtype=float)
-    if not np.isfinite(control_difference).all() or not np.isfinite(temperature_difference).all():
-        raise FloatingPointError("安全/明文差异包含 NaN 或无穷大")
+    control_difference = expected_control_difference
+    temperature_difference = expected_temperature_difference
     control_abs = np.abs(control_difference)
     temperature_abs = np.abs(temperature_difference)
     values = (
