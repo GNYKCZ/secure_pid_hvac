@@ -12,13 +12,22 @@ import yaml
 
 from secure_control.execution import PlaintextStateSpaceRuntime
 from secure_control.scenarios.hvac import (
+    HvacBranchMetrics,
+    HvacGainSearchAxis,
     HvacPidDesign,
+    HvacPidTuningContract,
+    HvacSegmentMetric,
+    HvacTuningInfeasibleError,
     load_hvac_pid_design,
+    load_hvac_pid_tuning_contract,
     load_hvac_scenario_contract,
     run_plaintext_hvac_baseline,
+    tune_hvac_pid,
 )
 
 PID_CONFIG_PATH = Path(__file__).parents[1] / "configs" / "hvac_pid_baseline.yaml"
+PLANT_2R2C_PATH = Path(__file__).parents[1] / "configs" / "hvac_2r2c_plant.yaml"
+PID_2R2C_PATH = Path(__file__).parents[1] / "configs" / "hvac_2r2c_pid_baseline.yaml"
 
 
 def _contract_and_design():
@@ -154,3 +163,72 @@ def test_plaintext_hvac_baseline_meets_predefined_bounds_and_tracking_metrics() 
     # 首步 raw PID 输出为 12.5 kW，但场景在 plant 前裁剪为 12 kW；runtime 内没有 saturation。
     assert np.allclose(result.raw_control_ideal[0], np.array([12.5]))
     assert np.array_equal(result.control_ideal[0], np.array([12.0]))
+
+
+def test_2r2c_tuner_reproduces_frozen_unique_selection_and_audit_counts() -> None:
+    """正式 exhaustive tuner 必须重现配置 gains、10179 候选和唯一 objective。"""
+    contract = load_hvac_scenario_contract(PLANT_2R2C_PATH)
+    selected, tuning, quality = load_hvac_pid_tuning_contract(PID_2R2C_PATH, contract)
+    result = tune_hvac_pid(contract, tuning, quality)
+
+    assert result.selected_design == selected
+    assert result.evaluated_candidate_count == 10179
+    assert result.feasible_candidate_count == 679
+    assert result.selected_objective == pytest.approx(
+        (0.0597207712547501, 1.1932930117280225, 1 / 30, 0.5, 0.0007, 0.85, -0.85, -0.0007, -0.5)
+    )
+    assert result.rejection_counts["segment_0:settling_time_seconds"] == 6419
+    with pytest.raises(TypeError):
+        result.rejection_counts["changed"] = 1  # type: ignore[index]
+
+    baseline = run_plaintext_hvac_baseline(contract, selected)
+    assert baseline.output_ideal.shape == (180, 1)
+    assert [metric.tail_mae_celsius for metric in baseline.segment_metrics] == pytest.approx(
+        [0.022305476494438637, 0.0597207712547501, 0.030022651226448715]
+    )
+
+
+def test_tuner_reports_explicit_infeasible_result_without_relaxing_thresholds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """全部候选失败时必须抛出诊断异常，不能调整门槛或返回次优 gains。"""
+    from secure_control.scenarios.hvac import tuning as tuning_module
+
+    contract = load_hvac_scenario_contract(PLANT_2R2C_PATH)
+    _, _, quality = load_hvac_pid_tuning_contract(PID_2R2C_PATH, contract)
+    search = HvacPidTuningContract(
+        HvacGainSearchAxis(-1.5, -0.2, 27),
+        HvacGainSearchAxis(-0.0015, -0.0001, 29),
+        HvacGainSearchAxis(-6.0, 0.0, 13),
+        "deterministic_exhaustive_grid_v1",
+        (
+            "maximum_segment_tail_mae_celsius",
+            "mean_segment_mae_celsius",
+            "global_saturation_fraction",
+        ),
+        (
+            "absolute_derivative_gain",
+            "absolute_integral_gain",
+            "absolute_proportional_gain",
+            "proportional_gain",
+            "integral_gain",
+            "derivative_gain",
+        ),
+    )
+    failed_metric = HvacSegmentMetric(
+        0, 3600, 15.0, 99.0, 99.0, 99.0, None, 99.0, -99.0, 1.0, 12.0, False, ("mae_celsius",)
+    )
+    failed_branch = HvacBranchMetrics((failed_metric,), 99.0, 1.0, 12.0, False)
+    baseline = run_plaintext_hvac_baseline(
+        contract, HvacPidDesign(-0.85, -0.0007, -0.5, 60, 0.0, 0.0, 600, 0.5)
+    )
+    monkeypatch.setattr(tuning_module, "run_plaintext_hvac_baseline", lambda *args: baseline)
+    monkeypatch.setattr(
+        tuning_module, "evaluate_hvac_branch_metrics", lambda **kwargs: failed_branch
+    )
+
+    with pytest.raises(HvacTuningInfeasibleError) as captured:
+        tune_hvac_pid.__wrapped__(contract, search, quality)  # type: ignore[attr-defined]
+    assert captured.value.evaluated_candidate_count == 10179
+    assert captured.value.best_failed_design is not None
+    assert captured.value.violations == ("segment_0:mae_celsius",)

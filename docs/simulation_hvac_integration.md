@@ -75,3 +75,25 @@ uv run ruff check .
 测试 seed 只保证隔离研究复现；默认 `None` 使用安全随机材料源，不承诺按位相同。
 当前 backend 仍是单进程协调器；正式结果持久化现由独立 `experiments` 层承担，
 见[实验产物约定](experiment_schema.md)。本场景级 CLI 仍只输出摘要；绘图仍属于 #14。
+
+## 2R2C 最终基线
+
+Issue #42 在不改变通用 simulation/result/artifact 接口的前提下增加
+`configs/hvac_2r2c_dual_loop.yaml`。两支仍各自拥有独立 plant、adapter、runtime 和安全会话；
+plant 内部状态为 `[T_air,T_wall]`，但反馈、正式 output 和绘图只使用 `T_air`。
+
+2R2C 路径先用 exact-ZOH 矩阵与 `[0,12] kW` 完整 actuator 区间传播 180 步二维物理界，
+再传播 `e/I/e_previous/raw u`，并将相同编码 input/state 界交给
+`ControllerRangeContract(horizon_steps=180)`。证书同时记录 state/output accumulator 最大界、
+centered modulus limit 和当前整数 `A/B` realization 的 `state_truncation_bits=0`。这些都是有限时域
+先验范围，不能外推到第 181 步或无限时域。
+
+场景层计算 ideal/secure 每个 reference 区段的 MAE、tail MAE、最大误差、持续调节时间、
+有符号偏差、饱和占比和最大 applied control，并计算 `u-û`、`T_air-T̂_air` 的 max/mean/RMS。
+正式产物仍是相同八字段 schema，现有 reader 与 plotting 直接生成 tracking、applied control、
+有符号 control error 和有符号 output error 四类图，不重新运行闭环。
+
+```powershell
+uv run python -m secure_control.scenarios.hvac.runner --config configs/hvac_2r2c_dual_loop.yaml --seed 42
+uv run python -m secure_control.experiments.runner --config configs/hvac_2r2c_dual_loop.yaml --seed 42
+```

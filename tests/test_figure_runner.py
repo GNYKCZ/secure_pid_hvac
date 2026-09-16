@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import tempfile
+from hashlib import sha256
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +18,7 @@ from secure_control.simulation import ChannelMetadata, ScenarioMetadata, Simulat
 
 PROJECT_ROOT = Path(__file__).parents[1]
 HVAC_CONFIG = PROJECT_ROOT / "configs" / "hvac_dual_loop.yaml"
+HVAC_2R2C_CONFIG = PROJECT_ROOT / "configs" / "hvac_2r2c_dual_loop.yaml"
 
 
 def _vector_run(tmp_path: Path) -> RunArtifacts:
@@ -113,6 +116,34 @@ def test_hvac_default_cli_renders_four_saved_run_figures_without_new_controller_
     assert all(
         (render_dirs[0].parent / entry["filename"]).is_file() for entry in manifest["figures"]
     )
+
+
+def test_2r2c_saved_run_renders_four_figures_with_same_source_manifest(tmp_path: Path) -> None:
+    """2R2C 正式 run 直接经 reader 生成四类图，manifest 绑定同一 source hash。"""
+    published = run_experiment(HVAC_2R2C_CONFIG, test_seed=42, output_root=tmp_path / "2R2C CSV")
+    from secure_control.experiments.plotting import PlotSelection, render_saved_run
+
+    # Windows 的传统路径上限较短，单独使用系统临时根目录验证正式批次发布。
+    with tempfile.TemporaryDirectory(prefix="sp42-") as short_root:
+        figures = render_saved_run(
+            published.run_dir,
+            PlotSelection(((0, 0),), (0,), "linear", "h", "png"),
+            output_root=short_root,
+        )
+        manifest = json.loads(figures.manifest_path.read_text(encoding="utf-8"))
+        assert len(figures.figure_paths) == 4
+        assert manifest["source_run_id"] == published.run_id
+        assert (
+            manifest["source_files_sha256"]["trajectory.csv"]
+            == sha256(published.trajectory_path.read_bytes()).hexdigest()
+        )
+        assert {item["category"] for item in manifest["figures"]} == {
+            "tracking",
+            "control",
+            "control_error",
+            "output_error",
+        }
+        assert manifest["figures"][0]["channels"]["output"]["name"] == "air_temperature"
 
 
 def test_vector_cli_repeated_channel_pairs_and_pdf_output(tmp_path: Path) -> None:

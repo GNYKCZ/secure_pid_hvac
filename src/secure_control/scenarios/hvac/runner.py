@@ -21,7 +21,7 @@ def main() -> None:
     comparison = run_hvac_dual_loop(args.config, test_seed=args.seed)
     result = comparison.result
     certificate = comparison.safety_certificate
-    summary = {
+    summary: dict[str, object] = {
         "sample_count": int(result.time.size),
         "maximum_applied_control_error_kw": float(np.max(np.abs(result.control_error))),
         "maximum_output_error_celsius": float(np.max(np.abs(result.output_error))),
@@ -32,10 +32,26 @@ def main() -> None:
             metric.tail_mae_celsius for metric in comparison.segment_metrics_secure
         ],
         "finite_horizon_steps": certificate.horizon_steps,
-        "temperature_bounds_celsius": certificate.temperature_bounds_celsius,
-        "input_payload_bound": certificate.input_payload_bound,
+        "plant_state_names": certificate.plant_state_names,
+        "plant_state_bounds_celsius": certificate.plant_state_bounds_celsius,
+        "controller_input_bounds_celsius": certificate.controller_input_bounds_celsius,
+        "input_payload_bounds": certificate.input_payload_bounds,
         "state_payload_bounds": certificate.state_payload_bounds,
+        "maximum_state_accumulator_bounds": certificate.maximum_state_accumulator_bounds,
+        "maximum_output_accumulator_bounds": certificate.maximum_output_accumulator_bounds,
+        "state_truncation_bits": certificate.state_truncation_bits,
     }
+    if comparison.comparison_metrics is not None:
+        metrics = comparison.comparison_metrics
+        summary["quality_passed"] = metrics.passed
+        summary["comparison"] = {
+            "max_control_error_kw": metrics.max_control_error_kw,
+            "mean_control_error_kw": metrics.mean_control_error_kw,
+            "rms_control_error_kw": metrics.rms_control_error_kw,
+            "max_temperature_error_celsius": metrics.max_temperature_error_celsius,
+            "mean_temperature_error_celsius": metrics.mean_temperature_error_celsius,
+            "rms_temperature_error_celsius": metrics.rms_temperature_error_celsius,
+        }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 

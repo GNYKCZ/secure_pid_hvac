@@ -8,8 +8,8 @@ GitHub 仓库和发行包继续使用 `secure_pid_hvac` / `secure-pid-hvac`，Py
 `secure_control`。HVAC 是第一个场景，不是核心领域；它的模型、参考轨迹、PID 设计、信号适配、
 单位和指标应集中在 `secure_control.scenarios.hvac`。
 
-当前已完成架构基础、HVAC 明文基线、安全算术原语与组合验证门、通用 Client/P1/P2 单进程协议
-核心、与明文接口兼容的通用安全状态空间运行时，以及领域无关 simulation engine 和
+当前已完成架构基础、一阶与 2R2C HVAC 明文基线、安全算术原语与组合验证门、通用
+Client/P1/P2 单进程协议核心、与明文接口兼容的通用安全状态空间运行时，以及领域无关 simulation engine 和
 180 步 HVAC 明文/安全双闭环。尚未实现 multiprocessing 或网络通信。
 现已提供显式场景选择的实验入口与通用 CSV/metadata/config 产物。
 
@@ -80,6 +80,7 @@ scenario:
 
 ```powershell
 uv run python -m secure_control.scenarios.hvac.runner --config configs/hvac_dual_loop.yaml --seed 12
+uv run python -m secure_control.scenarios.hvac.runner --config configs/hvac_2r2c_dual_loop.yaml --seed 42
 ```
 
 `--seed` 仅用于隔离测试复现；省略时使用安全随机材料源。CLI 只输出摘要，不保存 #13 的
@@ -88,10 +89,16 @@ uv run python -m secure_control.scenarios.hvac.runner --config configs/hvac_dual
 [HVAC PID 设计](docs/hvac_pid_design.md)；完整场景约定见
 [HVAC 场景契约](docs/hvac_scenario_contract.md)。
 
+2R2C 配置使用确定性 10,179 候选 plaintext exhaustive grid，冻结 gains 为
+`Kp=-0.85, Ki=-0.0007, Kd=-0.5`。调参规则、完整指标、二维有限时域范围和论文适配边界见
+[2R2C HVAC PID 设计](docs/hvac_2r2c_pid_design.md)。该结果是 adapted application，不能称为
+论文原数值实验复刻，也不声明无限时域稳定性。
+
 保存正式八字段实验产物使用独立入口，不改变上面的场景级摘要 CLI：
 
 ```powershell
 uv run python -m secure_control.experiments.runner --config configs/hvac_dual_loop.yaml --seed 12
+uv run python -m secure_control.experiments.runner --config configs/hvac_2r2c_dual_loop.yaml --seed 42
 ```
 
 每次运行创建独立的 `results/csv/<run_id>/trajectory.csv`、`metadata.json` 和

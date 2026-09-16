@@ -1,0 +1,111 @@
+# Issue #42 冻结的 2R2C plaintext PID 调参与品质契约。
+scenario:
+  name: hvac
+plant_config: hvac_2r2c_plant.yaml
+plant_sha256: 54d980b7b3d5ef7f9187de008a78348748f0246193fc8bdaf4ef9a3f6be33dbd
+
+controller:
+  kind: positional_pid_error_derivative
+  proportional_gain_kw_per_celsius: -0.85
+  integral_gain_kw_per_celsius_second: -0.0007
+  derivative_gain_kw_second_per_celsius: -0.5
+  initial_integral_error_celsius_seconds: 0.0
+  initial_previous_error_celsius: 0.0
+  derivative_filter: none
+  anti_windup: disabled
+  output_saturation: scenario_before_plant
+
+tracking:
+  tail_window_seconds: 600
+  max_tail_mae_celsius: 0.5
+
+tuning:
+  algorithm: deterministic_exhaustive_grid_v1
+  axes:
+    proportional: {minimum: -1.50, maximum: -0.20, points: 27}
+    integral: {minimum: -0.00150, maximum: -0.00010, points: 29}
+    derivative: {minimum: -6.0, maximum: 0.0, points: 13}
+  objective_order:
+    - maximum_segment_tail_mae_celsius
+    - mean_segment_mae_celsius
+    - global_saturation_fraction
+  tie_break_order:
+    - absolute_derivative_gain
+    - absolute_integral_gain
+    - absolute_proportional_gain
+    - proportional_gain
+    - integral_gain
+    - derivative_gain
+  result:
+    evaluated_candidate_count: 10179
+    feasible_candidate_count: 679
+    selected_objective:
+      - 0.0597207712547501
+      - 1.1932930117280225
+      - 0.03333333333333333
+      - 0.5
+      - 0.0007
+      - 0.85
+      - -0.85
+      - -0.0007
+      - -0.5
+    rejection_counts:
+      segment_0_mae_celsius: 3718
+      segment_0_tail_mae_celsius: 4010
+      segment_0_settling_time_seconds: 6419
+      segment_0_min_signed_deviation_celsius: 4342
+      segment_3600_mae_celsius: 1789
+      segment_3600_tail_mae_celsius: 796
+      segment_3600_max_abs_error_celsius: 4616
+      segment_3600_settling_time_seconds: 3194
+      segment_3600_max_signed_deviation_celsius: 2769
+      segment_3600_min_signed_deviation_celsius: 4616
+      segment_7200_mae_celsius: 1930
+      segment_7200_tail_mae_celsius: 914
+      segment_7200_max_abs_error_celsius: 13
+      segment_7200_settling_time_seconds: 3906
+      segment_7200_max_signed_deviation_celsius: 2391
+      segment_7200_min_signed_deviation_celsius: 13
+      segment_7200_saturation_fraction: 2435
+
+quality:
+  tail_window_seconds: 600
+  settling_band_celsius: 0.5
+  saturation_tolerance_kw: 1.0e-9
+  max_segment_saturation_fraction: 0.15
+  max_segment_applied_control_kw: 12.0
+  segments:
+    - start_seconds: 0
+      end_seconds: 3600
+      target_temperature_celsius: 15.0
+      max_mae_celsius: 3.0
+      max_tail_mae_celsius: 0.5
+      max_abs_error_celsius: 15.0
+      max_settling_time_seconds: 2400.0
+      max_signed_deviation_celsius: 15.0
+      min_signed_deviation_celsius: -0.5
+    - start_seconds: 3600
+      end_seconds: 7200
+      target_temperature_celsius: 20.0
+      max_mae_celsius: 1.0
+      max_tail_mae_celsius: 0.5
+      max_abs_error_celsius: 5.0
+      max_settling_time_seconds: 1800.0
+      max_signed_deviation_celsius: 0.5
+      min_signed_deviation_celsius: -5.0
+    - start_seconds: 7200
+      end_seconds: 10800
+      target_temperature_celsius: 25.0
+      max_mae_celsius: 1.2
+      max_tail_mae_celsius: 0.5
+      max_abs_error_celsius: 5.5
+      max_settling_time_seconds: 1800.0
+      max_signed_deviation_celsius: 0.5
+      min_signed_deviation_celsius: -5.5
+  comparison:
+    max_control_error_kw: 0.01
+    mean_control_error_kw: 0.005
+    rms_control_error_kw: 0.005
+    max_temperature_error_celsius: 0.01
+    mean_temperature_error_celsius: 0.005
+    rms_temperature_error_celsius: 0.005

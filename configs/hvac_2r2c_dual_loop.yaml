@@ -1,0 +1,10 @@
+# Issue #42 2R2C 明文/安全双闭环外壳；PID 文件继续引用唯一 plant 权威配置。
+scenario:
+  name: hvac
+baseline_config: hvac_2r2c_pid_baseline.yaml
+security:
+  modulus: 2305843009213693951
+  integer_bits: 48
+  fractional_bits: 20
+  security_parameter: 8
+  horizon_steps: 180
