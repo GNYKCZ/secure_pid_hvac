@@ -6,7 +6,6 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 import yaml
 
@@ -16,7 +15,11 @@ from secure_control.experiments.sweep import (
     load_precision_sweep_definition,
     materialize_point_config,
 )
-from secure_control.experiments.sweep_runner import derive_protocol_cost
+from secure_control.experiments.sweep_runner import (
+    _run_child,
+    build_preflight_report,
+    derive_protocol_cost,
+)
 from secure_control.scenarios.hvac.integration import HvacSafetyCertificate, HvacScenario
 
 PROJECT_ROOT = Path(__file__).parents[1]
@@ -87,7 +90,7 @@ def test_protocol_cost_is_derived_from_actual_shapes_and_zero_truncation_ledger(
     assert cost.q_bit_length == 256
     assert cost.wall_clock_seconds == 1.25
     assert SweepRunStatus.SUCCESS.value == "success"
-    assert asdict(cost)["timing_scope"] == "validated_point_execution_and_artifact_write"
+    assert asdict(cost)["timing_scope"] == "child_start_through_atomic_point_result"
 
 
 def test_runner_publishes_success_infeasible_and_failed_points_atomically(
@@ -96,86 +99,114 @@ def test_runner_publishes_success_infeasible_and_failed_points_atomically(
     """单点不可行或异常不吞掉诊断，也不阻止完整批次原子发布。"""
     loaded = load_precision_sweep_definition(DEFINITION_PATH)
     definition = replace(loaded, fractional_bits=(32,), seeds=(42, 43, 44))
-    centered_limit = (definition.q - 1) // 2
-
-    class FakeScenario:
-        """只为状态编排测试提供最小场景边界，不替代数值集成测试。"""
-
-        scenario_version = "1"
-
-        def __init__(self, _path: Path, *, test_seed: int) -> None:
-            self.seed = test_seed
-            payload = (1 << 59) if test_seed == 43 else 1
-            self.safety_certificate = HvacSafetyCertificate(
-                180,
-                ("plant",),
-                ((0.0, 1.0),),
-                (-1.0, 1.0),
-                ("state",),
-                ((-1.0, 1.0),),
-                (-1.0, 1.0),
-                (0.0, 1.0),
-                (payload,),
-                (1,),
-                (1,),
-                (1,),
-                centered_limit,
-                0,
-            )
-            self.metadata = SimpleNamespace(name="hvac")
-
-        def build_plan(self) -> SimpleNamespace:
-            """第三个 seed 模拟资源建立后的执行异常。"""
-            if self.seed == 44:
-                raise RuntimeError("simulated point failure")
-            runtime = SimpleNamespace(
-                spec=SimpleNamespace(state_dimension=2, input_dimension=1, output_dimension=1),
-                scale_ledger=SimpleNamespace(state_truncation_bits=0),
-                modulus_verification=SimpleNamespace(bit_length=256),
-            )
-            return SimpleNamespace(
-                ideal=object(),
-                secure=SimpleNamespace(runtime=runtime),
-                sample_times=np.arange(2, dtype=float),
-            )
-
-        def metrics_snapshot(self, _result: object) -> dict[str, bool]:
-            """返回最小场景指标快照。"""
-            return {"passed": True}
-
-        def effective_config_snapshot(self) -> dict[str, object]:
-            """返回 fake writer 不解释的最小快照。"""
-            return {"scenario": {"name": "hvac", "version": "1"}}
-
-    result = SimpleNamespace(
-        output_error=np.array([[0.0], [0.25]]),
-        control_error=np.array([[0.0], [0.5]]),
-    )
-
-    def fake_write(*_args: object, output_root: Path, **_kwargs: object) -> SimpleNamespace:
-        """为编排测试创建最短已发布 run 路径。"""
-        run_dir = Path(output_root) / "run"
-        run_dir.mkdir(parents=True)
-        return SimpleNamespace(run_dir=run_dir)
-
     stable = {"schur": {"status": "stable"}, "equilibria": [{"applicability": "applicable"}]}
+    outcomes = iter(
+        (
+            sweep_runner._ChildResult(None, True, "", ""),
+            sweep_runner._ChildResult(7, False, "", "worker failed"),
+            sweep_runner._ChildResult(0, False, "", ""),
+        )
+    )
     monkeypatch.setattr(sweep_runner, "load_precision_sweep_definition", lambda _path: definition)
     monkeypatch.setattr(
         sweep_runner, "stability_report_sha256", lambda _plant, _pid: ("hash", stable)
     )
     monkeypatch.setattr(sweep_runner, "_frozen_sources", lambda _definition, _hash: (True, {}))
-    monkeypatch.setattr(sweep_runner, "HvacScenario", FakeScenario)
-    monkeypatch.setattr(sweep_runner, "compare_closed_loops", lambda *_args: result)
-    monkeypatch.setattr(sweep_runner, "collect_provenance", lambda **_kwargs: {})
-    monkeypatch.setattr(sweep_runner, "write_artifacts", fake_write)
-    monkeypatch.setattr(sweep_runner, "render_saved_run", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(sweep_runner, "render_sweep_figures", lambda *_args, **_kwargs: ())
+    monkeypatch.setattr(sweep_runner, "_run_child", lambda *_args, **_kwargs: next(outcomes))
 
     artifacts = sweep_runner.run_precision_sweep(DEFINITION_PATH, output_root=tmp_path / "out")
     assert [record.status for record in artifacts.records] == [
-        SweepRunStatus.SUCCESS,
-        SweepRunStatus.INFEASIBLE,
         SweepRunStatus.FAILED,
+        SweepRunStatus.FAILED,
+        SweepRunStatus.FAILED,
+    ]
+    assert [record.failure_code for record in artifacts.records] == [
+        "point_timeout",
+        "worker_nonzero_exit",
+        "worker_result_invalid",
     ]
     assert artifacts.manifest_path.is_file()
     assert not list((tmp_path / "out").glob(".incomplete-*"))
+
+
+@pytest.mark.parametrize(
+    ("kappa_offset", "expected_reason"),
+    [(0, "kappa_not_greater_than_ell"), (-1, "kappa_not_greater_than_ell")],
+)
+def test_preflight_rejects_kappa_at_or_below_ell(kappa_offset: int, expected_reason: str) -> None:
+    """协议参数不满足 runtime 的严格边界时必须在 preflight 判为不可行。"""
+    definition = load_precision_sweep_definition(DEFINITION_PATH)
+    base = definition.points[0]
+    ell = base.kappa - kappa_offset
+    point = replace(base, ell=ell, k=ell + 28)
+    scenario = _minimal_preflight_scenario(definition.q)
+    report = build_preflight_report(
+        point,
+        scenario,
+        stability_passed=True,
+        prime_evidence_passed=True,
+        frozen_fields_passed=True,
+    )
+    assert not report.feasible
+    assert expected_reason in report.reason_codes
+
+
+def test_preflight_accepts_kappa_equal_ell_plus_one_and_rejects_derived_mismatch() -> None:
+    """门禁边界与保存的派生 kappa 都必须和 runtime 公式一致。"""
+    definition = load_precision_sweep_definition(DEFINITION_PATH)
+    base = definition.points[0]
+    ell = base.kappa - 1
+    point = replace(base, ell=ell, k=ell + 28)
+    scenario = _minimal_preflight_scenario(definition.q)
+    accepted = build_preflight_report(
+        point,
+        scenario,
+        stability_passed=True,
+        prime_evidence_passed=True,
+        frozen_fields_passed=True,
+    )
+    assert "kappa_not_greater_than_ell" not in accepted.reason_codes
+    mismatch = build_preflight_report(
+        replace(point, kappa=point.kappa - 1),
+        scenario,
+        stability_passed=True,
+        prime_evidence_passed=True,
+        frozen_fields_passed=True,
+    )
+    assert not mismatch.feasible
+    assert "derived_kappa_mismatch" in mismatch.reason_codes
+
+
+def test_real_child_timeout_is_bounded_and_reaped() -> None:
+    """Windows/Python 3.11 下真实阻塞 child 必须在 deadline 后被终止并回收。"""
+    import sys
+
+    result = _run_child([sys.executable, "-c", "import time; time.sleep(30)"], timeout_seconds=1)
+    assert result.timed_out
+    assert result.returncode is None
+    following = _run_child([sys.executable, "-c", "print('next')"], timeout_seconds=5)
+    assert not following.timed_out
+    assert following.returncode == 0
+    assert following.stdout.strip() == "next"
+
+
+def _minimal_preflight_scenario(q: int) -> SimpleNamespace:
+    """为纯 preflight 边界测试提供不会触发其他范围拒绝的最小证书。"""
+    return SimpleNamespace(
+        safety_certificate=HvacSafetyCertificate(
+            1,
+            ("plant",),
+            ((0.0, 1.0),),
+            (-1.0, 1.0),
+            ("state",),
+            ((-1.0, 1.0),),
+            (-1.0, 1.0),
+            (0.0, 1.0),
+            (1,),
+            (1,),
+            (1,),
+            (1,),
+            (q - 1) // 2,
+            0,
+        )
+    )

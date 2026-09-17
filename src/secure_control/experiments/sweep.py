@@ -58,6 +58,10 @@ class PrecisionSweepDefinition:
     primary_seed: int
     allowed_variable_fields: tuple[str, ...]
     timeout_seconds: int
+    max_protocol1_triples_per_point: int
+    max_protocol2_truncations_per_point: int
+    max_certified_integer_bit_length: int
+    max_artifact_bytes: int
     q: int
     modulus_evidence: Mapping[str, Any]
 
@@ -186,6 +190,10 @@ def load_precision_sweep_definition(path: str | Path) -> PrecisionSweepDefinitio
         "primary_seed",
         "allowed_variable_fields",
         "timeout_seconds",
+        "max_protocol1_triples_per_point",
+        "max_protocol2_truncations_per_point",
+        "max_certified_integer_bit_length",
+        "max_artifact_bytes",
     }
     if set(loaded) != required or loaded["schema_version"] != 1:
         raise ValueError("precision sweep 字段或 schema_version 无效")
@@ -216,6 +224,20 @@ def load_precision_sweep_definition(path: str | Path) -> PrecisionSweepDefinitio
         for item in (headroom, security_parameter, timeout)
     ):
         raise ValueError("headroom、security parameter 和 timeout 必须是正整数")
+    resource_limits = (
+        loaded["max_protocol1_triples_per_point"],
+        loaded["max_protocol2_truncations_per_point"],
+        loaded["max_certified_integer_bit_length"],
+        loaded["max_artifact_bytes"],
+    )
+    if any(isinstance(item, bool) or not isinstance(item, int) for item in resource_limits):
+        raise TypeError("resource limits 必须是整数")
+    if (
+        resource_limits[0] <= 0
+        or resource_limits[1] < 0
+        or any(item <= 0 for item in resource_limits[2:])
+    ):
+        raise ValueError("resource limits 必须满足正值约束")
     hashes = loaded["source_hashes"]
     if not isinstance(hashes, Mapping) or set(hashes) != {"wrapper", "baseline", "plant"}:
         raise ValueError("source_hashes 必须冻结 wrapper/baseline/plant")
@@ -245,6 +267,10 @@ def load_precision_sweep_definition(path: str | Path) -> PrecisionSweepDefinitio
         primary_seed=primary_seed,
         allowed_variable_fields=expected_allowed,
         timeout_seconds=timeout,
+        max_protocol1_triples_per_point=resource_limits[0],
+        max_protocol2_truncations_per_point=resource_limits[1],
+        max_certified_integer_bit_length=resource_limits[2],
+        max_artifact_bytes=resource_limits[3],
         q=q,
         modulus_evidence=dict(evidence),
     )

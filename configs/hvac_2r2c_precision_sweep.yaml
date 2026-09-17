@@ -21,3 +21,7 @@ allowed_variable_fields:
   - security.security_parameter
   - security.modulus_evidence
 timeout_seconds: 300
+max_protocol1_triples_per_point: 1620
+max_protocol2_truncations_per_point: 0
+max_certified_integer_bit_length: 192
+max_artifact_bytes: 1048576

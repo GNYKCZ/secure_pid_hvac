@@ -7,7 +7,9 @@ import json
 import os
 import secrets
 import shutil
-from dataclasses import asdict
+import subprocess
+import sys
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -16,12 +18,10 @@ from typing import Any
 
 import yaml
 
-from secure_control.experiments.artifacts import SCHEMA_VERSION, write_artifacts
+from secure_control.experiments.artifacts import load_artifacts
 from secure_control.experiments.plotting import PlotDisplay, PlotSelection, render_saved_run
-from secure_control.experiments.provenance import collect_provenance
 from secure_control.scenarios.hvac.integration import HvacSafetyCertificate, HvacScenario
 from secure_control.scenarios.hvac.stability import analyze_hvac_closed_loop_stability
-from secure_control.simulation import compare_closed_loops
 
 from .sweep import (
     PrecisionPreflightReport,
@@ -37,13 +37,65 @@ from .sweep import (
     materialize_point_config,
 )
 from .sweep_artifacts import (
+    build_summary_payload,
+    load_verified_sweep_data,
+    record_from_payload,
+    write_data_manifest,
     write_definition,
     write_json,
     write_manifest,
+    write_range_margins,
     write_summary,
 )
-from .sweep_metrics import aggregate_error_metrics, compute_error_metrics
 from .sweep_plotting import render_sweep_figures
+
+
+@dataclass(frozen=True, slots=True)
+class _ChildResult:
+    """保存一个直接子进程的有界输出、退出状态和 deadline 结果。"""
+
+    returncode: int | None
+    timed_out: bool
+    stdout: str
+    stderr: str
+    elapsed_seconds: float = 0.0
+
+
+def _bounded_text(value: str | bytes | None, limit: int = 4096) -> str:
+    """把 worker 输出统一为 UTF-8 文本并保留有界尾部诊断。"""
+    if value is None:
+        return ""
+    text = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+    return text[-limit:]
+
+
+def _run_child(command: list[str], *, timeout_seconds: int) -> _ChildResult:
+    """以 shell=False 运行一个直接子进程，deadline 后杀死并完成回收。"""
+    started = perf_counter()
+    try:
+        completed = subprocess.run(
+            command,
+            shell=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        return _ChildResult(
+            None,
+            True,
+            _bounded_text(error.stdout),
+            _bounded_text(error.stderr),
+            perf_counter() - started,
+        )
+    return _ChildResult(
+        completed.returncode,
+        False,
+        _bounded_text(completed.stdout),
+        _bounded_text(completed.stderr),
+        perf_counter() - started,
+    )
 
 
 def _source_paths(definition: PrecisionSweepDefinition) -> tuple[Path, Path, Path]:
@@ -74,11 +126,11 @@ def _margin(name: str, bound: int, limit: int) -> RangeMargin:
 
 
 def build_preflight_report(
-    definition: PrecisionSweepDefinition,
     point: SweepPointDefinition,
     scenario: HvacScenario,
     *,
     stability_passed: bool,
+    prime_evidence_passed: bool,
     frozen_fields_passed: bool,
 ) -> PrecisionPreflightReport:
     """在安全 session 建立前核对来源、素数和全部 payload/accumulator 界。"""
@@ -108,14 +160,18 @@ def build_preflight_report(
         reasons.append("stability_gate_failed")
     if not frozen_fields_passed:
         reasons.append("frozen_source_mismatch")
-    if canonical_file_sha256(definition.prime_evidence_path) != definition.prime_evidence_hash:
+    if not prime_evidence_passed:
         reasons.append("prime_evidence_hash_mismatch")
+    derived_kappa = point.q.bit_length() - point.lambda_ - 2
+    if point.kappa != derived_kappa:
+        reasons.append("derived_kappa_mismatch")
+    if point.kappa <= point.ell:
+        reasons.append("kappa_not_greater_than_ell")
     if any(item.remaining_margin < 0 for item in ranges):
         reasons.append("certified_range_exceeded")
-    prime_passed = not any(reason.startswith("prime_evidence") for reason in reasons)
     return PrecisionPreflightReport(
         stability_passed,
-        prime_passed,
+        prime_evidence_passed,
         frozen_fields_passed,
         ranges,
         not reasons,
@@ -148,7 +204,7 @@ def derive_protocol_cost(
         runtime.modulus_verification.bit_length,
         max(value.bit_length() for value in certified),
         wall_clock_seconds,
-        "validated_point_execution_and_artifact_write",
+        "child_start_through_atomic_point_result",
     )
 
 
@@ -181,36 +237,65 @@ def _new_sweep_id() -> str:
     return f"{now}-{secrets.token_hex(6)}"
 
 
-def _aggregate(records: tuple[SweepRunRecord, ...], stability: dict[str, Any]) -> dict[str, Any]:
-    """按 ell 汇总三次 seed 的误差，同时保留稳定性 claim boundary。"""
-    by_ell: dict[str, Any] = {}
-    for ell in sorted({record.point.ell for record in records}):
-        selected = [
-            record
-            for record in records
-            if record.point.ell == ell and record.status is SweepRunStatus.SUCCESS
+def _failed_record(point: SweepPointDefinition, code: str, message: str) -> SweepRunRecord:
+    """构造父进程可稳定发布的失败记录。"""
+    return SweepRunRecord(
+        point,
+        SweepRunStatus.FAILED,
+        _failure_preflight(code),
+        None,
+        None,
+        None,
+        None,
+        None,
+        code,
+        message,
+    )
+
+
+def _attempt_member(attempt: Path, relative: str) -> Path:
+    """将 worker 返回路径约束在本次 attempt，拒绝绝对路径和逃逸。"""
+    candidate = Path(relative)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise ValueError("worker_result_path_escape")
+    resolved = (attempt / candidate).resolve()
+    try:
+        resolved.relative_to(attempt.resolve())
+    except ValueError as error:
+        raise ValueError("worker_result_path_escape") from error
+    return resolved
+
+
+def _read_worker_record(attempt: Path, point: SweepPointDefinition) -> SweepRunRecord:
+    """读取 worker 原子结果并复验点身份及成功运行目录。"""
+    result_path = attempt / "result.json"
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or set(payload) != {"schema_version", "record"}:
+        raise ValueError("worker_result_invalid")
+    if payload["schema_version"] != 1:
+        raise ValueError("worker_result_invalid")
+    record = record_from_payload(payload["record"])
+    if record.point != point:
+        raise ValueError("worker_point_mismatch")
+    if record.status is SweepRunStatus.SUCCESS:
+        if not isinstance(record.artifact_path, str):
+            raise ValueError("worker_artifact_missing")
+        run_dir = _attempt_member(attempt, record.artifact_path)
+        load_artifacts(run_dir)
+        raw_root = attempt / "raw"
+        published = [
+            path
+            for path in raw_root.iterdir()
+            if path.is_dir() and not path.name.startswith(".incomplete-")
         ]
-        by_ell[str(ell)] = {
-            "success_count": len(selected),
-            "control_error": (
-                None
-                if not selected
-                else aggregate_error_metrics([record.control_error for record in selected])
-            ),
-            "output_error": (
-                None
-                if not selected
-                else aggregate_error_metrics([record.output_error for record in selected])
-            ),
-        }
-    return {
-        "by_fractional_bits": by_ell,
-        "stability": stability,
-        "claim_boundary": (
-            "Adapted 2R2C HVAC precision sweep; it does not reproduce the paper's exact plant, "
-            "closed-loop tuning, or Protocol 2 runtime path."
-        ),
-    }
+        if published != [run_dir]:
+            raise ValueError("worker_artifact_count_invalid")
+    return record
+
+
+def _artifact_size(path: Path) -> int:
+    """统计单次正式运行目录内的普通文件字节数。"""
+    return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
 
 
 def run_precision_sweep(
@@ -238,128 +323,131 @@ def run_precision_sweep(
             stage / "source_hashes.json",
             {"expected": definition.source_hashes, "actual": actual_hashes},
         )
+        prime_passed = (
+            canonical_file_sha256(definition.prime_evidence_path) == definition.prime_evidence_hash
+        )
         for point in definition.points:
             point_root = stage / "points" / point.point_id
-            config_path = materialize_point_config(definition, point, point_root / "config.yaml")
-            try:
-                scenario = HvacScenario(config_path, test_seed=point.seed)
-                preflight = build_preflight_report(
-                    definition,
+            materialize_point_config(definition, point, point_root / "config.yaml")
+            attempt = stage / "work" / point.point_id / secrets.token_hex(8)
+            attempt.mkdir(parents=True, exist_ok=False)
+            materialize_point_config(definition, point, attempt / "config.yaml")
+            request = {
+                "schema_version": 1,
+                "point": asdict(point),
+                "config_path": "config.yaml",
+                "artifact_root": "raw",
+                "result_path": "result.json",
+                "stability_passed": stability_passed,
+                "prime_evidence_passed": prime_passed,
+                "frozen_fields_passed": frozen_passed,
+                "resource_limits": {
+                    "max_protocol1_triples_per_point": definition.max_protocol1_triples_per_point,
+                    "max_protocol2_truncations_per_point": definition.max_protocol2_truncations_per_point,
+                    "max_certified_integer_bit_length": definition.max_certified_integer_bit_length,
+                },
+            }
+            write_json(attempt / "request.json", request)
+            child = _run_child(
+                [
+                    sys.executable,
+                    "-m",
+                    "secure_control.experiments._sweep_worker",
+                    "--request",
+                    str(attempt / "request.json"),
+                ],
+                timeout_seconds=definition.timeout_seconds,
+            )
+            if child.timed_out:
+                record = _failed_record(point, "point_timeout", "worker deadline exceeded")
+            elif child.returncode != 0:
+                record = _failed_record(
                     point,
-                    scenario,
-                    stability_passed=stability_passed,
-                    frozen_fields_passed=frozen_passed,
+                    "worker_nonzero_exit",
+                    f"returncode={child.returncode}; stderr={child.stderr}",
                 )
-            except Exception as error:  # noqa: BLE001 - 单点预检必须转成正式不可行记录。
-                record = SweepRunRecord(
-                    point,
-                    SweepRunStatus.INFEASIBLE,
-                    _failure_preflight(type(error).__name__),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    "preflight_rejected",
-                    str(error),
-                )
-                records.append(record)
-                write_json(point_root / "record.json", record)
-                continue
-            if not preflight.feasible:
-                record = SweepRunRecord(
-                    point,
-                    SweepRunStatus.INFEASIBLE,
-                    preflight,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    "preflight_infeasible",
-                    ";".join(preflight.reason_codes),
-                )
-                records.append(record)
-                write_json(point_root / "record.json", record)
-                continue
-            started = perf_counter()
-            try:
-                plan = scenario.build_plan()
-                result = compare_closed_loops(plan.ideal, plan.secure, plan.sample_times)
-                scenario_metrics = scenario.metrics_snapshot(result)
-                effective_config = scenario.effective_config_snapshot()
-                provenance = collect_provenance(
-                    scenario_name=scenario.metadata.name,
-                    scenario_version=scenario.scenario_version,
-                    schema_version=SCHEMA_VERSION,
-                    test_seed=point.seed,
-                )
-                published = write_artifacts(
-                    result,
-                    scenario.metadata,
-                    effective_config,
-                    provenance,
-                    output_root=stage / "runs" / point.point_id,
-                )
-                elapsed = perf_counter() - started
-                if elapsed > definition.timeout_seconds:
-                    raise TimeoutError(
-                        f"扫描点耗时 {elapsed:.3f}s 超过 {definition.timeout_seconds}s"
+            else:
+                try:
+                    record = _read_worker_record(attempt, point)
+                    if record.cost is not None:
+                        record = replace(
+                            record,
+                            cost=replace(
+                                record.cost,
+                                wall_clock_seconds=child.elapsed_seconds,
+                                timing_scope="child_start_through_atomic_point_result",
+                            ),
+                        )
+                    if record.status is SweepRunStatus.SUCCESS:
+                        source = _attempt_member(attempt, record.artifact_path)
+                        if _artifact_size(source) > definition.max_artifact_bytes:
+                            record = _failed_record(
+                                point,
+                                "artifact_budget_exceeded",
+                                "worker artifact exceeds configured byte budget",
+                            )
+                        else:
+                            destination_root = stage / "runs" / point.point_id
+                            destination_root.mkdir(parents=True, exist_ok=False)
+                            destination = destination_root / source.name
+                            os.rename(source, destination)
+                            record = replace(
+                                record, artifact_path=destination.relative_to(stage).as_posix()
+                            )
+                except Exception as error:  # noqa: BLE001 - worker 不可信输出转稳定失败码。
+                    code = (
+                        str(error) if str(error).startswith("worker_") else "worker_result_invalid"
                     )
-                # 通用 figure writer 还会追加 run/render ID；短目录避免 Windows 深工作区超长路径。
-                standard_figure_root = stage / "standard" / f"{point.ell}-{point.seed}"
-                standard_figure_root.mkdir(parents=True, exist_ok=False)
-                render_saved_run(
-                    published.run_dir,
-                    PlotSelection(((0, 0),), (0,), "linear", "h", "png", (0,)),
-                    output_root=standard_figure_root,
-                    display=PlotDisplay("h", f"ell={point.ell}, seed={point.seed}"),
-                )
-                cost = derive_protocol_cost(
-                    plan.secure.runtime,
-                    scenario.safety_certificate,
-                    len(plan.sample_times),
-                    elapsed,
-                )
-                record = SweepRunRecord(
-                    point,
-                    SweepRunStatus.SUCCESS,
-                    preflight,
-                    compute_error_metrics(result.output_error),
-                    compute_error_metrics(result.control_error),
-                    scenario_metrics,
-                    cost,
-                    published.run_dir.relative_to(stage).as_posix(),
-                    None,
-                    None,
-                )
-            except Exception as error:  # noqa: BLE001 - 单点失败不得阻止其余扫描点发布。
-                record = SweepRunRecord(
-                    point,
-                    SweepRunStatus.FAILED,
-                    preflight,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    type(error).__name__,
-                    str(error),
-                )
+                    record = _failed_record(point, code, str(error))
             records.append(record)
             write_json(point_root / "record.json", record)
+            shutil.rmtree(attempt.parent)
         frozen_records = tuple(records)
         write_definition(stage / "definition.json", definition)
         write_summary(stage / "summary.csv", frozen_records)
-        write_json(stage / "summary.json", _aggregate(frozen_records, stability_payload))
+        write_range_margins(stage / "range_margins.csv", frozen_records)
+        write_json(
+            stage / "summary.json",
+            build_summary_payload(
+                frozen_records,
+                stability_payload,
+                (
+                    "Adapted 2R2C HVAC precision sweep; it does not reproduce the paper's exact "
+                    "plant, closed-loop tuning, or Protocol 2 runtime path."
+                ),
+            ),
+        )
+        write_data_manifest(
+            stage / "data_manifest.json",
+            sweep_id=sweep_id,
+            definition=definition,
+            records=frozen_records,
+        )
+        verified = load_verified_sweep_data(stage, manifest_name="data_manifest.json")
+        for record in verified.records:
+            if record.status is not SweepRunStatus.SUCCESS:
+                continue
+            standard_root = stage / "standard" / f"{record.point.ell}-{record.point.seed}"
+            standard_root.mkdir(parents=True, exist_ok=False)
+            render_saved_run(
+                stage / record.artifact_path,
+                PlotSelection(((0, 0),), (0,), "linear", "h", "png", (0,)),
+                output_root=standard_root,
+                display=PlotDisplay("h", f"ell={record.point.ell}, seed={record.point.seed}"),
+            )
         if any(record.status is SweepRunStatus.SUCCESS for record in frozen_records):
-            render_sweep_figures(stage, primary_seed=definition.primary_seed)
+            render_sweep_figures(
+                stage,
+                primary_seed=definition.primary_seed,
+                manifest_name="data_manifest.json",
+            )
         write_manifest(
             stage / "manifest.json",
             sweep_id=sweep_id,
             definition=definition,
             records=frozen_records,
         )
+        load_verified_sweep_data(stage)
         os.rename(stage, final)
     except Exception:
         if stage.exists() and stage.resolve().parent == root:
