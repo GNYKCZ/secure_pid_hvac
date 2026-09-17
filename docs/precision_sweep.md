@@ -1,0 +1,72 @@
+# 2R2C HVAC 定点精度扫描
+
+## 冻结定义
+
+Issue #15 在同一份 2R2C plant、位置式 PID、15 → 20 → 25 °C reference、180 步 horizon 和
+`[0, 12] kW` 执行器约束上比较四种表示：
+
+| `ell` | `k` | `k-ell` | `lambda` | seed |
+|---:|---:|---:|---:|---|
+| 32 | 60 | 28 | 80 | 42, 43, 44 |
+| 40 | 68 | 28 | 80 | 42, 43, 44 |
+| 48 | 76 | 28 | 80 | 42, 43, 44 |
+| 56 | 84 | 28 | 80 | 42, 43, 44 |
+
+全部十二点使用 `configs/hvac_2r2c_sweep_prime.yaml` 中同一个 256-bit 素数及递归
+Pocklington 证据。`kappa=bit_length(q)-lambda-2=174`。seed 只控制测试用安全材料；每个 seed
+建立独立 session，不能解释为生产安全随机源。seed 42 是图表主轨迹，另外两个 seed 保留运行间
+分布，执行顺序固定为 ell 外层、seed 内层。
+
+## 预检与状态
+
+每点在建立安全 session 前执行下列门禁：
+
+1. wrapper、PID baseline、plant 和素数证据的规范化 SHA-256 与扫描定义一致；
+2. #37 的局部未饱和闭环报告仍为 Schur stable，且冻结工作点均 applicable；
+3. 256-bit 模数的 Pocklington 证据由统一 crypto verifier 验证；
+4. 精确物化后的有限时域 input/state payload 不超过 `k` 位范围，state/output accumulator 不超过
+   中心化模数范围；
+5. `ell=56` 的输入 payload 上界由 binary64 的 `as_integer_ratio()` 精确有理数计算
+   `ceil(abs_bound * 2^ell) + 1`，不先做可能丢低位的浮点乘法。
+
+状态只有 `success`、`infeasible`、`failed`。不可行点不开始协议执行；运行异常或超过固定
+300 s 预算的点标记失败。全部点完成后，无论是否存在单点失败，扫描诊断均以同盘 rename 发布；
+CLI 在存在非成功点时返回非零状态。
+
+## 指标、成本与工件
+
+每个成功点保存通用 schema v1 八字段轨迹、有效配置、provenance、HVAC 区段品质快照、有限时域
+range margin、控制/输出误差的 max、mean、RMS、零计数和最小正 binary64 误差。`ell=56` 出现
+零误差不等价于数学实数误差严格为零，因此必须同时读取 zero count 与 minimum positive value。
+
+资源计数由实际 controller shape 和 scale ledger 精确推导：二维状态、单输入、单输出每步需要
+`2*2 + 2*1 + 1*2 + 1*1 = 9` 个 Protocol 1 Beaver triples，180 步共 1620 个。位置式 PID 的
+`A_c/B_c` 是精确整数，ledger 选择 state no-Trunc 路径，所以 Protocol 2 每步和总计都为 0；
+禁止为获得非零数字而插入人工截断。计时口径是完成预检后的点执行和原始工件写入，标准图和跨点图
+不计入单点 wall-clock。
+
+正式输出位于 `results/sweeps/<sweep_id>/`：
+
+```text
+definition.json
+source_hashes.json
+manifest.json
+summary.csv
+summary.json
+points/<ell-seed>/config.yaml
+points/<ell-seed>/record.json
+standard/<ell>-<seed>/...
+runs/<ell-seed>/<run_id>/{trajectory.csv,metadata.json,config.json}
+figures/{control_error_vs_ell,output_error_vs_ell,precision_summary,timing_cost}.png
+```
+
+绘图只读取已保存工件，不重新运行场景或更改原始轨迹。`manifest.json` 对发布前的全部文件记录
+SHA-256；普通生成结果由 `.gitignore` 排除，不作为源码提交。
+
+## 结论边界
+
+该扫描复用论文的安全动态控制思想和类似 Figure 3 的精度比较方法，但 plant 参数、reference、
+PID、饱和约束和实验工件属于本项目的 Adapted HVAC application。它可以支持“当前冻结场景下安全
+与明文闭环一致、误差随表示精度变化”的结论，不能支持“论文原 HVAC 数值实验已逐项复刻”。由于
+本控制器的整数 `A_c/B_c` 不触发 Protocol 2，本扫描也不能作为 Protocol 2 运行时行为或成本的
+实证复现；Protocol 2 的正确性仍由独立的协议与算术测试覆盖。

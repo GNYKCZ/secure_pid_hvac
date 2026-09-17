@@ -121,6 +121,19 @@ PNG/PDF。无同单位 reference 的输出误差可用可重复的 `--output-err
 路径、单位、log 零值与追溯清单见
 [已保存结果绘图契约](docs/figure_contract.md)。普通生成图片默认不提交 Git。
 
+运行冻结的 2R2C 定点精度扫描：
+
+```powershell
+uv run python -m secure_control.experiments.sweep_runner --definition configs/hvac_2r2c_precision_sweep.yaml
+```
+
+扫描固定 plant、PID、reference、horizon、执行器、256-bit 素数与 `lambda=80`，只比较
+`ell={32,40,48,56}`（对应 `k=ell+28`）和三个测试材料 seed。每点先验证来源摘要、
+Pocklington 证据、局部稳定性报告与有限时域整数范围，再发布原始八字段结果、标准图、跨精度图、
+指标和精确推导的协议资源数。完整定义、状态语义和结论边界见
+[2R2C 定点精度扫描](docs/precision_sweep.md)。这些结果是 adapted application，不是论文原数值
+实验的逐项复刻。
+
 ## 安全算术基线
 
 `secure_control.crypto` 现已提供与场景无关的定点编码、2-out-of-2 加法秘密共享、标量 Beaver
@@ -162,5 +175,5 @@ Client/P1/P2、share 或一次性资源。输入 shape、更新顺序和输出 s
 尺度、事务式失败语义、数值容差和当前 backend 限制见
 [通用安全状态空间运行时契约](docs/secure_runtime_contract.md)。
 
-仿真产生的大量 CSV 文件与图片应分别写入 `results/csv/` 和 `results/figures/`；这些输出默认
-不会提交到 Git。
+仿真产生的大量 CSV、图片与扫描工件应分别写入 `results/csv/`、`results/figures/` 和
+`results/sweeps/`；这些输出默认不会提交到 Git。

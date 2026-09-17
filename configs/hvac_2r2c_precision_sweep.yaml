@@ -1,0 +1,23 @@
+# Issue #15 冻结扫描定义；只允许 ell/k 和测试材料 seed 随点变化。
+schema_version: 1
+scenario_id: hvac_2r2c_pid_v1
+source_config: hvac_2r2c_dual_loop.yaml
+source_hashes:
+  wrapper: d16a51688df4fc2b94eeda6adeb62e2fe50c48f6a9a3c6a91d97ce87b3ac7e3f
+  baseline: f5df82b1dc21123ed6d138006bedbdd1e1de595d8c56d1f6791f2ae9c008a44e
+  plant: 54d980b7b3d5ef7f9187de008a78348748f0246193fc8bdaf4ef9a3f6be33dbd
+stability_report_hash: c6861008bf0356fb82b27ab5a5306d89f6a0095ed718706ea69a1830e9672b8d
+prime_evidence_path: hvac_2r2c_sweep_prime.yaml
+prime_evidence_hash: b317a7db4f14fbf77258102d6b09766dc3b5f495252c1e29ed3ae315cb98340c
+fractional_bits: [32, 40, 48, 56]
+integer_headroom_bits: 28
+security_parameter: 80
+seeds: [42, 43, 44]
+primary_seed: 42
+allowed_variable_fields:
+  - security.modulus
+  - security.integer_bits
+  - security.fractional_bits
+  - security.security_parameter
+  - security.modulus_evidence
+timeout_seconds: 300
