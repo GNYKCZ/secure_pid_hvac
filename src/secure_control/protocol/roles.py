@@ -20,6 +20,7 @@ from secure_control.crypto import (
     MaskedDifferenceShare,
     MaskedTruncationShare,
     P1MaskedValue,
+    PrimeModulusEvidence,
     PublicMaskedDifferences,
     SecureTruncation,
     TwoPartySharing,
@@ -79,8 +80,9 @@ class Client:
         sharing: TwoPartySharing,
         *,
         security_parameter: int,
+        modulus_evidence: PrimeModulusEvidence | None = None,
     ) -> None:
-        """建立 Client 的定点、共享及 Protocol 1/2 一次性材料生成器。"""
+        """建立 Client，并把公开模数证据交给唯一的 Protocol 2 验证入口。"""
         if fixed_point.modulus != sharing.modulus:
             raise ValueError("FixedPointContext 与 TwoPartySharing 必须使用相同 modulus。")
         self.fixed_point = fixed_point
@@ -90,6 +92,7 @@ class Client:
             sharing,
             ell=fixed_point.fractional_bits,
             security_parameter=security_parameter,
+            modulus_evidence=modulus_evidence,
         )
         # 身份不从可重放的离线/在线材料 RNG 派生；Client 以此登记其签发能力。
         self._issued_sessions: set[str] = set()

@@ -4,7 +4,36 @@ import random
 
 import pytest
 
-from secure_control.crypto import SecureTruncation, TwoPartySharing
+from secure_control.crypto import (
+    PocklingtonCertificate,
+    PocklingtonFactorEvidence,
+    PrimeModulusEvidence,
+    PrimeVerificationError,
+    SecureTruncation,
+    TwoPartySharing,
+    pocklington_certificate_sha256,
+)
+
+LARGE_PRIME = 18_446_744_073_709_554_719
+
+
+def _large_prime_evidence() -> PrimeModulusEvidence:
+    """返回只供调用链测试使用的 65-bit Pocklington 证据。"""
+    certificate = PocklingtonCertificate(
+        candidate=LARGE_PRIME,
+        factors=(
+            PocklingtonFactorEvidence(2, 1, 7),
+            PocklingtonFactorEvidence(9_223_372_036_854_777_359, 1, 2),
+        ),
+    )
+    return PrimeModulusEvidence(
+        "pocklington_v1",
+        "Issue #33 truncation fixture",
+        "1",
+        "issue33-truncation-65bit-v1",
+        pocklington_certificate_sha256(certificate),
+        certificate,
+    )
 
 
 def protocol() -> SecureTruncation:
@@ -154,3 +183,19 @@ def test_parameters_inverse_and_input_range_fail_before_protocol_execution() -> 
         instance.share_message(instance.maximum_message + 1, rng=random.Random(1))
     with pytest.raises(TypeError, match="标量"):
         instance.validate_message(True)
+
+
+def test_direct_truncation_requires_and_exposes_large_modulus_verification() -> None:
+    """直接 Protocol 2 入口对大模数缺证据失败，并公开不可变验证摘要。"""
+    with pytest.raises(PrimeVerificationError) as captured:
+        SecureTruncation(TwoPartySharing(LARGE_PRIME), ell=8, security_parameter=8)
+    assert captured.value.reason_code == "evidence_required"
+
+    instance = SecureTruncation(
+        TwoPartySharing(LARGE_PRIME),
+        ell=8,
+        security_parameter=8,
+        modulus_evidence=_large_prime_evidence(),
+    )
+    assert instance.modulus_verification.method == "pocklington_v1"
+    assert instance.modulus_verification.modulus == LARGE_PRIME
