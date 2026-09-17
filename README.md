@@ -134,6 +134,15 @@ Pocklington 证据、局部稳定性报告与有限时域整数范围，再发�
 [2R2C 定点精度扫描](docs/precision_sweep.md)。这些结果是 adapted application，不是论文原数值
 实验的逐项复刻。
 
+从冻结 sweep 只读生成 01–12 中文阶段汇报图：
+
+```powershell
+uv run python -m secure_control.experiments.sweep_figure_runner --sweep-dir results/sweeps/<sweep_id> --display-config configs/hvac_2r2c_report_zh.yaml --output-root results/figures/reports
+```
+
+报告不会重跑实验或写回 sweep；中文 profile、字体 glyph 预检、科学计数法、固定图目录、
+原子发布与追溯边界见 [2R2C HVAC 中文汇报图](docs/chinese_report_figures.md)。
+
 ## 安全算术基线
 
 `secure_control.crypto` 现已提供与场景无关的定点编码、2-out-of-2 加法秘密共享、标量 Beaver

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .artifacts import ExperimentRecord, load_artifacts
 from .plotting import PlotDisplay, PlotSelection, render_saved_run
+from .reporting import render_chinese_saved_run
 
 
 def _tracking_pair(value: str) -> tuple[int, int]:
@@ -82,7 +83,26 @@ def main() -> None:
     parser.add_argument("--time-unit", choices=("s", "h"), default=None)
     parser.add_argument("--format", choices=("png", "pdf"), default="png")
     parser.add_argument("--output-root", default="results/figures")
+    parser.add_argument(
+        "--display-config",
+        help="optional localized report profile; renders the six saved-run figures",
+    )
     args = parser.parse_args()
+    if args.display_config:
+        published = render_chinese_saved_run(args.run_dir, args.display_config, args.output_root)
+        print(
+            json.dumps(
+                {
+                    "source_run_id": load_artifacts(Path(args.run_dir)).run_id,
+                    "render_id": published.report_id,
+                    "figures": [str(path) for path in published.figure_paths],
+                    "manifest": str(published.manifest_path),
+                    "catalog": str(published.catalog_path),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return
     record = load_artifacts(Path(args.run_dir))
     selection, display = _selection(record, args)
     published = render_saved_run(

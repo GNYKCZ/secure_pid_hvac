@@ -28,6 +28,8 @@ core ───────→ 标准库和基础数组类型
   已保存结果的绘图也在此层从正式 reader 获取数据，不参与 engine 的控制循环，
   不把场景算法加入通用 writer/plotting。通用 sweep 定义、误差汇总、工件和绘图同样不导入
   场景；只有 `sweep_runner` 作为 composition root 显式选择当前 HVAC 稳定性门和指标快照。
+  本地化报告由 `reporting` 从 verified reader 对象和外部 display profile 组合；薄
+  `sweep_figure_runner` 不运行实验，中文 HVAC 语义不进入通用 reader 或 simulation。
 
 低层模块不得反向导入 `scenarios`。具体场景名称、单位或控制器调参字段不得进入
 `core`、`crypto`、`protocol`、`execution` 或 `simulation`。
@@ -118,3 +120,5 @@ HVAC 的装配与 180 步物理/编码范围条件见 [仿真与双闭环集成]
 [已保存结果绘图契约](figure_contract.md)。
 冻结 2R2C 配置上的定点精度扫描、逐点预检和部分失败发布语义见
 [2R2C 定点精度扫描](precision_sweep.md)。
+冻结工件的中文 01–12 报告、字体预检与独立原子发布见
+[2R2C HVAC 中文汇报图](chinese_report_figures.md)。

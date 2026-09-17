@@ -74,6 +74,7 @@ def test_experiment_io_boundary_imports_only_generic_contracts() -> None:
         "sweep_metrics.py",
         "sweep_artifacts.py",
         "sweep_plotting.py",
+        "reporting.py",
     ):
         source = experiments / name
         assert "secure_control.scenarios" not in imported_modules(source)
@@ -84,6 +85,10 @@ def test_experiment_io_boundary_imports_only_generic_contracts() -> None:
     figure_imports = imported_modules(experiments / "figure_runner.py")
     assert "secure_control.scenarios" not in figure_imports
     assert "secure_control.simulation.runner" not in figure_imports
+    report_imports = imported_modules(experiments / "sweep_figure_runner.py")
+    assert "secure_control.experiments.sweep_runner" not in report_imports
+    assert "secure_control.simulation.runner" not in report_imports
+    assert not any(module.startswith("secure_control.scenarios") for module in report_imports)
     selector_imports = imported_modules(experiments / "runner.py")
     scenario_imports = {
         module for module in selector_imports if module.startswith("secure_control.scenarios")
