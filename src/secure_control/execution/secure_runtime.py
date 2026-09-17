@@ -9,7 +9,13 @@ import numpy as np
 from numpy.typing import NDArray
 
 from secure_control.core import ControllerSpec
-from secure_control.crypto import AdditiveShare, FixedPointContext, TwoPartySharing
+from secure_control.crypto import (
+    AdditiveShare,
+    FixedPointContext,
+    PrimeModulusEvidence,
+    PrimeModulusVerification,
+    TwoPartySharing,
+)
 from secure_control.protocol import (
     P1,
     P2,
@@ -49,6 +55,7 @@ class SecureStateSpaceRuntime:
         range_contract: ControllerRangeContract,
         *,
         security_parameter: int,
+        modulus_evidence: PrimeModulusEvidence | None = None,
         test_seed: int | None = None,
     ) -> None:
         """验证公共配置并建立一个独立、不可与其他实例混用的协议 session。
@@ -62,6 +69,8 @@ class SecureStateSpaceRuntime:
             raise TypeError("fixed_point 必须是 FixedPointContext。")
         if not isinstance(range_contract, ControllerRangeContract):
             raise TypeError("range_contract 必须是 ControllerRangeContract。")
+        if modulus_evidence is not None and not isinstance(modulus_evidence, PrimeModulusEvidence):
+            raise TypeError("modulus_evidence 必须是 PrimeModulusEvidence 或 None。")
         if test_seed is not None and (
             isinstance(test_seed, bool) or not isinstance(test_seed, int)
         ):
@@ -71,6 +80,7 @@ class SecureStateSpaceRuntime:
         self._fixed_point = fixed_point
         self._range_contract = range_contract
         self._security_parameter = security_parameter
+        self._modulus_evidence = modulus_evidence
         self._test_seed = test_seed
         self._install_session(self._build_session())
 
@@ -83,6 +93,11 @@ class SecureStateSpaceRuntime:
     def scale_ledger(self) -> ControllerScaleLedger:
         """返回当前 session 的只读公开尺度账本。"""
         return self._distribution.p1.layout.scale_ledger
+
+    @property
+    def modulus_verification(self) -> PrimeModulusVerification:
+        """返回当前 Client 对公开模数完成的不可变验证摘要。"""
+        return self._client.truncation.modulus_verification
 
     def step(self, v: Array | float) -> np.ndarray:
         """执行一个事务式安全控制步，并返回长度为 ``p`` 的有限浮点向量。
@@ -134,6 +149,7 @@ class SecureStateSpaceRuntime:
             self._fixed_point,
             sharing,
             security_parameter=self._security_parameter,
+            modulus_evidence=self._modulus_evidence,
         )
         material_rng = random.Random(self._test_seed) if self._test_seed is not None else None
         distribution = client.distribute_controller(

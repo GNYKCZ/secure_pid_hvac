@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import numpy as np
 import pytest
+import yaml
 
+from secure_control.crypto import (
+    PocklingtonCertificate,
+    PocklingtonFactorEvidence,
+    PrimeModulusEvidence,
+    PrimeVerificationError,
+    pocklington_certificate_sha256,
+)
 from secure_control.execution import PlaintextStateSpaceRuntime, SecureStateSpaceRuntime
 from secure_control.scenarios.hvac import (
     Hvac2R2CPlant,
@@ -24,6 +32,25 @@ BASELINE_PATH = Path(__file__).parents[1] / "configs" / "hvac_pid_baseline.yaml"
 CONFIG_2R2C_PATH = Path(__file__).parents[1] / "configs" / "hvac_2r2c_dual_loop.yaml"
 BASELINE_2R2C_PATH = Path(__file__).parents[1] / "configs" / "hvac_2r2c_pid_baseline.yaml"
 PLANT_2R2C_PATH = Path(__file__).parents[1] / "configs" / "hvac_2r2c_plant.yaml"
+
+
+def _large_prime_evidence() -> PrimeModulusEvidence:
+    """返回用于 HVAC YAML 入口传递测试的 65-bit 公开证据。"""
+    certificate = PocklingtonCertificate(
+        candidate=18_446_744_073_709_554_719,
+        factors=(
+            PocklingtonFactorEvidence(2, 1, 7),
+            PocklingtonFactorEvidence(9_223_372_036_854_777_359, 1, 2),
+        ),
+    )
+    return PrimeModulusEvidence(
+        "pocklington_v1",
+        "Issue #33 HVAC fixture",
+        "1",
+        "issue33-hvac-65bit-v1",
+        pocklington_certificate_sha256(certificate),
+        certificate,
+    )
 
 
 @dataclass(frozen=True)
@@ -363,3 +390,194 @@ def test_2r2c_secure_runtime_rejects_step_beyond_certified_horizon() -> None:
         plan.secure.runtime.step(np.array([0.0]))
     with pytest.raises(ValueError, match="horizon"):
         plan.secure.runtime.step(np.array([0.0]))
+
+
+def test_hvac_yaml_passes_large_modulus_evidence_and_records_public_summary(
+    tmp_path: Path,
+) -> None:
+    """HVAC 配置须完整传递大模数证据，工件快照只记录公开验证摘要。"""
+    evidence = _large_prime_evidence()
+    security = {
+        "modulus": evidence.certificate.candidate,
+        "integer_bits": 48,
+        "fractional_bits": 20,
+        "security_parameter": 8,
+        "horizon_steps": 180,
+        "modulus_evidence": asdict(evidence),
+    }
+    wrapper = tmp_path / "large-modulus-hvac.yaml"
+    wrapper.write_text(
+        yaml.safe_dump(
+            {
+                "scenario": {"name": "hvac"},
+                "baseline_config": str(BASELINE_PATH),
+                "security": security,
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    scenario = HvacScenario(wrapper, test_seed=45)
+    snapshot = scenario.effective_config_snapshot()
+    runtime = scenario.build_plan().secure.runtime
+
+    assert snapshot["modulus_verification"] == {
+        "modulus": str(evidence.certificate.candidate),
+        "bit_length": 65,
+        "method": "pocklington_v1",
+        "status": "verified",
+        "source": "Issue #33 HVAC fixture",
+        "source_version": "1",
+        "certificate_id": "issue33-hvac-65bit-v1",
+        "certificate_sha256": evidence.certificate_sha256,
+    }
+    assert "certificate" not in snapshot["modulus_verification"]
+    assert isinstance(runtime, SecureStateSpaceRuntime)
+    assert runtime.modulus_verification.certificate_id == "issue33-hvac-65bit-v1"
+
+    security.pop("modulus_evidence")
+    missing = tmp_path / "missing-evidence-hvac.yaml"
+    missing.write_text(
+        yaml.safe_dump(
+            {
+                "scenario": {"name": "hvac"},
+                "baseline_config": str(BASELINE_PATH),
+                "security": security,
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(PrimeVerificationError) as captured:
+        HvacScenario(missing)
+    assert captured.value.reason_code == "evidence_required"
+
+
+def test_hvac_modulus_evidence_parser_bounds_factor_entries_and_alias_cycles(
+    tmp_path: Path,
+) -> None:
+    """不可信 YAML 必须在递归类型物化前以稳定资源原因拒绝过量 factor 和 alias 环。"""
+    evidence = _large_prime_evidence()
+    base_security = {
+        "modulus": evidence.certificate.candidate,
+        "integer_bits": 48,
+        "fractional_bits": 20,
+        "security_parameter": 8,
+        "horizon_steps": 180,
+    }
+    factor = {"prime": 2, "exponent": 1, "witness": 2}
+    oversized_certificate = {
+        "candidate": evidence.certificate.candidate,
+        "factors": [factor.copy() for _ in range(300)],
+    }
+    oversized = tmp_path / "oversized-factor-evidence.yaml"
+    oversized.write_text(
+        yaml.safe_dump(
+            {
+                "scenario": {"name": "hvac"},
+                "baseline_config": str(BASELINE_PATH),
+                "security": {
+                    **base_security,
+                    "modulus_evidence": {
+                        "method": "pocklington_v1",
+                        "source": "Issue #33 parser regression",
+                        "source_version": "1",
+                        "certificate_id": "oversized",
+                        "certificate_sha256": "0" * 64,
+                        "certificate": oversized_certificate,
+                    },
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(PrimeVerificationError) as captured:
+        HvacScenario(oversized)
+    assert captured.value.reason_code == "resource_limit_exceeded"
+
+    cyclic_certificate: dict[str, object] = {
+        "candidate": evidence.certificate.candidate,
+        "factors": [],
+    }
+    cyclic_certificate["factors"] = [
+        {
+            "prime": evidence.certificate.candidate,
+            "exponent": 1,
+            "witness": 2,
+            "certificate": cyclic_certificate,
+        }
+    ]
+    cyclic = tmp_path / "cyclic-alias-evidence.yaml"
+    cyclic.write_text(
+        yaml.safe_dump(
+            {
+                "scenario": {"name": "hvac"},
+                "baseline_config": str(BASELINE_PATH),
+                "security": {
+                    **base_security,
+                    "modulus_evidence": {
+                        "method": "pocklington_v1",
+                        "source": "Issue #33 parser regression",
+                        "source_version": "1",
+                        "certificate_id": "cyclic",
+                        "certificate_sha256": "0" * 64,
+                        "certificate": cyclic_certificate,
+                    },
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(PrimeVerificationError) as captured:
+        HvacScenario(cyclic)
+    assert captured.value.reason_code == "resource_limit_exceeded"
+
+    nested_certificate: dict[str, object] = {
+        "candidate": 17,
+        "factors": [{"prime": 2, "exponent": 1, "witness": 2}],
+    }
+    for _ in range(34):
+        nested_certificate = {
+            "candidate": 17,
+            "factors": [
+                {
+                    "prime": 17,
+                    "exponent": 1,
+                    "witness": 2,
+                    "certificate": nested_certificate,
+                }
+            ],
+        }
+    too_deep = tmp_path / "too-deep-evidence.yaml"
+    too_deep.write_text(
+        yaml.safe_dump(
+            {
+                "scenario": {"name": "hvac"},
+                "baseline_config": str(BASELINE_PATH),
+                "security": {
+                    **base_security,
+                    "modulus_evidence": {
+                        "method": "pocklington_v1",
+                        "source": "Issue #33 parser regression",
+                        "source_version": "1",
+                        "certificate_id": "too-deep",
+                        "certificate_sha256": "0" * 64,
+                        "certificate": nested_certificate,
+                    },
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(PrimeVerificationError) as captured:
+        HvacScenario(too_deep)
+    assert captured.value.reason_code == "resource_limit_exceeded"
+
+    oversized_source = tmp_path / "oversized-wrapper-source.yaml"
+    oversized_source.write_bytes(b"#" * ((1 << 20) + 1))
+    with pytest.raises(PrimeVerificationError) as captured:
+        HvacScenario(oversized_source)
+    assert captured.value.reason_code == "resource_limit_exceeded"

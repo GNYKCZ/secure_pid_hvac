@@ -9,7 +9,12 @@ import numpy as np
 import pytest
 
 from secure_control.core import ControllerScaleMetadata, ControllerSpec
-from secure_control.crypto import AdditiveShare, FixedPointContext, TwoPartySharing
+from secure_control.crypto import (
+    AdditiveShare,
+    FixedPointContext,
+    PrimeVerificationError,
+    TwoPartySharing,
+)
 from secure_control.protocol import (
     P1,
     P2,
@@ -51,6 +56,15 @@ def make_stack(
 def share_values(share: AdditiveShare) -> list[int]:
     """把测试边界中的本地 share 转为普通列表，避免 object ndarray 比较歧义。"""
     return np.asarray(share.value, dtype=object).tolist()
+
+
+def test_client_cannot_bypass_large_modulus_evidence_contract() -> None:
+    """Client 必须把大模数交给 Protocol 2 验证，不能仅建立一般模环后继续。"""
+    modulus = 18_446_744_073_709_554_719
+    fixed_point = FixedPointContext(modulus, integer_bits=60, fractional_bits=8)
+    with pytest.raises(PrimeVerificationError) as captured:
+        Client(fixed_point, TwoPartySharing(modulus), security_parameter=8)
+    assert captured.value.reason_code == "evidence_required"
 
 
 def test_protocol_three_keeps_output_at_double_scale_and_truncates_once_per_state_row() -> None:

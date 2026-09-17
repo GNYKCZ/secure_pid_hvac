@@ -14,7 +14,14 @@ import numpy as np
 import yaml
 
 from secure_control.core import ControllerScaleMetadata, ControllerSpec
-from secure_control.crypto import FixedPointContext
+from secure_control.crypto import (
+    FixedPointContext,
+    PocklingtonCertificate,
+    PocklingtonFactorEvidence,
+    PrimeModulusEvidence,
+    PrimeVerificationError,
+    verify_prime_modulus,
+)
 from secure_control.execution import PlaintextStateSpaceRuntime, SecureStateSpaceRuntime
 from secure_control.protocol import ControllerRangeContract
 from secure_control.simulation import (
@@ -42,6 +49,63 @@ from .tuning import (
     load_hvac_pid_tuning_contract,
     tune_hvac_pid,
 )
+
+_MAX_WRAPPER_YAML_BYTES = 1 << 20
+_MAX_WRAPPER_YAML_DEPTH = 128
+_MAX_WRAPPER_YAML_NODES = 4096
+_MAX_POCKLINGTON_PARSE_DEPTH = 32
+_MAX_POCKLINGTON_PARSE_NODES = 256
+_MAX_POCKLINGTON_INTEGER_BITS = 4096
+
+
+class _BoundedSafeLoader(yaml.SafeLoader):
+    """在构造 Python 对象前限制 YAML 大小、组合节点和语法嵌套深度。"""
+
+    def __init__(self, stream: str) -> None:
+        self._composition_depth = 0
+        self._composition_nodes = 0
+        super().__init__(stream)
+
+    def compose_node(self, parent: Any, index: Any) -> yaml.Node:
+        """逐节点施加预算，alias 引用也计入总工作量。"""
+        if self._composition_depth >= _MAX_WRAPPER_YAML_DEPTH:
+            raise PrimeVerificationError(
+                "resource_limit_exceeded", "HVAC YAML 嵌套深度超过资源限制。"
+            )
+        self._composition_nodes += 1
+        if self._composition_nodes > _MAX_WRAPPER_YAML_NODES:
+            raise PrimeVerificationError(
+                "resource_limit_exceeded", "HVAC YAML 节点数超过资源限制。"
+            )
+        self._composition_depth += 1
+        try:
+            return super().compose_node(parent, index)
+        finally:
+            self._composition_depth -= 1
+
+
+@dataclass(slots=True)
+class _EvidenceParseBudget:
+    """在场景映射转换为 crypto 类型前限制证书树和 YAML alias 环。"""
+
+    nodes: int = 0
+    active_mapping_ids: set[int] | None = None
+
+    def __post_init__(self) -> None:
+        if self.active_mapping_ids is None:
+            self.active_mapping_ids = set()
+
+
+def _load_bounded_wrapper_yaml(source: bytes) -> Any:
+    """以受限 SafeLoader 读取 wrapper，资源异常保留稳定 reason code。"""
+    if len(source) > _MAX_WRAPPER_YAML_BYTES:
+        raise PrimeVerificationError("resource_limit_exceeded", "HVAC wrapper YAML 超过资源限制。")
+    try:
+        return yaml.load(source.decode("utf-8"), Loader=_BoundedSafeLoader)
+    except (MemoryError, OverflowError, RecursionError, ValueError) as error:
+        raise PrimeVerificationError(
+            "resource_limit_exceeded", "HVAC wrapper YAML 解析超过资源限制。"
+        ) from error
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,7 +178,7 @@ class HvacScenario:
         path = Path(config_path)
         try:
             wrapper_source = path.read_bytes()
-            loaded = yaml.safe_load(wrapper_source.decode("utf-8"))
+            loaded = _load_bounded_wrapper_yaml(wrapper_source)
         except (OSError, yaml.YAMLError) as error:
             raise ValueError(f"无法读取 HVAC 双闭环配置：{path}") from error
         if not isinstance(loaded, Mapping):
@@ -188,6 +252,10 @@ class HvacScenario:
             _positive_integer(security, "modulus"),
             integer_bits=_positive_integer(security, "integer_bits"),
             fractional_bits=_positive_integer(security, "fractional_bits"),
+        )
+        self._modulus_evidence = _parse_modulus_evidence(security.get("modulus_evidence"))
+        self._modulus_verification = verify_prime_modulus(
+            self._fixed_point.modulus, self._modulus_evidence
         )
         self._security_parameter = _positive_integer(security, "security_parameter")
         self._horizon_steps = _positive_integer(security, "horizon_steps")
@@ -277,6 +345,16 @@ class HvacScenario:
                     "deterministic_test" if self._test_seed is not None else "secure_random"
                 ),
             },
+            "modulus_verification": {
+                "modulus": str(self._modulus_verification.modulus),
+                "bit_length": self._modulus_verification.bit_length,
+                "method": self._modulus_verification.method,
+                "status": self._modulus_verification.status,
+                "source": self._modulus_verification.source,
+                "source_version": self._modulus_verification.source_version,
+                "certificate_id": self._modulus_verification.certificate_id,
+                "certificate_sha256": self._modulus_verification.certificate_sha256,
+            },
             "finite_horizon_certificate": asdict(self.safety_certificate),
         }
         if self._tuning_result is not None and self._tuning_contract is not None:
@@ -318,6 +396,7 @@ class HvacScenario:
                 self._fixed_point,
                 range_contract,
                 security_parameter=self._security_parameter,
+                modulus_evidence=self._modulus_evidence,
                 test_seed=self._test_seed,
             ),
         )
@@ -645,6 +724,123 @@ def _positive_integer(source: Mapping[str, Any], name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
         raise ValueError(f"security.{name} 必须是正整数。")
     return int(value)
+
+
+def _parse_modulus_evidence(value: Any) -> PrimeModulusEvidence | None:
+    """把 HVAC YAML 的可选公开证据映射为领域无关、深度冻结的 crypto 类型。"""
+    if value is None:
+        return None
+    evidence = _exact_mapping(
+        value,
+        "security.modulus_evidence",
+        {
+            "method",
+            "source",
+            "source_version",
+            "certificate_id",
+            "certificate_sha256",
+            "certificate",
+        },
+    )
+    return PrimeModulusEvidence(
+        method=evidence["method"],
+        source=evidence["source"],
+        source_version=evidence["source_version"],
+        certificate_id=evidence["certificate_id"],
+        certificate_sha256=evidence["certificate_sha256"],
+        certificate=_parse_pocklington_certificate(
+            evidence["certificate"],
+            "security.modulus_evidence.certificate",
+            depth=0,
+            budget=_EvidenceParseBudget(),
+        ),
+    )
+
+
+def _parse_pocklington_certificate(
+    value: Any,
+    path: str,
+    *,
+    depth: int,
+    budget: _EvidenceParseBudget,
+) -> PocklingtonCertificate:
+    """在共享资源预算内解析证书；数论条件仍只由 crypto verifier 判断。"""
+    if depth > _MAX_POCKLINGTON_PARSE_DEPTH:
+        raise PrimeVerificationError(
+            "resource_limit_exceeded", "Pocklington YAML 证书深度超过资源限制。"
+        )
+    certificate = _exact_mapping(value, path, {"candidate", "factors"})
+    factors = certificate["factors"]
+    if not isinstance(factors, list) or not factors:
+        raise TypeError(f"{path}.factors 必须是非空列表。")
+    candidate = certificate["candidate"]
+    if (
+        isinstance(candidate, Integral)
+        and not isinstance(candidate, bool)
+        and int(candidate).bit_length() > _MAX_POCKLINGTON_INTEGER_BITS
+    ):
+        raise PrimeVerificationError(
+            "resource_limit_exceeded", "Pocklington YAML candidate 超过资源限制。"
+        )
+    budget.nodes += 1 + len(factors)
+    if budget.nodes > _MAX_POCKLINGTON_PARSE_NODES:
+        raise PrimeVerificationError("resource_limit_exceeded", "Pocklington YAML 证书节点过多。")
+    assert budget.active_mapping_ids is not None
+    mapping_id = id(certificate)
+    if mapping_id in budget.active_mapping_ids:
+        raise PrimeVerificationError(
+            "resource_limit_exceeded", "Pocklington YAML 证书存在 alias 循环。"
+        )
+    budget.active_mapping_ids.add(mapping_id)
+    try:
+        parsed: list[PocklingtonFactorEvidence] = []
+        for index, item in enumerate(factors):
+            factor_path = f"{path}.factors[{index}]"
+            factor = _exact_mapping(
+                item,
+                factor_path,
+                {"prime", "exponent", "witness", "certificate"},
+                optional={"certificate"},
+            )
+            nested = factor.get("certificate")
+            parsed.append(
+                PocklingtonFactorEvidence(
+                    prime=factor["prime"],
+                    exponent=factor["exponent"],
+                    witness=factor["witness"],
+                    certificate=(
+                        None
+                        if nested is None
+                        else _parse_pocklington_certificate(
+                            nested,
+                            f"{factor_path}.certificate",
+                            depth=depth + 1,
+                            budget=budget,
+                        )
+                    ),
+                )
+            )
+        return PocklingtonCertificate(candidate=candidate, factors=tuple(parsed))
+    finally:
+        budget.active_mapping_ids.remove(mapping_id)
+
+
+def _exact_mapping(
+    value: Any,
+    path: str,
+    required: set[str],
+    *,
+    optional: set[str] | None = None,
+) -> Mapping[str, Any]:
+    """拒绝证据 schema 的缺失和未知字段，避免拼写错误被静默忽略。"""
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{path} 必须是映射。")
+    optional = set() if optional is None else optional
+    missing = required - optional - set(value)
+    unknown = set(value) - required
+    if missing or unknown:
+        raise ValueError(f"{path} 字段不匹配：missing={sorted(missing)}, unknown={sorted(unknown)}")
+    return value
 
 
 def run_hvac_dual_loop(config_path: str | Path, *, test_seed: int | None = None) -> HvacComparison:

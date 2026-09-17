@@ -6,7 +6,13 @@ import numpy as np
 import pytest
 
 from secure_control.core import ControllerScaleMetadata, ControllerSpec
-from secure_control.crypto import FixedPointContext
+from secure_control.crypto import (
+    FixedPointContext,
+    PocklingtonCertificate,
+    PocklingtonFactorEvidence,
+    PrimeModulusEvidence,
+    pocklington_certificate_sha256,
+)
 from secure_control.execution import (
     ControllerRuntime,
     PlaintextStateSpaceRuntime,
@@ -68,6 +74,25 @@ def make_secure_runtime(
         ),
         security_parameter=8,
         test_seed=seed,
+    )
+
+
+def _large_prime_evidence() -> PrimeModulusEvidence:
+    """返回用于 runtime 构造和 reset 传递验证的 65-bit 公开证据。"""
+    certificate = PocklingtonCertificate(
+        candidate=18_446_744_073_709_554_719,
+        factors=(
+            PocklingtonFactorEvidence(2, 1, 7),
+            PocklingtonFactorEvidence(9_223_372_036_854_777_359, 1, 2),
+        ),
+    )
+    return PrimeModulusEvidence(
+        "pocklington_v1",
+        "Issue #33 runtime fixture",
+        "1",
+        "issue33-runtime-65bit-v1",
+        pocklington_certificate_sha256(certificate),
+        certificate,
     )
 
 
@@ -271,6 +296,26 @@ def test_reset_replaces_protocol_session_and_restores_initial_sequence() -> None
 
     assert runtime._distribution.session_id != previous_session
     np.testing.assert_array_equal(runtime.step(0.25), fresh.step(0.25))
+
+
+def test_runtime_reset_reuses_and_revalidates_immutable_modulus_evidence() -> None:
+    """安全 runtime 首次构造与 reset 都使用同一公开证据并保留验证摘要。"""
+    modulus = 18_446_744_073_709_554_719
+    runtime = SecureStateSpaceRuntime(
+        integer_state_spec(),
+        FixedPointContext(modulus, integer_bits=60, fractional_bits=8),
+        ControllerRangeContract(state_payload_bounds=(128,), input_payload_bounds=(64,)),
+        security_parameter=8,
+        modulus_evidence=_large_prime_evidence(),
+        test_seed=131,
+    )
+    before = runtime.modulus_verification
+    runtime.step(0.25)
+    runtime.reset()
+
+    assert before.method == "pocklington_v1"
+    assert runtime.modulus_verification == before
+    np.testing.assert_array_equal(runtime.step(0.25), np.array([0.25]))
 
 
 def test_interleaved_instances_keep_state_and_rng_isolated() -> None:

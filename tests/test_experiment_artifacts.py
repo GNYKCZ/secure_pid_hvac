@@ -50,7 +50,18 @@ def _write(tmp_path: Path, channels: int = 1) -> artifacts.RunArtifacts:
     return artifacts.write_artifacts(
         result,
         metadata,
-        {"scenario": {"name": "toy", "version": "1"}, "input": {"value": 1.25}},
+        {
+            "scenario": {"name": "toy", "version": "1"},
+            "input": {"value": 1.25},
+            "modulus_verification": {
+                "modulus": "590295810358705751009",
+                "bit_length": 70,
+                "method": "pocklington_v1",
+                "status": "verified",
+                "certificate_id": "issue33-artifact-fixture-v1",
+                "certificate_sha256": "1" * 64,
+            },
+        },
         {
             "scenario_name": "toy",
             "scenario_version": "1",
@@ -74,6 +85,8 @@ def test_scalar_and_vector_schema_round_trip_binary64_and_metadata(
     assert loaded.run_id == published.run_id
     assert loaded.metadata == expected_metadata
     assert loaded.effective_config["input"]["value"] == 1.25
+    assert loaded.effective_config["modulus_verification"]["modulus"] == ("590295810358705751009")
+    assert loaded.effective_config["modulus_verification"]["status"] == "verified"
     assert loaded.provenance["configured_seeds"] == {"toy_seed": 4}
     for field in expected.__dataclass_fields__:
         np.testing.assert_array_equal(getattr(loaded.result, field), getattr(expected, field))

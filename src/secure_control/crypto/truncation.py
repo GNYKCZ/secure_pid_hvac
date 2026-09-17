@@ -7,41 +7,13 @@ import secrets
 from dataclasses import dataclass, field
 from typing import Any
 
+from .primes import PrimeModulusEvidence, PrimeModulusVerification, verify_prime_modulus
 from .secret_sharing import AdditiveShare, TwoPartySharing
 
 
 def _centered_mod(value: int, modulus: int) -> int:
     """按论文定义将整数约简到 ``[-modulus/2, modulus/2)``。"""
     return value - ((value + modulus // 2) // modulus) * modulus
-
-
-def _is_prime_candidate(value: int) -> bool:
-    """使用 Miller--Rabin 筛除合数；调用方仍须为大模数提供已验证的素数。"""
-    if value < 2:
-        return False
-    small_primes = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
-    if value in small_primes:
-        return True
-    if any(value % divisor == 0 for divisor in small_primes):
-        return False
-    exponent, twos = value - 1, 0
-    while exponent % 2 == 0:
-        exponent //= 2
-        twos += 1
-    # 这些基在 64 位以内构成确定性判据；对更大 q 是严格的合数筛查而非素数证书。
-    for base in (2, 325, 9_375, 28_178, 450_775, 9_780_504, 1_795_265_022):
-        if base % value == 0:
-            continue
-        witness = pow(base, exponent, value)
-        if witness in {1, value - 1}:
-            continue
-        for _ in range(twos - 1):
-            witness = (witness * witness) % value
-            if witness == value - 1:
-                break
-        else:
-            return False
-    return True
 
 
 class _MaskLifecycle:
@@ -131,6 +103,8 @@ class SecureTruncation:
     sharing: TwoPartySharing
     ell: int
     security_parameter: int
+    modulus_evidence: PrimeModulusEvidence | None = None
+    _modulus_verification: PrimeModulusVerification = field(init=False, repr=False)
     _created_masks: int = field(default=0, init=False, repr=False)
     _consumed_masks: int = field(default=0, init=False, repr=False)
 
@@ -144,8 +118,9 @@ class SecureTruncation:
             or self.security_parameter < 1
         ):
             raise ValueError("security_parameter 必须是正整数。")
-        if not _is_prime_candidate(self.sharing.modulus):
-            raise ValueError("Protocol 2 要求 modulus 为素数。")
+        self._modulus_verification = verify_prime_modulus(
+            self.sharing.modulus, self.modulus_evidence
+        )
         kappa = self.sharing.modulus.bit_length() - 1 - self.security_parameter - 1
         if kappa <= self.ell:
             raise ValueError("必须满足 kappa=floor(log2(q))-lambda-1 > ell。")
@@ -156,6 +131,11 @@ class SecureTruncation:
     def kappa(self) -> int:
         """返回论文定义的 ``floor(log2(q))-lambda-1``。"""
         return self.sharing.modulus.bit_length() - self.security_parameter - 2
+
+    @property
+    def modulus_verification(self) -> PrimeModulusVerification:
+        """返回不可变公开验证报告，不允许调用方替换内部可信性结论。"""
+        return self._modulus_verification
 
     @property
     def scale(self) -> int:
