@@ -19,6 +19,7 @@ from secure_control.crypto import (
     PocklingtonCertificate,
     PocklingtonFactorEvidence,
     PrimeModulusEvidence,
+    PrimeVerificationError,
     verify_prime_modulus,
 )
 from secure_control.execution import PlaintextStateSpaceRuntime, SecureStateSpaceRuntime
@@ -48,6 +49,63 @@ from .tuning import (
     load_hvac_pid_tuning_contract,
     tune_hvac_pid,
 )
+
+_MAX_WRAPPER_YAML_BYTES = 1 << 20
+_MAX_WRAPPER_YAML_DEPTH = 128
+_MAX_WRAPPER_YAML_NODES = 4096
+_MAX_POCKLINGTON_PARSE_DEPTH = 32
+_MAX_POCKLINGTON_PARSE_NODES = 256
+_MAX_POCKLINGTON_INTEGER_BITS = 4096
+
+
+class _BoundedSafeLoader(yaml.SafeLoader):
+    """在构造 Python 对象前限制 YAML 大小、组合节点和语法嵌套深度。"""
+
+    def __init__(self, stream: str) -> None:
+        self._composition_depth = 0
+        self._composition_nodes = 0
+        super().__init__(stream)
+
+    def compose_node(self, parent: Any, index: Any) -> yaml.Node:
+        """逐节点施加预算，alias 引用也计入总工作量。"""
+        if self._composition_depth >= _MAX_WRAPPER_YAML_DEPTH:
+            raise PrimeVerificationError(
+                "resource_limit_exceeded", "HVAC YAML 嵌套深度超过资源限制。"
+            )
+        self._composition_nodes += 1
+        if self._composition_nodes > _MAX_WRAPPER_YAML_NODES:
+            raise PrimeVerificationError(
+                "resource_limit_exceeded", "HVAC YAML 节点数超过资源限制。"
+            )
+        self._composition_depth += 1
+        try:
+            return super().compose_node(parent, index)
+        finally:
+            self._composition_depth -= 1
+
+
+@dataclass(slots=True)
+class _EvidenceParseBudget:
+    """在场景映射转换为 crypto 类型前限制证书树和 YAML alias 环。"""
+
+    nodes: int = 0
+    active_mapping_ids: set[int] | None = None
+
+    def __post_init__(self) -> None:
+        if self.active_mapping_ids is None:
+            self.active_mapping_ids = set()
+
+
+def _load_bounded_wrapper_yaml(source: bytes) -> Any:
+    """以受限 SafeLoader 读取 wrapper，资源异常保留稳定 reason code。"""
+    if len(source) > _MAX_WRAPPER_YAML_BYTES:
+        raise PrimeVerificationError("resource_limit_exceeded", "HVAC wrapper YAML 超过资源限制。")
+    try:
+        return yaml.load(source.decode("utf-8"), Loader=_BoundedSafeLoader)
+    except (MemoryError, OverflowError, RecursionError, ValueError) as error:
+        raise PrimeVerificationError(
+            "resource_limit_exceeded", "HVAC wrapper YAML 解析超过资源限制。"
+        ) from error
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,7 +178,7 @@ class HvacScenario:
         path = Path(config_path)
         try:
             wrapper_source = path.read_bytes()
-            loaded = yaml.safe_load(wrapper_source.decode("utf-8"))
+            loaded = _load_bounded_wrapper_yaml(wrapper_source)
         except (OSError, yaml.YAMLError) as error:
             raise ValueError(f"无法读取 HVAC 双闭环配置：{path}") from error
         if not isinstance(loaded, Mapping):
@@ -691,40 +749,80 @@ def _parse_modulus_evidence(value: Any) -> PrimeModulusEvidence | None:
         certificate_id=evidence["certificate_id"],
         certificate_sha256=evidence["certificate_sha256"],
         certificate=_parse_pocklington_certificate(
-            evidence["certificate"], "security.modulus_evidence.certificate"
+            evidence["certificate"],
+            "security.modulus_evidence.certificate",
+            depth=0,
+            budget=_EvidenceParseBudget(),
         ),
     )
 
 
-def _parse_pocklington_certificate(value: Any, path: str) -> PocklingtonCertificate:
-    """递归解析公开 Pocklington certificate，不在场景层复制任何数论判断。"""
+def _parse_pocklington_certificate(
+    value: Any,
+    path: str,
+    *,
+    depth: int,
+    budget: _EvidenceParseBudget,
+) -> PocklingtonCertificate:
+    """在共享资源预算内解析证书；数论条件仍只由 crypto verifier 判断。"""
+    if depth > _MAX_POCKLINGTON_PARSE_DEPTH:
+        raise PrimeVerificationError(
+            "resource_limit_exceeded", "Pocklington YAML 证书深度超过资源限制。"
+        )
     certificate = _exact_mapping(value, path, {"candidate", "factors"})
     factors = certificate["factors"]
     if not isinstance(factors, list) or not factors:
         raise TypeError(f"{path}.factors 必须是非空列表。")
-    parsed: list[PocklingtonFactorEvidence] = []
-    for index, item in enumerate(factors):
-        factor_path = f"{path}.factors[{index}]"
-        factor = _exact_mapping(
-            item,
-            factor_path,
-            {"prime", "exponent", "witness", "certificate"},
-            optional={"certificate"},
+    candidate = certificate["candidate"]
+    if (
+        isinstance(candidate, Integral)
+        and not isinstance(candidate, bool)
+        and int(candidate).bit_length() > _MAX_POCKLINGTON_INTEGER_BITS
+    ):
+        raise PrimeVerificationError(
+            "resource_limit_exceeded", "Pocklington YAML candidate 超过资源限制。"
         )
-        nested = factor.get("certificate")
-        parsed.append(
-            PocklingtonFactorEvidence(
-                prime=factor["prime"],
-                exponent=factor["exponent"],
-                witness=factor["witness"],
-                certificate=(
-                    None
-                    if nested is None
-                    else _parse_pocklington_certificate(nested, f"{factor_path}.certificate")
-                ),
+    budget.nodes += 1 + len(factors)
+    if budget.nodes > _MAX_POCKLINGTON_PARSE_NODES:
+        raise PrimeVerificationError("resource_limit_exceeded", "Pocklington YAML 证书节点过多。")
+    assert budget.active_mapping_ids is not None
+    mapping_id = id(certificate)
+    if mapping_id in budget.active_mapping_ids:
+        raise PrimeVerificationError(
+            "resource_limit_exceeded", "Pocklington YAML 证书存在 alias 循环。"
+        )
+    budget.active_mapping_ids.add(mapping_id)
+    try:
+        parsed: list[PocklingtonFactorEvidence] = []
+        for index, item in enumerate(factors):
+            factor_path = f"{path}.factors[{index}]"
+            factor = _exact_mapping(
+                item,
+                factor_path,
+                {"prime", "exponent", "witness", "certificate"},
+                optional={"certificate"},
             )
-        )
-    return PocklingtonCertificate(candidate=certificate["candidate"], factors=tuple(parsed))
+            nested = factor.get("certificate")
+            parsed.append(
+                PocklingtonFactorEvidence(
+                    prime=factor["prime"],
+                    exponent=factor["exponent"],
+                    witness=factor["witness"],
+                    certificate=(
+                        None
+                        if nested is None
+                        else _parse_pocklington_certificate(
+                            nested,
+                            f"{factor_path}.certificate",
+                            depth=depth + 1,
+                            budget=budget,
+                        )
+                    ),
+                )
+            )
+        return PocklingtonCertificate(candidate=candidate, factors=tuple(parsed))
+    finally:
+        budget.active_mapping_ids.remove(mapping_id)
 
 
 def _exact_mapping(

@@ -213,3 +213,35 @@ def test_incomplete_factor_coverage_and_certificate_cycle_fail_closed() -> None:
     with pytest.raises(PrimeVerificationError) as captured:
         verify_prime_modulus((1 << 4096) + 1)
     assert captured.value.reason_code == "resource_limit_exceeded"
+
+
+def test_factor_entries_are_bounded_before_canonical_sorting_and_serialization() -> None:
+    """大量 flat/nested factor entries 必须在排序和 JSON 物化前稳定拒绝。"""
+    factor = PocklingtonFactorEvidence(prime=2, exponent=1, witness=2)
+    with pytest.raises(PrimeVerificationError) as captured:
+        certificate = PocklingtonCertificate(candidate=17, factors=(factor,) * 300)
+        pocklington_certificate_sha256(certificate)
+    assert captured.value.reason_code == "resource_limit_exceeded"
+
+    nested = PocklingtonCertificate(candidate=19, factors=(factor,) * 130)
+    root_factor = PocklingtonFactorEvidence(
+        prime=19,
+        exponent=1,
+        witness=2,
+        certificate=nested,
+    )
+    root = PocklingtonCertificate(candidate=191, factors=(root_factor,) * 130)
+    with pytest.raises(PrimeVerificationError) as captured:
+        pocklington_certificate_sha256(root)
+    assert captured.value.reason_code == "resource_limit_exceeded"
+
+
+def test_oversized_factor_integer_is_rejected_before_canonical_string_conversion() -> None:
+    """factor 公开整数不得绕过 bit/exponent 上限扩大 canonical serialized work。"""
+    with pytest.raises(PrimeVerificationError) as captured:
+        PocklingtonFactorEvidence(prime=2, exponent=4097, witness=2)
+    assert captured.value.reason_code == "resource_limit_exceeded"
+
+    with pytest.raises(PrimeVerificationError) as captured:
+        PocklingtonFactorEvidence(prime=2, exponent=1, witness=1 << 4096)
+    assert captured.value.reason_code == "resource_limit_exceeded"

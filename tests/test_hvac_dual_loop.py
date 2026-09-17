@@ -451,3 +451,133 @@ def test_hvac_yaml_passes_large_modulus_evidence_and_records_public_summary(
     with pytest.raises(PrimeVerificationError) as captured:
         HvacScenario(missing)
     assert captured.value.reason_code == "evidence_required"
+
+
+def test_hvac_modulus_evidence_parser_bounds_factor_entries_and_alias_cycles(
+    tmp_path: Path,
+) -> None:
+    """不可信 YAML 必须在递归类型物化前以稳定资源原因拒绝过量 factor 和 alias 环。"""
+    evidence = _large_prime_evidence()
+    base_security = {
+        "modulus": evidence.certificate.candidate,
+        "integer_bits": 48,
+        "fractional_bits": 20,
+        "security_parameter": 8,
+        "horizon_steps": 180,
+    }
+    factor = {"prime": 2, "exponent": 1, "witness": 2}
+    oversized_certificate = {
+        "candidate": evidence.certificate.candidate,
+        "factors": [factor.copy() for _ in range(300)],
+    }
+    oversized = tmp_path / "oversized-factor-evidence.yaml"
+    oversized.write_text(
+        yaml.safe_dump(
+            {
+                "scenario": {"name": "hvac"},
+                "baseline_config": str(BASELINE_PATH),
+                "security": {
+                    **base_security,
+                    "modulus_evidence": {
+                        "method": "pocklington_v1",
+                        "source": "Issue #33 parser regression",
+                        "source_version": "1",
+                        "certificate_id": "oversized",
+                        "certificate_sha256": "0" * 64,
+                        "certificate": oversized_certificate,
+                    },
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(PrimeVerificationError) as captured:
+        HvacScenario(oversized)
+    assert captured.value.reason_code == "resource_limit_exceeded"
+
+    cyclic_certificate: dict[str, object] = {
+        "candidate": evidence.certificate.candidate,
+        "factors": [],
+    }
+    cyclic_certificate["factors"] = [
+        {
+            "prime": evidence.certificate.candidate,
+            "exponent": 1,
+            "witness": 2,
+            "certificate": cyclic_certificate,
+        }
+    ]
+    cyclic = tmp_path / "cyclic-alias-evidence.yaml"
+    cyclic.write_text(
+        yaml.safe_dump(
+            {
+                "scenario": {"name": "hvac"},
+                "baseline_config": str(BASELINE_PATH),
+                "security": {
+                    **base_security,
+                    "modulus_evidence": {
+                        "method": "pocklington_v1",
+                        "source": "Issue #33 parser regression",
+                        "source_version": "1",
+                        "certificate_id": "cyclic",
+                        "certificate_sha256": "0" * 64,
+                        "certificate": cyclic_certificate,
+                    },
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(PrimeVerificationError) as captured:
+        HvacScenario(cyclic)
+    assert captured.value.reason_code == "resource_limit_exceeded"
+
+    nested_certificate: dict[str, object] = {
+        "candidate": 17,
+        "factors": [{"prime": 2, "exponent": 1, "witness": 2}],
+    }
+    for _ in range(34):
+        nested_certificate = {
+            "candidate": 17,
+            "factors": [
+                {
+                    "prime": 17,
+                    "exponent": 1,
+                    "witness": 2,
+                    "certificate": nested_certificate,
+                }
+            ],
+        }
+    too_deep = tmp_path / "too-deep-evidence.yaml"
+    too_deep.write_text(
+        yaml.safe_dump(
+            {
+                "scenario": {"name": "hvac"},
+                "baseline_config": str(BASELINE_PATH),
+                "security": {
+                    **base_security,
+                    "modulus_evidence": {
+                        "method": "pocklington_v1",
+                        "source": "Issue #33 parser regression",
+                        "source_version": "1",
+                        "certificate_id": "too-deep",
+                        "certificate_sha256": "0" * 64,
+                        "certificate": nested_certificate,
+                    },
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(PrimeVerificationError) as captured:
+        HvacScenario(too_deep)
+    assert captured.value.reason_code == "resource_limit_exceeded"
+
+    oversized_source = tmp_path / "oversized-wrapper-source.yaml"
+    oversized_source.write_bytes(b"#" * ((1 << 20) + 1))
+    with pytest.raises(PrimeVerificationError) as captured:
+        HvacScenario(oversized_source)
+    assert captured.value.reason_code == "resource_limit_exceeded"

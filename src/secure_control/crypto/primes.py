@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 from dataclasses import dataclass
+from itertools import islice
 from math import gcd
 from typing import Literal, cast
 
@@ -67,6 +68,18 @@ def _require_nonempty(value: object, name: str) -> str:
     return value
 
 
+def _validate_factor_resource_bounds(prime: int, exponent: int, witness: int) -> None:
+    """在 canonical 字符串转换前限制 factor 的公开整数工作量。"""
+    if (
+        prime.bit_length() > _MAX_CERTIFICATE_BITS
+        or witness.bit_length() > _MAX_CERTIFICATE_BITS
+        or exponent > _MAX_FACTOR_EXPONENT
+    ):
+        raise PrimeVerificationError(
+            "resource_limit_exceeded", "Pocklington factor 整数字段超过资源限制。"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class PocklingtonFactorEvidence:
     """记录 ``n-1`` 中一个不同素因子的指数、witness 与递归证书。"""
@@ -81,6 +94,7 @@ class PocklingtonFactorEvidence:
         _require_integer(self.prime, "factor prime", minimum=2)
         _require_integer(self.exponent, "factor exponent", minimum=1)
         _require_integer(self.witness, "factor witness", minimum=0)
+        _validate_factor_resource_bounds(self.prime, self.exponent, self.witness)
         if self.certificate is not None and not isinstance(
             self.certificate, PocklingtonCertificate
         ):
@@ -97,10 +111,19 @@ class PocklingtonCertificate:
     def __post_init__(self) -> None:
         """将因子集合冻结为 tuple，并拒绝空证书或错误元素类型。"""
         _require_integer(self.candidate, "certificate candidate", minimum=2)
+        if self.candidate.bit_length() > _MAX_CERTIFICATE_BITS:
+            raise PrimeVerificationError(
+                "resource_limit_exceeded", "Pocklington candidate 超过资源限制。"
+            )
         try:
-            factors = tuple(self.factors)
+            # 最多读取上限数量的元素；无限迭代器或超长输入不能先被完整物化。
+            factors = tuple(islice(iter(self.factors), _MAX_CERTIFICATE_NODES))
         except TypeError as error:
             raise TypeError("certificate factors 必须是可迭代的因子证据。") from error
+        if len(factors) >= _MAX_CERTIFICATE_NODES:
+            raise PrimeVerificationError(
+                "resource_limit_exceeded", "Pocklington factor entries 超过资源限制。"
+            )
         if not factors or not all(isinstance(item, PocklingtonFactorEvidence) for item in factors):
             raise TypeError("certificate factors 必须包含 PocklingtonFactorEvidence。")
         object.__setattr__(self, "factors", factors)
@@ -150,7 +173,7 @@ class PrimeModulusVerification:
 
 @dataclass(slots=True)
 class _VerificationBudget:
-    """限制递归证书的深度、节点数和循环，防止配置型资源耗尽。"""
+    """限制证书、factor entries 的总节点数和递归循环，防止资源耗尽。"""
 
     nodes: int = 0
     active_candidates: set[int] | None = None
@@ -158,6 +181,13 @@ class _VerificationBudget:
     def __post_init__(self) -> None:
         if self.active_candidates is None:
             self.active_candidates = set()
+
+
+def _consume_structure_budget(budget: _VerificationBudget, factor_count: int) -> None:
+    """在排序、序列化或数学循环前统一计入 certificate 与全部 factor 节点。"""
+    budget.nodes += 1 + factor_count
+    if budget.nodes > _MAX_CERTIFICATE_NODES:
+        raise PrimeVerificationError("resource_limit_exceeded", "Pocklington 证书节点过多。")
 
 
 def _passes_miller_rabin_screen(value: int) -> bool:
@@ -199,12 +229,12 @@ def _canonical_certificate(
     assert budget.active_candidates is not None
     if certificate.candidate in budget.active_candidates:
         raise PrimeVerificationError("resource_limit_exceeded", "Pocklington 证书存在递归循环。")
-    budget.nodes += 1
-    if budget.nodes > _MAX_CERTIFICATE_NODES:
-        raise PrimeVerificationError("resource_limit_exceeded", "Pocklington 证书节点过多。")
+    _consume_structure_budget(budget, len(certificate.factors))
     budget.active_candidates.add(certificate.candidate)
     try:
         factors = []
+        for factor in certificate.factors:
+            _validate_factor_resource_bounds(factor.prime, factor.exponent, factor.witness)
         for factor in sorted(certificate.factors, key=lambda item: item.prime):
             nested = (
                 None
@@ -257,9 +287,7 @@ def _verify_pocklington(
     assert budget.active_candidates is not None
     if expected_candidate in budget.active_candidates:
         raise PrimeVerificationError("resource_limit_exceeded", "Pocklington 证书存在递归循环。")
-    budget.nodes += 1
-    if budget.nodes > _MAX_CERTIFICATE_NODES:
-        raise PrimeVerificationError("resource_limit_exceeded", "Pocklington 证书节点过多。")
+    _consume_structure_budget(budget, len(certificate.factors))
     if not _passes_miller_rabin_screen(expected_candidate):
         raise PrimeVerificationError("composite", "固定 Miller--Rabin bases 已证明候选为合数。")
 

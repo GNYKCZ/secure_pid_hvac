@@ -36,7 +36,9 @@ gcd(pow(a_i, (n-1)/p_i, n) - 1, n) == 1
 ```
 
 小于 `2^64` 的因子由 MR64 确定验证；更大的因子必须递归携带证书。实现使用纯 Python 整数，
-不以浮点 `sqrt` 判断覆盖条件，并限制证书 bit length、递归深度、节点数和指数，检测递归循环。
+不以浮点 `sqrt` 判断覆盖条件，并在 YAML/type 物化、canonical hash 和数学验证三处限制输入字节、
+bit length、递归深度、certificate+factor 总节点数和指数，检测 alias/递归循环；超限统一返回
+`resource_limit_exceeded`，不会先排序或序列化完整的超限 factor 列表。
 `PrimeVerificationError.reason_code` 是稳定机器接口，包括 `composite`、`evidence_required`、
 `certificate_hash_mismatch`、`incomplete_factorization`、`invalid_witness` 等；异常文本不应作为唯一判断。
 
