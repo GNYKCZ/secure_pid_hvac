@@ -108,5 +108,16 @@ def test_hvac_tuning_is_plaintext_only_and_has_no_secure_protocol_dependency() -
     )
 
 
+def test_stability_dependency_direction_remains_scenario_independent() -> None:
+    """通用稳定性检查器不得依赖场景/协议，simulation 也不得反向依赖 HVAC 分析。"""
+    core_stability = PACKAGE_ROOT / "core" / "stability.py"
+    assert not any(
+        module.startswith(("secure_control.scenarios", "secure_control.protocol"))
+        for module in imported_modules(core_stability)
+    )
+    for path in python_files("simulation"):
+        assert "secure_control.scenarios.hvac" not in imported_modules(path)
+
+
 def test_legacy_source_package_does_not_exist() -> None:
     assert not (PACKAGE_ROOT.parent / "secure_pid").exists()

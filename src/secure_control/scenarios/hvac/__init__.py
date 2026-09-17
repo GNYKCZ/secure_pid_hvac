@@ -28,6 +28,13 @@ from .plant import (
     build_hvac_plant,
 )
 from .reference import HvacStepReference
+from .stability import (
+    ApplicabilityStatus,
+    HvacClosedLoopStabilityReport,
+    HvacEquilibriumReport,
+    analyze_hvac_closed_loop_stability,
+    build_hvac_closed_loop_matrix,
+)
 from .tuning import (
     HvacGainSearchAxis,
     HvacPidTuningContract,
@@ -38,12 +45,15 @@ from .tuning import (
 )
 
 __all__ = [
+    "ApplicabilityStatus",
     "Hvac2R2CModelContract",
     "Hvac2R2CPlant",
     "Hvac2R2CStateSpace",
     "HvacBranchMetrics",
+    "HvacClosedLoopStabilityReport",
     "HvacComparisonMetrics",
     "HvacControlQualityContract",
+    "HvacEquilibriumReport",
     "HvacGainSearchAxis",
     "HvacParameterProvenance",
     "HvacPidDesign",
@@ -58,7 +68,9 @@ __all__ = [
     "HvacSignalAdapter",
     "HvacStepReference",
     "HvacTuningInfeasibleError",
+    "analyze_hvac_closed_loop_stability",
     "build_hvac_2r2c_state_space",
+    "build_hvac_closed_loop_matrix",
     "build_hvac_plant",
     "evaluate_hvac_branch_metrics",
     "evaluate_hvac_comparison_metrics",
