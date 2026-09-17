@@ -66,7 +66,15 @@ def test_dependency_direction_has_no_scenario_back_imports() -> None:
 def test_experiment_io_boundary_imports_only_generic_contracts() -> None:
     """通用 writer/provenance/plotting 不导入场景算法；薄 CLI 只调用已保存数据。"""
     experiments = PACKAGE_ROOT / "experiments"
-    for name in ("artifacts.py", "provenance.py", "plotting.py"):
+    for name in (
+        "artifacts.py",
+        "provenance.py",
+        "plotting.py",
+        "sweep.py",
+        "sweep_metrics.py",
+        "sweep_artifacts.py",
+        "sweep_plotting.py",
+    ):
         source = experiments / name
         assert "secure_control.scenarios" not in imported_modules(source)
         assert FORBIDDEN_DOMAIN_TERMS.search(source.read_text(encoding="utf-8")) is None
@@ -83,6 +91,13 @@ def test_experiment_io_boundary_imports_only_generic_contracts() -> None:
     assert scenario_imports == {"secure_control.scenarios.hvac.integration"}
     assert "secure_control.scenarios.hvac.plant" not in selector_imports
     assert "secure_control.scenarios.hvac.pid" not in selector_imports
+    sweep_runner_imports = imported_modules(experiments / "sweep_runner.py")
+    assert {
+        module for module in sweep_runner_imports if module.startswith("secure_control.scenarios")
+    } == {
+        "secure_control.scenarios.hvac.integration",
+        "secure_control.scenarios.hvac.stability",
+    }
 
 
 def test_2r2c_types_remain_owned_by_hvac_scenario() -> None:

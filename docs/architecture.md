@@ -26,7 +26,8 @@ core ───────→ 标准库和基础数组类型
 - `scenarios` 拥有 plant、reference、controller design、信号适配、单位和场景指标。
 - `experiments` 是独立 I/O/composition root：显式场景选择、通用结果产物与公开 provenance；
   已保存结果的绘图也在此层从正式 reader 获取数据，不参与 engine 的控制循环，
-  不把场景算法加入通用 writer/plotting。
+  不把场景算法加入通用 writer/plotting。通用 sweep 定义、误差汇总、工件和绘图同样不导入
+  场景；只有 `sweep_runner` 作为 composition root 显式选择当前 HVAC 稳定性门和指标快照。
 
 低层模块不得反向导入 `scenarios`。具体场景名称、单位或控制器调参字段不得进入
 `core`、`crypto`、`protocol`、`execution` 或 `simulation`。
@@ -115,3 +116,5 @@ HVAC 的装配与 180 步物理/编码范围条件见 [仿真与双闭环集成]
 正式场景选择、schema v1 与无覆盖发布见 [实验产物约定](experiment_schema.md)。
 从已发布结果生成四类图、显式向量通道选择与 log 零值规则见
 [已保存结果绘图契约](figure_contract.md)。
+冻结 2R2C 配置上的定点精度扫描、逐点预检和部分失败发布语义见
+[2R2C 定点精度扫描](precision_sweep.md)。

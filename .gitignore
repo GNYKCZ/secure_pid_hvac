@@ -24,3 +24,5 @@ results/csv/*
 !results/csv/.gitkeep
 results/figures/*
 !results/figures/.gitkeep
+results/sweeps/*
+!results/sweeps/.gitkeep

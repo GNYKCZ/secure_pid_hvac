@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from hashlib import sha256
-from math import ceil, isfinite
+from math import isfinite
 from numbers import Integral
 from pathlib import Path
 from typing import Any
@@ -433,6 +433,20 @@ class HvacScenario:
         )
         return HvacComparison(result, None, self.safety_certificate, ideal, secure)
 
+    def metrics_snapshot(self, result: SimulationResult) -> dict[str, Any]:
+        """返回可写入扫描工件的 HVAC 指标快照，不暴露内部 plant 状态。"""
+        comparison = self.metrics(result)
+        if comparison.comparison_metrics is not None:
+            return asdict(comparison.comparison_metrics)
+        return {
+            "legacy_segment_metrics_ideal": [
+                asdict(item) for item in comparison.legacy_segment_metrics_ideal
+            ],
+            "legacy_segment_metrics_secure": [
+                asdict(item) for item in comparison.legacy_segment_metrics_secure
+            ],
+        }
+
     def _controller_specs(self) -> tuple[ControllerSpec, ControllerSpec]:
         """返回语义相同的明文 spec 与带冻结 scale ledger 的安全 spec。"""
         plain = self._design.to_controller_spec()
@@ -496,8 +510,8 @@ class HvacScenario:
         ) or not all(isfinite(value) for value in (input_low, input_high, raw_low, raw_high)):
             raise FloatingPointError("HVAC finite-horizon 区间传播产生非有限值")
 
-        input_payload_bound = ceil(
-            max(abs(input_low), abs(input_high)) * self._fixed_point.scale + 1
+        input_payload_bound = _exact_scaled_upper_bound(
+            max(abs(input_low), abs(input_high)), self._fixed_point.scale
         )
         if input_payload_bound > self._fixed_point.maximum_payload:
             raise ValueError("HVAC input payload bound 超出 fixed-point 可表示范围")
@@ -841,6 +855,15 @@ def _exact_mapping(
     if missing or unknown:
         raise ValueError(f"{path} 字段不匹配：missing={sorted(missing)}, unknown={sorted(unknown)}")
     return value
+
+
+def _exact_scaled_upper_bound(value: float, scale: int) -> int:
+    """以 binary64 的精确有理数计算 ``ceil(value * scale) + 1``。"""
+    if not isfinite(value) or value < 0.0 or scale <= 0:
+        raise ValueError("范围值必须有限非负，scale 必须为正整数")
+    numerator, denominator = value.as_integer_ratio()
+    scaled_ceiling = -(-(numerator * scale) // denominator)
+    return scaled_ceiling + 1
 
 
 def run_hvac_dual_loop(config_path: str | Path, *, test_seed: int | None = None) -> HvacComparison:
