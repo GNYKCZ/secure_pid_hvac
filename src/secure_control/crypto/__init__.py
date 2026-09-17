@@ -7,6 +7,17 @@ from .beaver import (
     PublicMaskedDifferences,
 )
 from .fixed_point import FixedPointContext
+from .primes import (
+    PocklingtonCertificate,
+    PocklingtonFactorEvidence,
+    PrimeModulusEvidence,
+    PrimeModulusVerification,
+    PrimeVerificationError,
+    PrimeVerificationMethod,
+    PrimeVerificationReason,
+    pocklington_certificate_sha256,
+    verify_prime_modulus,
+)
 from .secret_sharing import AdditiveShare, TwoPartySharing
 from .truncation import (
     MaskedTruncationShare,
@@ -25,8 +36,17 @@ __all__ = [
     "MaskedTruncationShare",
     "P1MaskedValue",
     "P2MaskedMessage",
+    "PocklingtonCertificate",
+    "PocklingtonFactorEvidence",
+    "PrimeModulusEvidence",
+    "PrimeModulusVerification",
+    "PrimeVerificationError",
+    "PrimeVerificationMethod",
+    "PrimeVerificationReason",
     "PublicMaskedDifferences",
     "SecureTruncation",
     "TruncationAuxiliaryShare",
     "TwoPartySharing",
+    "pocklington_certificate_sha256",
+    "verify_prime_modulus",
 ]

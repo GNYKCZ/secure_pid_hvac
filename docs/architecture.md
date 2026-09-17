@@ -18,7 +18,7 @@ core ───────→ 标准库和基础数组类型
 ```
 
 - `core` 只定义通用控制数据，如 `ControllerSpec(A, B, C, D, x0)`。
-- `crypto` 只处理整数、向量/矩阵、定点 scale、模数、share 和辅助随机量。
+- `crypto` 只处理整数、向量/矩阵、定点 scale、模数、公开素数证据、share 和辅助随机量。
 - `protocol` 只编排通用控制器参数、状态、输入和输出的 shares。
 - `execution` 向上提供统一的 `step(v) -> u` 接口，具体 transport 不改变该接口。
 - `simulation` 只协调 reference、plant output、scenario adapter、runtime 和结果记录。
@@ -60,6 +60,11 @@ controller design 负责在进入 runtime 前生成这些矩阵。
 fixed-point A/B 的逐聚合 state 行 Trunc，或 integer A/B 的 no-Trunc 路径；选择不依赖场景或
 控制器类型。失败 step 回滚 state share 且不推进 step，reset 通过新建 session 恢复 x0。
 具体尺度、资源和安全边界见[安全运行时契约](secure_runtime_contract.md)。
+
+依赖素数域前提的 Protocol 2 统一调用 `crypto.primes`。该模块对 64 位范围执行确定性 MR64，
+对更大模数只接受本地可复核的递归 Pocklington 证据；它不读取 YAML 或访问网络。证据只沿
+`scenario -> execution -> protocol -> crypto` 单向传递，场景层仅映射配置 schema，不能复制
+数论验证。一般 `TwoPartySharing` 仍表示通用模环，不因截断的素数前提而改变构造契约。
 
 ## 场景与仿真契约
 

@@ -156,6 +156,16 @@ def test_effective_snapshot_and_provenance_record_actual_public_inputs(tmp_path:
     assert config["hvac"]["model"]["upper_control_bound_kw"] == 12.0
     assert config["hvac"]["pid"]["integral_gain_kw_per_celsius_second"] == -0.0005
     assert config["finite_horizon_certificate"]["horizon_steps"] == 180
+    assert config["modulus_verification"] == {
+        "modulus": "2305843009213693951",
+        "bit_length": 61,
+        "method": "deterministic_miller_rabin_64_v1",
+        "status": "verified",
+        "source": "secure_control.crypto.primes",
+        "source_version": "mr64-v1",
+        "certificate_id": None,
+        "certificate_sha256": None,
+    }
     assert config["execution"] == {
         "secure_material_test_seed": 13,
         "secure_material_randomness": "deterministic_test",

@@ -14,7 +14,13 @@ import numpy as np
 import yaml
 
 from secure_control.core import ControllerScaleMetadata, ControllerSpec
-from secure_control.crypto import FixedPointContext
+from secure_control.crypto import (
+    FixedPointContext,
+    PocklingtonCertificate,
+    PocklingtonFactorEvidence,
+    PrimeModulusEvidence,
+    verify_prime_modulus,
+)
 from secure_control.execution import PlaintextStateSpaceRuntime, SecureStateSpaceRuntime
 from secure_control.protocol import ControllerRangeContract
 from secure_control.simulation import (
@@ -189,6 +195,10 @@ class HvacScenario:
             integer_bits=_positive_integer(security, "integer_bits"),
             fractional_bits=_positive_integer(security, "fractional_bits"),
         )
+        self._modulus_evidence = _parse_modulus_evidence(security.get("modulus_evidence"))
+        self._modulus_verification = verify_prime_modulus(
+            self._fixed_point.modulus, self._modulus_evidence
+        )
         self._security_parameter = _positive_integer(security, "security_parameter")
         self._horizon_steps = _positive_integer(security, "horizon_steps")
         self._test_seed = test_seed
@@ -277,6 +287,16 @@ class HvacScenario:
                     "deterministic_test" if self._test_seed is not None else "secure_random"
                 ),
             },
+            "modulus_verification": {
+                "modulus": str(self._modulus_verification.modulus),
+                "bit_length": self._modulus_verification.bit_length,
+                "method": self._modulus_verification.method,
+                "status": self._modulus_verification.status,
+                "source": self._modulus_verification.source,
+                "source_version": self._modulus_verification.source_version,
+                "certificate_id": self._modulus_verification.certificate_id,
+                "certificate_sha256": self._modulus_verification.certificate_sha256,
+            },
             "finite_horizon_certificate": asdict(self.safety_certificate),
         }
         if self._tuning_result is not None and self._tuning_contract is not None:
@@ -318,6 +338,7 @@ class HvacScenario:
                 self._fixed_point,
                 range_contract,
                 security_parameter=self._security_parameter,
+                modulus_evidence=self._modulus_evidence,
                 test_seed=self._test_seed,
             ),
         )
@@ -645,6 +666,83 @@ def _positive_integer(source: Mapping[str, Any], name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
         raise ValueError(f"security.{name} 必须是正整数。")
     return int(value)
+
+
+def _parse_modulus_evidence(value: Any) -> PrimeModulusEvidence | None:
+    """把 HVAC YAML 的可选公开证据映射为领域无关、深度冻结的 crypto 类型。"""
+    if value is None:
+        return None
+    evidence = _exact_mapping(
+        value,
+        "security.modulus_evidence",
+        {
+            "method",
+            "source",
+            "source_version",
+            "certificate_id",
+            "certificate_sha256",
+            "certificate",
+        },
+    )
+    return PrimeModulusEvidence(
+        method=evidence["method"],
+        source=evidence["source"],
+        source_version=evidence["source_version"],
+        certificate_id=evidence["certificate_id"],
+        certificate_sha256=evidence["certificate_sha256"],
+        certificate=_parse_pocklington_certificate(
+            evidence["certificate"], "security.modulus_evidence.certificate"
+        ),
+    )
+
+
+def _parse_pocklington_certificate(value: Any, path: str) -> PocklingtonCertificate:
+    """递归解析公开 Pocklington certificate，不在场景层复制任何数论判断。"""
+    certificate = _exact_mapping(value, path, {"candidate", "factors"})
+    factors = certificate["factors"]
+    if not isinstance(factors, list) or not factors:
+        raise TypeError(f"{path}.factors 必须是非空列表。")
+    parsed: list[PocklingtonFactorEvidence] = []
+    for index, item in enumerate(factors):
+        factor_path = f"{path}.factors[{index}]"
+        factor = _exact_mapping(
+            item,
+            factor_path,
+            {"prime", "exponent", "witness", "certificate"},
+            optional={"certificate"},
+        )
+        nested = factor.get("certificate")
+        parsed.append(
+            PocklingtonFactorEvidence(
+                prime=factor["prime"],
+                exponent=factor["exponent"],
+                witness=factor["witness"],
+                certificate=(
+                    None
+                    if nested is None
+                    else _parse_pocklington_certificate(nested, f"{factor_path}.certificate")
+                ),
+            )
+        )
+    return PocklingtonCertificate(candidate=certificate["candidate"], factors=tuple(parsed))
+
+
+def _exact_mapping(
+    value: Any,
+    path: str,
+    required: set[str],
+    *,
+    optional: set[str] | None = None,
+) -> Mapping[str, Any]:
+    """拒绝证据 schema 的缺失和未知字段，避免拼写错误被静默忽略。"""
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{path} 必须是映射。")
+    optional = set() if optional is None else optional
+    missing = required - optional - set(value)
+    unknown = set(value) - required
+    if missing or unknown:
+        raise ValueError(f"{path} 字段不匹配：missing={sorted(missing)}, unknown={sorted(unknown)}")
+    return value
 
 
 def run_hvac_dual_loop(config_path: str | Path, *, test_seed: int | None = None) -> HvacComparison:
