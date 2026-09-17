@@ -98,11 +98,11 @@ class RangeMargin:
 class PrecisionPreflightReport:
     """记录运行前稳定性、证据、冻结字段和全部范围门禁。"""
 
-    stability_passed: bool
-    prime_evidence_passed: bool
-    frozen_fields_passed: bool
+    stability_passed: bool | None
+    prime_evidence_passed: bool | None
+    frozen_fields_passed: bool | None
     ranges: tuple[RangeMargin, ...]
-    feasible: bool
+    feasible: bool | None
     reason_codes: tuple[str, ...]
 
 

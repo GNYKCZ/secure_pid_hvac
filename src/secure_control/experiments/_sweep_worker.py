@@ -15,7 +15,13 @@ from secure_control.experiments.provenance import collect_provenance
 from secure_control.scenarios.hvac.integration import HvacScenario
 from secure_control.simulation import compare_closed_loops
 
-from .sweep import SweepPointDefinition, SweepRunRecord, SweepRunStatus
+from .sweep import (
+    PrecisionPreflightReport,
+    ProtocolCostReport,
+    SweepPointDefinition,
+    SweepRunRecord,
+    SweepRunStatus,
+)
 from .sweep_artifacts import record_payload, write_json
 from .sweep_metrics import compute_error_metrics
 from .sweep_runner import build_preflight_report, derive_protocol_cost
@@ -41,6 +47,42 @@ def _atomic_result(path: Path, record: SweepRunRecord) -> None:
     temporary = path.with_name(f".{path.name}.tmp")
     write_json(temporary, {"schema_version": 1, "record": record_payload(record)})
     os.replace(temporary, path)
+
+
+def _atomic_preflight(
+    path: Path, point: SweepPointDefinition, preflight: PrecisionPreflightReport
+) -> None:
+    """在执行阶段前原子保存真实门禁结论，供 timeout 后的父进程恢复。"""
+    temporary = path.with_name(f".{path.name}.tmp")
+    write_json(
+        temporary,
+        {
+            "schema_version": 1,
+            "point": point,
+            "preflight": preflight,
+        },
+    )
+    os.replace(temporary, path)
+
+
+def _incomplete_preflight(request: dict[str, Any]) -> PrecisionPreflightReport:
+    """保留父进程已知门禁；未形成证书的范围与可行性明确记为 unknown。"""
+    return PrecisionPreflightReport(
+        request["stability_passed"] if type(request["stability_passed"]) is bool else None,
+        (
+            request["prime_evidence_passed"]
+            if type(request["prime_evidence_passed"]) is bool
+            else None
+        ),
+        (
+            request["frozen_fields_passed"]
+            if type(request["frozen_fields_passed"]) is bool
+            else None
+        ),
+        (),
+        None,
+        ("preflight_not_completed",),
+    )
 
 
 def _resource_exceeded(cost: Any, limits: dict[str, Any]) -> bool:
@@ -78,7 +120,9 @@ def run_request(request_path: str | Path) -> None:
     config_path = _private_path(attempt, request["config_path"])
     artifact_root = _private_path(attempt, request["artifact_root"])
     result_path = _private_path(attempt, request["result_path"])
+    preflight_path = attempt / "preflight.json"
     started = perf_counter()
+    preflight = _incomplete_preflight(request)
     try:
         scenario = HvacScenario(config_path, test_seed=point.seed)
         preflight = build_preflight_report(
@@ -88,21 +132,39 @@ def run_request(request_path: str | Path) -> None:
             prime_evidence_passed=request["prime_evidence_passed"] is True,
             frozen_fields_passed=request["frozen_fields_passed"] is True,
         )
-        if not preflight.feasible:
-            record = SweepRunRecord(
-                point,
-                SweepRunStatus.INFEASIBLE,
-                preflight,
-                None,
-                None,
-                None,
-                None,
-                None,
-                "preflight_infeasible",
-                ";".join(preflight.reason_codes),
-            )
-            _atomic_result(result_path, record)
-            return
+    except Exception as error:  # noqa: BLE001 - 构造/门禁拒绝属于不可行点。
+        record = SweepRunRecord(
+            point,
+            SweepRunStatus.INFEASIBLE,
+            preflight,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "preflight_rejected",
+            f"{type(error).__name__}: {error}",
+        )
+        _atomic_result(result_path, record)
+        return
+    _atomic_preflight(preflight_path, point, preflight)
+    if not preflight.feasible:
+        record = SweepRunRecord(
+            point,
+            SweepRunStatus.INFEASIBLE,
+            preflight,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "preflight_infeasible",
+            ";".join(preflight.reason_codes),
+        )
+        _atomic_result(result_path, record)
+        return
+    preliminary_cost: ProtocolCostReport | None = None
+    try:
         plan = scenario.build_plan()
         preliminary_cost = derive_protocol_cost(
             plan.secure.runtime,
@@ -116,6 +178,7 @@ def run_request(request_path: str | Path) -> None:
                 feasible=False,
                 reason_codes=(*preflight.reason_codes, "resource_budget_exceeded"),
             )
+            _atomic_preflight(preflight_path, point, constrained)
             record = SweepRunRecord(
                 point,
                 SweepRunStatus.INFEASIBLE,
@@ -157,17 +220,15 @@ def run_request(request_path: str | Path) -> None:
             None,
             None,
         )
-    except Exception as error:  # noqa: BLE001 - 单点异常必须成为可审计失败记录。
-        from .sweep_runner import _failure_preflight
-
+    except Exception as error:  # noqa: BLE001 - 已通过门禁的执行异常保留真实证据。
         record = SweepRunRecord(
             point,
             SweepRunStatus.FAILED,
-            _failure_preflight(type(error).__name__),
+            preflight,
             None,
             None,
             None,
-            None,
+            preliminary_cost,
             None,
             type(error).__name__,
             str(error),

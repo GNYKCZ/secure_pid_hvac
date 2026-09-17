@@ -39,6 +39,7 @@ from .sweep import (
 from .sweep_artifacts import (
     build_summary_payload,
     load_verified_sweep_data,
+    preflight_from_payload,
     record_from_payload,
     write_data_manifest,
     write_definition,
@@ -208,9 +209,22 @@ def derive_protocol_cost(
     )
 
 
-def _failure_preflight(reason: str) -> PrecisionPreflightReport:
-    """在场景预检本身拒绝配置时保留稳定不可行原因。"""
-    return PrecisionPreflightReport(False, False, False, (), False, (reason,))
+def _incomplete_preflight(
+    *,
+    stability_passed: bool,
+    prime_evidence_passed: bool,
+    frozen_fields_passed: bool,
+    reason: str = "preflight_not_completed",
+) -> PrecisionPreflightReport:
+    """保留父进程已知门禁，并以 ``None`` 明示尚未形成的可行性结论。"""
+    return PrecisionPreflightReport(
+        stability_passed,
+        prime_evidence_passed,
+        frozen_fields_passed,
+        (),
+        None,
+        (reason,),
+    )
 
 
 def _frozen_sources(
@@ -237,20 +251,61 @@ def _new_sweep_id() -> str:
     return f"{now}-{secrets.token_hex(6)}"
 
 
-def _failed_record(point: SweepPointDefinition, code: str, message: str) -> SweepRunRecord:
-    """构造父进程可稳定发布的失败记录。"""
+def _failed_record(
+    point: SweepPointDefinition,
+    code: str,
+    message: str,
+    preflight: PrecisionPreflightReport,
+    cost: ProtocolCostReport | None = None,
+) -> SweepRunRecord:
+    """构造父进程失败记录，同时保留已获得的真实门禁与成本证据。"""
     return SweepRunRecord(
         point,
         SweepRunStatus.FAILED,
-        _failure_preflight(code),
+        preflight,
         None,
         None,
         None,
-        None,
+        cost,
         None,
         code,
         message,
     )
+
+
+def _read_preflight_checkpoint(
+    attempt: Path,
+    point: SweepPointDefinition,
+    *,
+    stability_passed: bool,
+    prime_evidence_passed: bool,
+    frozen_fields_passed: bool,
+) -> PrecisionPreflightReport:
+    """恢复 worker 原子 checkpoint；缺失或畸形时明确返回 unknown，而非伪造失败。"""
+    fallback = _incomplete_preflight(
+        stability_passed=stability_passed,
+        prime_evidence_passed=prime_evidence_passed,
+        frozen_fields_passed=frozen_fields_passed,
+    )
+    checkpoint_path = attempt / "preflight.json"
+    try:
+        payload = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return fallback
+    except (OSError, json.JSONDecodeError):
+        return replace(fallback, reason_codes=("preflight_checkpoint_invalid",))
+    if not isinstance(payload, dict) or set(payload) != {
+        "schema_version",
+        "point",
+        "preflight",
+    }:
+        return replace(fallback, reason_codes=("preflight_checkpoint_invalid",))
+    try:
+        if payload["schema_version"] != 1 or SweepPointDefinition(**payload["point"]) != point:
+            raise ValueError("checkpoint identity mismatch")
+        return preflight_from_payload(payload["preflight"])
+    except (TypeError, ValueError):
+        return replace(fallback, reason_codes=("preflight_checkpoint_invalid",))
 
 
 def _attempt_member(attempt: Path, relative: str) -> Path:
@@ -358,13 +413,26 @@ def run_precision_sweep(
                 ],
                 timeout_seconds=definition.timeout_seconds,
             )
+            checkpoint = _read_preflight_checkpoint(
+                attempt,
+                point,
+                stability_passed=stability_passed,
+                prime_evidence_passed=prime_passed,
+                frozen_fields_passed=frozen_passed,
+            )
             if child.timed_out:
-                record = _failed_record(point, "point_timeout", "worker deadline exceeded")
+                record = _failed_record(
+                    point,
+                    "point_timeout",
+                    "worker deadline exceeded",
+                    checkpoint,
+                )
             elif child.returncode != 0:
                 record = _failed_record(
                     point,
                     "worker_nonzero_exit",
                     f"returncode={child.returncode}; stderr={child.stderr}",
+                    checkpoint,
                 )
             else:
                 try:
@@ -385,6 +453,8 @@ def run_precision_sweep(
                                 point,
                                 "artifact_budget_exceeded",
                                 "worker artifact exceeds configured byte budget",
+                                record.preflight,
+                                record.cost,
                             )
                         else:
                             destination_root = stage / "runs" / point.point_id
@@ -398,7 +468,7 @@ def run_precision_sweep(
                     code = (
                         str(error) if str(error).startswith("worker_") else "worker_result_invalid"
                     )
-                    record = _failed_record(point, code, str(error))
+                    record = _failed_record(point, code, str(error), checkpoint)
             records.append(record)
             write_json(point_root / "record.json", record)
             shutil.rmtree(attempt.parent)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,12 +10,16 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from secure_control.experiments import sweep_runner
+from secure_control.experiments import _sweep_worker, sweep_runner
 from secure_control.experiments.sweep import (
+    PrecisionPreflightReport,
+    RangeMargin,
+    SweepPointDefinition,
     SweepRunStatus,
     load_precision_sweep_definition,
     materialize_point_config,
 )
+from secure_control.experiments.sweep_artifacts import record_from_payload, write_json
 from secure_control.experiments.sweep_runner import (
     _run_child,
     build_preflight_report,
@@ -100,19 +105,42 @@ def test_runner_publishes_success_infeasible_and_failed_points_atomically(
     loaded = load_precision_sweep_definition(DEFINITION_PATH)
     definition = replace(loaded, fractional_bits=(32,), seeds=(42, 43, 44))
     stable = {"schur": {"status": "stable"}, "equilibria": [{"applicability": "applicable"}]}
-    outcomes = iter(
-        (
-            sweep_runner._ChildResult(None, True, "", ""),
-            sweep_runner._ChildResult(7, False, "", "worker failed"),
-            sweep_runner._ChildResult(0, False, "", ""),
-        )
-    )
+    outcomes = iter(("timeout", "nonzero", "malformed"))
+
+    def fake_child(command: list[str], **_kwargs: object) -> sweep_runner._ChildResult:
+        """首点保存真实 checkpoint 后超时，其余点验证无 checkpoint 的 unknown 语义。"""
+        outcome = next(outcomes)
+        request_path = Path(command[-1])
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        if outcome == "timeout":
+            point = SweepPointDefinition(**request["point"])
+            preflight = PrecisionPreflightReport(
+                True,
+                True,
+                True,
+                (RangeMargin("saved_range", 1, 10, 9, 0.1),),
+                True,
+                (),
+            )
+            write_json(
+                request_path.parent / "preflight.json",
+                {
+                    "schema_version": 1,
+                    "point": asdict(point),
+                    "preflight": asdict(preflight),
+                },
+            )
+            return sweep_runner._ChildResult(None, True, "", "")
+        if outcome == "nonzero":
+            return sweep_runner._ChildResult(7, False, "", "worker failed")
+        return sweep_runner._ChildResult(0, False, "", "")
+
     monkeypatch.setattr(sweep_runner, "load_precision_sweep_definition", lambda _path: definition)
     monkeypatch.setattr(
         sweep_runner, "stability_report_sha256", lambda _plant, _pid: ("hash", stable)
     )
     monkeypatch.setattr(sweep_runner, "_frozen_sources", lambda _definition, _hash: (True, {}))
-    monkeypatch.setattr(sweep_runner, "_run_child", lambda *_args, **_kwargs: next(outcomes))
+    monkeypatch.setattr(sweep_runner, "_run_child", fake_child)
 
     artifacts = sweep_runner.run_precision_sweep(DEFINITION_PATH, output_root=tmp_path / "out")
     assert [record.status for record in artifacts.records] == [
@@ -125,8 +153,81 @@ def test_runner_publishes_success_infeasible_and_failed_points_atomically(
         "worker_nonzero_exit",
         "worker_result_invalid",
     ]
+    assert artifacts.records[0].preflight == PrecisionPreflightReport(
+        True,
+        True,
+        True,
+        (RangeMargin("saved_range", 1, 10, 9, 0.1),),
+        True,
+        (),
+    )
+    for record in artifacts.records[1:]:
+        assert record.preflight.stability_passed is True
+        assert record.preflight.prime_evidence_passed is True
+        assert record.preflight.frozen_fields_passed is True
+        assert record.preflight.ranges == ()
+        assert record.preflight.feasible is None
+        assert record.preflight.reason_codes == ("preflight_not_completed",)
     assert artifacts.manifest_path.is_file()
     assert not list((tmp_path / "out").glob(".incomplete-*"))
+
+
+def test_worker_preserves_passed_preflight_when_execution_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """门禁通过后的执行异常必须保留真实布尔结论和全部 range margins。"""
+    definition = load_precision_sweep_definition(DEFINITION_PATH)
+    point = definition.points[0]
+
+    class FailingExecutionScenario:
+        """提供有效证书，但在进入执行计划时稳定失败。"""
+
+        def __init__(self, _path: Path, *, test_seed: int) -> None:
+            assert test_seed == point.seed
+            self.safety_certificate = _minimal_preflight_scenario(point.q).safety_certificate
+
+        def build_plan(self) -> None:
+            """模拟 preflight 完成后的执行阶段异常。"""
+            raise RuntimeError("execution failed")
+
+    monkeypatch.setattr(_sweep_worker, "HvacScenario", FailingExecutionScenario)
+    request_path = _write_worker_request(tmp_path, point)
+    _sweep_worker.run_request(request_path)
+    payload = json.loads((tmp_path / "result.json").read_text(encoding="utf-8"))
+    record = record_from_payload(payload["record"])
+    assert record.status is SweepRunStatus.FAILED
+    assert record.failure_code == "RuntimeError"
+    assert record.preflight.feasible is True
+    assert record.preflight.stability_passed is True
+    assert record.preflight.prime_evidence_passed is True
+    assert record.preflight.frozen_fields_passed is True
+    assert record.preflight.ranges
+    assert (tmp_path / "preflight.json").is_file()
+
+
+def test_worker_classifies_scenario_construction_rejection_as_infeasible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """场景构造尚未形成证书时应保留已知门禁，并把未知结论显式序列化。"""
+    point = load_precision_sweep_definition(DEFINITION_PATH).points[0]
+
+    def reject_scenario(_path: Path, *, test_seed: int) -> None:
+        assert test_seed == point.seed
+        raise ValueError("invalid point config")
+
+    monkeypatch.setattr(_sweep_worker, "HvacScenario", reject_scenario)
+    request_path = _write_worker_request(tmp_path, point)
+    _sweep_worker.run_request(request_path)
+    payload = json.loads((tmp_path / "result.json").read_text(encoding="utf-8"))
+    record = record_from_payload(payload["record"])
+    assert record.status is SweepRunStatus.INFEASIBLE
+    assert record.failure_code == "preflight_rejected"
+    assert record.preflight.stability_passed is True
+    assert record.preflight.prime_evidence_passed is True
+    assert record.preflight.frozen_fields_passed is True
+    assert record.preflight.feasible is None
+    assert record.preflight.ranges == ()
+    assert record.preflight.reason_codes == ("preflight_not_completed",)
 
 
 @pytest.mark.parametrize(
@@ -210,3 +311,28 @@ def _minimal_preflight_scenario(q: int) -> SimpleNamespace:
             0,
         )
     )
+
+
+def _write_worker_request(tmp_path: Path, point: SweepPointDefinition) -> Path:
+    """写出不依赖真实场景文件内容的最小严格 worker request。"""
+    (tmp_path / "config.yaml").write_text("fixture: true\n", encoding="utf-8")
+    request_path = tmp_path / "request.json"
+    write_json(
+        request_path,
+        {
+            "schema_version": 1,
+            "point": asdict(point),
+            "config_path": "config.yaml",
+            "artifact_root": "raw",
+            "result_path": "result.json",
+            "stability_passed": True,
+            "prime_evidence_passed": True,
+            "frozen_fields_passed": True,
+            "resource_limits": {
+                "max_protocol1_triples_per_point": 1620,
+                "max_protocol2_truncations_per_point": 0,
+                "max_certified_integer_bit_length": 192,
+            },
+        },
+    )
+    return request_path

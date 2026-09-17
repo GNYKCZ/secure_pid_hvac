@@ -67,6 +67,40 @@ def record_payload(record: SweepRunRecord) -> dict[str, Any]:
     return _jsonable(record)
 
 
+def preflight_from_payload(payload: object) -> PrecisionPreflightReport:
+    """恢复 preflight checkpoint，并保留 ``null`` 表示尚未获得的结论。"""
+    if not isinstance(payload, dict) or set(payload) != {
+        "stability_passed",
+        "prime_evidence_passed",
+        "frozen_fields_passed",
+        "ranges",
+        "feasible",
+        "reason_codes",
+    }:
+        raise ValueError("preflight checkpoint 字段无效")
+
+    def optional_bool(value: object, name: str) -> bool | None:
+        """拒绝用 truthiness 把畸形值或 unknown 静默改写为布尔值。"""
+        if value is None or type(value) is bool:
+            return value
+        raise TypeError(f"{name} 必须是 bool 或 null")
+
+    ranges = payload["ranges"]
+    reasons = payload["reason_codes"]
+    if not isinstance(ranges, list):
+        raise TypeError("preflight.ranges 必须是数组")
+    if not isinstance(reasons, list) or any(not isinstance(item, str) for item in reasons):
+        raise TypeError("preflight.reason_codes 必须是字符串数组")
+    return PrecisionPreflightReport(
+        optional_bool(payload["stability_passed"], "stability_passed"),
+        optional_bool(payload["prime_evidence_passed"], "prime_evidence_passed"),
+        optional_bool(payload["frozen_fields_passed"], "frozen_fields_passed"),
+        tuple(RangeMargin(**item) for item in ranges),
+        optional_bool(payload["feasible"], "feasible"),
+        tuple(reasons),
+    )
+
+
 def record_from_payload(payload: object) -> SweepRunRecord:
     """从严格 JSON 对象恢复单点记录，拒绝额外字段和错型状态。"""
     if not isinstance(payload, dict):
@@ -96,26 +130,7 @@ def record_from_payload(payload: object) -> SweepRunRecord:
         "seed",
     }:
         raise ValueError("point record 的 point 无效")
-    if not isinstance(preflight_payload, dict) or set(preflight_payload) != {
-        "stability_passed",
-        "prime_evidence_passed",
-        "frozen_fields_passed",
-        "ranges",
-        "feasible",
-        "reason_codes",
-    }:
-        raise ValueError("point record 的 preflight 无效")
-    ranges = preflight_payload["ranges"]
-    if not isinstance(ranges, list):
-        raise TypeError("preflight.ranges 必须是数组")
-    preflight = PrecisionPreflightReport(
-        bool(preflight_payload["stability_passed"]),
-        bool(preflight_payload["prime_evidence_passed"]),
-        bool(preflight_payload["frozen_fields_passed"]),
-        tuple(RangeMargin(**item) for item in ranges),
-        bool(preflight_payload["feasible"]),
-        tuple(preflight_payload["reason_codes"]),
-    )
+    preflight = preflight_from_payload(preflight_payload)
 
     def error_metrics(value: object) -> ErrorMetrics | None:
         if value is None:

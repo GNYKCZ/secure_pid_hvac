@@ -33,6 +33,9 @@ Pocklington 证据。`kappa=bit_length(q)-lambda-2=174`。seed 只控制测试�
 状态只有 `success`、`infeasible`、`failed`。不可行点不开始协议执行；运行异常或超过固定
 300 s 预算的点标记失败。父进程串行启动私有单点 worker，deadline 到达后终止并回收该直接
 子进程，再继续下一点；worker 只写 `work/<point>/<attempt>/`，不能发布批次或创建后代进程。
+worker 在进入执行阶段前原子保存 `preflight.json`；后续异常或 timeout 沿用真实门禁与 range
+margin。若场景构造尚未形成证书，则未得到的可行性结论显式保存为 `null`，不得伪造为 `false`；
+该类预检拒绝记为 `infeasible`，门禁通过后的执行异常才记为 `failed`。
 每点还在仿真前核对 Protocol 1/2 数量与认证整数 bit length，提升运行目录前核对字节预算。
 全部点完成后，无论是否存在单点失败，扫描诊断均以同盘 rename 发布；
 CLI 在存在非成功点时返回非零状态。
