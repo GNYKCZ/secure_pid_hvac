@@ -17,7 +17,8 @@ crypto ─────→ 标准库和纯数值依赖
 core ───────→ 标准库和基础数组类型
 ```
 
-- `core` 只定义通用控制数据，如 `ControllerSpec(A, B, C, D, x0)`。
+- `core` 只定义通用控制数据与数值分析，如 `ControllerSpec(A, B, C, D, x0)` 和任意有限
+  实方阵的 Schur 诊断；它不装配具体场景闭环。
 - `crypto` 只处理整数、向量/矩阵、定点 scale、模数、公开素数证据、share 和辅助随机量。
 - `protocol` 只编排通用控制器参数、状态、输入和输出的 shares。
 - `execution` 向上提供统一的 `step(v) -> u` 接口，具体 transport 不改变该接口。
@@ -29,6 +30,12 @@ core ───────→ 标准库和基础数组类型
 
 低层模块不得反向导入 `scenarios`。具体场景名称、单位或控制器调参字段不得进入
 `core`、`crypto`、`protocol`、`execution` 或 `simulation`。
+
+HVAC 的稳定性只读旁路遵循 `scenarios.hvac.stability -> core.stability`。前者从冻结的
+2R2C plant 与 PID 装配场景闭环、求工作点并判断严格未饱和适用性；后者只检查传入矩阵的
+谱和数值诊断。该旁路不进入 `simulation`、`execution`、`protocol` 或 `crypto`，也不改变
+已有双闭环数据流。完整公式、当前结果与结论边界见
+[2R2C HVAC 局部闭环稳定性](hvac_closed_loop_stability.md)。
 
 ## 通用控制器契约
 
