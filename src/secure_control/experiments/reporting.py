@@ -590,9 +590,14 @@ def _cross_figure(
         display_values=display_values,
     )
     if is_time:
-        field = "control_error" if spec.key.startswith("control_") else "output_error"
+        control = spec.key.startswith("control_")
+        field = "control_error" if control else "output_error"
+        channel_index = profile.channel_indices["control" if control else "output"]
         for ell, raw_time, error in verified_error_series(
-            data, primary_seed=profile.primary_seed, field=field
+            data,
+            primary_seed=profile.primary_seed,
+            field=field,
+            channel_index=channel_index,
         ):
             style = profile.ell_styles[ell]
             values = np.ma.masked_equal(np.abs(error), 0.0)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import warnings
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
@@ -205,6 +206,217 @@ def test_report_atomically_publishes_twelve_figures_and_matching_indexes(tmp_pat
     assert source_after == source_before
 
 
+def test_formal_figures_preserve_curve_identity_text_layout_and_source_bytes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """直接检查 01–12 正式 Figure，而非仅以 PNG 存在代替图义验收。"""
+    sweep = _verified_sweep(tmp_path / "sweep")
+    data = load_verified_sweep_data(sweep)
+    representative = next(
+        item
+        for item in data.records
+        if item.status is SweepRunStatus.SUCCESS and item.point.ell == 48
+    )
+    record = data.runs[representative.point.point_id]
+    trajectory = sweep / str(representative.artifact_path) / "trajectory.csv"
+    source_bytes = trajectory.read_bytes()
+    profile = load_report_profile(PROFILE)
+    from secure_control.experiments import reporting
+
+    original_save = reporting._save_figure
+    captured: dict[str, dict[str, object]] = {}
+
+    def capture_then_save(figure, path, active_profile):
+        figure.canvas.draw()
+        axes = []
+        for axis in figure.axes:
+            legend = axis.get_legend()
+            axes.append(
+                {
+                    "title": axis.get_title(),
+                    "x_label": axis.get_xlabel(),
+                    "y_label": axis.get_ylabel(),
+                    "x_range": axis.get_xlim(),
+                    "texts": [item.get_text() for item in axis.texts],
+                    "legend": []
+                    if legend is None
+                    else [item.get_text() for item in legend.get_texts()],
+                    "ticks": [
+                        axis.xaxis.get_offset_text().get_text(),
+                        axis.yaxis.get_offset_text().get_text(),
+                        *(item.get_text() for item in axis.get_xticklabels()),
+                        *(item.get_text() for item in axis.get_yticklabels()),
+                    ],
+                    "lines": [
+                        {
+                            "label": line.get_label(),
+                            "x": np.asarray(line.get_xdata()).copy(),
+                            "y": np.ma.array(line.get_ydata(), copy=True),
+                            "color": line.get_color(),
+                            "linestyle": line.get_linestyle(),
+                        }
+                        for line in axis.lines
+                    ],
+                }
+            )
+        captured[path.name] = {"axes": axes}
+        original_save(figure, path, active_profile)
+
+    monkeypatch.setattr(reporting, "_save_figure", capture_then_save)
+    render_chinese_report(sweep, PROFILE, tmp_path / "reports")
+    assert len(captured) == 12
+    forbidden = re.compile(r"Control input|Tracking error|Time step|Secure output|Ideal|Secure")
+    time_names = {
+        *(item.filename for item in profile.figures[:6]),
+        profile.figures[6].filename,
+        profile.figures[8].filename,
+    }
+    expected_x_range = (record.result.time[0] / 3600.0, record.result.time[-1] / 3600.0)
+    expected_boundary = 120.0 / 3600.0
+    for filename, snapshot in captured.items():
+        primary = snapshot["axes"][0]
+        assert re.search(r"[\u4e00-\u9fff]", primary["title"])
+        assert primary["y_label"]
+        for axis in snapshot["axes"]:
+            visible_text = [
+                axis["title"],
+                axis["x_label"],
+                axis["y_label"],
+                *axis["texts"],
+                *axis["legend"],
+                *axis["ticks"],
+            ]
+            assert not any(forbidden.search(text) for text in visible_text)
+            assert not any(re.search(r"1e[+-]?\d+", text) for text in visible_text)
+        if filename in time_names:
+            np.testing.assert_allclose(primary["x_range"], expected_x_range)
+            assert primary["x_label"] == "时间（h）"
+            stage_lines = [
+                line
+                for line in primary["lines"]
+                if line["label"].startswith("_child")
+                and line["x"].size == 2
+                and np.allclose(line["x"], expected_boundary)
+            ]
+            assert len(stage_lines) == 1
+
+    for sequence in (1, 5, 6, 9, 10):
+        assert "°C" in captured[profile.figures[sequence - 1].filename]["axes"][0]["y_label"]
+    for sequence in (2, 3, 4, 7, 8):
+        assert "kW" in captured[profile.figures[sequence - 1].filename]["axes"][0]["y_label"]
+    assert "s" in captured[profile.figures[11].filename]["axes"][0]["y_label"]
+    assert captured[profile.figures[11].filename]["axes"][1]["y_label"] == (
+        "每次运行的精确推导资源数"
+    )
+    assert captured[profile.figures[3].filename]["axes"][0]["texts"] == ["已掩码精确零样本：2"]
+    assert captured[profile.figures[5].filename]["axes"][0]["texts"] == ["已掩码精确零样本：2"]
+
+    def visible_lines(sequence: int) -> list[dict[str, object]]:
+        """排除阶段线和零基线，仅返回带正式图例的业务曲线。"""
+        return [
+            line
+            for line in captured[profile.figures[sequence - 1].filename]["axes"][0]["lines"]
+            if not line["label"].startswith("_child")
+        ]
+
+    control_lines = visible_lines(2)
+    np.testing.assert_array_equal(control_lines[0]["y"], record.result.control_ideal[:, 0])
+    np.testing.assert_array_equal(control_lines[1]["y"], record.result.control_secure[:, 0])
+    np.testing.assert_array_equal(visible_lines(3)[0]["y"], record.result.control_error[:, 0])
+    np.testing.assert_array_equal(visible_lines(5)[0]["y"], record.result.output_error[:, 0])
+    np.testing.assert_array_equal(
+        visible_lines(4)[0]["y"].compressed(),
+        np.abs(record.result.control_error[:, 0])[record.result.control_error[:, 0] != 0.0],
+    )
+    np.testing.assert_array_equal(
+        visible_lines(6)[0]["y"].compressed(),
+        np.abs(record.result.output_error[:, 0])[record.result.output_error[:, 0] != 0.0],
+    )
+    expected_legend = [rf"$\ell={ell}$" for ell in (32, 40, 48, 56)]
+    expected_colors = [profile.ell_styles[ell].color for ell in (32, 40, 48, 56)]
+    expected_linestyles = [profile.ell_styles[ell].linestyle for ell in (32, 40, 48, 56)]
+    for sequence in (7, 9):
+        lines = visible_lines(sequence)
+        assert [line["label"] for line in lines] == expected_legend
+        assert [line["color"] for line in lines] == expected_colors
+        assert [line["linestyle"] for line in lines] == expected_linestyles
+    assert trajectory.read_bytes() == source_bytes
+
+
+def test_formal_report_rejects_missing_glyph_warning_and_cleans_stage(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """正式 renderer 保存任一图出现 missing-glyph warning 时必须整批失败。"""
+    sweep = _verified_sweep(tmp_path / "sweep")
+
+    def warn_missing_glyph(*_args, **_kwargs):
+        warnings.warn("Glyph 20013 missing from current font", UserWarning, stacklevel=2)
+
+    monkeypatch.setattr(Figure, "savefig", warn_missing_glyph)
+    output = tmp_path / "reports"
+    with pytest.raises(ValueError, match="glyph"):
+        render_chinese_report(sweep, PROFILE, output)
+    assert not list(output.rglob(".incomplete-*"))
+    assert not list(output.rglob("report_manifest.json"))
+
+
+@pytest.mark.parametrize("mutation", ("source", "profile"))
+def test_sweep_report_rechecks_source_and_profile_at_atomic_commit(
+    tmp_path: Path, monkeypatch, mutation: str
+) -> None:
+    """sweep 报告在目录写完后变更 source/profile 必须拒绝发布并清理 staging。"""
+    sweep = _verified_sweep(tmp_path / "sweep")
+    profile_path = tmp_path / "profile.yaml"
+    profile_path.write_bytes(PROFILE.read_bytes())
+    from secure_control.experiments import reporting
+
+    original = reporting._index_markdown
+
+    def mutate_after_old_check(*args, **kwargs):
+        target = sweep / "data_manifest.json" if mutation == "source" else profile_path
+        target.write_bytes(target.read_bytes() + b"\n")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(reporting, "_index_markdown", mutate_after_old_check)
+    output = tmp_path / "reports"
+    with pytest.raises(ValueError, match="发布前"):
+        render_chinese_report(sweep, profile_path, output)
+    assert not list(output.rglob(".incomplete-*"))
+    assert not list(output.rglob("report_manifest.json"))
+
+
+def test_single_run_chinese_cli_successfully_publishes_six_figures(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """单次中文 CLI 成功路径必须发布 01–06，并输出可解析的正式路径摘要。"""
+    sweep = _verified_sweep(tmp_path / "sweep")
+    data = load_verified_sweep_data(sweep)
+    successful = next(item for item in data.records if item.status is SweepRunStatus.SUCCESS)
+    source_run = sweep / str(successful.artifact_path)
+    output = tmp_path / "reports"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "figure_runner",
+            "--run-dir",
+            str(source_run),
+            "--display-config",
+            str(PROFILE),
+            "--output-root",
+            str(output),
+        ],
+    )
+    from secure_control.experiments.figure_runner import main
+
+    main()
+    summary = json.loads(capsys.readouterr().out)
+    assert len(summary["figures"]) == 6
+    assert all(Path(path).is_file() for path in summary["figures"])
+    assert Path(summary["manifest"]).is_file()
+    assert Path(summary["catalog"]).is_file()
+
+
 def test_report_rejects_existing_render_id_without_overwrite(tmp_path: Path, monkeypatch) -> None:
     """相同 render ID 的第二次发布必须拒绝且不留下 staging。"""
     sweep = _verified_sweep(tmp_path / "sweep")
@@ -284,6 +496,90 @@ def test_profile_mappings_control_single_figure_text_and_selected_curves(tmp_pat
     np.testing.assert_array_equal(plotted[0].get_ydata(), record.result.reference[:, 0])
     np.testing.assert_array_equal(plotted[1].get_ydata(), record.result.output_ideal[:, 0])
     np.testing.assert_array_equal(plotted[2].get_ydata(), record.result.output_secure[:, 0])
+
+
+def test_cross_precision_time_figures_use_profile_selected_channels(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """07/09 必须与单点图读取相同的 profile 通道，不能退回第 0 列。"""
+    sweep = _verified_sweep(tmp_path / "sweep")
+    data = load_verified_sweep_data(sweep)
+    metadata = ScenarioMetadata(
+        "hvac",
+        ChannelMetadata(("target_temperature", "target_secondary"), ("degC", "degC")),
+        ChannelMetadata(("air_temperature", "air_secondary"), ("degC", "degC")),
+        ChannelMetadata(
+            ("cooling_power", "cooling_secondary"),
+            ("kW_thermal_cooling", "kW_thermal_cooling"),
+        ),
+    )
+    expected_control: dict[int, np.ndarray] = {}
+    expected_output: dict[int, np.ndarray] = {}
+    runs = dict(data.runs)
+    for item in data.records:
+        if item.status is not SweepRunStatus.SUCCESS:
+            continue
+        record = runs[item.point.point_id]
+        control = np.arange(4, dtype=float) + item.point.ell
+        output = control + 100.0
+        expected_control[item.point.ell] = control
+        expected_output[item.point.ell] = output
+        result = record.result
+        runs[item.point.point_id] = replace(
+            record,
+            metadata=metadata,
+            result=SimulationResult(
+                time=result.time,
+                reference=np.column_stack((result.reference[:, 0], result.reference[:, 0] + 1.0)),
+                output_ideal=np.column_stack((np.zeros(4), output)),
+                output_secure=np.zeros((4, 2)),
+                control_ideal=np.column_stack((np.zeros(4), control)),
+                control_secure=np.zeros((4, 2)),
+                control_error=np.column_stack((np.zeros(4), control)),
+                output_error=np.column_stack((np.zeros(4), output)),
+            ),
+        )
+    altered_data = replace(data, runs=runs)
+    profile_data = yaml.safe_load(PROFILE.read_text(encoding="utf-8"))
+    profile_data["channel_names"].update(
+        {
+            "target_secondary": "第二参考",
+            "air_secondary": "第二输出",
+            "cooling_secondary": "第二控制",
+        }
+    )
+    profile_data["channel_indices"] = {"reference": 1, "output": 1, "control": 1}
+    profile_path = tmp_path / "profile.yaml"
+    profile_path.write_text(
+        yaml.safe_dump(profile_data, allow_unicode=True, sort_keys=False), encoding="utf-8"
+    )
+    from secure_control.experiments import reporting
+
+    monkeypatch.setattr(
+        reporting, "load_verified_sweep_data", lambda *_args, **_kwargs: altered_data
+    )
+    original_save = reporting._save_figure
+    captured: dict[str, list[np.ndarray]] = {}
+
+    def capture_then_save(figure, path, profile):
+        if path.name.startswith(("07_", "09_")):
+            captured[path.name] = [
+                np.ma.getdata(line.get_ydata()).copy()
+                for line in figure.axes[0].lines
+                if line.get_label().startswith("$\\ell=")
+            ]
+        original_save(figure, path, profile)
+
+    monkeypatch.setattr(reporting, "_save_figure", capture_then_save)
+    render_chinese_report(sweep, profile_path, tmp_path / "reports")
+    np.testing.assert_equal(
+        captured["07_跨精度控制误差时序.png"],
+        [expected_control[ell] for ell in (32, 40, 48, 56)],
+    )
+    np.testing.assert_equal(
+        captured["09_跨精度温度误差时序.png"],
+        [expected_output[ell] for ell in (32, 40, 48, 56)],
+    )
 
 
 @pytest.mark.parametrize(

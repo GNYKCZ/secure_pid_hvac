@@ -55,11 +55,13 @@ def select_primary_records(
 
 
 def verified_error_series(
-    data: VerifiedSweepData, *, primary_seed: int, field: str
+    data: VerifiedSweepData, *, primary_seed: int, field: str, channel_index: int = 0
 ) -> tuple[tuple[int, np.ndarray, np.ndarray], ...]:
-    """从 verified runs 提取同网格误差序列，不读取孤立 CSV。"""
+    """从 verified runs 提取指定通道的同网格误差序列，不读取孤立 CSV。"""
     if field not in ("control_error", "output_error"):
         raise ValueError("field 必须是 control_error 或 output_error")
+    if type(channel_index) is not int or channel_index < 0:
+        raise ValueError("channel_index 必须是非负整数")
     reference_time: np.ndarray | None = None
     series: list[tuple[int, np.ndarray, np.ndarray]] = []
     for record in select_primary_records(data, primary_seed):
@@ -68,7 +70,10 @@ def verified_error_series(
             reference_time = result.time
         elif not np.array_equal(reference_time, result.time):
             raise ValueError("primary seed 的 time grids 不一致")
-        series.append((record.point.ell, result.time, getattr(result, field)[:, 0]))
+        error = getattr(result, field)
+        if channel_index >= error.shape[1]:
+            raise ValueError(f"{field} 的 channel_index 越界")
+        series.append((record.point.ell, result.time, error[:, channel_index]))
     return tuple(series)
 
 
