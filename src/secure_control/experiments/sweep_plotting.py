@@ -34,6 +34,49 @@ def _successful(data: VerifiedSweepData) -> list[SweepRunRecord]:
     return records
 
 
+def select_primary_records(
+    data: VerifiedSweepData, primary_seed: int
+) -> tuple[SweepRunRecord, ...]:
+    """按精度返回主 seed 的成功点，缺失任一定义精度时明确失败。"""
+    records = tuple(
+        sorted(
+            (
+                record
+                for record in data.records
+                if record.status is SweepRunStatus.SUCCESS and record.point.seed == primary_seed
+            ),
+            key=lambda record: record.point.ell,
+        )
+    )
+    expected = tuple(data.definition["fractional_bits"])
+    if tuple(record.point.ell for record in records) != expected:
+        raise ValueError("主 seed 未完整覆盖 sweep definition 的全部精度")
+    return records
+
+
+def verified_error_series(
+    data: VerifiedSweepData, *, primary_seed: int, field: str, channel_index: int = 0
+) -> tuple[tuple[int, np.ndarray, np.ndarray], ...]:
+    """从 verified runs 提取指定通道的同网格误差序列，不读取孤立 CSV。"""
+    if field not in ("control_error", "output_error"):
+        raise ValueError("field 必须是 control_error 或 output_error")
+    if type(channel_index) is not int or channel_index < 0:
+        raise ValueError("channel_index 必须是非负整数")
+    reference_time: np.ndarray | None = None
+    series: list[tuple[int, np.ndarray, np.ndarray]] = []
+    for record in select_primary_records(data, primary_seed):
+        result = data.runs[record.point.point_id].result
+        if reference_time is None:
+            reference_time = result.time
+        elif not np.array_equal(reference_time, result.time):
+            raise ValueError("primary seed 的 time grids 不一致")
+        error = getattr(result, field)
+        if channel_index >= error.shape[1]:
+            raise ValueError(f"{field} 的 channel_index 越界")
+        series.append((record.point.ell, result.time, error[:, channel_index]))
+    return tuple(series)
+
+
 def _error_figure(
     records: list[SweepRunRecord], *, name: str, title: str, primary_seed: int
 ) -> Figure:
@@ -67,28 +110,12 @@ def _time_series_figure(
     data: VerifiedSweepData, *, primary_seed: int, field: str, title: str
 ) -> Figure:
     """在同一时间网格上画四个 ell 的主 seed 绝对误差，零值以 mask 保留。"""
-    selected = sorted(
-        (
-            record
-            for record in data.records
-            if record.status is SweepRunStatus.SUCCESS and record.point.seed == primary_seed
-        ),
-        key=lambda record: record.point.ell,
-    )
-    if not selected:
-        raise ValueError("缺少 primary seed 的成功轨迹")
-    reference_time: np.ndarray | None = None
     figure = Figure(figsize=(7.2, 4.5))
     axis = figure.subplots()
-    for record in selected:
-        result = data.runs[record.point.point_id].result
-        if reference_time is None:
-            reference_time = result.time
-        elif not np.array_equal(reference_time, result.time):
-            raise ValueError("primary seed 的 time grids 不一致")
-        values = np.abs(getattr(result, field)[:, 0])
+    for ell, time, error in verified_error_series(data, primary_seed=primary_seed, field=field):
+        values = np.abs(error)
         masked = np.ma.masked_equal(values, 0.0)
-        axis.plot(result.time / 3600.0, masked, label=f"ell={record.point.ell}")
+        axis.plot(time / 3600.0, masked, label=f"ell={ell}")
     axis.set_yscale("log")
     axis.set_xlabel("time (h)")
     axis.set_ylabel("absolute error")

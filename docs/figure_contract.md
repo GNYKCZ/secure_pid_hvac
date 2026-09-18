@@ -74,3 +74,11 @@ error 尺度/零样本数量及图文件 SHA-256。它不存用户绝对路径�
 
 普通生成图及 CSV 被路径级 `.gitignore` 规则精确忽略；论文正式代表结果若需
 版本管理，必须另有明确交付要求，而非把本 Issue 的临时验证图提交 Git。
+
+## 中文汇报 profile
+
+传入 `--display-config configs/hvac_2r2c_report_zh.yaml` 时，单次入口从同一 canonical run
+生成 01–06 中文图；不传时上述既有英文接口完全不变。完整 01–12 报告必须使用只消费
+verified sweep 的 `sweep_figure_runner`，并发布到独立 report 根目录，不能写回 frozen sweep。
+完整的展示、字体、科学计数法、目录与来源契约见
+[2R2C HVAC 中文汇报图](chinese_report_figures.md)。

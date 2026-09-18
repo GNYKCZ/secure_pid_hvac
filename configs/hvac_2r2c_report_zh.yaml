@@ -1,0 +1,80 @@
+schema_version: 1
+locale: zh-CN
+primary_seed: 42
+representative_ell: 48
+time_unit: h
+phase_segments_path: [hvac, reference_segments]
+channel_names:
+  target_temperature: 参考温度
+  air_temperature: 室内空气温度
+  cooling_power: 制冷功率
+unit_names:
+  seconds: s
+  degC: °C
+  kW_thermal_cooling: kW
+# 通道索引由展示配置显式拥有，报告编排层不会默认选择第一个 HVAC 通道。
+channel_indices:
+  reference: 0
+  output: 0
+  control: 0
+# 所有图例、注释和轴模板均由 profile 注入；占位符来自已验证 metadata 的显示名称与单位。
+labels:
+  time_axis: "时间（{time_unit}）"
+  tracking_reference: "{reference_name}"
+  tracking_ideal: "明文 {output_name} $T_{air}(k)$"
+  tracking_secure: "安全计算 {output_name} $\\hat{T}_{air}(k)$"
+  control_ideal: "明文实际控制 {control_name} $u(k)$"
+  control_secure: "安全计算实际控制 {control_name} $\\hat{u}(k)$"
+  signed_error: 有符号误差
+  absolute_error: 绝对误差
+  zero_count: "已掩码精确零样本：{count}"
+  all_zero: 全部误差为零，无正值可显示
+  ell: "$\\ell={ell}$"
+  max_abs: 最大值
+  mean_abs: 均值
+  rms: 均方根
+  precision_axis: "定点小数位数 $\\ell$"
+  control_max_abs: "{control_name}最大绝对误差"
+  output_max_abs: "{output_name}最大绝对误差"
+  precision_scale: "$2^{-\\ell}$ 参考尺度"
+  mean_time: 平均执行时间
+  protocol1: 协议 1 三元组
+  protocol2: 协议 2 截断
+  resource_axis: 每次运行的精确推导资源数
+limitations_zh:
+  - 控制量为实际 applied control，不是 raw PID output
+  - 对数轴精确零值仅掩码，未注入 epsilon
+  - 数值受 binary64 边界限制
+  - 模型属于 Adapted HVAC plant model
+  - SHA-256 只用于完整性关联，不是数字签名
+font:
+  families: [Microsoft YaHei, SimHei]
+style:
+  width_inches: 12.8
+  height_inches: 7.2
+  dpi: 200
+  title_size: 18
+  label_size: 14
+  tick_size: 12
+  legend_size: 12
+  line_width: 2.0
+  grid_alpha: 0.25
+  marker_every: 18
+ell_styles:
+  "32": {color: "#0072B2", linestyle: "-"}
+  "40": {color: "#E69F00", linestyle: "--"}
+  "48": {color: "#009E73", linestyle: "-."}
+  "56": {color: "#CC79A7", linestyle: ":"}
+figures:
+  - {sequence: 1, key: tracking, filename: 01_温度跟踪.png, priority: P1, title: 温度闭环跟踪, y_label: "{output_name}（{output_unit}）", purpose_zh: 展示参考温度与明文、安全计算室内空气温度的闭环跟踪。, speaker_note_zh: 三条曲线近乎重合，说明安全计算保持了明文闭环的跟踪行为。, source_fields: [reference, output_ideal, output_secure]}
+  - {sequence: 2, key: applied_control, filename: 02_实际控制输入对比.png, priority: P1, title: 实际施加给被控对象的控制输入, y_label: "{control_name}（{control_unit}）", purpose_zh: 对比明文与安全计算实际施加给被控对象的控制输入。, speaker_note_zh: 曲线重合表示 applied control 差异很小，并非未保存的原始 PID 输出。, source_fields: [control_ideal, control_secure]}
+  - {sequence: 3, key: control_signed, filename: 03_控制误差_有符号.png, priority: P1, title: 控制输入有符号误差, y_label: "u(k) − û(k)（{control_unit}）", purpose_zh: 展示控制误差的方向和随时间的变化。, speaker_note_zh: 零线上下分别表示明文控制量大于或小于安全计算控制量。, source_fields: [control_error]}
+  - {sequence: 4, key: control_absolute, filename: 04_控制误差_绝对值_对数.png, priority: P2, title: 控制输入绝对误差, y_label: "|u(k) − û(k)|（{control_unit}）", purpose_zh: 给出与论文 Fig. 3 一致的控制绝对误差比较对象。, speaker_note_zh: 对数轴中的精确零样本被掩码，未注入 epsilon。, source_fields: [control_error]}
+  - {sequence: 5, key: output_signed, filename: 05_空气温度误差_有符号.png, priority: P2, title: 室内空气温度有符号误差, y_label: "{output_name}差（{output_unit}）", purpose_zh: 展示明文与安全计算空气温度误差的方向。, speaker_note_zh: 该图保留正负号，反映两条输出轨迹的相对方向。, source_fields: [output_error]}
+  - {sequence: 6, key: output_absolute, filename: 06_空气温度误差_绝对值_对数.png, priority: P2, title: 室内空气温度绝对误差, y_label: "{output_name}绝对差（{output_unit}）", purpose_zh: 展示空气温度误差的绝对数量级。, speaker_note_zh: 对数轴中的精确零样本被掩码，未改变源数组。, source_fields: [output_error]}
+  - {sequence: 7, key: control_time_by_ell, filename: 07_跨精度控制误差时序.png, priority: P1, title: 不同定点精度下的控制绝对误差, y_label: "|u(k) − û(k)|（{control_unit}）", purpose_zh: 比较四个定点精度的控制误差时间结构。, speaker_note_zh: 主图只画 seed=42，全部 seed 与状态仍保留在 manifest 中。, source_fields: [control_error]}
+  - {sequence: 8, key: control_metrics_by_ell, filename: 08_跨精度控制误差指标.png, priority: P1, title: 控制误差指标随定点精度变化, y_label: "{control_name}绝对误差（{control_unit}）", purpose_zh: 汇总控制误差的最大值、均值和均方根。, speaker_note_zh: 每个精度只展示冻结的主 seed，避免重复轨迹造成拥挤。, source_fields: [control_error.max_abs, control_error.mean_abs, control_error.rms]}
+  - {sequence: 9, key: output_time_by_ell, filename: 09_跨精度温度误差时序.png, priority: P2, title: 不同定点精度下的温度绝对误差, y_label: "{output_name}绝对差（{output_unit}）", purpose_zh: 比较四个定点精度的温度误差时间结构。, speaker_note_zh: 图例颜色与线型在全部跨精度图中保持一致。, source_fields: [output_error]}
+  - {sequence: 10, key: output_metrics_by_ell, filename: 10_跨精度温度误差指标.png, priority: P2, title: 温度误差指标随定点精度变化, y_label: "{output_name}绝对误差（{output_unit}）", purpose_zh: 汇总温度误差的最大值、均值和均方根。, speaker_note_zh: 指标直接来自 verified sweep 的正式记录，未重新计算实验。, source_fields: [output_error.max_abs, output_error.mean_abs, output_error.rms]}
+  - {sequence: 11, key: precision_summary, filename: 11_精度影响汇总.png, priority: P1, title: 定点精度影响汇总, y_label: 最大绝对误差, purpose_zh: 总结控制与输出最大绝对误差随精度的数量级变化。, speaker_note_zh: 虚线 2 的负 ℓ 次方仅作为精度尺度参考，不是误差拟合。, source_fields: [control_error.max_abs, output_error.max_abs]}
+  - {sequence: 12, key: timing_cost, filename: 12_时间与协议资源.png, priority: P3, title: 执行时间与协议资源, y_label: "平均执行时间（{seconds_unit}）", purpose_zh: 展示各精度的执行时间和协议资源计数。, speaker_note_zh: 资源计数为 derived exact；哈希用于完整性关联而非数字签名。, source_fields: [cost.wall_clock_seconds, cost.protocol1_triples_total, cost.protocol2_truncations_total]}

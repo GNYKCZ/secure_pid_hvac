@@ -15,8 +15,10 @@ from typing import Literal
 
 import matplotlib
 import numpy as np
+from matplotlib.axis import Axis
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
+from matplotlib.ticker import LogFormatterMathtext, ScalarFormatter
 
 from secure_control.simulation import ChannelMetadata, ScenarioMetadata, SimulationResult
 
@@ -26,6 +28,86 @@ ErrorScale = Literal["linear", "log"]
 TimeUnit = Literal["s", "h"]
 FigureFormat = Literal["png", "pdf"]
 _RENDER_ID_PATTERN = re.compile(r"\A\d{8}T\d{12}Z-[0-9a-f]{12}\Z")
+
+
+@dataclass(frozen=True, slots=True)
+class LineStyle:
+    """冻结一条曲线的颜色与线型，供展示层注入而不携带领域语义。"""
+
+    color: str
+    linestyle: str
+
+    def __post_init__(self) -> None:
+        """拒绝空样式，避免配置错误延迟到 Matplotlib。"""
+        if not isinstance(self.color, str) or not self.color:
+            raise ValueError("line color 不能为空。")
+        if self.linestyle not in ("-", "--", "-.", ":"):
+            raise ValueError("line style 无效。")
+
+
+@dataclass(frozen=True, slots=True)
+class FigureStyle:
+    """冻结报告画布和字号；数值数组不受展示样式影响。"""
+
+    width_inches: float
+    height_inches: float
+    dpi: int
+    title_size: float
+    label_size: float
+    tick_size: float
+    legend_size: float
+    line_width: float
+    grid_alpha: float
+    marker_every: int
+
+    def __post_init__(self) -> None:
+        """画布、DPI、字号和线宽必须是有限正数。"""
+        numeric = (
+            self.width_inches,
+            self.height_inches,
+            self.title_size,
+            self.label_size,
+            self.tick_size,
+            self.legend_size,
+            self.line_width,
+            self.grid_alpha,
+        )
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not np.isfinite(value)
+            or value <= 0
+            for value in numeric
+        ):
+            raise ValueError("figure style 数值必须有限且为正。")
+        if type(self.dpi) is not int or self.dpi <= 0:
+            raise ValueError("figure DPI 必须是正整数。")
+        if type(self.marker_every) is not int or self.marker_every <= 0:
+            raise ValueError("marker_every 必须是正整数。")
+
+
+def apply_axis_format(
+    axis: Axis,
+    *,
+    scale: ErrorScale,
+    signed: bool,
+    scientific: bool = True,
+) -> None:
+    """只格式化刻度与零基线，不缩放、截断或改写曲线数组。"""
+    if scale not in ("linear", "log"):
+        raise ValueError("scale 必须是 linear 或 log。")
+    if scale == "log":
+        if axis.axis_name == "y":
+            axis.axes.set_yscale("log")
+        else:
+            axis.axes.set_xscale("log")
+        axis.set_major_formatter(LogFormatterMathtext())
+    elif scientific:
+        formatter = ScalarFormatter(useMathText=True)
+        formatter.set_powerlimits((-3, 3))
+        axis.set_major_formatter(formatter)
+    if signed:
+        axis.axes.axhline(0.0, color="#666666", linewidth=0.9, zorder=0)
 
 
 @dataclass(frozen=True, slots=True)
