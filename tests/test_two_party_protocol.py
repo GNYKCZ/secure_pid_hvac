@@ -44,6 +44,8 @@ def make_stack(
     )
     contract = ControllerRangeContract(state_payload_bounds=(256, 256), input_payload_bounds=(64,))
     distribution = client.distribute_controller(spec, contract, rng=random.Random(seed))
+    assert client.range_verification.proof_mode == "independent_input_invariant"
+    assert client.range_verification.certificate_sha256 is None
     return (
         client,
         P1(distribution.p1),
@@ -145,6 +147,7 @@ def test_zero_state_static_controller_uses_only_d_products() -> None:
         ControllerRangeContract(state_payload_bounds=(), input_payload_bounds=(128, 64)),
         rng=random.Random(3),
     )
+    assert client.range_verification.proof_mode == "independent_input_invariant"
     p1, p2 = P1(distribution.p1), P2(distribution.p2)
     online = client.prepare_online(distribution, [0.5, -0.25], step=0, rng=random.Random(4))
 
@@ -746,6 +749,7 @@ def test_integrator_needs_proven_finite_horizon_and_rejects_overrun_before_resou
             state_payload_bounds=(768,), input_payload_bounds=(256,), horizon_steps=3
         ),
     )
+    assert client.range_verification.proof_mode == "finite_horizon"
 
     with pytest.raises(ValueError, match="horizon"):
         client.prepare_online(distribution, [0.25], step=3)

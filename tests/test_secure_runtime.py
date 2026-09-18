@@ -310,11 +310,14 @@ def test_runtime_reset_reuses_and_revalidates_immutable_modulus_evidence() -> No
         test_seed=131,
     )
     before = runtime.modulus_verification
+    range_before = runtime.range_verification
     runtime.step(0.25)
     runtime.reset()
 
     assert before.method == "pocklington_v1"
     assert runtime.modulus_verification == before
+    assert runtime.range_verification == range_before
+    assert runtime.range_verification.proof_mode == "independent_input_invariant"
     np.testing.assert_array_equal(runtime.step(0.25), np.array([0.25]))
 
 

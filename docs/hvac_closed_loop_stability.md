@@ -99,5 +99,6 @@ plant/PID 文件 SHA-256、假设和 claim boundary。复杂特征值拆为 real
 - 安全协议执行正确性或协议安全；
 - 无限时域状态/控制范围安全。
 
-后续 Issue #38 如消费本结果，必须同时消费来源 hash、假设、数值诊断和工作点适用性，不能
-把 `stable` 单字段重解释为无限时域证书。
+Issue #38 已在独立旁路中同时消费来源 hash、实际量化矩阵、扰动界和精确不变集 witness；不能
+把本页的 `stable` 单字段重解释为无限时域证书。完整条件见
+[2R2C HVAC 条件化无限时域安全契约](infinite_horizon_safety.md)。

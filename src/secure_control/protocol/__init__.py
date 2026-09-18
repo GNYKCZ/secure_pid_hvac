@@ -2,8 +2,10 @@
 
 from .coordinator import SingleProcessCoordinator
 from .messages import (
+    ClosedLoopRangeEvidence,
     ControllerLayout,
     ControllerRangeContract,
+    ControllerRangeVerification,
     ControllerScaleLedger,
     ControllerShare,
     ControlShareMessage,
@@ -15,10 +17,12 @@ from .messages import (
     OpenedMaskedMessage,
     PartyResources,
     ProductResourceShare,
+    RangeProofMode,
     ResourceMetadata,
     StateTruncationResourceShare,
     StepResourcePlan,
     TruncationMaskedMessage,
+    controller_payload_fingerprint,
 )
 from .roles import P1, P2, Client
 
@@ -26,9 +30,11 @@ __all__ = [
     "P1",
     "P2",
     "Client",
+    "ClosedLoopRangeEvidence",
     "ControlShareMessage",
     "ControllerLayout",
     "ControllerRangeContract",
+    "ControllerRangeVerification",
     "ControllerScaleLedger",
     "ControllerShare",
     "InputShareMessage",
@@ -39,9 +45,11 @@ __all__ = [
     "OpenedMaskedMessage",
     "PartyResources",
     "ProductResourceShare",
+    "RangeProofMode",
     "ResourceMetadata",
     "SingleProcessCoordinator",
     "StateTruncationResourceShare",
     "StepResourcePlan",
     "TruncationMaskedMessage",
+    "controller_payload_fingerprint",
 ]

@@ -139,5 +139,18 @@ def test_stability_dependency_direction_remains_scenario_independent() -> None:
         assert "secure_control.scenarios.hvac" not in imported_modules(path)
 
 
+def test_infinite_safety_keeps_verifier_and_scenario_assembly_separate() -> None:
+    """通用精确 verifier 不感知场景，HVAC 装配也不反向依赖 experiments。"""
+    verifier = PACKAGE_ROOT / "core" / "invariance.py"
+    assert not any(
+        module.startswith(("secure_control.scenarios", "secure_control.protocol"))
+        for module in imported_modules(verifier)
+    )
+    assembler = PACKAGE_ROOT / "scenarios" / "hvac" / "infinite_safety.py"
+    assert not any(
+        module.startswith("secure_control.experiments") for module in imported_modules(assembler)
+    )
+
+
 def test_legacy_source_package_does_not_exist() -> None:
     assert not (PACKAGE_ROOT.parent / "secure_pid").exists()

@@ -26,3 +26,5 @@ results/figures/*
 !results/figures/.gitkeep
 results/sweeps/*
 !results/sweeps/.gitkeep
+results/safety/*
+!results/safety/.gitkeep

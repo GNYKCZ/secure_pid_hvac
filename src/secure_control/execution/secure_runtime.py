@@ -21,6 +21,7 @@ from secure_control.protocol import (
     P2,
     Client,
     ControllerRangeContract,
+    ControllerRangeVerification,
     ControllerScaleLedger,
     OfflineDistribution,
     SingleProcessCoordinator,
@@ -98,6 +99,11 @@ class SecureStateSpaceRuntime:
     def modulus_verification(self) -> PrimeModulusVerification:
         """返回当前 Client 对公开模数完成的不可变验证摘要。"""
         return self._client.truncation.modulus_verification
+
+    @property
+    def range_verification(self) -> ControllerRangeVerification:
+        """返回当前 session 在分享前完成的不可变范围验证摘要。"""
+        return self._client.range_verification
 
     def step(self, v: Array | float) -> np.ndarray:
         """执行一个事务式安全控制步，并返回长度为 ``p`` 的有限浮点向量。

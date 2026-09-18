@@ -1,0 +1,80 @@
+# Issue #38：固定 25°C 参考下的局部、未饱和、无限时域闭环安全假设。
+schema_version: 1
+scenario_id: hvac_2r2c_pid_infinite_safety_v1
+sources:
+  plant: {path: hvac_2r2c_plant.yaml, sha256: 54d980b7b3d5ef7f9187de008a78348748f0246193fc8bdaf4ef9a3f6be33dbd}
+  pid: {path: hvac_2r2c_pid_baseline.yaml, sha256: f5df82b1dc21123ed6d138006bedbdd1e1de595d8c56d1f6791f2ae9c008a44e}
+  sweep: {path: hvac_2r2c_precision_sweep.yaml, sha256: 53bdd80aee5801f9dfb6f413e642e84ffc9b0596f18faee7d04fa0e3adf5fa84}
+  prime: {path: hvac_2r2c_sweep_prime.yaml, sha256: b317a7db4f14fbf77258102d6b09766dc3b5f495252c1e29ed3ae315cb98340c}
+
+fixed_assumptions:
+  reference_celsius: "25"
+  ambient_celsius: "30"
+  continues_forever: true
+  strictly_unsaturated: true
+  actuator_lower_kw: "0"
+  actuator_upper_kw: "12"
+  controller_input_abs_bound_celsius: "1/100"
+  controller_state_abs_bounds: ["727", "1"]
+  air_temperature_bounds_celsius: ["24", "26"]
+  wall_temperature_bounds_celsius: ["25", "28"]
+  initial_half_width: "1/100000000"
+  actuation_decode_abs_error_kw: "1/281474976710656"
+  plant_roundoff_abs_error_celsius: ["0", "0"]
+  state_truncation_abs_error: "0"
+
+security:
+  fractional_bits: [32, 40, 48, 56]
+  integer_headroom_bits: 28
+  security_parameter: 80
+
+# 每个 ell 独立冻结有理 witness。P 的元素均为整数分子除以 10^9。
+witnesses:
+  "32":
+    shape_denominator: 1000000000
+    shape_numerators:
+      - [2841159439, 2070947164, -1582048256542, 1479451648090]
+      - [2070947164, 2922129165, -1430375361298, 1075396855864]
+      - [-1582048256542, -1430375361298, 1070726870120214, -821707502433396]
+      - [1479451648090, 1075396855864, -821707502433396, 1043931437405778]
+    contraction_bound: "1999/2000"
+    disturbance_norm_bounds: ["57", "152"]
+    radius: "1/10000"
+    constraint_dual_norm_bounds: ["10", "10", "10", "10", "10", "10", "10"]
+  "40":
+    shape_denominator: 1000000000
+    shape_numerators:
+      - [2841159439, 2070947164, -1582048256542, 1479451648090]
+      - [2070947164, 2922129165, -1430375361298, 1075396855864]
+      - [-1582048256542, -1430375361298, 1070726870120214, -821707502433396]
+      - [1479451648090, 1075396855864, -821707502433396, 1043931437405778]
+    contraction_bound: "1999/2000"
+    disturbance_norm_bounds: ["57", "152"]
+    radius: "1/10000"
+    constraint_dual_norm_bounds: ["10", "10", "10", "10", "10", "10", "10"]
+  "48":
+    shape_denominator: 1000000000
+    shape_numerators:
+      - [2841159439, 2070947164, -1582048256542, 1479451648090]
+      - [2070947164, 2922129165, -1430375361298, 1075396855864]
+      - [-1582048256542, -1430375361298, 1070726870120214, -821707502433396]
+      - [1479451648090, 1075396855864, -821707502433396, 1043931437405778]
+    contraction_bound: "1999/2000"
+    disturbance_norm_bounds: ["57", "152"]
+    radius: "1/10000"
+    constraint_dual_norm_bounds: ["10", "10", "10", "10", "10", "10", "10"]
+  "56":
+    shape_denominator: 1000000000
+    shape_numerators:
+      - [2841159439, 2070947164, -1582048256542, 1479451648090]
+      - [2070947164, 2922129165, -1430375361298, 1075396855864]
+      - [-1582048256542, -1430375361298, 1070726870120214, -821707502433396]
+      - [1479451648090, 1075396855864, -821707502433396, 1043931437405778]
+    contraction_bound: "1999/2000"
+    disturbance_norm_bounds: ["57", "152"]
+    radius: "1/10000"
+    constraint_dual_norm_bounds: ["10", "10", "10", "10", "10", "10", "10"]
+
+claim_boundary: >-
+  只证明固定 reference=25°C、固定 ambient=30°C、无限持续、局部初始盒、严格未饱和且
+  扰动不超过声明界时的量化闭环安全；默认 180 步 15→20→25°C 饱和基线不在本证书覆盖内。

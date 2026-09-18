@@ -26,6 +26,7 @@ runtime.step(v) -> ndarray(p,)
 runtime.reset() -> None
 runtime.spec -> ControllerSpec
 runtime.scale_ledger -> ControllerScaleLedger
+runtime.range_verification -> ControllerRangeVerification
 ```
 
 `step` 接受单输入标量、`(m,)` 扁平向量或 `(m, 1)` 单步列向量，与明文 runtime
@@ -86,6 +87,12 @@ A/B 路径为 0 对。no-Trunc 仍执行 centered `Z_q` 范围验证，仅不需
 选择正整数 `horizon_steps`，使 Client 在离线阶段逐步证明有限时域 state/output 范围，并在
 在线资源创建前拒绝 `step>=horizon_steps`。reset 创建的新 session 保留同一 horizon 契约。
 output accumulator 在两条路径中都必须位于 centered `Z_q`。
+
+Issue #38 增加的闭环证据模式不会改变 `step/reset`。runtime 在 session 建立时取得 Client 的
+不可变 `range_verification` 摘要，包含 proof mode、证书摘要、state/output accumulator 上界、
+centered modulus limit 与最大 Trunc message。`reset()` 创建新 Client 并重新验证证据；若验证
+失败，旧 session 不被替换。条件和不覆盖项见
+[无限时域安全契约](infinite_horizon_safety.md)。
 
 ## 数值证据与容差
 
