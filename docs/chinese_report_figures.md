@@ -23,7 +23,7 @@ uv run python -m secure_control.experiments.figure_runner --run-dir <run_dir> --
 ## 展示配置与字体
 
 `configs/hvac_2r2c_report_zh.yaml` 是场景拥有的纯展示配置，冻结 `zh-CN` 文案、机器通道和单位
-到中文名称的映射、主 seed、代表精度、阶段配置路径、16:9 画布、DPI、颜色、线型、marker、
+到中文名称的映射、显式通道索引、所有图面文字模板、主 seed、代表精度、阶段配置路径、16:9 画布、DPI、颜色、线型、marker、
 01–12 中文文件名以及 P1/P2/P3。配置 SHA-256 会写入报告清单；它不改变 metadata、通道选择、
 实验数组或指标。
 
@@ -46,9 +46,10 @@ seed 的重复曲线；全部 seed、成功/失败/不可行状态仍记录在�
 
 ## 发布与追溯
 
-报告写入 `results/figures/reports/<source_sweep_id>/<render_id>/`，不写回 frozen sweep。全部图、
-`report_manifest.json` 和 `汇报图目录.md` 先写入私有 staging，源 manifest 在读取前、绘图后和发布前
-保持相同才原子发布；已有 render ID 拒绝覆盖，失败清理本次 staging。
+报告写入 `results/figures/reports/<source_sweep_id>/<render_id>/`，不写回 frozen sweep。正式 sweep
+入口固定验证最终 `manifest.json` 及其绑定的 `data_manifest.json`，不提供降级为 data manifest 的选项。
+全部图、`report_manifest.json` 和 `汇报图目录.md` 先写入私有 staging，源与 display profile 在读取前、绘图后
+和原子发布前保持相同才发布；已有 render ID 拒绝覆盖，失败清理本次 staging。
 
 JSON 与 Markdown 使用同一个内存 catalog，逐图记录 sequence、priority、中文文件名、用途、讲解
 建议、来源字段、限制和图 SHA-256。manifest 还记录 source sweep/run、final/data manifest hash、

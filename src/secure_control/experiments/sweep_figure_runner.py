@@ -14,13 +14,8 @@ def main() -> None:
     parser.add_argument("--sweep-dir", required=True)
     parser.add_argument("--display-config", required=True)
     parser.add_argument("--output-root", default="results/figures/reports")
-    parser.add_argument(
-        "--manifest-name", default="manifest.json", choices=("manifest.json", "data_manifest.json")
-    )
     args = parser.parse_args()
-    report = render_chinese_report(
-        args.sweep_dir, args.display_config, args.output_root, manifest_name=args.manifest_name
-    )
+    report = render_chinese_report(args.sweep_dir, args.display_config, args.output_root)
     print(
         json.dumps(
             {

@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal
 
 import matplotlib
@@ -69,6 +70,8 @@ class ReportProfile:
     phase_segments_path: tuple[str, ...]
     channel_names: Mapping[str, str]
     unit_names: Mapping[str, str]
+    channel_indices: Mapping[str, int]
+    labels: Mapping[str, str]
     limitations_zh: tuple[str, ...]
     font: FontSpec
     style: FigureStyle
@@ -118,6 +121,8 @@ def load_report_profile(path: str | Path) -> ReportProfile:
         "phase_segments_path",
         "channel_names",
         "unit_names",
+        "channel_indices",
+        "labels",
         "limitations_zh",
         "font",
         "style",
@@ -143,12 +148,15 @@ def load_report_profile(path: str | Path) -> ReportProfile:
     except TypeError as error:
         raise ValueError("style 字段无效") from error
     ell_styles_data = _mapping(root["ell_styles"], "ell_styles")
-    ell_styles = {
-        int(key): LineStyle(**_mapping(value, f"ell_styles.{key}"))
-        for key, value in ell_styles_data.items()
-    }
-    if tuple(sorted(ell_styles)) != (32, 40, 48, 56):
-        raise ValueError("ell_styles 必须完整覆盖 32/40/48/56")
+    try:
+        ell_styles = {
+            int(key): LineStyle(**_mapping(value, f"ell_styles.{key}"))
+            for key, value in ell_styles_data.items()
+        }
+    except (TypeError, ValueError) as error:
+        raise ValueError("ell_styles 的精度键或样式无效") from error
+    if not ell_styles or any(ell <= 0 for ell in ell_styles):
+        raise ValueError("ell_styles 必须使用正整数精度键")
     figures_data = root["figures"]
     if not isinstance(figures_data, list):
         raise TypeError("figures 必须是数组")
@@ -197,6 +205,8 @@ def load_report_profile(path: str | Path) -> ReportProfile:
         raise ValueError("phase_segments_path 无效")
     channel_names = _mapping(root["channel_names"], "channel_names")
     unit_names = _mapping(root["unit_names"], "unit_names")
+    channel_indices = _mapping(root["channel_indices"], "channel_indices")
+    labels = _mapping(root["labels"], "labels")
     if not all(
         isinstance(key, str) and isinstance(value, str) for key, value in channel_names.items()
     ):
@@ -205,6 +215,38 @@ def load_report_profile(path: str | Path) -> ReportProfile:
         isinstance(key, str) and isinstance(value, str) for key, value in unit_names.items()
     ):
         raise TypeError("unit_names 必须是字符串映射")
+    if set(channel_indices) != {"reference", "output", "control"} or not all(
+        type(value) is int and value >= 0 for value in channel_indices.values()
+    ):
+        raise ValueError("channel_indices 必须完整声明非负 reference/output/control 索引")
+    required_labels = {
+        "time_axis",
+        "tracking_reference",
+        "tracking_ideal",
+        "tracking_secure",
+        "control_ideal",
+        "control_secure",
+        "signed_error",
+        "absolute_error",
+        "zero_count",
+        "all_zero",
+        "ell",
+        "max_abs",
+        "mean_abs",
+        "rms",
+        "precision_axis",
+        "control_max_abs",
+        "output_max_abs",
+        "precision_scale",
+        "mean_time",
+        "protocol1",
+        "protocol2",
+        "resource_axis",
+    }
+    if set(labels) != required_labels or not all(
+        isinstance(value, str) and value for value in labels.values()
+    ):
+        raise ValueError("labels 必须完整声明正式图面文案")
     limitations = root["limitations_zh"]
     if (
         not isinstance(limitations, list)
@@ -223,12 +265,14 @@ def load_report_profile(path: str | Path) -> ReportProfile:
         representative_ell,
         root["time_unit"],
         tuple(path_parts),
-        dict(channel_names),
-        dict(unit_names),
+        MappingProxyType(dict(channel_names)),
+        MappingProxyType(dict(unit_names)),
+        MappingProxyType(dict(channel_indices)),
+        MappingProxyType(dict(labels)),
         tuple(limitations),
         FontSpec(tuple(families)),
         style,
-        ell_styles,
+        MappingProxyType(ell_styles),
         figures,
     )
 
@@ -309,6 +353,50 @@ def _validate_display_mappings(record: ExperimentRecord, profile: ReportProfile)
         missing_units = set(channels.units) - set(profile.unit_names)
         if missing_names or missing_units:
             raise ValueError(f"display profile 缺少通道/单位映射：{missing_names or missing_units}")
+    for kind, channels, arrays in (
+        ("reference", record.metadata.reference, (record.result.reference,)),
+        (
+            "output",
+            record.metadata.output,
+            (record.result.output_ideal, record.result.output_secure, record.result.output_error),
+        ),
+        (
+            "control",
+            record.metadata.control,
+            (
+                record.result.control_ideal,
+                record.result.control_secure,
+                record.result.control_error,
+            ),
+        ),
+    ):
+        index = profile.channel_indices[kind]
+        if index >= len(channels.names) or any(index >= array.shape[1] for array in arrays):
+            raise ValueError(f"display profile 的 {kind} 通道索引越界")
+
+
+def _display_values(record: ExperimentRecord, profile: ReportProfile) -> dict[str, object]:
+    """由 profile 选择 metadata 通道，避免展示层默认猜测第一个领域通道。"""
+    values: dict[str, object] = {
+        "seconds_unit": profile.unit_names["seconds"],
+        "time_unit": profile.time_unit,
+    }
+    for kind, channels in (
+        ("reference", record.metadata.reference),
+        ("output", record.metadata.output),
+        ("control", record.metadata.control),
+    ):
+        index = profile.channel_indices[kind]
+        values[f"{kind}_name"] = profile.channel_names[channels.names[index]]
+        values[f"{kind}_unit"] = profile.unit_names[channels.units[index]]
+    return values
+
+
+def _format_text(template: str, values: Mapping[str, object]) -> str:
+    """替换已声明占位符，同时保留 mathtext 使用的花括号。"""
+    # ``str.format`` 会把 ``T_{air}`` 误认为 Python 占位符；只替换已声明的展示字段。
+    pattern = re.compile("|".join(re.escape("{" + key + "}") for key in values))
+    return pattern.sub(lambda match: str(values[match.group()[1:-1]]), template)
 
 
 def _figure(
@@ -319,19 +407,28 @@ def _figure(
     time_axis: bool,
     boundaries: tuple[float, ...],
     x_range: tuple[float, float],
+    display_values: Mapping[str, object],
 ) -> tuple[Figure, object]:
     """构造统一 16:9 画布、字体、网格、边距和阶段线。"""
     figure = Figure(figsize=(profile.style.width_inches, profile.style.height_inches))
     FigureCanvasAgg(figure)
     axis = figure.subplots()
     prop = FontProperties(fname=str(font.path))
-    axis.set_title(spec.title, fontproperties=prop, fontsize=profile.style.title_size)
-    axis.set_ylabel(spec.y_label, fontproperties=prop, fontsize=profile.style.label_size)
+    axis.set_title(
+        _format_text(spec.title, display_values),
+        fontproperties=prop,
+        fontsize=profile.style.title_size,
+    )
+    axis.set_ylabel(
+        _format_text(spec.y_label, display_values),
+        fontproperties=prop,
+        fontsize=profile.style.label_size,
+    )
     axis.tick_params(labelsize=profile.style.tick_size)
     axis.grid(True, which="both", alpha=profile.style.grid_alpha)
     if time_axis:
         axis.set_xlabel(
-            "时间（s）" if profile.time_unit == "s" else "时间（h）",
+            _format_text(profile.labels["time_axis"], display_values),
             fontproperties=prop,
             fontsize=profile.style.label_size,
         )
@@ -362,6 +459,7 @@ def _single_figure(
 ) -> Figure:
     """从同一个 ExperimentRecord 生成六类单点图。"""
     time = _time(record, profile.time_unit)
+    display_values = _display_values(record, profile)
     figure, axis = _figure(
         spec,
         profile,
@@ -369,68 +467,80 @@ def _single_figure(
         time_axis=True,
         boundaries=boundaries,
         x_range=(float(time[0]), float(time[-1])),
+        display_values=display_values,
     )
     width = profile.style.line_width
     if spec.key == "tracking":
         axis.plot(
             time,
-            record.result.reference[:, 0],
+            record.result.reference[:, profile.channel_indices["reference"]],
             color="#000000",
             linestyle="--",
             linewidth=width,
-            label="参考温度",
+            label=_format_text(profile.labels["tracking_reference"], display_values),
         )
         axis.plot(
             time,
-            record.result.output_ideal[:, 0],
+            record.result.output_ideal[:, profile.channel_indices["output"]],
             color="#0072B2",
             linewidth=width,
-            label=r"明文 $T_{air}(k)$",
+            label=_format_text(profile.labels["tracking_ideal"], display_values),
         )
         axis.plot(
             time,
-            record.result.output_secure[:, 0],
+            record.result.output_secure[:, profile.channel_indices["output"]],
             color="#D55E00",
             linestyle=":",
             linewidth=width,
-            label=r"安全计算 $\hat{T}_{air}(k)$",
+            label=_format_text(profile.labels["tracking_secure"], display_values),
         )
         _legend(axis, font, profile)
     elif spec.key == "applied_control":
         axis.plot(
             time,
-            record.result.control_ideal[:, 0],
+            record.result.control_ideal[:, profile.channel_indices["control"]],
             color="#0072B2",
             linewidth=width,
             marker="o",
             markevery=profile.style.marker_every,
-            label=r"明文实际控制 $u(k)$",
+            label=_format_text(profile.labels["control_ideal"], display_values),
         )
         axis.plot(
             time,
-            record.result.control_secure[:, 0],
+            record.result.control_secure[:, profile.channel_indices["control"]],
             color="#D55E00",
             linestyle="--",
             linewidth=width,
             marker="s",
             markevery=profile.style.marker_every,
-            label=r"安全计算实际控制 $\hat{u}(k)$",
+            label=_format_text(profile.labels["control_secure"], display_values),
         )
         _legend(axis, font, profile, ncol=2)
     else:
         control = spec.key.startswith("control_")
-        error = record.result.control_error[:, 0] if control else record.result.output_error[:, 0]
+        index = profile.channel_indices["control" if control else "output"]
+        error = (
+            record.result.control_error[:, index]
+            if control
+            else record.result.output_error[:, index]
+        )
         absolute = spec.key.endswith("absolute")
         if absolute:
             values = np.ma.masked_equal(np.abs(error), 0.0)
             if values.count():
-                axis.plot(time, values, color="#CC3311", linewidth=width, label="绝对误差")
+                axis.plot(
+                    time,
+                    values,
+                    color="#CC3311",
+                    linewidth=width,
+                    label=_format_text(profile.labels["absolute_error"], display_values),
+                )
                 _legend(axis, font, profile, ncol=1)
             zero_count = int(np.count_nonzero(error == 0.0))
             axis.text(
                 0.98,
                 0.03,
-                f"已掩码精确零样本：{zero_count}",
+                _format_text(profile.labels["zero_count"], {**display_values, "count": zero_count}),
                 ha="right",
                 transform=axis.transAxes,
                 fontproperties=FontProperties(fname=str(font.path)),
@@ -439,14 +549,20 @@ def _single_figure(
                 axis.text(
                     0.5,
                     0.5,
-                    "全部误差为零，无正值可显示",
+                    _format_text(profile.labels["all_zero"], display_values),
                     ha="center",
                     transform=axis.transAxes,
                     fontproperties=FontProperties(fname=str(font.path)),
                 )
             apply_axis_format(axis.yaxis, scale="log", signed=False)
         else:
-            axis.plot(time, error, color="#AA3377", linewidth=width, label="有符号误差")
+            axis.plot(
+                time,
+                error,
+                color="#AA3377",
+                linewidth=width,
+                label=_format_text(profile.labels["signed_error"], display_values),
+            )
             _legend(axis, font, profile, ncol=1)
             apply_axis_format(axis.yaxis, scale="linear", signed=True)
     return figure
@@ -460,11 +576,18 @@ def _cross_figure(
     font: ResolvedFont,
     boundaries: tuple[float, ...],
     x_range: tuple[float, float],
+    display_values: Mapping[str, object],
 ) -> Figure:
     """生成跨精度时序、指标、精度汇总与资源附录图。"""
     is_time = spec.key.endswith("time_by_ell")
     figure, axis = _figure(
-        spec, profile, font, time_axis=is_time, boundaries=boundaries, x_range=x_range
+        spec,
+        profile,
+        font,
+        time_axis=is_time,
+        boundaries=boundaries,
+        x_range=x_range,
+        display_values=display_values,
     )
     if is_time:
         field = "control_error" if spec.key.startswith("control_") else "output_error"
@@ -479,7 +602,7 @@ def _cross_figure(
                 color=style.color,
                 linestyle=style.linestyle,
                 linewidth=profile.style.line_width,
-                label=rf"$\ell={ell}$",
+                label=_format_text(profile.labels["ell"], {**display_values, "ell": ell}),
             )
         apply_axis_format(axis.yaxis, scale="log", signed=False)
         _legend(axis, font, profile, ncol=4)
@@ -487,20 +610,20 @@ def _cross_figure(
     ell = [record.point.ell for record in records]
     if spec.key.endswith("metrics_by_ell"):
         name = "control_error" if spec.key.startswith("control_") else "output_error"
-        for metric, marker, label in (
-            ("max_abs", "o", "最大值"),
-            ("mean_abs", "s", "均值"),
-            ("rms", "^", "均方根"),
+        for metric, marker, label_key in (
+            ("max_abs", "o", "max_abs"),
+            ("mean_abs", "s", "mean_abs"),
+            ("rms", "^", "rms"),
         ):
             axis.plot(
                 ell,
                 [getattr(getattr(record, name), metric) for record in records],
                 marker=marker,
                 linewidth=profile.style.line_width,
-                label=label,
+                label=_format_text(profile.labels[label_key], display_values),
             )
         axis.set_xlabel(
-            r"定点小数位数 $\ell$",
+            _format_text(profile.labels["precision_axis"], display_values),
             fontproperties=FontProperties(fname=str(font.path)),
             fontsize=profile.style.label_size,
         )
@@ -512,18 +635,23 @@ def _cross_figure(
             [record.control_error.max_abs for record in records],
             "o-",
             linewidth=profile.style.line_width,
-            label="控制最大绝对误差",
+            label=_format_text(profile.labels["control_max_abs"], display_values),
         )
         axis.plot(
             ell,
             [record.output_error.max_abs for record in records],
             "s-",
             linewidth=profile.style.line_width,
-            label="温度最大绝对误差",
+            label=_format_text(profile.labels["output_max_abs"], display_values),
         )
-        axis.plot(ell, [2.0**-value for value in ell], "--", label=r"$2^{-\ell}$ 参考尺度")
+        axis.plot(
+            ell,
+            [2.0**-value for value in ell],
+            "--",
+            label=_format_text(profile.labels["precision_scale"], display_values),
+        )
         axis.set_xlabel(
-            r"定点小数位数 $\ell$",
+            _format_text(profile.labels["precision_axis"], display_values),
             fontproperties=FontProperties(fname=str(font.path)),
             fontsize=profile.style.label_size,
         )
@@ -542,17 +670,17 @@ def _cross_figure(
             ],
             color="#56B4E9",
             alpha=0.7,
-            label="平均执行时间",
+            label=_format_text(profile.labels["mean_time"], display_values),
         )
         axis.set_xlabel(
-            r"定点小数位数 $\ell$",
+            _format_text(profile.labels["precision_axis"], display_values),
             fontproperties=FontProperties(fname=str(font.path)),
             fontsize=profile.style.label_size,
         )
         other = axis.twinx()
-        for field, marker, label in (
-            ("protocol1_triples_total", "o", "协议 1 三元组"),
-            ("protocol2_truncations_total", "s", "协议 2 截断"),
+        for field, marker, label_key in (
+            ("protocol1_triples_total", "o", "protocol1"),
+            ("protocol2_truncations_total", "s", "protocol2"),
         ):
             other.plot(
                 ell,
@@ -562,10 +690,10 @@ def _cross_figure(
                 ],
                 marker=marker,
                 linewidth=profile.style.line_width,
-                label=label,
+                label=_format_text(profile.labels[label_key], display_values),
             )
         other.set_ylabel(
-            "每次运行的精确推导资源数",
+            _format_text(profile.labels["resource_axis"], display_values),
             fontproperties=FontProperties(fname=str(font.path)),
             fontsize=profile.style.label_size,
         )
@@ -655,6 +783,8 @@ def render_chinese_report(
     manifest_name: str = "manifest.json",
 ) -> ReportArtifacts:
     """验证最终 sweep 后将 12 图、manifest 与目录同批原子发布。"""
+    if manifest_name != "manifest.json":
+        raise ValueError("正式中文 sweep 报告只能验证最终 manifest.json")
     source = Path(sweep_dir)
     profile_source = Path(profile_path)
     profile_hash = _digest(profile_source)
@@ -663,6 +793,8 @@ def render_chinese_report(
     }
     data = load_verified_sweep_data(source, manifest_name=manifest_name)
     profile = load_report_profile(profile_source)
+    if tuple(profile.ell_styles) != tuple(data.definition["fractional_bits"]):
+        raise ValueError("ell_styles 必须按 sweep definition 完整且有序覆盖全部精度")
     records = select_primary_records(data, profile.primary_seed)
     representative = next(
         (record for record in records if record.point.ell == profile.representative_ell), None
@@ -671,11 +803,24 @@ def render_chinese_report(
         raise ValueError("representative ell 不存在成功的 primary seed 点")
     record = data.runs[representative.point.point_id]
     _validate_display_mappings(record, profile)
+    display_values = _display_values(record, profile)
     boundaries = _phase_boundaries(record, profile)
     time = _time(record, profile.time_unit)
-    texts = [profile.locale, *profile.channel_names.values(), *profile.unit_names.values()]
+    texts = [
+        profile.locale,
+        *profile.channel_names.values(),
+        *profile.unit_names.values(),
+        *profile.labels.values(),
+    ]
     for spec in profile.figures:
-        texts.extend((spec.title, spec.y_label, spec.purpose_zh, spec.speaker_note_zh))
+        texts.extend(
+            (
+                _format_text(spec.title, display_values),
+                _format_text(spec.y_label, display_values),
+                spec.purpose_zh,
+                spec.speaker_note_zh,
+            )
+        )
     font = resolve_report_font(profile.font, texts)
     report_id = _new_render_id()
     if not _RENDER_ID_PATTERN.fullmatch(report_id):
@@ -702,6 +847,7 @@ def render_chinese_report(
                     font,
                     boundaries,
                     (float(time[0]), float(time[-1])),
+                    display_values,
                 )
             path = stage / spec.filename
             _save_figure(figure, path, profile)
@@ -826,6 +972,9 @@ def render_chinese_report(
         )
         if source_snapshot != {name: _digest(source / name) for name in source_snapshot}:
             raise ValueError("source sweep 在发布前发生变化")
+        load_verified_sweep_data(source, manifest_name="manifest.json")
+        if _digest(profile_source) != profile_hash:
+            raise ValueError("display profile 在发布前发生变化")
         if os.path.lexists(final):
             raise FileExistsError(f"report ID 已存在：{report_id}")
         os.rename(stage, final)
@@ -847,17 +996,25 @@ def render_chinese_saved_run(
 ) -> ReportArtifacts:
     """从单个 canonical run 只读生成 01–06 中文图，保留旧 CLI 默认语义。"""
     source = Path(run_dir)
+    profile_source = Path(profile_path)
+    profile_hash = _digest(profile_source)
     snapshot = {
         name: _digest(source / name) for name in ("trajectory.csv", "metadata.json", "config.json")
     }
     record = load_artifacts(source)
-    profile = load_report_profile(profile_path)
+    profile = load_report_profile(profile_source)
     _validate_display_mappings(record, profile)
+    display_values = _display_values(record, profile)
     boundaries = _phase_boundaries(record, profile)
     texts = [
         text
         for item in profile.figures[:6]
-        for text in (item.title, item.y_label, item.purpose_zh, item.speaker_note_zh)
+        for text in (
+            _format_text(item.title, display_values),
+            _format_text(item.y_label, display_values),
+            item.purpose_zh,
+            item.speaker_note_zh,
+        )
     ]
     font = resolve_report_font(profile.font, texts)
     report_id = _new_render_id()
@@ -892,7 +1049,7 @@ def render_chinese_saved_run(
             "report_id": report_id,
             "source_run_id": record.run_id,
             "source_files_sha256": snapshot,
-            "display_profile_sha256": _digest(Path(profile_path)),
+            "display_profile_sha256": profile_hash,
             "font": {
                 "family": font.family,
                 "path": str(font.path),
@@ -909,6 +1066,14 @@ def render_chinese_saved_run(
         (stage / "汇报图目录.md").write_text(
             _index_markdown(entries, profile.limitations_zh), encoding="utf-8", newline="\n"
         )
+        if snapshot != {name: _digest(source / name) for name in snapshot}:
+            raise ValueError("source run 在发布前发生变化")
+        # 在 rename 前重走 canonical reader，确保源三文件没有在目录生成期间被替换。
+        load_artifacts(source)
+        if _digest(profile_source) != profile_hash:
+            raise ValueError("display profile 在发布前发生变化")
+        if os.path.lexists(final):
+            raise FileExistsError(f"report ID 已存在：{report_id}")
         os.rename(stage, final)
     except Exception:
         if _owned_stage(stage, parent, identity):
