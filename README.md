@@ -81,6 +81,7 @@ scenario:
 ```powershell
 uv run python -m secure_control.scenarios.hvac.runner --config configs/hvac_dual_loop.yaml --seed 12
 uv run python -m secure_control.scenarios.hvac.runner --config configs/hvac_2r2c_dual_loop.yaml --seed 42
+uv run python -m secure_control.scenarios.hvac.runner --config configs/hvac_2r2c_dual_loop_25_20_15.yaml --seed 42
 ```
 
 `--seed` 仅用于隔离测试复现；省略时使用安全随机材料源。CLI 只输出摘要，不保存 #13 的
@@ -94,11 +95,17 @@ uv run python -m secure_control.scenarios.hvac.runner --config configs/hvac_2r2c
 [2R2C HVAC PID 设计](docs/hvac_2r2c_pid_design.md)。该结果是 adapted application，不能称为
 论文原数值实验复刻，也不声明无限时域稳定性。
 
+Issue #53 将正式参考迁移为 25→20→15 °C；当前 PID 先经独立 plaintext 门禁并直接复用，
+没有重新执行网格搜索。新配置链、稳定 baseline identity、180 步证书和历史证据边界见
+[2R2C HVAC 参考迁移](docs/hvac_reference_migration.md)。旧 15→20→25 配置及其下游报告继续作为
+历史证据保留，不自动代表新正式基线。
+
 保存正式八字段实验产物使用独立入口，不改变上面的场景级摘要 CLI：
 
 ```powershell
 uv run python -m secure_control.experiments.runner --config configs/hvac_dual_loop.yaml --seed 12
 uv run python -m secure_control.experiments.runner --config configs/hvac_2r2c_dual_loop.yaml --seed 42
+uv run python -m secure_control.experiments.runner --config configs/hvac_2r2c_dual_loop_25_20_15.yaml --seed 42
 ```
 
 每次运行创建独立的 `results/csv/<run_id>/trajectory.csv`、`metadata.json` 和

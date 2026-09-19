@@ -4,6 +4,10 @@
 场景级明文闭环基线见 [HVAC PID 设计](hvac_pid_design.md)；通用仿真循环和任何安全协议仍未实现。
 所有 HVAC 概念只属于 `secure_control.scenarios.hvac` 及其 YAML、测试和本文档。
 
+Issue #53 的当前正式 2R2C reference 为 25→20→15 °C，并保存在独立版本化 scenario 中；
+旧 `hvac_2r2c_plant.yaml` 及其 15→20→25 °C reference 继续作为历史证据保留。新旧配置除
+reference/endpoint 外逐字段相同，详见 [参考迁移说明](hvac_reference_migration.md)。
+
 ## 一阶历史基线模型与单位
 
 配置 `model.kind: first_order_rc_cooling` 表示一阶 RC 热模型；`HvacPlant` 采用：

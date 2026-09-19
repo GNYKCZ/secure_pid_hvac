@@ -1,5 +1,9 @@
 # 2R2C HVAC PID 调参与双闭环基线
 
+> 历史基线说明：本文冻结的是 15→20→25 参考及其 Issue #42 调参结果。Issue #53 的正式
+> 25→20→15 迁移见 [hvac_reference_migration.md](hvac_reference_migration.md)；本文数值不自动
+> 外推为新基线的代表运行结果。
+
 ## 适用边界
 
 本基线把项目的 2R2C HVAC plant、15→20→25 °C reference、执行器饱和和位置式 PID

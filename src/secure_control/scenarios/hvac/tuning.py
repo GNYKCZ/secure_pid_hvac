@@ -116,6 +116,20 @@ class HvacPidTuningResult:
         object.__setattr__(self, "rejection_counts", MappingProxyType(copied))
 
 
+@dataclass(frozen=True, slots=True)
+class _HvacPidConfigInputs:
+    """保存一次严格解析的 PID 配置及其 TOCTOU 复验所需原始 bytes。"""
+
+    config_path: Path
+    config_source: bytes
+    loaded: Mapping[str, Any]
+    plant_path: Path
+    plant_source: bytes
+    design: HvacPidDesign
+    tuning: HvacPidTuningContract
+    quality: HvacControlQualityContract
+
+
 class HvacTuningInfeasibleError(ValueError):
     """报告固定网格没有可行候选，并保留最佳失败候选的诊断。"""
 
@@ -135,6 +149,36 @@ def load_hvac_pid_tuning_contract(
     path: str | Path, plant_contract: HvacScenarioContract
 ) -> tuple[HvacPidDesign, HvacPidTuningContract, HvacControlQualityContract]:
     """读取 2R2C PID 配置并校验 plant 引用、hash、策略与冻结调参规则。"""
+    inputs = _load_hvac_pid_config_inputs(path, plant_contract)
+    report = _mapping(_mapping(inputs.loaded, "tuning"), "result")
+    rerun = tune_hvac_pid(plant_contract, inputs.tuning, inputs.quality)
+    if rerun.selected_design != inputs.design:
+        raise ValueError("配置 selected gains 与确定性 tuner 重跑结果不一致")
+    if _integer(report, "evaluated_candidate_count") != rerun.evaluated_candidate_count:
+        raise ValueError("配置 evaluated candidate count 与 tuner 重跑结果不一致")
+    if _integer(report, "feasible_candidate_count") != rerun.feasible_candidate_count:
+        raise ValueError("配置 feasible candidate count 与 tuner 重跑结果不一致")
+    objective = report.get("selected_objective")
+    if (
+        not isinstance(objective, list)
+        or tuple(float(item) for item in objective) != rerun.selected_objective
+    ):
+        raise ValueError("配置 selected objective 与 tuner 重跑结果不一致")
+    rejection_report = _mapping(report, "rejection_counts")
+    configured_rejections = {key: _integer(rejection_report, key) for key in rejection_report}
+    normalized_rerun = {
+        key.replace(":", "_", 1): value for key, value in rerun.rejection_counts.items()
+    }
+    if configured_rejections != normalized_rerun:
+        raise ValueError("配置 rejection counts 与 tuner 重跑结果不一致")
+    _revalidate_pid_config_inputs(inputs)
+    return inputs.design, inputs.tuning, inputs.quality
+
+
+def _load_hvac_pid_config_inputs(
+    path: str | Path, plant_contract: HvacScenarioContract
+) -> _HvacPidConfigInputs:
+    """严格解析共享 PID/tuning/quality 字段，但不运行 exhaustive tuner。"""
     if not isinstance(plant_contract, HvacScenarioContract) or not isinstance(
         plant_contract.model, Hvac2R2CModelContract
     ):
@@ -184,30 +228,25 @@ def load_hvac_pid_tuning_contract(
     )
     tuning = _parse_tuning(_mapping(loaded, "tuning"))
     quality = _parse_quality(_mapping(loaded, "quality"), plant_contract)
-    report = _mapping(_mapping(loaded, "tuning"), "result")
-    rerun = tune_hvac_pid(plant_contract, tuning, quality)
-    if rerun.selected_design != selected:
-        raise ValueError("配置 selected gains 与确定性 tuner 重跑结果不一致")
-    if _integer(report, "evaluated_candidate_count") != rerun.evaluated_candidate_count:
-        raise ValueError("配置 evaluated candidate count 与 tuner 重跑结果不一致")
-    if _integer(report, "feasible_candidate_count") != rerun.feasible_candidate_count:
-        raise ValueError("配置 feasible candidate count 与 tuner 重跑结果不一致")
-    objective = report.get("selected_objective")
+    return _HvacPidConfigInputs(
+        config_path,
+        source,
+        loaded,
+        plant_path,
+        plant_source,
+        selected,
+        tuning,
+        quality,
+    )
+
+
+def _revalidate_pid_config_inputs(inputs: _HvacPidConfigInputs) -> None:
+    """在派生结果返回前复验 PID 与 scenario bytes，发生变化时 fail closed。"""
     if (
-        not isinstance(objective, list)
-        or tuple(float(item) for item in objective) != rerun.selected_objective
+        inputs.config_path.read_bytes() != inputs.config_source
+        or inputs.plant_path.read_bytes() != inputs.plant_source
     ):
-        raise ValueError("配置 selected objective 与 tuner 重跑结果不一致")
-    rejection_report = _mapping(report, "rejection_counts")
-    configured_rejections = {key: _integer(rejection_report, key) for key in rejection_report}
-    normalized_rerun = {
-        key.replace(":", "_", 1): value for key, value in rerun.rejection_counts.items()
-    }
-    if configured_rejections != normalized_rerun:
-        raise ValueError("配置 rejection counts 与 tuner 重跑结果不一致")
-    if config_path.read_bytes() != source or plant_path.read_bytes() != plant_source:
         raise ValueError("2R2C PID/plant 配置在解析期间发生变化")
-    return selected, tuning, quality
 
 
 @lru_cache(maxsize=8)

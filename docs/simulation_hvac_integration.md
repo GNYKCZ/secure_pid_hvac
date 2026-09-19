@@ -78,6 +78,10 @@ uv run ruff check .
 
 ## 2R2C 最终基线
 
+> 历史说明：本节的 `hvac_2r2c_dual_loop.yaml` 是 15→20→25 基线。Issue #53 的当前正式
+> 25→20→15 入口、PID 先验证后可选调参流程及 baseline identity 见
+> [hvac_reference_migration.md](hvac_reference_migration.md)；本节旧数值不自动外推。
+
 Issue #42 在不改变通用 simulation/result/artifact 接口的前提下增加
 `configs/hvac_2r2c_dual_loop.yaml`。两支仍各自拥有独立 plant、adapter、runtime 和安全会话；
 plant 内部状态为 `[T_air,T_wall]`，但反馈、正式 output 和绘图只使用 `T_air`。
@@ -96,4 +100,11 @@ centered modulus limit 和当前整数 `A/B` realization 的 `state_truncation_b
 ```powershell
 uv run python -m secure_control.scenarios.hvac.runner --config configs/hvac_2r2c_dual_loop.yaml --seed 42
 uv run python -m secure_control.experiments.runner --config configs/hvac_2r2c_dual_loop.yaml --seed 42
+```
+
+新正式入口为：
+
+```powershell
+uv run python -m secure_control.scenarios.hvac.runner --config configs/hvac_2r2c_dual_loop_25_20_15.yaml --seed 42
+uv run python -m secure_control.experiments.runner --config configs/hvac_2r2c_dual_loop_25_20_15.yaml --seed 42
 ```

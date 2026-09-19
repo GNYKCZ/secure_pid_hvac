@@ -325,6 +325,20 @@ def test_2r2c_tuner_reproduces_frozen_unique_selection_and_audit_counts() -> Non
     )
 
 
+def test_legacy_2r2c_loader_still_recomputes_and_rejects_tampered_result(
+    tmp_path: Path,
+) -> None:
+    """解析步骤拆分后，旧 #42 loader 仍必须重跑 tuner 并核对冻结 result。"""
+    plant = tmp_path / PLANT_2R2C_PATH.name
+    plant.write_bytes(PLANT_2R2C_PATH.read_bytes())
+    loaded = yaml.safe_load(PID_2R2C_PATH.read_text(encoding="utf-8"))
+    loaded["tuning"]["result"]["evaluated_candidate_count"] = 10178
+    baseline = tmp_path / PID_2R2C_PATH.name
+    baseline.write_text(yaml.safe_dump(loaded, sort_keys=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="evaluated candidate count"):
+        load_hvac_pid_tuning_contract(baseline, load_hvac_scenario_contract(plant))
+
+
 def test_tuner_reports_explicit_infeasible_result_without_relaxing_thresholds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

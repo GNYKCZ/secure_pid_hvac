@@ -1,5 +1,8 @@
 # 2R2C HVAC 局部闭环稳定性
 
+> 历史证据说明：本文分析绑定旧 15→20→25 配置链。Issue #53 没有重跑或改写本报告；
+> 25→20→15 正式基线的适用边界见 [hvac_reference_migration.md](hvac_reference_migration.md)。
+
 ## 分析对象
 
 本报告旁路只读消费 `configs/hvac_2r2c_plant.yaml` 与

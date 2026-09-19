@@ -1,5 +1,9 @@
 # 2R2C HVAC 中文汇报图
 
+> 历史证据说明：现有中文报告读取旧 15→20→25 sweep。Issue #53 没有重绘这些图，图中数值
+> 不代表 25→20→15 正式基线；迁移边界见
+> [hvac_reference_migration.md](hvac_reference_migration.md)。
+
 ## 只读数据链
 
 中文报告只消费已冻结的正式工件。单次运行入口先调用 `load_artifacts()`；完整报告入口先调用
