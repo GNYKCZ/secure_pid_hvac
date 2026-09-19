@@ -196,6 +196,8 @@ def load_hvac_pid_baseline_resolution(
         "method",
         "start_commit",
         "supersedes_baseline",
+        "source_wrapper_config",
+        "source_wrapper_sha256",
         "source_pid_config",
         "source_pid_sha256",
         "quality_contract_sha256",
@@ -211,6 +213,25 @@ def load_hvac_pid_baseline_resolution(
 
     source_name = _string(migration, "source_pid_config")
     _safe_filename(source_name, "source_pid_config")
+    source_wrapper_name = _string(migration, "source_wrapper_config")
+    _safe_filename(source_wrapper_name, "source_wrapper_config")
+    source_wrapper_path = current.config_path.parent / source_wrapper_name
+    try:
+        source_wrapper_bytes = source_wrapper_path.read_bytes()
+        source_wrapper_loaded = yaml.safe_load(source_wrapper_bytes.decode("utf-8"))
+    except (OSError, yaml.YAMLError) as error:
+        raise ValueError(f"无法读取 migration source wrapper：{source_wrapper_path}") from error
+    if canonical_hvac_source_sha256(source_wrapper_bytes) != _string(
+        migration, "source_wrapper_sha256"
+    ):
+        raise ValueError("migration source wrapper SHA-256 不一致")
+    if not isinstance(source_wrapper_loaded, Mapping):
+        raise TypeError("migration source wrapper 根节点必须是映射")
+    if _string(_mapping(source_wrapper_loaded, "scenario"), "name") != "hvac":
+        raise ValueError("migration source wrapper scenario.name 必须为 hvac")
+    if _string(source_wrapper_loaded, "baseline_config") != source_name:
+        raise ValueError("migration source wrapper 未引用声明的 source PID")
+
     source_path = current.config_path.parent / source_name
     try:
         source_bytes = source_path.read_bytes()
@@ -227,6 +248,18 @@ def load_hvac_pid_baseline_resolution(
     source_inputs = _load_hvac_pid_config_inputs(source_path, source_contract)
     if current.tuning != source_inputs.tuning:
         raise ValueError("migration fallback tuning 必须与旧 PID source 完全一致")
+    historical_identity = canonical_hvac_mapping_sha256(
+        {
+            "scheme": "hvac_historical_config_chain_v1",
+            "source_hashes": {
+                "wrapper": canonical_hvac_source_sha256(source_wrapper_bytes),
+                "baseline": canonical_hvac_source_sha256(source_bytes),
+                "scenario": canonical_hvac_source_sha256(source_inputs.plant_source),
+            },
+        }
+    )
+    if supersedes != historical_identity:
+        raise ValueError("supersedes_baseline 与旧三配置链 canonical identity 不一致")
 
     quality_hash = canonical_hvac_mapping_sha256(asdict(current.quality))
     if quality_hash != _string(migration, "quality_contract_sha256"):
@@ -254,8 +287,11 @@ def load_hvac_pid_baseline_resolution(
     )
     _revalidate_pid_config_inputs(current)
     _revalidate_pid_config_inputs(source_inputs)
-    if source_path.read_bytes() != source_bytes:
-        raise ValueError("migration source PID 在解析期间发生变化")
+    if (
+        source_path.read_bytes() != source_bytes
+        or source_wrapper_path.read_bytes() != source_wrapper_bytes
+    ):
+        raise ValueError("migration source wrapper/PID 在解析期间发生变化")
     return HvacPidBaselineResolution(
         final_design,
         current.tuning,

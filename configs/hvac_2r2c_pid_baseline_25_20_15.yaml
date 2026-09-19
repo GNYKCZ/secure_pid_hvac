@@ -84,6 +84,8 @@ migration:
   method: validate_current_then_conditionally_tune_v1
   start_commit: a1561d0800127e35f263cf6afd0213d4d7563a3a
   supersedes_baseline: 2489e5476ad316ea2d9599783e29f2d849ffcf485ca860e0db76c80312c532f9
+  source_wrapper_config: hvac_2r2c_dual_loop.yaml
+  source_wrapper_sha256: d16a51688df4fc2b94eeda6adeb62e2fe50c48f6a9a3c6a91d97ce87b3ac7e3f
   source_pid_config: hvac_2r2c_pid_baseline.yaml
   source_pid_sha256: f5df82b1dc21123ed6d138006bedbdd1e1de595d8c56d1f6791f2ae9c008a44e
   quality_contract_sha256: a7cbc38beb93556d0e073a796d455cc6adce57e17ec94d9dffd1eeb9b7d31a83

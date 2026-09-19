@@ -36,7 +36,7 @@ OLD_SCENARIO = CONFIGS / "hvac_2r2c_plant.yaml"
 
 def _copy_migration_chain(destination: Path) -> Path:
     """复制测试所需的完整配置链，避免篡改仓库中的冻结配置。"""
-    for source in (BASELINE, SCENARIO, OLD_BASELINE, OLD_SCENARIO):
+    for source in (WRAPPER, BASELINE, SCENARIO, OLD_WRAPPER, OLD_BASELINE, OLD_SCENARIO):
         (destination / source.name).write_bytes(source.read_bytes())
     return destination / BASELINE.name
 
@@ -51,6 +51,12 @@ def test_new_scenario_changes_only_reference_and_preserves_historical_hashes() -
     )
     assert canonical_hvac_source_sha256(OLD_SCENARIO.read_bytes()) == (
         "54d980b7b3d5ef7f9187de008a78348748f0246193fc8bdaf4ef9a3f6be33dbd"
+    )
+    wrapper = yaml.safe_load(WRAPPER.read_text(encoding="utf-8"))
+    baseline = yaml.safe_load(BASELINE.read_text(encoding="utf-8"))
+    assert wrapper["baseline_sha256"] == canonical_hvac_source_sha256(BASELINE.read_bytes())
+    assert baseline["migration"]["source_wrapper_sha256"] == canonical_hvac_source_sha256(
+        OLD_WRAPPER.read_bytes()
     )
 
     old = yaml.safe_load(OLD_SCENARIO.read_text(encoding="utf-8"))["scenario"]["hvac"]
@@ -171,6 +177,32 @@ def test_declared_selection_tampering_fails_closed(tmp_path: Path) -> None:
     loaded["migration"]["selection"]["evaluated_candidate_count"] = 1
     baseline.write_text(yaml.safe_dump(loaded, sort_keys=False), encoding="utf-8")
     with pytest.raises(ValueError, match="selection 声明"):
+        load_hvac_pid_baseline_resolution(
+            baseline, load_hvac_scenario_contract(tmp_path / SCENARIO.name)
+        )
+
+
+def test_migration_wrapper_rejects_preexisting_baseline_drift(tmp_path: Path) -> None:
+    """wrapper 必须用冻结摘要拒绝在本次解析开始前已经漂移的 PID baseline。"""
+    baseline = _copy_migration_chain(tmp_path)
+    wrapper = tmp_path / WRAPPER.name
+    wrapper_loaded = yaml.safe_load(wrapper.read_text(encoding="utf-8"))
+    wrapper_loaded["baseline_sha256"] = canonical_hvac_source_sha256(baseline.read_bytes())
+    wrapper.write_text(yaml.safe_dump(wrapper_loaded, sort_keys=False), encoding="utf-8")
+    baseline.write_bytes(baseline.read_bytes() + b"\n# post-freeze drift\n")
+
+    with pytest.raises(ValueError, match="baseline.*SHA-256"):
+        HvacScenario(wrapper)
+
+
+def test_supersedes_baseline_must_match_recomputed_historical_chain(tmp_path: Path) -> None:
+    """格式合法但并非旧三配置链真实身份的 supersedes 声明必须 fail closed。"""
+    baseline = _copy_migration_chain(tmp_path)
+    loaded = yaml.safe_load(baseline.read_text(encoding="utf-8"))
+    loaded["migration"]["supersedes_baseline"] = "0" * 64
+    baseline.write_text(yaml.safe_dump(loaded, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="supersedes_baseline"):
         load_hvac_pid_baseline_resolution(
             baseline, load_hvac_scenario_contract(tmp_path / SCENARIO.name)
         )

@@ -218,6 +218,12 @@ class HvacScenario:
             raise ValueError(f"无法读取 HVAC PID 基线配置：{baseline_path}") from error
         if not isinstance(baseline_loaded, Mapping):
             raise TypeError("HVAC PID 基线配置根节点必须是映射。")
+        if "migration" in baseline_loaded:
+            expected_baseline_hash = loaded.get("baseline_sha256")
+            if not isinstance(expected_baseline_hash, str) or not expected_baseline_hash.strip():
+                raise TypeError("migration wrapper 的 baseline_sha256 必须是非空字符串。")
+            if canonical_hvac_source_sha256(baseline_source) != expected_baseline_hash:
+                raise ValueError("migration wrapper 的 PID baseline SHA-256 不一致。")
         security = loaded.get("security")
         if not isinstance(security, Mapping):
             raise TypeError("security 必须是映射。")

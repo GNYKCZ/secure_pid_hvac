@@ -42,12 +42,15 @@ plaintext 门禁的三个区段 MAE 分别为 `0.699426`、`0.690107`、`0.68003
 
 `start_commit=a1561d0800127e35f263cf6afd0213d4d7563a3a` 记录迁移开始点；
 `supersedes_baseline=2489e5476ad316ea2d9599783e29f2d849ffcf485ca860e0db76c80312c532f9`
-是旧三配置链的规范内容身份。两者作为 lineage 与新 `baseline_id` 并列记录，不混入可变运行信息。
+是旧三配置链的规范内容身份。loader 会验证旧 wrapper 摘要及其 PID 引用，再结合旧 PID 和 scenario
+的 canonical hashes 重算该身份；任一来源漂移或伪造 predecessor 都会 fail closed。新 wrapper
+也以 canonical SHA-256 固定其 PID baseline。两者作为 lineage 与新 `baseline_id` 并列记录，
+不混入可变运行信息。
 
 当前冻结摘要为：
 
 ```text
-baseline_id                       b6abb6681051f3a8fdfc5206a15a9b4a0d8317657a9a324bfb1ce42b2d23a5e8
+baseline_id                       f5d1bee247279ff85ba33db12778621724e46b76b880c48d8ee5637838e5aeab
 quality_contract_sha256           a7cbc38beb93556d0e073a796d455cc6adce57e17ec94d9dffd1eeb9b7d31a83
 selection_record_sha256           9f965a4ed4147abcc88e3e8ae2c5727886adc1b9645e877866db04b291246897
 controller_spec_sha256            f15604f828c3a53b1b2f5a45c3f845c88a399c2998f6b3e3a2a23c5e0eef1aeb

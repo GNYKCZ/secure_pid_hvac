@@ -2,6 +2,7 @@
 scenario:
   name: hvac
 baseline_config: hvac_2r2c_pid_baseline_25_20_15.yaml
+baseline_sha256: abde75841190d1b23a73923047f3232c3879db2a027a6b0b52d63e5b9e598dba
 security:
   modulus: 2305843009213693951
   integer_bits: 48
