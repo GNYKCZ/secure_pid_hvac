@@ -1,0 +1,77 @@
+# 安全执行证据与增强中文报告
+
+## 目的与边界
+
+Issue #51 为冻结的 2R2C HVAC 精度扫描增加一条显式、默认关闭的诊断路径。它记录真实
+`SecureStateSpaceRuntime` 执行中的编码整数、Protocol 1/2 资源生命周期、Client 重构、decode、
+controller state 更新和 actuator 后的 applied control；不会用展示层重新计算协议结果，也不会
+改变正式八字段结果 schema。
+
+诊断使用固定 `test_seed`，因此只适用于可复现性验证。combined-share 文件仅在命令行显式授权后
+写入 `results/diagnostics/private/<trace_id>/`，标记 `deployment_security=false`，不进入公开 evidence
+manifest，也不代表部署中的任一参与方可以同时取得两份 share。公开工件只保留重构结论、资源 ID
+不可逆摘要和无损十进制整数。
+
+## 固定复现入口
+
+以下命令只复现冻结 sweep 中的 `(ell=48, seed=42)` 成功点，并在 `k=60` 保存完整状态证据：
+
+```powershell
+uv run python -m secure_control.experiments.evidence_runner `
+  --source-sweep-id 20260917T141734484659Z-0b0eb456cc01 `
+  --ell 48 --seed 42 --trace-step 60 `
+  --allow-combined-share-diagnostic
+```
+
+发布前会用 canonical sweep reader 复验来源，并对 `time/reference/output_ideal/output_secure/`
+`control_ideal/control_secure/control_error/output_error` 同时检查 dtype、shape 与 `array_equal`。任一字段
+不严格相等、来源 bytes 在运行期间变化、180 个 step 不连续、资源累计与正式 summary 不一致，都会
+拒绝发布。
+
+公开目录 `results/diagnostics/<sweep_id>/<trace_id>/` 包含：
+
+- `integer_control.csv`：逐 step 的 raw 明文/安全控制、residue、centered integer、scale、applied control；
+- `resource_counts.csv`：真实创建/消费/废弃累计数、逐步增量及 A/B/C/D/state truncation 分解；
+- `selected_step_trace.json`：固定 step 的输入、输出与 controller state 更新证据，不含 raw shares；
+- `metadata.json` 与 `manifest.json`：来源、模数 `q`、严格等价结论、随机性声明、private audit 摘要及文件哈希闭包。reader 会按 `q` 验证每个 canonical residue 与 centered integer 的映射，并拒绝公开目录中的任何未声明目录、嵌套文件或链接成员。
+
+大整数以十进制文本保存，不经 JSON binary64。删除 private combined-share 文件后，公开 reader 仍可
+独立复验 sanitized evidence。
+
+## 增强报告
+
+增强报告只组合 `load_verified_sweep_data()` 与 `load_verified_evidence_artifacts()` 的返回值，不导入
+场景、runtime 或诊断 runner，也不会重跑仿真：
+
+```powershell
+uv run python -m secure_control.experiments.evidence_report_runner `
+  --source-sweep-id 20260917T141734484659Z-0b0eb456cc01 `
+  --trace-id <trace_id> `
+  --display-config configs/hvac_2r2c_evidence_report_zh.yaml
+```
+
+输出位于 `results/figures/evidence_reports/<sweep_id>/<report_id>/`。主汇报依次展示双路径、选定 step、
+整数/decode/applied 对应、状态更新、分钟轴闭环结果、applied-control Fig. 3 adapted、无量纲精度影响、
+四精度定量表与协议资源/实测时间。附录保留 Issue #48 的十二类图、raw-control 数值诊断图，以及
+`[0,60)`、`[60,120)`、`[120,180)` 三个无重复无遗漏的分钟分段。
+
+整数图中的完整轨迹直接读取 `integer_control.csv` 的 180 个 centered integer，并用 marker 强调每个
+离散 secure step；折线只辅助观察。图内固定列出 `k=58..62` 的原始十进制整数，并从真实
+`ControllerScaleLedger.output` 展示 `û_raw=m_centered/2^ell_out`。当前代表点 `ell_out=96`，`k=60`
+继续与单步 trace 的 residue、centered integer、raw decode 和 applied control 交叉核对。纵轴若使用
+十进制显示缩放，只作用于绘图副本，不修改或替代 artifact 中的精确整数。
+
+Fig. 3 adapted 只使用正式八字段中的 applied control error；raw control error 单列为数值机制诊断。
+报告中的 wall-clock 是三 seed 的实测 mean ± sample std，协议资源是跨 seed 完全相等后才展示的 exact
+计数；代表点资源子图还直接展示 180 步实际累计消费与逐步增量。报告 manifest 绑定两个来源
+manifest、两个展示 profile、字体和全部输出哈希。
+
+## Protocol 2 为零的含义
+
+当前冻结 PID 的 `A/B` 是零分数位整数矩阵，state accumulator 已处于 state scale，因此正式路径不需
+执行 state Trunc，180 步的 Protocol 2 count 为 0。这不影响本次双闭环数值复现：严格八字段比较、
+Protocol 1、重构、decode、state 更新和 applied control 都已实际执行。它也不证明 Protocol 2 在完整
+HVAC 闭环中的行为；Protocol 2 正负数、边界与允许误差语义由独立通用测试覆盖。
+
+本报告支持“冻结 adapted HVAC 应用在当前单进程、半诚实协议模型下可严格复现”的结论，不支持论文
+原 Numerical Example 的逐项复刻、进程/主机隔离、网络安全、抗恶意安全或真实建筑标定结论。

@@ -28,3 +28,4 @@ results/sweeps/*
 !results/sweeps/.gitkeep
 results/safety/*
 !results/safety/.gitkeep
+results/diagnostics/*

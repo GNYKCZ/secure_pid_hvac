@@ -143,6 +143,18 @@ uv run python -m secure_control.experiments.sweep_figure_runner --sweep-dir resu
 报告不会重跑实验或写回 sweep；中文 profile、字体 glyph 预检、科学计数法、固定图目录、
 原子发布与追溯边界见 [2R2C HVAC 中文汇报图](docs/chinese_report_figures.md)。
 
+为冻结代表点生成默认关闭的真实安全执行证据，并从 verified sweep/evidence 只读生成增强报告：
+
+```powershell
+uv run python -m secure_control.experiments.evidence_runner --source-sweep-id 20260917T141734484659Z-0b0eb456cc01 --ell 48 --seed 42 --trace-step 60 --allow-combined-share-diagnostic
+uv run python -m secure_control.experiments.evidence_report_runner --source-sweep-id 20260917T141734484659Z-0b0eb456cc01 --trace-id <trace_id>
+```
+
+该路径严格复验正式八字段，不修改已有 sweep。公开 evidence 与短时 combined-share 诊断物理隔离；
+增强报告使用分钟轴、applied-control Fig. 3 adapted、三 seed timing 与 exact 协议资源。完整命令、
+文件闭包、安全声明和 Protocol 2 计数为零的含义见
+[安全执行证据与增强中文报告](docs/secure_execution_evidence.md)。
+
 ## 安全算术基线
 
 `secure_control.crypto` 现已提供与场景无关的定点编码、2-out-of-2 加法秘密共享、标量 Beaver
@@ -184,5 +196,5 @@ Client/P1/P2、share 或一次性资源。输入 shape、更新顺序和输出 s
 尺度、事务式失败语义、数值容差和当前 backend 限制见
 [通用安全状态空间运行时契约](docs/secure_runtime_contract.md)。
 
-仿真产生的大量 CSV、图片与扫描工件应分别写入 `results/csv/`、`results/figures/` 和
-`results/sweeps/`；这些输出默认不会提交到 Git。
+仿真产生的大量 CSV、图片、扫描与诊断工件应分别写入 `results/csv/`、`results/figures/`、
+`results/sweeps/` 和 `results/diagnostics/`；这些输出默认不会提交到 Git。

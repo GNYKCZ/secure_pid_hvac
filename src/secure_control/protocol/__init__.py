@@ -1,6 +1,7 @@
 """领域无关的 Client/P1/P2 两方控制协议编排。"""
 
 from .coordinator import SingleProcessCoordinator
+from .evidence import IntegerVectorEvidence
 from .messages import (
     ClosedLoopAffineComposition,
     ClosedLoopRangeEvidence,
@@ -41,6 +42,7 @@ __all__ = [
     "ControllerScaleLedger",
     "ControllerShare",
     "InputShareMessage",
+    "IntegerVectorEvidence",
     "MaskedExchangeMessage",
     "OfflineControllerMessage",
     "OfflineDistribution",

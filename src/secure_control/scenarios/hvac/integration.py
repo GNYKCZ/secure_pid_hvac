@@ -22,7 +22,12 @@ from secure_control.crypto import (
     PrimeVerificationError,
     verify_prime_modulus,
 )
-from secure_control.execution import PlaintextStateSpaceRuntime, SecureStateSpaceRuntime
+from secure_control.execution import (
+    PlaintextStateSpaceRuntime,
+    SecureStateSpaceRuntime,
+    SecureTraceCollector,
+    SecureTracePolicy,
+)
 from secure_control.protocol import ControllerRangeContract
 from secure_control.simulation import (
     ScenarioMetadata,
@@ -173,7 +178,14 @@ class HvacScenario:
 
     scenario_version = "1"
 
-    def __init__(self, config_path: str | Path, *, test_seed: int | None = None) -> None:
+    def __init__(
+        self,
+        config_path: str | Path,
+        *,
+        test_seed: int | None = None,
+        trace_policy: SecureTracePolicy | None = None,
+        trace_collector: SecureTraceCollector | None = None,
+    ) -> None:
         """读取 wrapper/PID/plant 配置并在创建安全资源前完成全部校验。"""
         path = Path(config_path)
         try:
@@ -204,6 +216,8 @@ class HvacScenario:
             isinstance(test_seed, bool) or not isinstance(test_seed, int)
         ):
             raise TypeError("test_seed 必须是整数或 None。")
+        if (trace_policy is None) != (trace_collector is None):
+            raise ValueError("trace_policy 与 trace_collector 必须同时提供或同时省略。")
 
         self._plant_source: bytes | None = None
         self._plant_filename: str | None = None
@@ -260,6 +274,8 @@ class HvacScenario:
         self._security_parameter = _positive_integer(security, "security_parameter")
         self._horizon_steps = _positive_integer(security, "horizon_steps")
         self._test_seed = test_seed
+        self._trace_policy = trace_policy
+        self._trace_collector = trace_collector
         if self._contract.timing.terminal_sample_included:
             raise ValueError("当前双闭环仅支持 terminal_sample_included=false。")
         if self._horizon_steps != self._contract.timing.sample_count:
@@ -398,6 +414,8 @@ class HvacScenario:
                 security_parameter=self._security_parameter,
                 modulus_evidence=self._modulus_evidence,
                 test_seed=self._test_seed,
+                trace_policy=self._trace_policy,
+                trace_collector=self._trace_collector,
             ),
         )
         return SimulationPlan(

@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterator
 
 from secure_control.crypto import AdditiveShare, BeaverMultiplier, SecureTruncation, TwoPartySharing
 
+from .evidence import ProtocolStepSnapshot, copy_share
 from .messages import (
     ControllerScaleLedger,
     ControlShareMessage,
@@ -48,8 +49,41 @@ class SingleProcessCoordinator:
         多 ``ell`` 位时，聚合后的每一行才使用一对 Trunc 随机量。输出不截断，保持 ledger
         的 output scale 直到 Client 解码。任意失败均废弃本轮未完成资源且不提交新 state。
         """
+        output, _ = self._execute(p1, p2, online, capture_evidence=False)
+        return output
+
+    def execute_with_evidence(
+        self, p1: P1, p2: P2, online: OnlineRound
+    ) -> tuple[tuple[ControlShareMessage, ControlShareMessage], ProtocolStepSnapshot]:
+        """执行同一 Protocol 3 路径，并复制诊断所需 share，不做任何重构。
+
+        该入口只供显式 opt-in 的 execution 诊断使用。它不增加随机数、triple、mask
+        或协议消息，只在现有计算点复制不可变快照，因此不能改变被诊断 round 的数值。
+        """
+        output, evidence = self._execute(p1, p2, online, capture_evidence=True)
+        if evidence is None:
+            raise RuntimeError("诊断执行未产生协议快照。")
+        return output, evidence
+
+    def _execute(
+        self,
+        p1: P1,
+        p2: P2,
+        online: OnlineRound,
+        *,
+        capture_evidence: bool,
+    ) -> tuple[
+        tuple[ControlShareMessage, ControlShareMessage],
+        ProtocolStepSnapshot | None,
+    ]:
+        """共享普通/诊断执行实现，确保两条入口使用完全相同的协议顺序。"""
         try:
             self._validate_round(p1, p2, online)
+            state_before = (
+                (copy_share(p1.state_share), copy_share(p2.state_share))
+                if capture_evidence
+                else None
+            )
             first_input = p1.input_share(
                 online.p1_input,
                 session_id=online.session_id,
@@ -96,7 +130,7 @@ class SingleProcessCoordinator:
             next_state = self._truncate_state_rows(p1, p2, raw_next_state, online)
             p1.commit_state(next_state[0])
             p2.commit_state(next_state[1])
-            return (
+            output_messages = (
                 ControlShareMessage(
                     0,
                     online.session_id,
@@ -114,6 +148,27 @@ class SingleProcessCoordinator:
                     output[1],
                 ),
             )
+            if not capture_evidence:
+                return output_messages, None
+            if state_before is None:
+                raise RuntimeError("诊断执行缺少更新前 state 快照。")
+            snapshot = ProtocolStepSnapshot(
+                session_id=online.session_id,
+                round_id=online.round_id,
+                step=online.step,
+                plan=online.p1_resources.plan,
+                input_p1=copy_share(first_input),
+                input_p2=copy_share(second_input),
+                output_p1=copy_share(output[0]),
+                output_p2=copy_share(output[1]),
+                state_before_p1=state_before[0],
+                state_before_p2=state_before[1],
+                state_accumulator_p1=copy_share(raw_next_state[0]),
+                state_accumulator_p2=copy_share(raw_next_state[1]),
+                state_after_p1=copy_share(next_state[0]),
+                state_after_p2=copy_share(next_state[1]),
+            )
+            return output_messages, snapshot
         except Exception:
             self._abort_round(online)
             raise

@@ -66,7 +66,7 @@ class ReportProfile:
     locale: str
     primary_seed: int
     representative_ell: int
-    time_unit: Literal["s", "h"]
+    time_unit: Literal["s", "min", "h"]
     phase_segments_path: tuple[str, ...]
     channel_names: Mapping[str, str]
     unit_names: Mapping[str, str]
@@ -131,7 +131,7 @@ def load_report_profile(path: str | Path) -> ReportProfile:
     }
     if set(root) != required or root["schema_version"] != 1:
         raise ValueError("report profile 字段或 schema_version 无效")
-    if root["locale"] != "zh-CN" or root["time_unit"] not in ("s", "h"):
+    if root["locale"] != "zh-CN" or root["time_unit"] not in ("s", "min", "h"):
         raise ValueError("locale/time_unit 无效")
     font = _mapping(root["font"], "font")
     families = font.get("families")
@@ -326,7 +326,8 @@ def _owned_stage(stage: Path, parent: Path, identity: int) -> bool:
 
 def _time(record: ExperimentRecord, unit: str) -> np.ndarray:
     """只换算已有采样点，不补造 horizon 终点。"""
-    return record.result.time if unit == "s" else record.result.time / 3600.0
+    divisor = {"s": 1.0, "min": 60.0, "h": 3600.0}[unit]
+    return record.result.time / divisor
 
 
 def _phase_boundaries(record: ExperimentRecord, profile: ReportProfile) -> tuple[float, ...]:
@@ -342,7 +343,8 @@ def _phase_boundaries(record: ExperimentRecord, profile: ReportProfile) -> tuple
         end = segment.get("end_seconds")
         if isinstance(end, bool) or not isinstance(end, (int, float)):
             raise TypeError("阶段 end_seconds 无效")
-        ends.append(float(end) if profile.time_unit == "s" else float(end) / 3600.0)
+        divisor = {"s": 1.0, "min": 60.0, "h": 3600.0}[profile.time_unit]
+        ends.append(float(end) / divisor)
     return tuple(ends)
 
 
@@ -602,7 +604,7 @@ def _cross_figure(
             style = profile.ell_styles[ell]
             values = np.ma.masked_equal(np.abs(error), 0.0)
             axis.plot(
-                raw_time if profile.time_unit == "s" else raw_time / 3600.0,
+                raw_time / {"s": 1.0, "min": 60.0, "h": 3600.0}[profile.time_unit],
                 values,
                 color=style.color,
                 linestyle=style.linestyle,

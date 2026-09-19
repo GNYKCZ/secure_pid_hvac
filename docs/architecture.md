@@ -30,6 +30,9 @@ core ───────→ 标准库和基础数组类型
   场景；只有 `sweep_runner` 作为 composition root 显式选择当前 HVAC 稳定性门和指标快照。
   本地化报告由 `reporting` 从 verified reader 对象和外部 display profile 组合；薄
   `sweep_figure_runner` 不运行实验，中文 HVAC 语义不进入通用 reader 或 simulation。
+  Issue #51 的 `evidence_runner` 是唯一可装配场景与 trace 的诊断 composition root；
+  `evidence_artifacts` 保持领域无关。`evidence_reporting` 只消费两个 verified reader 的内存结果，
+  不导入场景、runtime、仿真执行器或诊断 runner。
 
 低层模块不得反向导入 `scenarios`。具体场景名称、单位或控制器调参字段不得进入
 `core`、`crypto`、`protocol`、`execution` 或 `simulation`。
@@ -129,3 +132,5 @@ HVAC 的装配与 180 步物理/编码范围条件见 [仿真与双闭环集成]
 [2R2C 定点精度扫描](precision_sweep.md)。
 冻结工件的中文 01–12 报告、字体预检与独立原子发布见
 [2R2C HVAC 中文汇报图](chinese_report_figures.md)。
+默认关闭的安全执行 trace、private combined-share 隔离与增强报告见
+[安全执行证据与增强中文报告](secure_execution_evidence.md)。
