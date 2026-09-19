@@ -7,12 +7,13 @@ import math
 import random
 import secrets
 from dataclasses import dataclass
+from fractions import Fraction
 from numbers import Integral
 from typing import Any
 
 import numpy as np
 
-from secure_control.core import ControllerSpec
+from secure_control.core import ControllerSpec, verify_ellipsoidal_invariant
 from secure_control.crypto import (
     AdditiveShare,
     BeaverMultiplier,
@@ -27,8 +28,10 @@ from secure_control.crypto import (
 )
 
 from .messages import (
+    ClosedLoopRangeEvidence,
     ControllerLayout,
     ControllerRangeContract,
+    ControllerRangeVerification,
     ControllerScaleLedger,
     ControllerShare,
     ControlShareMessage,
@@ -43,6 +46,8 @@ from .messages import (
     StateTruncationResourceShare,
     StepResourcePlan,
     _ResourceLifecycle,
+    closed_loop_composition_sha256,
+    controller_payload_fingerprint,
 )
 
 
@@ -99,6 +104,14 @@ class Client:
         self._issued_rounds: dict[tuple[str, str, int], ControllerLayout] = {}
         # 测试 RNG 每次 online 预处理都分配不同域，避免重新播种导致辅助材料复用。
         self._test_material_epoch = 0
+        self._range_verification: ControllerRangeVerification | None = None
+
+    @property
+    def range_verification(self) -> ControllerRangeVerification:
+        """返回最近一次成功离线分发对应的不可变范围验证摘要。"""
+        if self._range_verification is None:
+            raise RuntimeError("尚未成功分发 controller，范围验证摘要不可用")
+        return self._range_verification
 
     def distribute_controller(
         self,
@@ -130,7 +143,7 @@ class Client:
             )
             for name in ("A", "B", "C", "D", "x0")
         }
-        self._validate_range_contract(payloads, layout, range_contract)
+        verification = self._validate_range_contract(payloads, layout, range_contract)
         shares = {
             name: self.sharing.share(self.fixed_point.to_residue(value), rng=rng)
             for name, value in payloads.items()
@@ -145,7 +158,11 @@ class Client:
         second_message = OfflineControllerMessage(
             1, session_id, second, shares["x0"][1], layout, range_contract
         )
-        return OfflineDistribution(session_id, range_contract, first_message, second_message)
+        distribution = OfflineDistribution(
+            session_id, range_contract, first_message, second_message
+        )
+        self._range_verification = verification
+        return distribution
 
     def prepare_online(
         self,
@@ -354,7 +371,7 @@ class Client:
         payloads: dict[str, np.ndarray],
         layout: ControllerLayout,
         contract: ControllerRangeContract,
-    ) -> None:
+    ) -> ControllerRangeVerification:
         """证明有界输入下 state 递推保持 Protocol 2 与 centered ``Z_q`` 的前置条件。"""
         state_bounds = contract.state_payload_bounds
         input_bounds = contract.input_payload_bounds
@@ -371,8 +388,25 @@ class Client:
                 raise ValueError("x0 payload 超出公开 state_payload_bounds。")
 
         if contract.horizon_steps is not None:
-            self._validate_finite_horizon(payloads, layout, contract)
-            return
+            state_raw_bounds, output_raw_bounds = self._validate_finite_horizon(
+                payloads, layout, contract
+            )
+            return self._range_verification_summary(
+                contract, state_raw_bounds, output_raw_bounds, None
+            )
+
+        if contract.closed_loop_evidence is not None:
+            certificate_hash = self._validate_closed_loop_evidence(payloads, layout, contract)
+            state_raw_bounds = self._row_bounds(
+                payloads["A"], state_bounds, payloads["B"], input_bounds
+            )
+            output_raw_bounds = self._row_bounds(
+                payloads["C"], state_bounds, payloads["D"], input_bounds
+            )
+            self._validate_accumulator_limits(state_raw_bounds, output_raw_bounds, layout)
+            return self._range_verification_summary(
+                contract, state_raw_bounds, output_raw_bounds, certificate_hash
+            )
 
         state_raw_bounds = self._row_bounds(
             payloads["A"], state_bounds, payloads["B"], input_bounds
@@ -401,13 +435,14 @@ class Client:
             raise ValueError("control output 聚合乘积可能越出 centered Z_q 范围。")
         if len(state_raw_bounds) != layout.state_dimension:
             raise AssertionError("state 范围验证的行数与 controller layout 不一致。")
+        return self._range_verification_summary(contract, state_raw_bounds, output_raw_bounds, None)
 
     def _validate_finite_horizon(
         self,
         payloads: dict[str, np.ndarray],
         layout: ControllerLayout,
         contract: ControllerRangeContract,
-    ) -> None:
+    ) -> tuple[list[int], list[int]]:
         """以 Python 精确整数从编码 x0 逐步证明有限 horizon 的范围前提。
 
         ``s_k`` 是各 state payload 的公开绝对上界。每个可执行 k 先用 ``s_k``
@@ -421,17 +456,25 @@ class Client:
         centered_limit = (self.sharing.modulus - 1) // 2
         maximum_truncation_message = self.truncation.maximum_message
         assert contract.horizon_steps is not None
+        maximum_state_raw = [0] * layout.state_dimension
+        maximum_output_raw = [0] * layout.output_dimension
 
         for step in range(contract.horizon_steps):
             output_raw_bounds = self._row_bounds(
                 payloads["C"], tuple(current), payloads["D"], input_bounds
             )
+            maximum_output_raw = [
+                max(old, new) for old, new in zip(maximum_output_raw, output_raw_bounds)
+            ]
             if any(value > centered_limit for value in output_raw_bounds):
                 raise ValueError(f"finite horizon 第 {step} 步 output 超出 centered Z_q 范围。")
 
             state_raw_bounds = self._row_bounds(
                 payloads["A"], tuple(current), payloads["B"], input_bounds
             )
+            maximum_state_raw = [
+                max(old, new) for old, new in zip(maximum_state_raw, state_raw_bounds)
+            ]
             next_bounds: list[int] = []
             for raw_bound in state_raw_bounds:
                 if ledger.state_truncation_bits:
@@ -454,6 +497,301 @@ class Client:
                     f"finite horizon 第 {step + 1} 步 state 超出 state_payload_bounds。"
                 )
             current = next_bounds
+        return maximum_state_raw, maximum_output_raw
+
+    def _validate_closed_loop_evidence(
+        self,
+        payloads: dict[str, np.ndarray],
+        layout: ControllerLayout,
+        contract: ControllerRangeContract,
+    ) -> str:
+        """在创建 share 前精确复验闭环证书、摘要、指纹和 payload 投影。"""
+        evidence = contract.closed_loop_evidence
+        assert evidence is not None
+        if evidence.state_payload_bounds != contract.state_payload_bounds:
+            raise ValueError("closed-loop evidence 的 state payload bounds 与契约不一致")
+        if evidence.input_payload_bounds != contract.input_payload_bounds:
+            raise ValueError("closed-loop evidence 的 input payload bounds 与契约不一致")
+        if len(evidence.controller_state_indices) != layout.state_dimension:
+            raise ValueError("closed-loop evidence 的 controller state 投影维数无效")
+        if len(set(evidence.controller_state_indices)) != layout.state_dimension:
+            raise ValueError("closed-loop evidence 的 controller state 投影不得重复")
+        fingerprint = controller_payload_fingerprint(payloads, layout)
+        if fingerprint != evidence.controller_fingerprint:
+            raise ValueError("closed-loop evidence 的 controller fingerprint 不匹配")
+        self._validate_closed_loop_composition(payloads, layout, evidence)
+        report = verify_ellipsoidal_invariant(evidence.problem, evidence.witness)
+        if report.certificate_sha256 != evidence.certificate_sha256:
+            raise ValueError("closed-loop evidence 的 certificate SHA-256 不匹配")
+        if report.status != "certified":
+            reasons = ",".join(report.reason_codes) or "unknown"
+            raise ValueError(f"closed-loop invariant 精确复验未通过：{reasons}")
+        scale = 1 << layout.scale_ledger.state
+        for state_index, problem_index in enumerate(evidence.controller_state_indices):
+            if problem_index >= len(report.coordinate_bounds):
+                raise ValueError("closed-loop evidence 的 controller state 投影越界")
+            initial_value = Fraction(int(payloads["x0"][state_index]), scale)
+            initial_lower = evidence.problem.initial_set.lower[problem_index].fraction
+            initial_upper = evidence.problem.initial_set.upper[problem_index].fraction
+            if not initial_lower <= initial_value <= initial_upper:
+                raise ValueError("controller x0 不属于 closed-loop invariant 的初始集合")
+            interval = report.coordinate_bounds[problem_index]
+            bound = Fraction(contract.state_payload_bounds[state_index], scale)
+            if interval.lower.fraction < -bound or interval.upper.fraction > bound:
+                raise ValueError("closed-loop invariant 的 controller state 投影超出 payload 界")
+        constraint_map = dict(report.constraint_bounds)
+        input_scale = 1 << layout.scale_ledger.input
+        for index, payload_bound in enumerate(contract.input_payload_bounds):
+            name = f"controller_input_payload[{index}]"
+            if name not in constraint_map:
+                raise ValueError("closed-loop invariant 缺少 controller input payload 约束")
+            interval = constraint_map[name]
+            bound = Fraction(payload_bound, input_scale)
+            if interval.lower.fraction < -bound or interval.upper.fraction > bound:
+                raise ValueError("closed-loop invariant 的 controller input 投影超出 payload 界")
+        return report.certificate_sha256
+
+    def _validate_closed_loop_composition(
+        self,
+        payloads: dict[str, np.ndarray],
+        layout: ControllerLayout,
+        evidence: ClosedLoopRangeEvidence,
+    ) -> None:
+        """用已安装 ``A/B/C/D`` 精确重建证书闭环，拒绝无关 problem 旁路。
+
+        composition 声明 ``v=Lz+l+Mw`` 与外部状态
+        ``z_e+=Fz+f+Gw+Hu``。将控制器的 ``x_c+=Ax_c+Bv``、
+        ``u=Cx_c+Dv`` 代入后，所得完整 transition/affine/disturbance 必须与
+        exact invariant problem 逐项相等；比较不使用浮点容差。
+        """
+        composition = evidence.composition
+        digest = evidence.composition_sha256
+        if composition is None or digest is None:
+            raise ValueError("closed-loop evidence 缺少可复验 composition")
+        if closed_loop_composition_sha256(composition) != digest:
+            raise ValueError("closed-loop evidence 的 composition SHA-256 不匹配")
+
+        problem = evidence.problem
+        state_dimension = len(problem.transition)
+        disturbance_dimension = len(problem.disturbance_abs_bounds)
+        controller_indices = evidence.controller_state_indices
+        external_indices = composition.external_state_indices
+        if composition.controller_state_indices != controller_indices:
+            raise ValueError("closed-loop composition 的 controller state 投影不匹配")
+        if (
+            len(external_indices) != state_dimension - layout.state_dimension
+            or len(set(external_indices)) != len(external_indices)
+            or set(controller_indices).intersection(external_indices)
+            or (set(controller_indices) | set(external_indices)) != set(range(state_dimension))
+        ):
+            raise ValueError("closed-loop composition 的 state 索引不是完整不重复分区")
+
+        def rational_matrix(value, rows: int, columns: int, name: str):
+            if len(value) != rows or any(len(row) != columns for row in value):
+                raise ValueError(f"closed-loop composition 的 {name} shape 无效")
+            return tuple(tuple(item.fraction for item in row) for row in value)
+
+        def rational_vector(value, length: int, name: str):
+            if len(value) != length:
+                raise ValueError(f"closed-loop composition 的 {name} shape 无效")
+            return tuple(item.fraction for item in value)
+
+        def payload_matrix(name: str, rows: int, columns: int, scale: int):
+            array = np.asarray(payloads[name], dtype=object)
+            if array.shape != (rows, columns):
+                raise ValueError(f"controller {name} payload shape 与 layout 不一致")
+            denominator = 1 << scale
+            return tuple(
+                tuple(Fraction(int(array[row, column]), denominator) for column in range(columns))
+                for row in range(rows)
+            )
+
+        n_c = layout.state_dimension
+        n_v = layout.input_dimension
+        n_u = layout.output_dimension
+        n_e = len(external_indices)
+        ledger = layout.scale_ledger
+        controller_a = payload_matrix("A", n_c, n_c, ledger.A)
+        controller_b = payload_matrix("B", n_c, n_v, ledger.B)
+        controller_c = payload_matrix("C", n_u, n_c, ledger.C)
+        controller_d = payload_matrix("D", n_u, n_v, ledger.D)
+        input_state = rational_matrix(
+            composition.input_state_matrix,
+            n_v,
+            state_dimension,
+            "input_state_matrix",
+        )
+        input_affine = rational_vector(composition.input_affine, n_v, "input_affine")
+        input_disturbance = rational_matrix(
+            composition.input_disturbance_matrix,
+            n_v,
+            disturbance_dimension,
+            "input_disturbance_matrix",
+        )
+        external_transition = rational_matrix(
+            composition.external_transition,
+            n_e,
+            state_dimension,
+            "external_transition",
+        )
+        external_affine = rational_vector(composition.external_affine, n_e, "external_affine")
+        external_disturbance = rational_matrix(
+            composition.external_disturbance_matrix,
+            n_e,
+            disturbance_dimension,
+            "external_disturbance_matrix",
+        )
+        output_injection = rational_matrix(
+            composition.output_injection,
+            n_e,
+            n_u,
+            "output_injection",
+        )
+
+        output_state = tuple(
+            tuple(
+                sum(
+                    (
+                        controller_c[output][state]
+                        if controller_indices[state] == column
+                        else Fraction(0)
+                    )
+                    for state in range(n_c)
+                )
+                + sum(
+                    controller_d[output][channel] * input_state[channel][column]
+                    for channel in range(n_v)
+                )
+                for column in range(state_dimension)
+            )
+            for output in range(n_u)
+        )
+        output_affine = tuple(
+            sum(controller_d[output][channel] * input_affine[channel] for channel in range(n_v))
+            for output in range(n_u)
+        )
+        output_disturbance = tuple(
+            tuple(
+                sum(
+                    controller_d[output][channel] * input_disturbance[channel][noise]
+                    for channel in range(n_v)
+                )
+                for noise in range(disturbance_dimension)
+            )
+            for output in range(n_u)
+        )
+
+        expected_transition = [
+            [Fraction(0) for _ in range(state_dimension)] for _ in range(state_dimension)
+        ]
+        expected_affine = [Fraction(0) for _ in range(state_dimension)]
+        expected_disturbance = [
+            [Fraction(0) for _ in range(disturbance_dimension)] for _ in range(state_dimension)
+        ]
+        for state, row_index in enumerate(controller_indices):
+            for column in range(state_dimension):
+                expected_transition[row_index][column] = sum(
+                    (
+                        controller_a[state][source]
+                        if controller_indices[source] == column
+                        else Fraction(0)
+                    )
+                    for source in range(n_c)
+                ) + sum(
+                    controller_b[state][channel] * input_state[channel][column]
+                    for channel in range(n_v)
+                )
+            expected_affine[row_index] = sum(
+                controller_b[state][channel] * input_affine[channel] for channel in range(n_v)
+            )
+            for noise in range(disturbance_dimension):
+                expected_disturbance[row_index][noise] = sum(
+                    controller_b[state][channel] * input_disturbance[channel][noise]
+                    for channel in range(n_v)
+                )
+        for external, row_index in enumerate(external_indices):
+            for column in range(state_dimension):
+                expected_transition[row_index][column] = external_transition[external][
+                    column
+                ] + sum(
+                    output_injection[external][output] * output_state[output][column]
+                    for output in range(n_u)
+                )
+            expected_affine[row_index] = external_affine[external] + sum(
+                output_injection[external][output] * output_affine[output] for output in range(n_u)
+            )
+            for noise in range(disturbance_dimension):
+                expected_disturbance[row_index][noise] = external_disturbance[external][
+                    noise
+                ] + sum(
+                    output_injection[external][output] * output_disturbance[output][noise]
+                    for output in range(n_u)
+                )
+
+        actual_transition = tuple(
+            tuple(value.fraction for value in row) for row in problem.transition
+        )
+        actual_affine = tuple(value.fraction for value in problem.affine)
+        actual_disturbance = tuple(
+            tuple(value.fraction for value in row) for row in problem.disturbance_matrix
+        )
+        if tuple(tuple(row) for row in expected_transition) != actual_transition:
+            raise ValueError("closed-loop composition 重建的 transition 与证书不一致")
+        if tuple(expected_affine) != actual_affine:
+            raise ValueError("closed-loop composition 重建的 affine 与证书不一致")
+        if tuple(tuple(row) for row in expected_disturbance) != actual_disturbance:
+            raise ValueError("closed-loop composition 重建的 disturbance 与证书不一致")
+
+        constraints = {constraint.name: constraint for constraint in problem.constraints}
+        if len(constraints) != len(problem.constraints):
+            raise ValueError("closed-loop invariant 的 constraint name 不得重复")
+        for channel in range(n_v):
+            name = f"controller_input_payload[{channel}]"
+            constraint = constraints.get(name)
+            if constraint is None:
+                raise ValueError("closed-loop invariant 缺少 controller input payload 约束")
+            if (
+                tuple(value.fraction for value in constraint.state_row) != input_state[channel]
+                or constraint.offset.fraction != input_affine[channel]
+                or tuple(value.fraction for value in constraint.disturbance_row)
+                != input_disturbance[channel]
+            ):
+                raise ValueError(
+                    "closed-loop invariant 的 controller input 投影与 composition 不一致"
+                )
+
+    def _validate_accumulator_limits(
+        self,
+        state_raw_bounds: list[int],
+        output_raw_bounds: list[int],
+        layout: ControllerLayout,
+    ) -> None:
+        """对闭环证明模式保留 Protocol 2 与 centered ``Z_q`` 数值门禁。"""
+        centered_limit = (self.sharing.modulus - 1) // 2
+        if layout.scale_ledger.state_truncation_bits:
+            if any(value > self.truncation.maximum_message for value in state_raw_bounds):
+                raise ValueError("state 聚合乘积超出 Protocol 2 的 Z<kappa> 范围。")
+        elif any(value > centered_limit for value in state_raw_bounds):
+            raise ValueError("无需 Trunc 的 state 聚合乘积可能越出 centered Z_q 范围。")
+        if any(value > centered_limit for value in output_raw_bounds):
+            raise ValueError("control output 聚合乘积可能越出 centered Z_q 范围。")
+
+    def _range_verification_summary(
+        self,
+        contract: ControllerRangeContract,
+        state_raw_bounds: list[int],
+        output_raw_bounds: list[int],
+        certificate_sha256: str | None,
+    ) -> ControllerRangeVerification:
+        """构造不含 share 或场景语义的公开范围验证摘要。"""
+        return ControllerRangeVerification(
+            contract.proof_mode,
+            certificate_sha256,
+            tuple(state_raw_bounds),
+            tuple(output_raw_bounds),
+            (self.sharing.modulus - 1) // 2,
+            self.truncation.maximum_message,
+        )
 
     def _validate_input_bound(self, payload: np.ndarray, contract: ControllerRangeContract) -> None:
         """在 Client 分享前检查每个实际 input payload 未超出公开范围。"""

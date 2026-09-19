@@ -2,10 +2,20 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import json
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass, field
+from hashlib import sha256
 from numbers import Integral
-from typing import Literal
+from typing import Any, Literal
 
+import numpy as np
+
+from secure_control.core import (
+    EllipsoidalInvariantWitness,
+    RationalValue,
+    RobustAffineInvariantProblem,
+)
 from secure_control.crypto import (
     AdditiveShare,
     BeaverTripleShare,
@@ -16,6 +26,11 @@ from secure_control.crypto import (
 )
 
 PartyIndex = Literal[0, 1]
+RangeProofMode = Literal[
+    "finite_horizon",
+    "independent_input_invariant",
+    "closed_loop_invariant",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +105,133 @@ class ControllerLayout:
 
 
 @dataclass(frozen=True, slots=True)
+class ClosedLoopAffineComposition:
+    """声明控制器与外部仿射系统如何共同生成完整闭环问题。
+
+    设证书状态为 ``z``、扰动为 ``w``，本记录公开
+    ``v=Lz+l+Mw`` 与 ``z_e+=Fz+f+Gw+Hu``。Client 使用已安装控制器的
+    ``A/B/C/D`` 精确重建完整 ``z+``，从而不能把无关的稳定问题附到控制器上。
+    字段只表达通用仿射组合，不含任何场景或物理量语义。
+    """
+
+    controller_state_indices: tuple[int, ...]
+    external_state_indices: tuple[int, ...]
+    input_state_matrix: tuple[tuple[RationalValue, ...], ...]
+    input_affine: tuple[RationalValue, ...]
+    input_disturbance_matrix: tuple[tuple[RationalValue, ...], ...]
+    external_transition: tuple[tuple[RationalValue, ...], ...]
+    external_affine: tuple[RationalValue, ...]
+    external_disturbance_matrix: tuple[tuple[RationalValue, ...], ...]
+    output_injection: tuple[tuple[RationalValue, ...], ...]
+
+    def __post_init__(self) -> None:
+        """拒绝负索引和非精确有理数，矩阵维数由 Client 结合控制器复验。"""
+        for name in ("controller_state_indices", "external_state_indices"):
+            indices = getattr(self, name)
+            if any(
+                isinstance(value, bool) or not isinstance(value, Integral) or value < 0
+                for value in indices
+            ):
+                raise ValueError(f"{name} 必须是非负整数 tuple")
+            object.__setattr__(self, name, tuple(int(value) for value in indices))
+        vectors = (self.input_affine, self.external_affine)
+        matrices = (
+            self.input_state_matrix,
+            self.input_disturbance_matrix,
+            self.external_transition,
+            self.external_disturbance_matrix,
+            self.output_injection,
+        )
+        if any(not isinstance(value, RationalValue) for vector in vectors for value in vector):
+            raise TypeError("closed-loop composition 向量必须使用 RationalValue")
+        if any(
+            not isinstance(value, RationalValue)
+            for matrix in matrices
+            for row in matrix
+            for value in row
+        ):
+            raise TypeError("closed-loop composition 矩阵必须使用 RationalValue")
+
+
+def closed_loop_composition_sha256(composition: ClosedLoopAffineComposition) -> str:
+    """返回带版本域分离的规范组合记录 SHA-256。"""
+    if not isinstance(composition, ClosedLoopAffineComposition):
+        raise TypeError("composition 必须是 ClosedLoopAffineComposition")
+    encoded = json.dumps(
+        asdict(composition),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return sha256(b"secure_control.protocol.closed_loop_composition.v1\0" + encoded).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class ClosedLoopRangeEvidence:
+    """绑定通用闭环不变集证书、controller 指纹和 payload 投影。"""
+
+    problem: RobustAffineInvariantProblem
+    witness: EllipsoidalInvariantWitness
+    certificate_sha256: str
+    controller_fingerprint: str
+    controller_state_indices: tuple[int, ...]
+    state_payload_bounds: tuple[int, ...]
+    input_payload_bounds: tuple[int, ...]
+    composition: ClosedLoopAffineComposition | None = None
+    composition_sha256: str | None = None
+
+    def __post_init__(self) -> None:
+        """冻结索引与摘要格式，详细数学复验由 Client 在分享前完成。"""
+        for name in ("certificate_sha256", "controller_fingerprint"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or len(value) != 64:
+                raise ValueError(f"{name} 必须是 64 字符 SHA-256")
+            try:
+                int(value, 16)
+            except ValueError as error:
+                raise ValueError(f"{name} 必须是十六进制 SHA-256") from error
+        indices = self.controller_state_indices
+        if any(
+            isinstance(value, bool) or not isinstance(value, Integral) or value < 0
+            for value in indices
+        ):
+            raise ValueError("controller_state_indices 必须是非负整数 tuple")
+        object.__setattr__(self, "controller_state_indices", tuple(int(value) for value in indices))
+        for name in ("state_payload_bounds", "input_payload_bounds"):
+            values = getattr(self, name)
+            if any(
+                isinstance(value, bool) or not isinstance(value, Integral) or value < 0
+                for value in values
+            ):
+                raise ValueError(f"{name} 必须是非负整数 tuple")
+            object.__setattr__(self, name, tuple(int(value) for value in values))
+        if self.composition is not None and not isinstance(
+            self.composition, ClosedLoopAffineComposition
+        ):
+            raise TypeError("composition 必须是 ClosedLoopAffineComposition 或 None")
+        if self.composition_sha256 is not None:
+            if not isinstance(self.composition_sha256, str) or len(self.composition_sha256) != 64:
+                raise ValueError("composition_sha256 必须是 64 字符 SHA-256")
+            try:
+                int(self.composition_sha256, 16)
+            except ValueError as error:
+                raise ValueError("composition_sha256 必须是十六进制 SHA-256") from error
+
+
+@dataclass(frozen=True, slots=True)
+class ControllerRangeVerification:
+    """保存离线分享前完成的不可变范围验证摘要。"""
+
+    proof_mode: RangeProofMode
+    certificate_sha256: str | None
+    state_accumulator_bounds: tuple[int, ...]
+    output_accumulator_bounds: tuple[int, ...]
+    centered_modulus_limit: int
+    maximum_truncation_message: int
+
+
+@dataclass(frozen=True, slots=True)
 class ControllerRangeContract:
     """以编码 payload 的绝对值声明输入与 state 的公开范围。
 
@@ -100,6 +242,7 @@ class ControllerRangeContract:
     state_payload_bounds: tuple[int, ...]
     input_payload_bounds: tuple[int, ...]
     horizon_steps: int | None = None
+    closed_loop_evidence: ClosedLoopRangeEvidence | None = None
 
     def __post_init__(self) -> None:
         """拒绝负数、布尔值和非整数范围，避免将实数界误作编码 payload。"""
@@ -121,6 +264,12 @@ class ControllerRangeContract:
             ):
                 raise ValueError("horizon_steps 必须是正整数或 None。")
             object.__setattr__(self, "horizon_steps", int(self.horizon_steps))
+        if self.closed_loop_evidence is not None and not isinstance(
+            self.closed_loop_evidence, ClosedLoopRangeEvidence
+        ):
+            raise TypeError("closed_loop_evidence 必须是 ClosedLoopRangeEvidence 或 None")
+        if self.horizon_steps is not None and self.closed_loop_evidence is not None:
+            raise ValueError("finite horizon 与 closed-loop invariant 证据不得同时声明")
 
     def validate_layout(self, layout: ControllerLayout) -> None:
         """确认公开范围长度覆盖已安装控制器的 state 与 input channel。"""
@@ -128,6 +277,49 @@ class ControllerRangeContract:
             raise ValueError("state_payload_bounds 的长度必须等于 state dimension。")
         if len(self.input_payload_bounds) != layout.input_dimension:
             raise ValueError("input_payload_bounds 的长度必须等于 input dimension。")
+
+    @property
+    def proof_mode(self) -> RangeProofMode:
+        """返回当前契约明确选择的三种证明模式之一。"""
+        if self.horizon_steps is not None:
+            return "finite_horizon"
+        if self.closed_loop_evidence is not None:
+            return "closed_loop_invariant"
+        return "independent_input_invariant"
+
+
+def controller_payload_fingerprint(
+    payloads: Mapping[str, np.ndarray], layout: ControllerLayout
+) -> str:
+    """规范化编码后的 A/B/C/D/x0 与完整 ledger，返回稳定 SHA-256。"""
+    if set(payloads) != {"A", "B", "C", "D", "x0"}:
+        raise ValueError("controller payload fingerprint 字段必须恰为 A/B/C/D/x0")
+
+    def encoded_array(value: Any) -> dict[str, Any]:
+        array = np.asarray(value, dtype=object)
+        return {
+            "shape": list(array.shape),
+            "values": [int(item) for item in array.flat],
+        }
+
+    ledger = layout.scale_ledger
+    payload = {
+        "controller": {name: encoded_array(payloads[name]) for name in ("A", "B", "C", "D", "x0")},
+        "layout": {
+            "state_dimension": layout.state_dimension,
+            "input_dimension": layout.input_dimension,
+            "output_dimension": layout.output_dimension,
+            "scale_ledger": {name: getattr(ledger, name) for name in ledger.__dataclass_fields__},
+        },
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)

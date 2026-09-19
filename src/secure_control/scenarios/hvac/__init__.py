@@ -19,6 +19,11 @@ from .contract import (
     HvacScenarioContract,
     load_hvac_scenario_contract,
 )
+from .infinite_safety import (
+    HvacInfiniteSafetyBundle,
+    HvacInfiniteSafetyProfile,
+    load_hvac_infinite_safety_bundle,
+)
 from .pid import HvacPidDesign, load_hvac_pid_design
 from .plant import (
     Hvac2R2CPlant,
@@ -55,6 +60,8 @@ __all__ = [
     "HvacControlQualityContract",
     "HvacEquilibriumReport",
     "HvacGainSearchAxis",
+    "HvacInfiniteSafetyBundle",
+    "HvacInfiniteSafetyProfile",
     "HvacParameterProvenance",
     "HvacPidDesign",
     "HvacPidTuningContract",
@@ -74,6 +81,7 @@ __all__ = [
     "build_hvac_plant",
     "evaluate_hvac_branch_metrics",
     "evaluate_hvac_comparison_metrics",
+    "load_hvac_infinite_safety_bundle",
     "load_hvac_pid_design",
     "load_hvac_pid_tuning_contract",
     "load_hvac_scenario_contract",

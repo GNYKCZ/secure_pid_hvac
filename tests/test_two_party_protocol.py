@@ -8,7 +8,16 @@ from dataclasses import fields, replace
 import numpy as np
 import pytest
 
-from secure_control.core import ControllerScaleMetadata, ControllerSpec
+from secure_control.core import (
+    ControllerScaleMetadata,
+    ControllerSpec,
+    EllipsoidalInvariantWitness,
+    LinearSafetyConstraint,
+    RationalBox,
+    RationalValue,
+    RobustAffineInvariantProblem,
+    invariant_certificate_sha256,
+)
 from secure_control.crypto import (
     AdditiveShare,
     FixedPointContext,
@@ -19,11 +28,16 @@ from secure_control.protocol import (
     P1,
     P2,
     Client,
+    ClosedLoopAffineComposition,
+    ClosedLoopRangeEvidence,
+    ControllerLayout,
     ControllerRangeContract,
     ControllerScaleLedger,
     OfflineDistribution,
     OnlineRound,
     SingleProcessCoordinator,
+    closed_loop_composition_sha256,
+    controller_payload_fingerprint,
 )
 
 
@@ -44,6 +58,8 @@ def make_stack(
     )
     contract = ControllerRangeContract(state_payload_bounds=(256, 256), input_payload_bounds=(64,))
     distribution = client.distribute_controller(spec, contract, rng=random.Random(seed))
+    assert client.range_verification.proof_mode == "independent_input_invariant"
+    assert client.range_verification.certificate_sha256 is None
     return (
         client,
         P1(distribution.p1),
@@ -145,6 +161,7 @@ def test_zero_state_static_controller_uses_only_d_products() -> None:
         ControllerRangeContract(state_payload_bounds=(), input_payload_bounds=(128, 64)),
         rng=random.Random(3),
     )
+    assert client.range_verification.proof_mode == "independent_input_invariant"
     p1, p2 = P1(distribution.p1), P2(distribution.p2)
     online = client.prepare_online(distribution, [0.5, -0.25], step=0, rng=random.Random(4))
 
@@ -746,12 +763,106 @@ def test_integrator_needs_proven_finite_horizon_and_rejects_overrun_before_resou
             state_payload_bounds=(768,), input_payload_bounds=(256,), horizon_steps=3
         ),
     )
+    assert client.range_verification.proof_mode == "finite_horizon"
 
     with pytest.raises(ValueError, match="horizon"):
         client.prepare_online(distribution, [0.25], step=3)
     with pytest.raises(ValueError, match="input_payload_bounds"):
         client.prepare_online(distribution, [2.0], step=0)
     assert (client.multiplier.created_triples, client.truncation.created_masks) == (0, 0)
+
+
+def test_closed_loop_evidence_rejects_unrelated_stable_problem_before_sharing(
+    monkeypatch,
+) -> None:
+    """无关稳定 problem 即使带正确 controller 指纹，也不得绕过积分器反例。"""
+    q = RationalValue
+    fixed_point = FixedPointContext(2_147_483_647, integer_bits=20, fractional_bits=8)
+    sharing = TwoPartySharing(fixed_point.modulus)
+    client = Client(fixed_point, sharing, security_parameter=8)
+    spec = ControllerSpec(
+        A=np.array([[1.0]]),
+        B=np.array([[1.0]]),
+        C=np.array([[0.0]]),
+        D=np.array([[0.0]]),
+        x0=np.array([0.0]),
+        scale_metadata=ControllerScaleMetadata(state=8, input=8, output=8, A=0, B=0, C=0, D=0),
+    )
+    layout = ControllerLayout(
+        1,
+        1,
+        1,
+        ControllerScaleLedger(8, 8, 0, 0, 0, 0, 8, 0, 8, 8),
+    )
+    payloads = {
+        "A": np.array([[1]], dtype=object),
+        "B": np.array([[1]], dtype=object),
+        "C": np.array([[0]], dtype=object),
+        "D": np.array([[0]], dtype=object),
+        "x0": np.array([0], dtype=object),
+    }
+    fake_problem = RobustAffineInvariantProblem(
+        transition=((q(0),),),
+        affine=(q(0),),
+        disturbance_matrix=((),),
+        disturbance_abs_bounds=(),
+        initial_set=RationalBox((q(0),), (q(0),)),
+        constraints=(
+            LinearSafetyConstraint(
+                "controller_input_payload[0]",
+                (q(0),),
+                q(0),
+                (),
+                q(-1, 256),
+                q(1, 256),
+            ),
+        ),
+        state_labels=("controller_state",),
+    )
+    witness = EllipsoidalInvariantWitness(
+        equilibrium=(q(0),),
+        shape_matrix=((q(1),),),
+        contraction_bound=q(1, 2),
+        disturbance_norm_bounds=(),
+        radius=q(1),
+        constraint_dual_norm_bounds=(q(1),),
+    )
+    # 攻击证据声明 v=0，因此 composition 与 problem 自洽外观成立；但代入实际 A=1
+    # 后闭环 transition 应为 1，而不是 fake problem 中的 0。
+    composition = ClosedLoopAffineComposition(
+        controller_state_indices=(0,),
+        external_state_indices=(),
+        input_state_matrix=((q(0),),),
+        input_affine=(q(0),),
+        input_disturbance_matrix=((),),
+        external_transition=(),
+        external_affine=(),
+        external_disturbance_matrix=(),
+        output_injection=(),
+    )
+    evidence = ClosedLoopRangeEvidence(
+        fake_problem,
+        witness,
+        invariant_certificate_sha256(fake_problem, witness),
+        controller_payload_fingerprint(payloads, layout),
+        (0,),
+        (256,),
+        (1,),
+        composition,
+        closed_loop_composition_sha256(composition),
+    )
+    contract = ControllerRangeContract((256,), (1,), closed_loop_evidence=evidence)
+    called = False
+
+    def forbidden_share(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("composition 验证失败前不得创建 share")
+
+    monkeypatch.setattr(TwoPartySharing, "share", forbidden_share)
+    with pytest.raises(ValueError, match="transition"):
+        client.distribute_controller(spec, contract)
+    assert called is False
 
 
 @pytest.mark.parametrize("horizon", [0, -1, True, 1.5])

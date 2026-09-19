@@ -40,6 +40,13 @@ HVAC 的稳定性只读旁路遵循 `scenarios.hvac.stability -> core.stability`
 已有双闭环数据流。完整公式、当前结果与结论边界见
 [2R2C HVAC 局部闭环稳定性](hvac_closed_loop_stability.md)。
 
+无限时域安全旁路遵循
+`experiments.infinite_safety_runner -> scenarios.hvac.infinite_safety -> core.invariance`。
+通用 verifier 只理解有理仿射系统、扰动盒与线性约束；HVAC 层负责从实际量化 PID、2R2C
+binary64 矩阵和冻结来源装配证书，且不得导入 `experiments`。实验层只组合正式 verified sweep
+reader 与场景证书并原子发布报告，不进入 simulation 控制循环。详见
+[2R2C HVAC 条件化无限时域安全契约](infinite_horizon_safety.md)。
+
 ## 通用控制器契约
 
 控制器使用离散状态空间形式：
