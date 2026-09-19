@@ -33,7 +33,7 @@ uv run python -m secure_control.experiments.evidence_runner `
 - `integer_control.csv`：逐 step 的 raw 明文/安全控制、residue、centered integer、scale、applied control；
 - `resource_counts.csv`：真实创建/消费/废弃累计数、逐步增量及 A/B/C/D/state truncation 分解；
 - `selected_step_trace.json`：固定 step 的输入、输出与 controller state 更新证据，不含 raw shares；
-- `metadata.json` 与 `manifest.json`：来源、严格等价结论、随机性声明、private audit 摘要及文件哈希闭包。
+- `metadata.json` 与 `manifest.json`：来源、模数 `q`、严格等价结论、随机性声明、private audit 摘要及文件哈希闭包。reader 会按 `q` 验证每个 canonical residue 与 centered integer 的映射，并拒绝公开目录中的任何未声明目录、嵌套文件或链接成员。
 
 大整数以十进制文本保存，不经 JSON binary64。删除 private combined-share 文件后，公开 reader 仍可
 独立复验 sanitized evidence。

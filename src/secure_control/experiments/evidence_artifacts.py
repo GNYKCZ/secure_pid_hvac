@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import shutil
+import stat
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -226,7 +227,7 @@ def _read_evidence(root: Path, *, allow_staging: bool) -> VerifiedEvidenceData:
     """共享 staging/final reader；private 文件从不属于 sanitized 目录闭包。"""
     if (
         not root.is_dir()
-        or root.is_symlink()
+        or _is_link_or_reparse(root)
         or (root.name.startswith(".incomplete-") and not allow_staging)
     ):
         raise ValueError("只允许读取已发布的 evidence 目录。")
@@ -266,9 +267,11 @@ def _read_evidence(root: Path, *, allow_staging: bool) -> VerifiedEvidenceData:
     declared = manifest.get("files_sha256")
     if not isinstance(declared, dict) or set(declared) != expected_files:
         raise ValueError("evidence manifest 文件闭包无效。")
-    actual_members = {item.name for item in root.iterdir() if item.is_file()}
-    if actual_members != expected_files | {"manifest.json"}:
-        raise ValueError("evidence 目录包含缺失或未声明的文件。")
+    members = tuple(root.iterdir())
+    if {item.name for item in members} != expected_files | {"manifest.json"} or any(
+        _is_link_or_reparse(item) or not item.is_file() for item in members
+    ):
+        raise ValueError("evidence 目录包含缺失、未声明、非普通文件或链接成员。")
     for name, digest in declared.items():
         member = _safe_member(root, name)
         if not isinstance(digest, str) or _digest(member) != digest:
@@ -290,6 +293,8 @@ def _read_evidence(root: Path, *, allow_staging: bool) -> VerifiedEvidenceData:
         raise ValueError("private audit 安全标记或摘要无效。")
     metadata = _read_json(root / "metadata.json")
     selected = _read_json(root / "selected_step_trace.json")
+    modulus = metadata.get("modulus")
+    source_point = metadata.get("source_point")
     if (
         metadata.get("schema_version") != EVIDENCE_SCHEMA_VERSION
         or metadata.get("trace_id") != trace_id
@@ -302,11 +307,19 @@ def _read_evidence(root: Path, *, allow_staging: bool) -> VerifiedEvidenceData:
             "deployment_security": False,
             "contains_raw_share_values": private["sha256"] is not None,
         }
+        or type(modulus) is not int
+        or modulus < 3
+        or (
+            source_point is not None
+            and (not isinstance(source_point, dict) or source_point.get("q") != modulus)
+        )
     ):
-        raise ValueError("metadata 与 manifest/private audit descriptor 不一致。")
+        raise ValueError(
+            "metadata 与 manifest/private audit descriptor、模数或 source point 不一致。"
+        )
     _reject_raw_share_keys(metadata, "metadata")
     _reject_raw_share_keys(selected, "selected_step_trace")
-    integer_rows = _read_integer_rows(root / "integer_control.csv")
+    integer_rows = _read_integer_rows(root / "integer_control.csv", modulus)
     resource_rows = _read_resource_rows(root / "resource_counts.csv")
     sample_count = metadata.get("sample_count")
     if type(sample_count) is not int or sample_count <= 0:
@@ -321,7 +334,8 @@ def _read_evidence(root: Path, *, allow_staging: bool) -> VerifiedEvidenceData:
         or selected_step not in steps
     ):
         raise ValueError("selected step 与 metadata/trajectory 不一致。")
-    _validate_selected_payload(selected)
+    selected_raw, selected_decoded = _validate_selected_payload(selected, modulus)
+    _validate_selected_trajectory(integer_rows, selected, selected_raw, selected_decoded)
     _validate_resource_rows(resource_rows)
     resource_contract = metadata.get("resource_contract")
     if resource_contract is not None:
@@ -355,6 +369,9 @@ def _validate_trace_inputs(
         raise ValueError("evidence 必须且只能包含一个 selected state transition。")
     if not isinstance(metadata, Mapping):
         raise TypeError("metadata 必须是映射。")
+    modulus = metadata.get("modulus")
+    if type(modulus) is not int or modulus < 3:
+        raise ValueError("metadata.modulus 必须是不小于 3 的整数。")
 
 
 def _write_integer_control(
@@ -468,7 +485,7 @@ def _integer_vector_payload(value: IntegerVectorEvidence) -> dict[str, Any]:
     }
 
 
-def _read_integer_rows(path: Path) -> list[dict[str, Any]]:
+def _read_integer_rows(path: Path, modulus: int) -> list[dict[str, Any]]:
     """严格解析控制 CSV；整数列保持 Python int，浮点列拒绝 NaN/Inf。"""
     rows: list[dict[str, Any]] = []
     with path.open("r", encoding="utf-8", newline="") as source:
@@ -492,6 +509,12 @@ def _read_integer_rows(path: Path) -> list[dict[str, Any]]:
             }
             if row["step"] < 0 or row["channel"] < 0 or row["output_fractional_bits"] < 0:
                 raise ValueError("integer control 索引与 scale 必须非负。")
+            _validate_residue_centered_pair(
+                row["secure_output_residue"],
+                row["secure_output_centered"],
+                modulus,
+                "integer_control.csv secure output",
+            )
             scale = 1 << row["output_fractional_bits"]
             if row["raw_secure_control"] != row["secure_output_centered"] / scale:
                 raise ValueError("centered integer 与 decoded raw secure control 不一致。")
@@ -604,7 +627,9 @@ def _validate_resource_contract(rows: list[dict[str, int]], value: object) -> No
         raise ValueError("resource_contract 与实际 lifecycle 记录不一致。")
 
 
-def _validate_selected_payload(value: Mapping[str, Any]) -> None:
+def _validate_selected_payload(
+    value: Mapping[str, Any], modulus: int
+) -> tuple[dict[str, Any], tuple[float, ...]]:
     """验证选定 step 的 schema、哈希、无损整数文本、scale 和状态证据。"""
     required = {
         "schema_version",
@@ -627,8 +652,8 @@ def _validate_selected_payload(value: Mapping[str, Any]) -> None:
     hashes = value["resource_id_sha256"]
     if not isinstance(hashes, list) or any(not _is_sha256(item) for item in hashes):
         raise ValueError("resource identity hash 无效。")
-    controller_input = _parse_integer_vector(value["controller_input"])
-    raw = _parse_integer_vector(value["raw_control"])
+    controller_input = _parse_integer_vector(value["controller_input"], modulus)
+    raw = _parse_integer_vector(value["raw_control"], modulus)
     decoded = value["decoded_raw_control"]
     if not isinstance(decoded, list) or len(decoded) != len(raw["centered"]):
         raise ValueError("decoded raw control shape 无效。")
@@ -674,10 +699,10 @@ def _validate_selected_payload(value: Mapping[str, Any]) -> None:
         "equation_verified",
     }:
         raise ValueError("state transition schema 无效。")
-    before = _parse_integer_vector(state["state_before"])
-    state_input = _parse_integer_vector(state["controller_input"])
-    accumulator = _parse_integer_vector(state["state_accumulator"])
-    after = _parse_integer_vector(state["state_after"])
+    before = _parse_integer_vector(state["state_before"], modulus)
+    state_input = _parse_integer_vector(state["controller_input"], modulus)
+    accumulator = _parse_integer_vector(state["state_accumulator"], modulus)
+    after = _parse_integer_vector(state["state_after"], modulus)
     if len(before["centered"]) != len(accumulator["centered"]) or len(before["centered"]) != len(
         after["centered"]
     ):
@@ -703,6 +728,26 @@ def _validate_selected_payload(value: Mapping[str, Any]) -> None:
         for actual, target in zip(after["centered"], expected, strict=True)
     ):
         raise ValueError("state transition 整数方程与 Trunc 语义不一致。")
+    return raw, tuple(float(item) for item in decoded)
+
+
+def _validate_selected_trajectory(
+    rows: list[dict[str, Any]],
+    selected: Mapping[str, Any],
+    raw: Mapping[str, Any],
+    decoded: tuple[float, ...],
+) -> None:
+    """把 selected step 的整数输出逐通道绑定到完整 CSV 轨迹。"""
+    selected_rows = [row for row in rows if row["step"] == selected["step"]]
+    if (
+        len(selected_rows) != len(raw["residue"])
+        or tuple(row["channel"] for row in selected_rows) != tuple(range(len(selected_rows)))
+        or tuple(row["secure_output_residue"] for row in selected_rows) != raw["residue"]
+        or tuple(row["secure_output_centered"] for row in selected_rows) != raw["centered"]
+        or any(row["output_fractional_bits"] != raw["fractional_bits"] for row in selected_rows)
+        or tuple(row["raw_secure_control"] for row in selected_rows) != decoded
+    ):
+        raise ValueError("selected step 整数输出与 integer trajectory 跨文件不一致。")
 
 
 def _parse_resource_snapshot(value: object) -> dict[str, int]:
@@ -728,8 +773,8 @@ def _parse_resource_snapshot(value: object) -> dict[str, int]:
     return value
 
 
-def _parse_integer_vector(value: object) -> dict[str, Any]:
-    """验证 JSON 中的十进制整数向量与非负分数位数。"""
+def _parse_integer_vector(value: object, modulus: int) -> dict[str, Any]:
+    """验证 JSON 整数向量、非负 scale 与模数下的 canonical 映射。"""
     if not isinstance(value, dict) or set(value) != {"residue", "centered", "fractional_bits"}:
         raise ValueError("integer vector schema 无效。")
     residue, centered, bits = value["residue"], value["centered"], value["fractional_bits"]
@@ -742,11 +787,34 @@ def _parse_integer_vector(value: object) -> dict[str, Any]:
         or bits < 0
     ):
         raise ValueError("integer vector shape/scale 无效。")
+    parsed_residue = tuple(_parse_integer(item) for item in residue)
+    parsed_centered = tuple(_parse_integer(item) for item in centered)
+    for residue_item, centered_item in zip(parsed_residue, parsed_centered, strict=True):
+        _validate_residue_centered_pair(
+            residue_item,
+            centered_item,
+            modulus,
+            "selected integer vector",
+        )
     return {
-        "residue": tuple(_parse_integer(item) for item in residue),
-        "centered": tuple(_parse_integer(item) for item in centered),
+        "residue": parsed_residue,
+        "centered": parsed_centered,
         "fractional_bits": bits,
     }
+
+
+def _validate_residue_centered_pair(
+    residue: int,
+    centered: int,
+    modulus: int,
+    name: str,
+) -> None:
+    """验证 canonical residue，并按 FixedPointContext 规则恢复有符号整数。"""
+    if not 0 <= residue < modulus:
+        raise ValueError(f"{name} residue 必须位于 canonical 区间 [0, modulus)。")
+    expected = residue if residue < (modulus + 1) // 2 else residue - modulus
+    if centered != expected:
+        raise ValueError(f"{name} residue 与 centered integer 的模数映射不一致。")
 
 
 def _reject_raw_share_keys(value: object, path: str) -> None:
@@ -847,12 +915,23 @@ def _validate_path_component(value: object, name: str) -> None:
         raise ValueError(f"{name} 必须是安全的单级目录名。")
 
 
+def _is_link_or_reparse(path: Path) -> bool:
+    """识别 symlink 及 Windows junction 等 reparse point，避免跟随到闭包外。"""
+    try:
+        status = path.stat(follow_symlinks=False)
+    except OSError:
+        return True
+    attributes = getattr(status, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return path.is_symlink() or bool(attributes & reparse_flag)
+
+
 def _safe_member(root: Path, name: str) -> Path:
     """拒绝绝对路径、目录逃逸和 symlink 成员。"""
     candidate = root / name
     if (
         Path(name).name != name
-        or candidate.is_symlink()
+        or _is_link_or_reparse(candidate)
         or candidate.resolve().parent != root.resolve()
     ):
         raise ValueError("evidence manifest 成员路径不安全。")

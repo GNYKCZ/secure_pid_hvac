@@ -162,6 +162,7 @@ def run_evidence_diagnostic(
             "source_point": {
                 "ell": ell,
                 "seed": seed,
+                "q": point.q,
                 "point_id": record.point.point_id,
                 "run_id": source_record.run_id,
                 "artifact_path": record.artifact_path,
@@ -175,6 +176,7 @@ def run_evidence_diagnostic(
                 "all_equal": True,
             },
             "scale_ledger": asdict(ledger),
+            "modulus": point.q,
             "resource_contract": {
                 "protocol1_triples_per_step": record.cost.protocol1_triples_per_step,
                 "protocol1_triples_total": record.cost.protocol1_triples_total,

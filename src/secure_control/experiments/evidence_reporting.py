@@ -425,9 +425,25 @@ def _validate_inputs(
     ) != (profile.source_manifest_sha256, profile.source_data_manifest_sha256):
         raise ValueError("evidence source hashes 与冻结 profile 不一致。")
     point = evidence.metadata.get("source_point")
-    if not isinstance(point, dict) or (point.get("ell"), point.get("seed")) != (
-        profile.representative_ell,
-        profile.representative_seed,
+    representative = next(
+        (
+            item
+            for item in sweep.records
+            if (item.point.ell, item.point.seed)
+            == (profile.representative_ell, profile.representative_seed)
+        ),
+        None,
+    )
+    if (
+        representative is None
+        or not isinstance(point, dict)
+        or (point.get("ell"), point.get("seed"), point.get("q"))
+        != (
+            profile.representative_ell,
+            profile.representative_seed,
+            representative.point.q,
+        )
+        or evidence.metadata.get("modulus") != representative.point.q
     ):
         raise ValueError("evidence representative point 与 profile 不一致。")
     if evidence.metadata.get("selected_step") != profile.selected_step:
