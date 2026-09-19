@@ -27,6 +27,12 @@ from secure_control.crypto import (
     TwoPartySharing,
 )
 
+from .evidence import (
+    CombinedShareStepAudit,
+    IntegerVectorEvidence,
+    ProtocolReconstructionEvidence,
+    ProtocolStepSnapshot,
+)
 from .messages import (
     ClosedLoopRangeEvidence,
     ControllerLayout,
@@ -229,6 +235,50 @@ class Client:
         self, first: ControlShareMessage, second: ControlShareMessage
     ) -> np.ndarray:
         """在 Client 边界对已签发 round 的正确 shape/ledger scale control shares 重构一次。"""
+        result, _ = self._reconstruct_control(
+            first,
+            second,
+            snapshot=None,
+            include_state=False,
+            include_combined_share_audit=False,
+        )
+        return result
+
+    def reconstruct_control_with_evidence(
+        self,
+        first: ControlShareMessage,
+        second: ControlShareMessage,
+        snapshot: ProtocolStepSnapshot,
+        *,
+        include_state: bool,
+        include_combined_share_audit: bool,
+    ) -> tuple[np.ndarray, ProtocolReconstructionEvidence]:
+        """在同一次 Client capability 内重构控制量及显式诊断证据。
+
+        该方法不会重新执行协议或消费随机材料。两方 input/output share 只在 Client
+        边界组合；controller state share 永不进入 combined-share 审计对象。
+        """
+        result, evidence = self._reconstruct_control(
+            first,
+            second,
+            snapshot=snapshot,
+            include_state=include_state,
+            include_combined_share_audit=include_combined_share_audit,
+        )
+        if evidence is None:
+            raise RuntimeError("诊断重构未产生证据。")
+        return result, evidence
+
+    def _reconstruct_control(
+        self,
+        first: ControlShareMessage,
+        second: ControlShareMessage,
+        *,
+        snapshot: ProtocolStepSnapshot | None,
+        include_state: bool,
+        include_combined_share_audit: bool,
+    ) -> tuple[np.ndarray, ProtocolReconstructionEvidence | None]:
+        """共享普通与诊断重构逻辑，并仅在全部校验成功后关闭 round capability。"""
         if not isinstance(first, ControlShareMessage) or not isinstance(
             second, ControlShareMessage
         ):
@@ -253,20 +303,113 @@ class Client:
             or np.asarray(second.value.value, dtype=object).shape != expected_shape
         ):
             raise ValueError(f"控制输出 share 必须具有 output dimension shape {expected_shape}。")
-        signed = np.asarray(
-            self.fixed_point.from_residue(self.sharing.reconstruct(first.value, second.value)),
-            dtype=object,
+        raw_control = self._reconstruct_integer_vector(
+            first.value, second.value, first.fractional_bits
         )
-        result = np.empty(signed.shape, dtype=float)
-        scale = 1 << first.fractional_bits
-        for index in np.ndindex(signed.shape):
-            value = int(signed[index]) / scale
+        result = np.empty((len(raw_control.centered),), dtype=float)
+        scale = 1 << raw_control.fractional_bits
+        for index, integer in enumerate(raw_control.centered):
+            value = integer / scale
             if not math.isfinite(value):
                 raise ValueError("ledger scale control output 无法安全解码为有限浮点数。")
             result[index] = value
+
+        evidence = None
+        if snapshot is not None:
+            if not isinstance(snapshot, ProtocolStepSnapshot):
+                raise TypeError("snapshot 必须是 ProtocolStepSnapshot。")
+            if (
+                (snapshot.session_id, snapshot.round_id, snapshot.step)
+                != (first.session_id, first.round_id, first.step)
+                or snapshot.plan.scale_ledger != layout.scale_ledger
+                or snapshot.plan.state_shape != (layout.state_dimension,)
+                or snapshot.plan.input_shape != (layout.input_dimension,)
+                or snapshot.plan.output_shape != (layout.output_dimension,)
+            ):
+                raise ValueError("协议快照与当前 Client round 的身份、shape 或 scale 不一致。")
+            if not np.array_equal(
+                np.asarray(snapshot.output_p1.value, dtype=object),
+                np.asarray(first.value.value, dtype=object),
+            ) or not np.array_equal(
+                np.asarray(snapshot.output_p2.value, dtype=object),
+                np.asarray(second.value.value, dtype=object),
+            ):
+                raise ValueError("协议快照的 output shares 与 Client 收到的消息不一致。")
+            ledger = layout.scale_ledger
+            controller_input = self._reconstruct_integer_vector(
+                snapshot.input_p1, snapshot.input_p2, ledger.input
+            )
+            state_before = state_accumulator = state_after = None
+            state_equation_verified = None
+            if include_state:
+                state_before = self._reconstruct_integer_vector(
+                    snapshot.state_before_p1, snapshot.state_before_p2, ledger.state
+                )
+                state_accumulator = self._reconstruct_integer_vector(
+                    snapshot.state_accumulator_p1,
+                    snapshot.state_accumulator_p2,
+                    ledger.state_accumulator,
+                )
+                state_after = self._reconstruct_integer_vector(
+                    snapshot.state_after_p1, snapshot.state_after_p2, ledger.state
+                )
+                if ledger.state_truncation_bits == 0:
+                    state_equation_verified = state_accumulator.centered == state_after.centered
+                else:
+                    divisor = 1 << ledger.state_truncation_bits
+                    expected = tuple(
+                        (2 * value + divisor) // (2 * divisor)
+                        for value in state_accumulator.centered
+                    )
+                    # 论文 Protocol 2 允许最终结果相对规定 rounding 出现 w∈{-1,0,1}。
+                    state_equation_verified = all(
+                        abs(actual - target) <= 1
+                        for actual, target in zip(state_after.centered, expected, strict=True)
+                    )
+                if not state_equation_verified:
+                    raise ValueError("controller state 转移不满足当前 ledger/Trunc 语义。")
+            audit = None
+            if include_combined_share_audit:
+                audit = CombinedShareStepAudit.from_shares(
+                    step=first.step,
+                    input_p1=snapshot.input_p1,
+                    input_p2=snapshot.input_p2,
+                    output_p1=first.value,
+                    output_p2=second.value,
+                    reconstruction_verified=True,
+                )
+            evidence = ProtocolReconstructionEvidence(
+                session_id=first.session_id,
+                round_id=first.round_id,
+                step=first.step,
+                controller_input=controller_input,
+                raw_control=raw_control,
+                decoded_raw_control=tuple(float(value) for value in result),
+                state_before=state_before,
+                state_accumulator=state_accumulator,
+                state_after=state_after,
+                state_truncation_bits=ledger.state_truncation_bits,
+                state_equation_verified=state_equation_verified,
+                plan=snapshot.plan,
+                combined_share_audit=audit,
+            )
         # 成功解码后关闭 capability，防止上层误把同一 round 的 control 重复应用。
         del self._issued_rounds[identity]
-        return result
+        return result, evidence
+
+    def _reconstruct_integer_vector(
+        self, first: AdditiveShare, second: AdditiveShare, fractional_bits: int
+    ) -> IntegerVectorEvidence:
+        """无损重构真实 residue/centered integer，禁止经 binary64 反编码。"""
+        residue_array = np.asarray(self.sharing.reconstruct(first, second), dtype=object)
+        if residue_array.ndim != 1:
+            raise ValueError("诊断重构只接受一维协议向量。")
+        centered_array = np.asarray(self.fixed_point.from_residue(residue_array), dtype=object)
+        return IntegerVectorEvidence(
+            residue=tuple(int(value) for value in residue_array),
+            centered=tuple(int(value) for value in centered_array),
+            fractional_bits=fractional_bits,
+        )
 
     def abort_round(self, online: OnlineRound) -> None:
         """关闭当前 Client 已签发但未成功重构的 round capability。

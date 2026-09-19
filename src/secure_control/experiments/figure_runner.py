@@ -80,7 +80,7 @@ def main() -> None:
         help="output error channel index independent of tracking; repeatable",
     )
     parser.add_argument("--control-error-scale", choices=("linear", "log"), default="linear")
-    parser.add_argument("--time-unit", choices=("s", "h"), default=None)
+    parser.add_argument("--time-unit", choices=("s", "min", "h"), default=None)
     parser.add_argument("--format", choices=("png", "pdf"), default="png")
     parser.add_argument("--output-root", default="results/figures")
     parser.add_argument(

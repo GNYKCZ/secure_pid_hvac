@@ -99,3 +99,13 @@ input share、triple 或 mask；不同 Client 的首轮仍可重复测试。`rng
 Issue #11 已在 execution 层提供运行时 `step(v)` 包装；Issue #12 的 HVAC 仿真集成只使用
 公开有限时间范围契约，不改变本协议消息算法。多进程和网络 transport 仍不属于本协议
 数据模型。运行时契约见 [通用安全状态空间运行时](secure_runtime_contract.md)。
+
+## 默认关闭的诊断证据
+
+`execute_with_evidence()` 与 `reconstruct_control_with_evidence()` 复用同一个 Protocol 3 执行和 Client
+重构路径，只复制本次真实消息、scale、资源计划及选定状态更新，不创建第二套协议算法，也不额外消耗
+RNG。原有 `execute()` 与 `reconstruct_control()` 接口和默认行为保持不变。
+
+sanitized evidence 只含 residue、centered integer、fractional bits、decode 结果、资源 ID hash 与已验证
+状态方程。两份 raw share 仅能在显式授权的本地组合诊断对象中同时出现，不能由公共包入口导出，也不
+进入公开 manifest。详见[安全执行证据与增强中文报告](secure_execution_evidence.md)。

@@ -26,8 +26,15 @@ from secure_control.protocol import (
     OfflineDistribution,
     SingleProcessCoordinator,
 )
+from secure_control.protocol.messages import OnlineRound
 
 from ._inputs import normalize_step_input
+from .evidence import (
+    ProtocolResourceSnapshot,
+    SecureTraceCollector,
+    SecureTracePolicy,
+    build_secure_step_trace,
+)
 
 Array = NDArray[Any]
 Session = tuple[
@@ -58,6 +65,8 @@ class SecureStateSpaceRuntime:
         security_parameter: int,
         modulus_evidence: PrimeModulusEvidence | None = None,
         test_seed: int | None = None,
+        trace_policy: SecureTracePolicy | None = None,
+        trace_collector: SecureTraceCollector | None = None,
     ) -> None:
         """验证公共配置并建立一个独立、不可与其他实例混用的协议 session。
 
@@ -76,6 +85,14 @@ class SecureStateSpaceRuntime:
             isinstance(test_seed, bool) or not isinstance(test_seed, int)
         ):
             raise TypeError("test_seed 必须是整数或 None。")
+        if (trace_policy is None) != (trace_collector is None):
+            raise ValueError("trace_policy 与 trace_collector 必须同时提供或同时省略。")
+        if trace_policy is not None and not isinstance(trace_policy, SecureTracePolicy):
+            raise TypeError("trace_policy 必须是 SecureTracePolicy 或 None。")
+        if trace_collector is not None and not isinstance(trace_collector, SecureTraceCollector):
+            raise TypeError("trace_collector 必须是 SecureTraceCollector 或 None。")
+        if trace_policy is not None and test_seed is None:
+            raise ValueError("诊断 trace 必须使用显式 deterministic test_seed。")
 
         self._spec = spec
         self._fixed_point = fixed_point
@@ -83,6 +100,8 @@ class SecureStateSpaceRuntime:
         self._security_parameter = security_parameter
         self._modulus_evidence = modulus_evidence
         self._test_seed = test_seed
+        self._trace_policy = trace_policy
+        self._trace_collector = trace_collector
         self._install_session(self._build_session())
 
     @property
@@ -115,7 +134,10 @@ class SecureStateSpaceRuntime:
         input_vector = normalize_step_input(v, self._spec.input_dimension)
         first_state = self._copy_share(self._p1.state_share)
         second_state = self._copy_share(self._p2.state_share)
-        online = None
+        online: OnlineRound | None = None
+        resources_before = self._resource_snapshot() if self._trace_policy is not None else None
+        resources_finalized = False
+        capability_open = False
         try:
             online = self._client.prepare_online(
                 self._distribution,
@@ -123,17 +145,52 @@ class SecureStateSpaceRuntime:
                 step=self._step_index,
                 rng=self._material_rng,
             )
-            output_shares = self._coordinator.execute(self._p1, self._p2, online)
-            output = self._client.reconstruct_control(*output_shares)
+            capability_open = True
+            self._account_created_resources(online)
+            if self._trace_policy is None:
+                output_shares = self._coordinator.execute(self._p1, self._p2, online)
+                output = self._client.reconstruct_control(*output_shares)
+                capability_open = False
+            else:
+                output_shares, snapshot = self._coordinator.execute_with_evidence(
+                    self._p1, self._p2, online
+                )
+                selected = self._step_index == self._trace_policy.selected_step
+                output, evidence = self._client.reconstruct_control_with_evidence(
+                    *output_shares,
+                    snapshot,
+                    include_state=selected,
+                    include_combined_share_audit=(
+                        selected and self._trace_policy.allow_combined_share_diagnostic
+                    ),
+                )
+                capability_open = False
+            self._account_finalized_resources(online)
+            resources_finalized = True
             if not np.isfinite(output).all():
                 raise FloatingPointError("安全控制输出包含 NaN 或无穷大")
+            if self._trace_policy is not None:
+                if resources_before is None:
+                    raise RuntimeError("诊断 trace 缺少执行前资源快照。")
+                resources_after = self._resource_snapshot()
+                trace = build_secure_step_trace(
+                    evidence,
+                    resources_before,
+                    resources_after,
+                    include_state=selected,
+                )
+                if self._trace_collector is None:
+                    raise RuntimeError("诊断 trace collector 不可用。")
+                self._trace_collector.append(trace, evidence.combined_share_audit)
         except Exception:
             # coordinator 可能在两方依次提交 state 之间失败，或 Client 可能在提交后重构失败；
             # 使用调用前的本地 share 快照回滚，不在 execution 层重构 controller state。
             self._p1.commit_state(first_state)
             self._p2.commit_state(second_state)
-            if online is not None:
+            if online is not None and capability_open:
                 self._client.abort_round(online)
+            if online is not None and not resources_finalized:
+                self._account_finalized_resources(online)
             raise
 
         self._step_index += 1
@@ -147,6 +204,8 @@ class SecureStateSpaceRuntime:
         """
         session = self._build_session()
         self._install_session(session)
+        if self._trace_collector is not None:
+            self._trace_collector.reset()
 
     def _build_session(self) -> Session:
         """在局部变量中完整建立新 Client、Servers 与 coordinator，支持原子 reset。"""
@@ -178,6 +237,45 @@ class SecureStateSpaceRuntime:
             self._material_rng,
         ) = session
         self._step_index = 0
+        if self._trace_policy is not None:
+            self._resource_totals = {
+                "triples_created": 0,
+                "triples_consumed": 0,
+                "triples_aborted": 0,
+                "truncations_created": 0,
+                "truncations_consumed": 0,
+                "truncations_aborted": 0,
+            }
+
+    def _account_created_resources(self, online: OnlineRound) -> None:
+        """按真实 OnlineRound 中已创建的材料数量更新诊断累计值。"""
+        if self._trace_policy is None:
+            return
+        self._resource_totals["triples_created"] += len(online.p1_resources.product_resources)
+        self._resource_totals["truncations_created"] += len(
+            online.p1_resources.state_truncation_resources
+        )
+
+    def _account_finalized_resources(self, online: OnlineRound) -> None:
+        """从共享 lifecycle 的最终状态读取真实消费/废弃数，不能用理论常量代替。"""
+        if self._trace_policy is None:
+            return
+        for prefix, resources in (
+            ("triples", online.p1_resources.product_resources),
+            ("truncations", online.p1_resources.state_truncation_resources),
+        ):
+            self._resource_totals[f"{prefix}_consumed"] += sum(
+                item._lifecycle.status == "consumed" for item in resources
+            )
+            self._resource_totals[f"{prefix}_aborted"] += sum(
+                item._lifecycle.status == "aborted" for item in resources
+            )
+
+    def _resource_snapshot(self) -> ProtocolResourceSnapshot:
+        """仅在显式 trace 模式下返回真实诊断资源累计快照。"""
+        if self._trace_policy is None:
+            raise RuntimeError("默认关闭的 runtime 不提供诊断资源快照。")
+        return ProtocolResourceSnapshot(**self._resource_totals)
 
     @staticmethod
     def _copy_share(share: AdditiveShare) -> AdditiveShare:

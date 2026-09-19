@@ -75,6 +75,7 @@ def test_experiment_io_boundary_imports_only_generic_contracts() -> None:
         "sweep_artifacts.py",
         "sweep_plotting.py",
         "reporting.py",
+        "evidence_artifacts.py",
     ):
         source = experiments / name
         assert "secure_control.scenarios" not in imported_modules(source)
@@ -103,6 +104,18 @@ def test_experiment_io_boundary_imports_only_generic_contracts() -> None:
         "secure_control.scenarios.hvac.integration",
         "secure_control.scenarios.hvac.stability",
     }
+    evidence_report_imports = imported_modules(experiments / "evidence_reporting.py")
+    assert not any(
+        module.startswith(
+            (
+                "secure_control.scenarios",
+                "secure_control.execution",
+                "secure_control.experiments.evidence_runner",
+                "secure_control.simulation.runner",
+            )
+        )
+        for module in evidence_report_imports
+    )
 
 
 def test_2r2c_types_remain_owned_by_hvac_scenario() -> None:
@@ -154,3 +167,18 @@ def test_infinite_safety_keeps_verifier_and_scenario_assembly_separate() -> None
 
 def test_legacy_source_package_does_not_exist() -> None:
     assert not (PACKAGE_ROOT.parent / "secure_pid").exists()
+
+
+def test_private_diagnostics_are_ignored_and_not_uploaded_by_ci() -> None:
+    """combined-share 私有诊断不得进入 Git 或未来 CI artifact 上传路径。"""
+    project_root = PACKAGE_ROOT.parents[1]
+    ignore = (project_root / ".gitignore").read_text(encoding="utf-8")
+    assert "results/diagnostics/*" in ignore
+    workflows = project_root / ".github" / "workflows"
+    if workflows.is_dir():
+        violations = [
+            path.name
+            for path in workflows.rglob("*")
+            if path.is_file() and "results/diagnostics/private" in path.read_text(encoding="utf-8")
+        ]
+        assert violations == []

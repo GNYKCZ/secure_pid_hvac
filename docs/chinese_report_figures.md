@@ -61,3 +61,17 @@ JSON 与 Markdown 使用同一个内存 catalog，逐图记录 sequence、priori
 这些图是冻结工件的 Equivalent 重渲染，未重新运行实验也未改变任何 metric。2R2C 模型仍是
 Adapted HVAC plant model；报告不把它表述为论文原数值例，不新增闭环性能、安全性或真实建筑
 标定结论。数值继续受 binary64 与已记录定点误差边界限制。
+
+## Issue #51 增强报告
+
+`configs/hvac_2r2c_evidence_report_zh.yaml` 在不改变本页 01–12 类别的前提下，增加安全执行论证链、
+分钟轴、三个半开 60 min 分段、applied-control Fig. 3 adapted、无量纲精度图和四精度定量总表。
+增强入口同时要求 canonical sweep 与 sanitized evidence 两个 verified reader，并在原子发布前再次
+检查来源 bytes。原 01–12 图作为附录完整保留；raw control error 明确标为机制诊断，不与正式
+applied control 指标混用。命令、文件和结论边界见
+[安全执行证据与增强中文报告](secure_execution_evidence.md)。
+
+其中 02 图负责固定 `k=60` 的纵向协议链路，03 图负责完整 180 步的横向整数执行证据。03 图保留
+全部样本，以 marker 强调离散控制时刻，另列 `k=58..62` 的真实十进制整数和来自 scale ledger 的
+decode 公式；图形样式本身不作为整数证明。09 图同时区分 wall-clock 统计、跨 seed exact 总资源、
+代表点实际累计资源与每步 delta。

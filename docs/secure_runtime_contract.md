@@ -29,6 +29,11 @@ runtime.scale_ledger -> ControllerScaleLedger
 runtime.range_verification -> ControllerRangeVerification
 ```
 
+Issue #51 另提供可选的 `trace_policy` 与 `trace_collector`。二者必须同时给出，且只允许配合显式
+`test_seed` 的诊断复现；默认均为 `None`，因此既有调用不会创建、复制或暴露 trace。启用后记录的
+是实际 step 路径产生的 sanitized 证据和真实资源生命周期，不增加协议运算或 RNG 消耗。只有 policy
+固定的单个 step 保存完整 controller state 更新；combined-share 审计还需要独立显式授权。
+
 `step` 接受单输入标量、`(m,)` 扁平向量或 `(m, 1)` 单步列向量，与明文 runtime
 共用同一个输入规范化函数。行向量、批量二维输入、非实数和非有限值在进入分享前被拒绝。
 在符合公开范围契约的前提下，有限实数中的小数输入也合法，不由 `ControllerSpec` 的矩阵
@@ -112,3 +117,7 @@ session/round identity 始终由独立安全随机源生成。
 不声明进程/主机隔离、网络认证、抗恶意安全或生产级端到端安全。multiprocessing、socket、
 transport abstraction、双 plant simulation 和任何场景集成都不属于 Issue #11；Issue #12
 仅通过场景层装配完成 HVAC 双闭环，不让本 runtime 依赖 HVAC。
+
+诊断 trace 不改变上述安全声明。公开导出不得包含 raw shares；显式 combined-share 文件只属于本地
+离线审计，标记 `deployment_security=false` 并与公开 evidence manifest 物理隔离。完整发布契约见
+[安全执行证据与增强中文报告](secure_execution_evidence.md)。

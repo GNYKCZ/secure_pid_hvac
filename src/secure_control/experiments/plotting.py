@@ -25,7 +25,7 @@ from secure_control.simulation import ChannelMetadata, ScenarioMetadata, Simulat
 from .artifacts import SCHEMA_VERSION, ExperimentRecord, load_artifacts
 
 ErrorScale = Literal["linear", "log"]
-TimeUnit = Literal["s", "h"]
+TimeUnit = Literal["s", "min", "h"]
 FigureFormat = Literal["png", "pdf"]
 _RENDER_ID_PATTERN = re.compile(r"\A\d{8}T\d{12}Z-[0-9a-f]{12}\Z")
 
@@ -154,7 +154,7 @@ class PlotSelection:
                 raise ValueError("重复的 output error channel 选择无效。")
         if self.control_error_scale not in ("linear", "log"):
             raise ValueError("control error scale 必须是 linear 或 log。")
-        if self.time_unit not in ("s", "h") or self.format not in ("png", "pdf"):
+        if self.time_unit not in ("s", "min", "h") or self.format not in ("png", "pdf"):
             raise ValueError("time unit/figure format 无效。")
 
 
@@ -167,7 +167,7 @@ class PlotDisplay:
 
     def __post_init__(self) -> None:
         """显式拒绝不受支持的时间换算，保持 schema v1 秒轴不被猜测。"""
-        if self.time_unit not in ("s", "h") or not isinstance(self.title_prefix, str):
+        if self.time_unit not in ("s", "min", "h") or not isinstance(self.title_prefix, str):
             raise ValueError("展示时间单位或标题无效。")
 
 
@@ -210,10 +210,11 @@ def _series(
 
 
 def _time(record: ExperimentRecord, display: PlotDisplay) -> np.ndarray:
-    """小时轴只换算既有秒样本，不补造 horizon 终点。"""
+    """只换算既有秒样本，不补造 horizon 终点。"""
     if not isinstance(display, PlotDisplay):
         raise TypeError("display 必须是 PlotDisplay。")
-    return record.result.time if display.time_unit == "s" else record.result.time / 3600.0
+    divisor = {"s": 1.0, "min": 60.0, "h": 3600.0}[display.time_unit]
+    return record.result.time / divisor
 
 
 def _axes(record: ExperimentRecord, display: PlotDisplay, title: str, ylabel: str):
@@ -223,7 +224,7 @@ def _axes(record: ExperimentRecord, display: PlotDisplay, title: str, ylabel: st
     axes = figure.subplots()
     prefix = display.title_prefix or record.metadata.name
     axes.set_title(f"{prefix} · {title}")
-    axes.set_xlabel("Time (s)" if display.time_unit == "s" else "Time (h)")
+    axes.set_xlabel({"s": "Time (s)", "min": "Time (min)", "h": "Time (h)"}[display.time_unit])
     axes.set_ylabel(ylabel)
     axes.grid(True, alpha=0.3)
     return figure, axes
