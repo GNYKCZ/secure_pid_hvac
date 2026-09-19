@@ -90,8 +90,9 @@ output accumulator 在两条路径中都必须位于 centered `Z_q`。
 
 Issue #38 增加的闭环证据模式不会改变 `step/reset`。runtime 在 session 建立时取得 Client 的
 不可变 `range_verification` 摘要，包含 proof mode、证书摘要、state/output accumulator 上界、
-centered modulus limit 与最大 Trunc message。`reset()` 创建新 Client 并重新验证证据；若验证
-失败，旧 session 不被替换。条件和不覆盖项见
+centered modulus limit 与最大 Trunc message。Client 还会用已安装 A/B/C/D 精确重建证书声明的
+仿射 composition；无关闭环问题不能只凭 controller 指纹进入该模式。`reset()` 创建新 Client 并
+重新验证证据；若验证失败，旧 session 不被替换。条件和不覆盖项见
 [无限时域安全契约](infinite_horizon_safety.md)。
 
 ## 数值证据与容差

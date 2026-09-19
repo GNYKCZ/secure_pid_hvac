@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from hashlib import sha256
 from numbers import Integral
 from typing import Any, Literal
 
 import numpy as np
 
-from secure_control.core import EllipsoidalInvariantWitness, RobustAffineInvariantProblem
+from secure_control.core import (
+    EllipsoidalInvariantWitness,
+    RationalValue,
+    RobustAffineInvariantProblem,
+)
 from secure_control.crypto import (
     AdditiveShare,
     BeaverTripleShare,
@@ -101,6 +105,69 @@ class ControllerLayout:
 
 
 @dataclass(frozen=True, slots=True)
+class ClosedLoopAffineComposition:
+    """声明控制器与外部仿射系统如何共同生成完整闭环问题。
+
+    设证书状态为 ``z``、扰动为 ``w``，本记录公开
+    ``v=Lz+l+Mw`` 与 ``z_e+=Fz+f+Gw+Hu``。Client 使用已安装控制器的
+    ``A/B/C/D`` 精确重建完整 ``z+``，从而不能把无关的稳定问题附到控制器上。
+    字段只表达通用仿射组合，不含任何场景或物理量语义。
+    """
+
+    controller_state_indices: tuple[int, ...]
+    external_state_indices: tuple[int, ...]
+    input_state_matrix: tuple[tuple[RationalValue, ...], ...]
+    input_affine: tuple[RationalValue, ...]
+    input_disturbance_matrix: tuple[tuple[RationalValue, ...], ...]
+    external_transition: tuple[tuple[RationalValue, ...], ...]
+    external_affine: tuple[RationalValue, ...]
+    external_disturbance_matrix: tuple[tuple[RationalValue, ...], ...]
+    output_injection: tuple[tuple[RationalValue, ...], ...]
+
+    def __post_init__(self) -> None:
+        """拒绝负索引和非精确有理数，矩阵维数由 Client 结合控制器复验。"""
+        for name in ("controller_state_indices", "external_state_indices"):
+            indices = getattr(self, name)
+            if any(
+                isinstance(value, bool) or not isinstance(value, Integral) or value < 0
+                for value in indices
+            ):
+                raise ValueError(f"{name} 必须是非负整数 tuple")
+            object.__setattr__(self, name, tuple(int(value) for value in indices))
+        vectors = (self.input_affine, self.external_affine)
+        matrices = (
+            self.input_state_matrix,
+            self.input_disturbance_matrix,
+            self.external_transition,
+            self.external_disturbance_matrix,
+            self.output_injection,
+        )
+        if any(not isinstance(value, RationalValue) for vector in vectors for value in vector):
+            raise TypeError("closed-loop composition 向量必须使用 RationalValue")
+        if any(
+            not isinstance(value, RationalValue)
+            for matrix in matrices
+            for row in matrix
+            for value in row
+        ):
+            raise TypeError("closed-loop composition 矩阵必须使用 RationalValue")
+
+
+def closed_loop_composition_sha256(composition: ClosedLoopAffineComposition) -> str:
+    """返回带版本域分离的规范组合记录 SHA-256。"""
+    if not isinstance(composition, ClosedLoopAffineComposition):
+        raise TypeError("composition 必须是 ClosedLoopAffineComposition")
+    encoded = json.dumps(
+        asdict(composition),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return sha256(b"secure_control.protocol.closed_loop_composition.v1\0" + encoded).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
 class ClosedLoopRangeEvidence:
     """绑定通用闭环不变集证书、controller 指纹和 payload 投影。"""
 
@@ -111,6 +178,8 @@ class ClosedLoopRangeEvidence:
     controller_state_indices: tuple[int, ...]
     state_payload_bounds: tuple[int, ...]
     input_payload_bounds: tuple[int, ...]
+    composition: ClosedLoopAffineComposition | None = None
+    composition_sha256: str | None = None
 
     def __post_init__(self) -> None:
         """冻结索引与摘要格式，详细数学复验由 Client 在分享前完成。"""
@@ -137,6 +206,17 @@ class ClosedLoopRangeEvidence:
             ):
                 raise ValueError(f"{name} 必须是非负整数 tuple")
             object.__setattr__(self, name, tuple(int(value) for value in values))
+        if self.composition is not None and not isinstance(
+            self.composition, ClosedLoopAffineComposition
+        ):
+            raise TypeError("composition 必须是 ClosedLoopAffineComposition 或 None")
+        if self.composition_sha256 is not None:
+            if not isinstance(self.composition_sha256, str) or len(self.composition_sha256) != 64:
+                raise ValueError("composition_sha256 必须是 64 字符 SHA-256")
+            try:
+                int(self.composition_sha256, 16)
+            except ValueError as error:
+                raise ValueError("composition_sha256 必须是十六进制 SHA-256") from error
 
 
 @dataclass(frozen=True, slots=True)

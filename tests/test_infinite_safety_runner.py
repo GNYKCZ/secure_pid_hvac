@@ -54,6 +54,9 @@ def test_runner_consumes_verified_reader_without_rerunning_experiment(
         },
         records=records,
     )
+    verified.root.mkdir()
+    (verified.root / "manifest.json").write_text("final-manifest\n", encoding="utf-8")
+    (verified.root / "data_manifest.json").write_text("data-manifest\n", encoding="utf-8")
     monkeypatch.setattr(
         infinite_safety_runner,
         "load_hvac_infinite_safety_bundle",
@@ -62,7 +65,7 @@ def test_runner_consumes_verified_reader_without_rerunning_experiment(
     monkeypatch.setattr(
         infinite_safety_runner,
         "load_verified_sweep_data",
-        lambda _path: verified,
+        lambda _path, **_kwargs: verified,
     )
 
     target = infinite_safety_runner.publish_infinite_safety_report(
@@ -78,7 +81,15 @@ def test_runner_consumes_verified_reader_without_rerunning_experiment(
     certificate = json.loads((target / "certificate.json").read_text(encoding="utf-8"))
     assert manifest["complete"] is True
     assert certificate["default_180_step_baseline_covered"] is False
+    assert certificate["schema_version"] == 2
+    assert certificate["upstream_stability"]["report_sha256"] == bundle.stability_report_sha256
+    assert set(certificate["verified_sweep"]) == {
+        "sweep_id",
+        "final_manifest_sha256",
+        "data_manifest_sha256",
+    }
     assert {profile["status"] for profile in certificate["profiles"]} == {"certified"}
+    assert all(profile["composition_sha256"] for profile in certificate["profiles"])
     assert {profile["protocol2_truncations_per_step"] for profile in certificate["profiles"]} == {0}
     assert not list((tmp_path / "safety").glob(".*.tmp-*"))
 
@@ -92,9 +103,40 @@ def test_runner_consumes_verified_reader_without_rerunning_experiment(
     monkeypatch.setattr(
         infinite_safety_runner,
         "load_verified_sweep_data",
-        lambda _path: bad_verified,
+        lambda _path, **_kwargs: bad_verified,
     )
     with pytest.raises(ValueError, match="q/kappa"):
         infinite_safety_runner.publish_infinite_safety_report(
             CONFIG, verified.root, tmp_path / "bad-safety"
         )
+
+    monkeypatch.setattr(
+        infinite_safety_runner,
+        "load_verified_sweep_data",
+        lambda _path, **_kwargs: verified,
+    )
+    initial = {"manifest.json": "a" * 64, "data_manifest.json": "b" * 64}
+    changed = {"manifest.json": "c" * 64, "data_manifest.json": "b" * 64}
+    observed = iter((initial, initial, changed))
+    monkeypatch.setattr(
+        infinite_safety_runner,
+        "_sweep_manifest_hashes",
+        lambda _root: next(observed),
+    )
+    with pytest.raises(ValueError, match="发布期间发生变化"):
+        infinite_safety_runner.publish_infinite_safety_report(
+            CONFIG, verified.root, tmp_path / "changed-safety"
+        )
+    assert not list((tmp_path / "changed-safety").glob(".*.tmp-*"))
+
+    observed_during_verification = iter((initial, changed))
+    monkeypatch.setattr(
+        infinite_safety_runner,
+        "_sweep_manifest_hashes",
+        lambda _root: next(observed_during_verification),
+    )
+    with pytest.raises(ValueError, match="复验期间发生变化"):
+        infinite_safety_runner.publish_infinite_safety_report(
+            CONFIG, verified.root, tmp_path / "verification-changed-safety"
+        )
+    assert not (tmp_path / "verification-changed-safety").exists()

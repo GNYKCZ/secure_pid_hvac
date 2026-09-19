@@ -52,14 +52,18 @@ Protocol 1 的乘法、模数范围或闭环证书门禁。
 
 `ControllerRangeContract` 有三种互斥模式：`finite_horizon`、旧的
 `independent_input_invariant`、以及 `closed_loop_invariant`。第三种模式携带完整 problem/witness、
-证书 SHA-256、实际编码 controller 指纹、controller state 坐标投影和 payload 界。
+证书 SHA-256、实际编码 controller 指纹、controller state 坐标投影、payload 界，以及领域无关的
+仿射 composition 记录。该记录明确给出 `v=Lz+l+Mw` 和外部状态
+`z_e+=Fz+f+Gw+Hu`，并以独立 SHA-256 内容寻址。
 
 Client 在创建参数 share、Beaver triple 或 mask 前重新验证：
 
 1. controller 编码 payload、维数及 scale ledger 的指纹；
-2. problem/witness 的规范摘要与全部精确数学条件；
-3. controller state 和 input 投影没有越过公开 payload 界；
-4. state accumulator 的 `Z<kappa>`/centered `Z_q` 门禁和 output accumulator 的 centered `Z_q`
+2. 把已安装的 A/B/C/D 代入 composition，逐项精确重建 problem 的
+   transition、affine、disturbance 和 controller input 投影；
+3. problem/witness 的规范摘要与全部精确数学条件；
+4. controller state 和 input 投影没有越过公开 payload 界；
+5. state accumulator 的 `Z<kappa>`/centered `Z_q` 门禁和 output accumulator 的 centered `Z_q`
    门禁。
 
 运行时公开不可变 `range_verification` 摘要；`reset()` 建立新 Client/session，因而重新执行同一
@@ -68,7 +72,9 @@ Client 在创建参数 share、Beaver triple 或 mask 前重新验证：
 ## 来源与发布
 
 权威假设在 `configs/hvac_2r2c_infinite_safety.yaml`。它冻结 plant、PID、precision sweep 和
-Pocklington prime 证据的规范文本 SHA-256，以及四个精度点各自的有理 witness。
+Pocklington prime 证据的规范文本 SHA-256、#37 完整稳定性报告参数与内容摘要，以及四个精度点
+各自的有理 witness。发布证书保存完整 #37 报告，并同时保存 #15 final/data manifest 的
+SHA-256；原子发布前会重读两个 manifest，任一发生变化即删除临时目录并拒绝发布。
 
 报告命令只读取已经由正式 reader 完整复验的 sweep，不运行实验、仿真或绘图：
 

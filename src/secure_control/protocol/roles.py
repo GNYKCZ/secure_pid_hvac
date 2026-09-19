@@ -28,6 +28,7 @@ from secure_control.crypto import (
 )
 
 from .messages import (
+    ClosedLoopRangeEvidence,
     ControllerLayout,
     ControllerRangeContract,
     ControllerRangeVerification,
@@ -45,6 +46,7 @@ from .messages import (
     StateTruncationResourceShare,
     StepResourcePlan,
     _ResourceLifecycle,
+    closed_loop_composition_sha256,
     controller_payload_fingerprint,
 )
 
@@ -517,6 +519,7 @@ class Client:
         fingerprint = controller_payload_fingerprint(payloads, layout)
         if fingerprint != evidence.controller_fingerprint:
             raise ValueError("closed-loop evidence 的 controller fingerprint 不匹配")
+        self._validate_closed_loop_composition(payloads, layout, evidence)
         report = verify_ellipsoidal_invariant(evidence.problem, evidence.witness)
         if report.certificate_sha256 != evidence.certificate_sha256:
             raise ValueError("closed-loop evidence 的 certificate SHA-256 不匹配")
@@ -547,6 +550,215 @@ class Client:
             if interval.lower.fraction < -bound or interval.upper.fraction > bound:
                 raise ValueError("closed-loop invariant 的 controller input 投影超出 payload 界")
         return report.certificate_sha256
+
+    def _validate_closed_loop_composition(
+        self,
+        payloads: dict[str, np.ndarray],
+        layout: ControllerLayout,
+        evidence: ClosedLoopRangeEvidence,
+    ) -> None:
+        """用已安装 ``A/B/C/D`` 精确重建证书闭环，拒绝无关 problem 旁路。
+
+        composition 声明 ``v=Lz+l+Mw`` 与外部状态
+        ``z_e+=Fz+f+Gw+Hu``。将控制器的 ``x_c+=Ax_c+Bv``、
+        ``u=Cx_c+Dv`` 代入后，所得完整 transition/affine/disturbance 必须与
+        exact invariant problem 逐项相等；比较不使用浮点容差。
+        """
+        composition = evidence.composition
+        digest = evidence.composition_sha256
+        if composition is None or digest is None:
+            raise ValueError("closed-loop evidence 缺少可复验 composition")
+        if closed_loop_composition_sha256(composition) != digest:
+            raise ValueError("closed-loop evidence 的 composition SHA-256 不匹配")
+
+        problem = evidence.problem
+        state_dimension = len(problem.transition)
+        disturbance_dimension = len(problem.disturbance_abs_bounds)
+        controller_indices = evidence.controller_state_indices
+        external_indices = composition.external_state_indices
+        if composition.controller_state_indices != controller_indices:
+            raise ValueError("closed-loop composition 的 controller state 投影不匹配")
+        if (
+            len(external_indices) != state_dimension - layout.state_dimension
+            or len(set(external_indices)) != len(external_indices)
+            or set(controller_indices).intersection(external_indices)
+            or (set(controller_indices) | set(external_indices)) != set(range(state_dimension))
+        ):
+            raise ValueError("closed-loop composition 的 state 索引不是完整不重复分区")
+
+        def rational_matrix(value, rows: int, columns: int, name: str):
+            if len(value) != rows or any(len(row) != columns for row in value):
+                raise ValueError(f"closed-loop composition 的 {name} shape 无效")
+            return tuple(tuple(item.fraction for item in row) for row in value)
+
+        def rational_vector(value, length: int, name: str):
+            if len(value) != length:
+                raise ValueError(f"closed-loop composition 的 {name} shape 无效")
+            return tuple(item.fraction for item in value)
+
+        def payload_matrix(name: str, rows: int, columns: int, scale: int):
+            array = np.asarray(payloads[name], dtype=object)
+            if array.shape != (rows, columns):
+                raise ValueError(f"controller {name} payload shape 与 layout 不一致")
+            denominator = 1 << scale
+            return tuple(
+                tuple(Fraction(int(array[row, column]), denominator) for column in range(columns))
+                for row in range(rows)
+            )
+
+        n_c = layout.state_dimension
+        n_v = layout.input_dimension
+        n_u = layout.output_dimension
+        n_e = len(external_indices)
+        ledger = layout.scale_ledger
+        controller_a = payload_matrix("A", n_c, n_c, ledger.A)
+        controller_b = payload_matrix("B", n_c, n_v, ledger.B)
+        controller_c = payload_matrix("C", n_u, n_c, ledger.C)
+        controller_d = payload_matrix("D", n_u, n_v, ledger.D)
+        input_state = rational_matrix(
+            composition.input_state_matrix,
+            n_v,
+            state_dimension,
+            "input_state_matrix",
+        )
+        input_affine = rational_vector(composition.input_affine, n_v, "input_affine")
+        input_disturbance = rational_matrix(
+            composition.input_disturbance_matrix,
+            n_v,
+            disturbance_dimension,
+            "input_disturbance_matrix",
+        )
+        external_transition = rational_matrix(
+            composition.external_transition,
+            n_e,
+            state_dimension,
+            "external_transition",
+        )
+        external_affine = rational_vector(composition.external_affine, n_e, "external_affine")
+        external_disturbance = rational_matrix(
+            composition.external_disturbance_matrix,
+            n_e,
+            disturbance_dimension,
+            "external_disturbance_matrix",
+        )
+        output_injection = rational_matrix(
+            composition.output_injection,
+            n_e,
+            n_u,
+            "output_injection",
+        )
+
+        output_state = tuple(
+            tuple(
+                sum(
+                    (
+                        controller_c[output][state]
+                        if controller_indices[state] == column
+                        else Fraction(0)
+                    )
+                    for state in range(n_c)
+                )
+                + sum(
+                    controller_d[output][channel] * input_state[channel][column]
+                    for channel in range(n_v)
+                )
+                for column in range(state_dimension)
+            )
+            for output in range(n_u)
+        )
+        output_affine = tuple(
+            sum(controller_d[output][channel] * input_affine[channel] for channel in range(n_v))
+            for output in range(n_u)
+        )
+        output_disturbance = tuple(
+            tuple(
+                sum(
+                    controller_d[output][channel] * input_disturbance[channel][noise]
+                    for channel in range(n_v)
+                )
+                for noise in range(disturbance_dimension)
+            )
+            for output in range(n_u)
+        )
+
+        expected_transition = [
+            [Fraction(0) for _ in range(state_dimension)] for _ in range(state_dimension)
+        ]
+        expected_affine = [Fraction(0) for _ in range(state_dimension)]
+        expected_disturbance = [
+            [Fraction(0) for _ in range(disturbance_dimension)] for _ in range(state_dimension)
+        ]
+        for state, row_index in enumerate(controller_indices):
+            for column in range(state_dimension):
+                expected_transition[row_index][column] = sum(
+                    (
+                        controller_a[state][source]
+                        if controller_indices[source] == column
+                        else Fraction(0)
+                    )
+                    for source in range(n_c)
+                ) + sum(
+                    controller_b[state][channel] * input_state[channel][column]
+                    for channel in range(n_v)
+                )
+            expected_affine[row_index] = sum(
+                controller_b[state][channel] * input_affine[channel] for channel in range(n_v)
+            )
+            for noise in range(disturbance_dimension):
+                expected_disturbance[row_index][noise] = sum(
+                    controller_b[state][channel] * input_disturbance[channel][noise]
+                    for channel in range(n_v)
+                )
+        for external, row_index in enumerate(external_indices):
+            for column in range(state_dimension):
+                expected_transition[row_index][column] = external_transition[external][
+                    column
+                ] + sum(
+                    output_injection[external][output] * output_state[output][column]
+                    for output in range(n_u)
+                )
+            expected_affine[row_index] = external_affine[external] + sum(
+                output_injection[external][output] * output_affine[output] for output in range(n_u)
+            )
+            for noise in range(disturbance_dimension):
+                expected_disturbance[row_index][noise] = external_disturbance[external][
+                    noise
+                ] + sum(
+                    output_injection[external][output] * output_disturbance[output][noise]
+                    for output in range(n_u)
+                )
+
+        actual_transition = tuple(
+            tuple(value.fraction for value in row) for row in problem.transition
+        )
+        actual_affine = tuple(value.fraction for value in problem.affine)
+        actual_disturbance = tuple(
+            tuple(value.fraction for value in row) for row in problem.disturbance_matrix
+        )
+        if tuple(tuple(row) for row in expected_transition) != actual_transition:
+            raise ValueError("closed-loop composition 重建的 transition 与证书不一致")
+        if tuple(expected_affine) != actual_affine:
+            raise ValueError("closed-loop composition 重建的 affine 与证书不一致")
+        if tuple(tuple(row) for row in expected_disturbance) != actual_disturbance:
+            raise ValueError("closed-loop composition 重建的 disturbance 与证书不一致")
+
+        constraints = {constraint.name: constraint for constraint in problem.constraints}
+        if len(constraints) != len(problem.constraints):
+            raise ValueError("closed-loop invariant 的 constraint name 不得重复")
+        for channel in range(n_v):
+            name = f"controller_input_payload[{channel}]"
+            constraint = constraints.get(name)
+            if constraint is None:
+                raise ValueError("closed-loop invariant 缺少 controller input payload 约束")
+            if (
+                tuple(value.fraction for value in constraint.state_row) != input_state[channel]
+                or constraint.offset.fraction != input_affine[channel]
+                or tuple(value.fraction for value in constraint.disturbance_row)
+                != input_disturbance[channel]
+            ):
+                raise ValueError(
+                    "closed-loop invariant 的 controller input 投影与 composition 不一致"
+                )
 
     def _validate_accumulator_limits(
         self,

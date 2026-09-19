@@ -2,6 +2,7 @@
 
 from .coordinator import SingleProcessCoordinator
 from .messages import (
+    ClosedLoopAffineComposition,
     ClosedLoopRangeEvidence,
     ControllerLayout,
     ControllerRangeContract,
@@ -22,6 +23,7 @@ from .messages import (
     StateTruncationResourceShare,
     StepResourcePlan,
     TruncationMaskedMessage,
+    closed_loop_composition_sha256,
     controller_payload_fingerprint,
 )
 from .roles import P1, P2, Client
@@ -30,6 +32,7 @@ __all__ = [
     "P1",
     "P2",
     "Client",
+    "ClosedLoopAffineComposition",
     "ClosedLoopRangeEvidence",
     "ControlShareMessage",
     "ControllerLayout",
@@ -51,5 +54,6 @@ __all__ = [
     "StateTruncationResourceShare",
     "StepResourcePlan",
     "TruncationMaskedMessage",
+    "closed_loop_composition_sha256",
     "controller_payload_fingerprint",
 ]

@@ -7,6 +7,12 @@ sources:
   sweep: {path: hvac_2r2c_precision_sweep.yaml, sha256: 53bdd80aee5801f9dfb6f413e642e84ffc9b0596f18faee7d04fa0e3adf5fa84}
   prime: {path: hvac_2r2c_sweep_prime.yaml, sha256: b317a7db4f14fbf77258102d6b09766dc3b5f495252c1e29ed3ae315cb98340c}
 
+# Issue #37 的完整机器报告由冻结 plant/PID 与这些显式参数确定；摘要阻止只消费 stable 布尔值。
+upstream_stability:
+  references_celsius: ["15", "20", "25"]
+  boundary_tolerance: "1/1000000000"
+  report_sha256: c6861008bf0356fb82b27ab5a5306d89f6a0095ed718706ea69a1830e9672b8d
+
 fixed_assumptions:
   reference_celsius: "25"
   ambient_celsius: "30"

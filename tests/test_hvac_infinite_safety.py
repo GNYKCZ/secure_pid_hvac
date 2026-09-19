@@ -132,6 +132,26 @@ def test_configuration_rejects_missing_infinite_reference_tail(tmp_path: Path) -
         load_hvac_infinite_safety_bundle(path)
 
 
+def test_configuration_rejects_mismatched_upstream_stability_report(tmp_path: Path) -> None:
+    """#37 完整报告摘要不匹配时，不得继续生成 #38 证书。"""
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir()
+    source = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
+    source["upstream_stability"]["report_sha256"] = "0" * 64
+    for name in (
+        "hvac_2r2c_plant.yaml",
+        "hvac_2r2c_pid_baseline.yaml",
+        "hvac_2r2c_precision_sweep.yaml",
+        "hvac_2r2c_sweep_prime.yaml",
+    ):
+        (config_dir / name).write_bytes((PROJECT_ROOT / "configs" / name).read_bytes())
+    path = config_dir / CONFIG.name
+    path.write_text(yaml.safe_dump(source, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="stability report SHA-256"):
+        load_hvac_infinite_safety_bundle(path)
+
+
 def test_input_encoding_bound_is_exact_half_lsb(bundle) -> None:
     """闭环 problem 的第一扰动界逐 ell 精确等于输入编码半 LSB。"""
     for profile in bundle.profiles:

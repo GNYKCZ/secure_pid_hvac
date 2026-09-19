@@ -70,9 +70,11 @@ Client 用 Python 精确整数从每通道 `s_0=|Encode(x0)|` 递推 `k=0…h-1`
 
 `horizon_steps=None` 且提供 `closed_loop_evidence` 时启用第三种
 `closed_loop_invariant` 模式。Client 会在任何 share、triple 或 mask 创建前，精确复验证书
-SHA-256、实际编码 controller 指纹、鲁棒正不变椭球、controller state/input payload 投影以及
-全部 accumulator 数值门禁。证书为 `rejected`、`indeterminate`，或其来源/指纹/投影不匹配时
-一律 fail closed。该模式不改变 Protocol 1/2 消息算法；整数 A/B 的 state Trunc shift 仍为零。
+SHA-256、实际编码 controller 指纹，并把 A/B/C/D 代入内容寻址的通用仿射 composition，精确
+重建 problem 的 transition、affine、disturbance 与 controller input 投影。随后才复验鲁棒正
+不变椭球、controller state/input payload 投影以及全部 accumulator 数值门禁。证书为
+`rejected`、`indeterminate`，或其来源、指纹、composition、投影不匹配时一律 fail closed。
+该模式不改变 Protocol 1/2 消息算法；整数 A/B 的 state Trunc shift 仍为零。
 完整条件和不覆盖项见 [无限时域安全契约](infinite_horizon_safety.md)。
 
 每个 `ProductResourceShare` 或 `StateTruncationResourceShare` 只能被其所属角色使用一次。两个

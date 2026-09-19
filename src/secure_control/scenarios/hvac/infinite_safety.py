@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from fractions import Fraction
 from hashlib import sha256
 from pathlib import Path
@@ -32,16 +32,19 @@ from secure_control.crypto import (
     verify_prime_modulus,
 )
 from secure_control.protocol import (
+    ClosedLoopAffineComposition,
     ClosedLoopRangeEvidence,
     ControllerLayout,
     ControllerRangeContract,
     ControllerScaleLedger,
+    closed_loop_composition_sha256,
     controller_payload_fingerprint,
 )
 
 from .contract import Hvac2R2CModelContract, load_hvac_scenario_contract
 from .integration import _parse_modulus_evidence
 from .plant import build_hvac_2r2c_state_space
+from .stability import HvacClosedLoopStabilityReport, analyze_hvac_closed_loop_stability
 from .tuning import load_hvac_pid_tuning_contract
 
 _MAX_CONFIG_BYTES = 1 << 20
@@ -74,6 +77,8 @@ class HvacInfiniteSafetyBundle:
     scenario_id: str
     profiles: tuple[HvacInfiniteSafetyProfile, ...]
     source_hashes: tuple[tuple[str, str], ...]
+    stability_report: HvacClosedLoopStabilityReport
+    stability_report_sha256: str
     assumptions: tuple[str, ...]
     claim_boundary: str
 
@@ -99,6 +104,7 @@ def load_hvac_infinite_safety_bundle(
         "schema_version",
         "scenario_id",
         "sources",
+        "upstream_stability",
         "fixed_assumptions",
         "security",
         "witnesses",
@@ -109,6 +115,60 @@ def load_hvac_infinite_safety_bundle(
     scenario_id = _nonempty_string(loaded["scenario_id"], "scenario_id")
     claim_boundary = _nonempty_string(loaded["claim_boundary"], "claim_boundary")
     source_paths, source_hashes = _validated_sources(path.parent, loaded["sources"])
+
+    stability_source = _mapping(loaded["upstream_stability"], "upstream_stability")
+    if set(stability_source) != {
+        "references_celsius",
+        "boundary_tolerance",
+        "report_sha256",
+    }:
+        raise ValueError("upstream_stability 字段无效")
+    stability_references = tuple(
+        _fraction(value, "upstream_stability.references_celsius")
+        for value in stability_source["references_celsius"]
+    )
+    if stability_references != (Fraction(15), Fraction(20), Fraction(25)):
+        raise ValueError("#37 stability references 必须冻结为 15/20/25°C")
+    boundary_tolerance = _fraction(
+        stability_source["boundary_tolerance"],
+        "upstream_stability.boundary_tolerance",
+    )
+    if boundary_tolerance != Fraction(1, 1_000_000_000):
+        raise ValueError("#37 boundary tolerance 必须冻结为 1e-9")
+    raw_stability_report = analyze_hvac_closed_loop_stability(
+        source_paths["plant"],
+        source_paths["pid"],
+        references_celsius=tuple(float(value) for value in stability_references),
+        boundary_tolerance=float(boundary_tolerance),
+    )
+    if (
+        raw_stability_report.schur.status != "stable"
+        or any(item.applicability != "applicable" for item in raw_stability_report.equilibria)
+        or raw_stability_report.plant_source_sha256
+        != sha256(source_paths["plant"].read_bytes()).hexdigest()
+        or raw_stability_report.pid_source_sha256
+        != sha256(source_paths["pid"].read_bytes()).hexdigest()
+    ):
+        raise ValueError("#37 完整 stability report 与 #38 来源或适用性不一致")
+    # #37 报告原始哈希忠实记录本地文件字节；#38 的长期内容身份改用已验证的规范文本
+    # 哈希，避免 Windows CRLF 与 POSIX LF 让同一 Git 内容得到不同证书。
+    stability_report = replace(
+        raw_stability_report,
+        plant_source_sha256=source_hashes["plant"],
+        pid_source_sha256=source_hashes["pid"],
+    )
+    stability_payload = json.dumps(
+        asdict(stability_report),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    stability_report_sha256 = sha256(stability_payload).hexdigest()
+    if stability_report_sha256 != _nonempty_string(
+        stability_source["report_sha256"], "upstream_stability.report_sha256"
+    ):
+        raise ValueError("#37 完整 stability report SHA-256 不匹配")
 
     contract = load_hvac_scenario_contract(source_paths["plant"])
     if not isinstance(contract.model, Hvac2R2CModelContract):
@@ -218,6 +278,8 @@ def load_hvac_infinite_safety_bundle(
         scenario_id,
         profiles,
         tuple(sorted(source_hashes.items())),
+        stability_report,
+        stability_report_sha256,
         (
             "reference 固定为 25°C 且从证书初态起无限持续",
             "ambient 固定为 30°C，2R2C plant 与 PID 来源哈希保持不变",
@@ -468,6 +530,27 @@ def _build_profile(
         value > centered_limit for value in (*state_accumulator_bounds, *output_accumulator_bounds)
     ):
         raise ValueError("#38 编码 accumulator 超出 centered Z_q")
+    # 公开组合记录只描述通用仿射关系：v=r-Cp*xp+w0，xp+=Ap*xp+Ep*Ta+Bp*u+Bp*w1。
+    # Client 将把已安装的 A/B/C/D 代入该记录，精确重建 problem，避免证书与控制器脱节。
+    composition = ClosedLoopAffineComposition(
+        controller_state_indices=(0, 1),
+        external_state_indices=(2, 3),
+        input_state_matrix=_rational_matrix(((0, 0, -cp[0][0], -cp[0][1]),)),
+        input_affine=(_rational(reference),),
+        input_disturbance_matrix=_rational_matrix(((1, 0),)),
+        external_transition=_rational_matrix(
+            (
+                (0, 0, ap[0][0], ap[0][1]),
+                (0, 0, ap[1][0], ap[1][1]),
+            )
+        ),
+        external_affine=(
+            _rational(ep[0][0] * ambient),
+            _rational(ep[1][0] * ambient),
+        ),
+        external_disturbance_matrix=_rational_matrix(((0, bp[0][0]), (0, bp[1][0]))),
+        output_injection=_rational_matrix(((bp[0][0],), (bp[1][0],))),
+    )
     evidence = ClosedLoopRangeEvidence(
         problem,
         witness,
@@ -476,6 +559,8 @@ def _build_profile(
         (0, 1),
         state_payload_bounds,
         input_payload_bounds,
+        composition,
+        closed_loop_composition_sha256(composition),
     )
     range_contract = ControllerRangeContract(
         state_payload_bounds,

@@ -7,7 +7,7 @@ import json
 import os
 import shutil
 import uuid
-from dataclasses import fields, is_dataclass
+from dataclasses import asdict, fields, is_dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -29,9 +29,22 @@ def publish_infinite_safety_report(
 ) -> Path:
     """复验来源后原子发布 certificate/report/manifest，绝不重新运行扫描。"""
     bundle = load_hvac_infinite_safety_bundle(assumptions_path)
+    sweep_root = Path(sweep_dir).resolve()
+    sweep_manifest_hashes = _sweep_manifest_hashes(sweep_root)
     verified = load_verified_sweep_data(sweep_dir)
+    verified_data = load_verified_sweep_data(sweep_dir, manifest_name="data_manifest.json")
     _validate_sweep(bundle, verified)
-    certificate = _certificate_payload(bundle, verified.root)
+    _validate_sweep(bundle, verified_data)
+    if (
+        verified.root != sweep_root
+        or verified_data.root != sweep_root
+        or verified.definition != verified_data.definition
+        or verified.records != verified_data.records
+    ):
+        raise ValueError("verified sweep 的 final/data manifest 复验结果不一致")
+    if _sweep_manifest_hashes(sweep_root) != sweep_manifest_hashes:
+        raise ValueError("verified sweep 的 final/data manifest 在复验期间发生变化")
+    certificate = _certificate_payload(bundle, verified.root, sweep_manifest_hashes)
     digest_source = json.dumps(
         certificate, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
@@ -63,6 +76,8 @@ def publish_infinite_safety_report(
                 "files_sha256": hashes,
             },
         )
+        if _sweep_manifest_hashes(verified.root) != sweep_manifest_hashes:
+            raise ValueError("verified sweep 的 final/data manifest 在发布期间发生变化")
         os.replace(temporary, target)
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)
@@ -115,7 +130,11 @@ def _validate_sweep(bundle: HvacInfiniteSafetyBundle, verified) -> None:
         raise ValueError("verified sweep 未完整覆盖三个冻结 seed")
 
 
-def _certificate_payload(bundle: HvacInfiniteSafetyBundle, sweep_root: Path) -> dict[str, Any]:
+def _certificate_payload(
+    bundle: HvacInfiniteSafetyBundle,
+    sweep_root: Path,
+    sweep_manifest_hashes: dict[str, str],
+) -> dict[str, Any]:
     """构造不含机器绝对路径的稳定证书载荷。"""
     profiles = []
     for profile in bundle.profiles:
@@ -132,6 +151,8 @@ def _certificate_payload(bundle: HvacInfiniteSafetyBundle, sweep_root: Path) -> 
                 "reason_codes": list(profile.invariant_report.reason_codes),
                 "certificate_sha256": profile.invariant_report.certificate_sha256,
                 "controller_fingerprint": evidence.controller_fingerprint,
+                "composition_sha256": evidence.composition_sha256,
+                "composition": _exact_payload(evidence.composition),
                 "model_sha256": profile.model_sha256,
                 "float_hex_snapshot": list(profile.float_hex_snapshot),
                 "state_payload_bounds": list(profile.range_contract.state_payload_bounds),
@@ -155,17 +176,37 @@ def _certificate_payload(bundle: HvacInfiniteSafetyBundle, sweep_root: Path) -> 
             }
         )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "scenario_id": bundle.scenario_id,
         "quantifier": "for_all_integer_k_greater_than_or_equal_to_zero",
         "proof_mode": "closed_loop_invariant",
         "source_hashes": dict(bundle.source_hashes),
-        "verified_sweep_id": sweep_root.name,
+        "upstream_stability": {
+            "report_sha256": bundle.stability_report_sha256,
+            "report": asdict(bundle.stability_report),
+        },
+        "verified_sweep": {
+            "sweep_id": sweep_root.name,
+            "final_manifest_sha256": sweep_manifest_hashes["manifest.json"],
+            "data_manifest_sha256": sweep_manifest_hashes["data_manifest.json"],
+        },
         "assumptions": list(bundle.assumptions),
         "claim_boundary": bundle.claim_boundary,
         "default_180_step_baseline_covered": False,
         "profiles": profiles,
     }
+
+
+def _sweep_manifest_hashes(sweep_root: Path) -> dict[str, str]:
+    """读取两个已验证清单的稳定摘要，供发布前后检测上游替换。"""
+    root = sweep_root.resolve()
+    result: dict[str, str] = {}
+    for name in ("manifest.json", "data_manifest.json"):
+        path = root / name
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"verified sweep 缺少普通文件 {name}")
+        result[name] = sha256(path.read_bytes()).hexdigest()
+    return result
 
 
 def _markdown_report(bundle: HvacInfiniteSafetyBundle, certificate: dict[str, Any]) -> str:
@@ -222,7 +263,7 @@ def _exact_payload(value: Any) -> Any:
         return {field.name: _exact_payload(getattr(value, field.name)) for field in fields(value)}
     if isinstance(value, tuple):
         return [_exact_payload(item) for item in value]
-    if isinstance(value, (str, bool)):
+    if isinstance(value, (str, bool, int)):
         return value
     raise TypeError(f"证书含不可序列化类型：{type(value).__name__}")
 
