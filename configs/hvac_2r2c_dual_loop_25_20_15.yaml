@@ -1,0 +1,10 @@
+# Issue #53 的正式 25→20→15 明文/安全双闭环入口。
+scenario:
+  name: hvac
+baseline_config: hvac_2r2c_pid_baseline_25_20_15.yaml
+security:
+  modulus: 2305843009213693951
+  integer_bits: 48
+  fractional_bits: 20
+  security_parameter: 8
+  horizon_steps: 180

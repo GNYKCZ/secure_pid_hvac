@@ -30,6 +30,9 @@ from secure_control.simulation import SimulationPlan, run
 CONFIG_PATH = Path(__file__).parents[1] / "configs" / "hvac_dual_loop.yaml"
 BASELINE_PATH = Path(__file__).parents[1] / "configs" / "hvac_pid_baseline.yaml"
 CONFIG_2R2C_PATH = Path(__file__).parents[1] / "configs" / "hvac_2r2c_dual_loop.yaml"
+CONFIG_2R2C_MIGRATED_PATH = (
+    Path(__file__).parents[1] / "configs" / "hvac_2r2c_dual_loop_25_20_15.yaml"
+)
 BASELINE_2R2C_PATH = Path(__file__).parents[1] / "configs" / "hvac_2r2c_pid_baseline.yaml"
 PLANT_2R2C_PATH = Path(__file__).parents[1] / "configs" / "hvac_2r2c_plant.yaml"
 
@@ -386,6 +389,32 @@ def test_2r2c_certificate_rejects_every_undersized_bound_before_plan_build() -> 
 def test_2r2c_secure_runtime_rejects_step_beyond_certified_horizon() -> None:
     """第 181 次 controller step 必须 fail closed，不能把有限证书扩称无限时域。"""
     plan = HvacScenario(CONFIG_2R2C_PATH, test_seed=44).build_plan()
+    for _ in range(180):
+        plan.secure.runtime.step(np.array([0.0]))
+    with pytest.raises(ValueError, match="horizon"):
+        plan.secure.runtime.step(np.array([0.0]))
+
+
+def test_migrated_2r2c_certificate_is_rederived_and_rejects_step_181() -> None:
+    """新 reference 必须得到独立 PID/编码界，且有限证书不能覆盖第 181 次更新。"""
+    scenario = HvacScenario(CONFIG_2R2C_MIGRATED_PATH, test_seed=45)
+    certificate = scenario.safety_certificate
+    plan = scenario.build_plan()
+    assert plan.ideal.plant is not plan.secure.plant
+    assert plan.ideal.runtime is not plan.secure.runtime
+    assert certificate.controller_input_bounds_celsius == pytest.approx((-15.0, 27.356822440223024))
+    np.testing.assert_allclose(
+        certificate.controller_state_bounds,
+        ((-108000.0, 223328.7523215874), (-15.0, 27.356822440223024)),
+    )
+    assert certificate.raw_control_bounds_kw == pytest.approx(
+        (-173.1173945137133, 88.01497266600526)
+    )
+    assert certificate.applied_control_bounds_kw == (0.0, 12.0)
+    assert certificate.input_payload_bounds == (28685709,)
+    assert certificate.state_payload_bounds == (309805657200, 28685709)
+    assert certificate.maximum_state_accumulator_bounds == (309805657200, 28685709)
+    assert certificate.maximum_output_accumulator_bounds == (252202630785534,)
     for _ in range(180):
         plan.secure.runtime.step(np.array([0.0]))
     with pytest.raises(ValueError, match="horizon"):

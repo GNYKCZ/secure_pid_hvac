@@ -1,5 +1,9 @@
 # 2R2C HVAC 定点精度扫描
 
+> 历史证据说明：本 sweep 绑定旧 15→20→25 配置链。Issue #53 不重跑 sweep，本文结果不能
+> 自动视为 25→20→15 正式基线的精度证据；迁移边界见
+> [hvac_reference_migration.md](hvac_reference_migration.md)。
+
 ## 冻结定义
 
 Issue #15 在同一份 2R2C plant、位置式 PID、15 → 20 → 25 °C reference、180 步 horizon 和

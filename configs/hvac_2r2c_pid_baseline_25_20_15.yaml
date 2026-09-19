@@ -1,0 +1,151 @@
+# Issue #53 的 25→20→15 正式 PID 基线；先验证 Issue #42 PID，仅失败时才运行冻结网格。
+scenario:
+  name: hvac
+plant_config: hvac_2r2c_scenario_25_20_15.yaml
+plant_sha256: 23a4c63930b5ac8c5ffed0c1696700da443afc1c505322f84a9d6cc85c2abe25
+
+controller:
+  kind: positional_pid_error_derivative
+  proportional_gain_kw_per_celsius: -0.85
+  integral_gain_kw_per_celsius_second: -0.0007
+  derivative_gain_kw_second_per_celsius: -0.5
+  initial_integral_error_celsius_seconds: 0.0
+  initial_previous_error_celsius: 0.0
+  derivative_filter: none
+  anti_windup: disabled
+  output_saturation: scenario_before_plant
+
+tracking:
+  tail_window_seconds: 600
+  max_tail_mae_celsius: 0.5
+
+tuning:
+  algorithm: deterministic_exhaustive_grid_v1
+  axes:
+    proportional: {minimum: -1.50, maximum: -0.20, points: 27}
+    integral: {minimum: -0.00150, maximum: -0.00010, points: 29}
+    derivative: {minimum: -6.0, maximum: 0.0, points: 13}
+  objective_order:
+    - maximum_segment_tail_mae_celsius
+    - mean_segment_mae_celsius
+    - global_saturation_fraction
+  tie_break_order:
+    - absolute_derivative_gain
+    - absolute_integral_gain
+    - absolute_proportional_gain
+    - proportional_gain
+    - integral_gain
+    - derivative_gain
+
+quality:
+  tail_window_seconds: 600
+  settling_band_celsius: 0.5
+  saturation_tolerance_kw: 1.0e-9
+  max_segment_saturation_fraction: 0.15
+  max_segment_applied_control_kw: 12.0
+  segments:
+    - start_seconds: 0
+      end_seconds: 3600
+      target_temperature_celsius: 25.0
+      max_mae_celsius: 1.2
+      max_tail_mae_celsius: 0.5
+      max_abs_error_celsius: 5.5
+      max_settling_time_seconds: 1800.0
+      max_signed_deviation_celsius: 5.5
+      min_signed_deviation_celsius: -0.5
+    - start_seconds: 3600
+      end_seconds: 7200
+      target_temperature_celsius: 20.0
+      max_mae_celsius: 1.2
+      max_tail_mae_celsius: 0.5
+      max_abs_error_celsius: 5.5
+      max_settling_time_seconds: 1800.0
+      max_signed_deviation_celsius: 5.5
+      min_signed_deviation_celsius: -0.5
+    - start_seconds: 7200
+      end_seconds: 10800
+      target_temperature_celsius: 15.0
+      max_mae_celsius: 1.2
+      max_tail_mae_celsius: 0.5
+      max_abs_error_celsius: 5.5
+      max_settling_time_seconds: 1800.0
+      max_signed_deviation_celsius: 5.5
+      min_signed_deviation_celsius: -0.5
+  comparison:
+    max_control_error_kw: 0.01
+    mean_control_error_kw: 0.005
+    rms_control_error_kw: 0.005
+    max_temperature_error_celsius: 0.01
+    mean_temperature_error_celsius: 0.005
+    rms_temperature_error_celsius: 0.005
+
+migration:
+  schema_version: 1
+  method: validate_current_then_conditionally_tune_v1
+  start_commit: a1561d0800127e35f263cf6afd0213d4d7563a3a
+  supersedes_baseline: 2489e5476ad316ea2d9599783e29f2d849ffcf485ca860e0db76c80312c532f9
+  source_pid_config: hvac_2r2c_pid_baseline.yaml
+  source_pid_sha256: f5df82b1dc21123ed6d138006bedbdd1e1de595d8c56d1f6791f2ae9c008a44e
+  quality_contract_sha256: a7cbc38beb93556d0e073a796d455cc6adce57e17ec94d9dffd1eeb9b7d31a83
+  selection:
+    pid_reused: true
+    old_gains:
+      proportional_gain_kw_per_celsius: -0.85
+      integral_gain_kw_per_celsius_second: -0.0007
+      derivative_gain_kw_second_per_celsius: -0.5
+    final_gains:
+      proportional_gain_kw_per_celsius: -0.85
+      integral_gain_kw_per_celsius_second: -0.0007
+      derivative_gain_kw_second_per_celsius: -0.5
+    current_gain_validation:
+      segments:
+        - start_seconds: 0
+          end_seconds: 3600
+          target_temperature_celsius: 25.0
+          mae_celsius: 0.6994261676289336
+          tail_mae_celsius: 0.009250770188846147
+          max_abs_error_celsius: 5.0
+          settling_time_seconds: 1140.0
+          max_signed_deviation_celsius: 5.0
+          min_signed_deviation_celsius: 0.002791286416691463
+          saturation_fraction: 0.0
+          max_abs_applied_control_kw: 4.291666666666666
+          passed: true
+          violations: []
+        - start_seconds: 3600
+          end_seconds: 7200
+          target_temperature_celsius: 20.0
+          mae_celsius: 0.6901072235241617
+          tail_mae_celsius: 0.007583136703368609
+          max_abs_error_celsius: 5.001676081579173
+          settling_time_seconds: 1140.0
+          max_signed_deviation_celsius: 5.001676081579173
+          min_signed_deviation_celsius: -0.014162812419968418
+          saturation_fraction: 0.0
+          max_abs_applied_control_kw: 6.05563598506023
+          passed: true
+          violations: []
+        - start_seconds: 7200
+          end_seconds: 10800
+          target_temperature_celsius: 15.0
+          mae_celsius: 0.6800365489036262
+          tail_mae_celsius: 0.024846262500507876
+          max_abs_error_celsius: 4.9846808001044955
+          settling_time_seconds: 1080.0
+          max_signed_deviation_celsius: 4.9846808001044955
+          min_signed_deviation_celsius: -0.031505382681730865
+          saturation_fraction: 0.0
+          max_abs_applied_control_kw: 7.773937278769589
+          passed: true
+          violations: []
+      global_max_abs_error_celsius: 5.001676081579173
+      global_saturation_fraction: 0.0
+      global_max_abs_applied_control_kw: 7.773937278769589
+      passed: true
+    current_gain_rejection_reasons: []
+    tuning_executed: false
+    search_space_candidate_count: 10179
+    evaluated_candidate_count: 0
+    feasible_candidate_count: null
+    selected_objective: null
+    rejection_counts: {}

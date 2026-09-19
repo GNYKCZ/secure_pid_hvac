@@ -46,6 +46,15 @@ from .baseline import (
     evaluate_hvac_comparison_metrics,
 )
 from .contract import Hvac2R2CModelContract, HvacModelContract, load_hvac_scenario_contract
+from .migration import (
+    HvacBaselineIdentity,
+    HvacPidBaselineResolution,
+    baseline_identity_payload,
+    build_hvac_baseline_identity,
+    canonical_hvac_source_sha256,
+    load_hvac_pid_baseline_resolution,
+    selection_record_payload,
+)
 from .pid import load_hvac_pid_design
 from .plant import build_hvac_2r2c_state_space, build_hvac_plant
 from .tuning import (
@@ -224,6 +233,8 @@ class HvacScenario:
         self._quality_contract: HvacControlQualityContract | None = None
         self._tuning_contract: HvacPidTuningContract | None = None
         self._tuning_result: HvacPidTuningResult | None = None
+        self._migration_resolution: HvacPidBaselineResolution | None = None
+        self._baseline_identity: HvacBaselineIdentity | None = None
         plant_name = baseline_loaded.get("plant_config")
         if plant_name is None:
             self._contract = load_hvac_scenario_contract(baseline_path)
@@ -242,14 +253,22 @@ class HvacScenario:
                 raise ValueError(f"无法读取 HVAC plant 配置：{plant_path}") from error
             self._plant_filename = plant_path.name
             self._contract = load_hvac_scenario_contract(plant_path)
-            (
-                self._design,
-                self._tuning_contract,
-                self._quality_contract,
-            ) = load_hvac_pid_tuning_contract(baseline_path, self._contract)
-            self._tuning_result = tune_hvac_pid(
-                self._contract, self._tuning_contract, self._quality_contract
-            )
+            if "migration" in baseline_loaded:
+                resolution = load_hvac_pid_baseline_resolution(baseline_path, self._contract)
+                self._migration_resolution = resolution
+                self._design = resolution.design
+                self._tuning_contract = resolution.tuning_contract
+                self._quality_contract = resolution.quality_contract
+                self._tuning_result = resolution.tuning_result
+            else:
+                (
+                    self._design,
+                    self._tuning_contract,
+                    self._quality_contract,
+                ) = load_hvac_pid_tuning_contract(baseline_path, self._contract)
+                self._tuning_result = tune_hvac_pid(
+                    self._contract, self._tuning_contract, self._quality_contract
+                )
             if plant_path.read_bytes() != self._plant_source:
                 raise ValueError("HVAC plant 配置在解析期间发生变化。")
         if path.read_bytes() != wrapper_source or baseline_path.read_bytes() != baseline_source:
@@ -282,11 +301,32 @@ class HvacScenario:
             raise ValueError("horizon_steps 必须等于 HVAC sample_count。")
         self._required_safety_certificate = self._derive_safety_certificate()
         self.safety_certificate = self._required_safety_certificate
+        if self._migration_resolution is not None:
+            if self._plant_source is None:
+                raise RuntimeError("migration baseline 缺少 scenario source")
+            self._baseline_identity = build_hvac_baseline_identity(
+                source_hashes={
+                    "wrapper": canonical_hvac_source_sha256(wrapper_source),
+                    "baseline": canonical_hvac_source_sha256(baseline_source),
+                    "scenario": canonical_hvac_source_sha256(self._plant_source),
+                },
+                quality_contract=self._migration_resolution.quality_contract,
+                selection=self._migration_resolution.selection,
+                controller_spec=self._design.to_controller_spec(),
+                safety_certificate=self.safety_certificate,
+                supersedes_baseline=self._migration_resolution.supersedes_baseline,
+                start_commit=self._migration_resolution.start_commit,
+            )
 
     @property
     def metadata(self) -> ScenarioMetadata:
         """返回已解析的通道元数据，不创建安全 session。"""
         return self._contract.metadata
+
+    @property
+    def baseline_identity(self) -> HvacBaselineIdentity | None:
+        """返回迁移基线身份；历史配置为兼容旧接口返回 ``None``。"""
+        return self._baseline_identity
 
     def effective_config_snapshot(self) -> dict[str, Any]:
         """快照实际参与装配的三源配置、调参、品质和范围证书。"""
@@ -387,6 +427,28 @@ class HvacScenario:
                 "selected_objective": self._tuning_result.selected_objective,
             }
             snapshot["hvac"]["quality"] = asdict(self._quality_contract)
+        if self._migration_resolution is not None:
+            resolution = self._migration_resolution
+            selection = resolution.selection
+            snapshot["hvac"]["tuning"] = {
+                "algorithm": resolution.tuning_contract.algorithm,
+                "proportional": asdict(resolution.tuning_contract.proportional),
+                "integral": asdict(resolution.tuning_contract.integral),
+                "derivative": asdict(resolution.tuning_contract.derivative),
+                "objective_order": resolution.tuning_contract.objective_order,
+                "tie_break_order": resolution.tuning_contract.tie_break_order,
+                "search_space_candidate_count": selection.search_space_candidate_count,
+                "executed": selection.tuning_executed,
+                "evaluated_candidate_count": selection.evaluated_candidate_count,
+                "feasible_candidate_count": selection.feasible_candidate_count,
+                "rejection_counts": dict(selection.rejection_counts),
+                "selected_objective": selection.selected_objective,
+            }
+            snapshot["hvac"]["quality"] = asdict(resolution.quality_contract)
+            snapshot["hvac"]["pid_selection"] = selection_record_payload(selection)
+            if self._baseline_identity is None:
+                raise RuntimeError("migration baseline identity 尚未构造")
+            snapshot["baseline_identity"] = baseline_identity_payload(self._baseline_identity)
         return snapshot
 
     def build_plan(self) -> SimulationPlan:

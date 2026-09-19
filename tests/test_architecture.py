@@ -141,6 +141,24 @@ def test_hvac_tuning_is_plaintext_only_and_has_no_secure_protocol_dependency() -
     )
 
 
+def test_hvac_migration_gate_remains_plaintext_only() -> None:
+    """基线选择与身份模块不得导入密码、协议、安全运行时或实验层。"""
+    migration = PACKAGE_ROOT / "scenarios" / "hvac" / "migration.py"
+    modules = imported_modules(migration)
+    assert not any(
+        module.startswith(
+            (
+                "secure_control.crypto",
+                "secure_control.protocol",
+                "secure_control.execution",
+                "secure_control.simulation",
+                "secure_control.experiments",
+            )
+        )
+        for module in modules
+    )
+
+
 def test_stability_dependency_direction_remains_scenario_independent() -> None:
     """通用稳定性检查器不得依赖场景/协议，simulation 也不得反向依赖 HVAC 分析。"""
     core_stability = PACKAGE_ROOT / "core" / "stability.py"
