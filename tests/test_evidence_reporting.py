@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import yaml
 
 from secure_control.experiments.evidence_reporting import (
     _integer_decode_data,
     _integer_decode_figure,
     _quantitative_rows,
     _resource_timing_figure,
+    _validate_inputs,
     load_evidence_report_profile,
 )
 from secure_control.experiments.reporting import ResolvedFont, load_report_profile
@@ -28,6 +31,7 @@ from secure_control.experiments.sweep_metrics import ErrorMetrics
 
 PROJECT_ROOT = Path(__file__).parents[1]
 PROFILE = PROJECT_ROOT / "configs" / "hvac_2r2c_evidence_report_zh.yaml"
+PROFILE_V2 = PROJECT_ROOT / "configs" / "hvac_2r2c_evidence_report_profile_zh.yaml"
 BASE_PROFILE = PROJECT_ROOT / "configs" / "hvac_2r2c_report_zh.yaml"
 
 
@@ -57,6 +61,71 @@ def test_evidence_profile_freezes_minute_segments_main_order_and_limitations() -
     assert profile.deployment_security is False
     assert profile.main_order[-2:] == ("quantitative_table", "resource_and_timing")
     assert any("Protocol 2 count 为 0" in item for item in profile.limitations_zh)
+
+
+def test_v2_evidence_profile_has_no_artifact_identity_and_rejects_legacy_pins(
+    tmp_path: Path,
+) -> None:
+    """v2 profile 只拥有展示语义，不能重新引入 sweep 或 manifest 的第二份事实。"""
+    profile = load_evidence_report_profile(PROFILE_V2)
+    assert profile.schema_version == 2
+    assert profile.source_sweep_id is None
+    assert profile.source_manifest_sha256 is None
+    assert profile.source_data_manifest_sha256 is None
+
+    payload = yaml.safe_load(PROFILE_V2.read_text(encoding="utf-8"))
+    payload["source_sweep_id"] = "copied-identity"
+    target = tmp_path / "profile.yaml"
+    target.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="字段"):
+        load_evidence_report_profile(target)
+
+
+def test_v2_profile_validates_direct_evidence_to_actual_sweep_lineage(tmp_path: Path) -> None:
+    """删除 profile pins 后，lineage 仍直接绑定实际 verified sweep 的两个 manifest。"""
+    sweep_root = tmp_path / "sweep-identity"
+    sweep_root.mkdir()
+    (sweep_root / "manifest.json").write_text("final\n", encoding="utf-8")
+    (sweep_root / "data_manifest.json").write_text("data\n", encoding="utf-8")
+    records = tuple(_record(48, seed) for seed in (42, 43, 44))
+    record = records[0]
+    sweep = VerifiedSweepData(sweep_root, {}, records, {})
+    hashes = {
+        "manifest.json": hashlib.sha256((sweep_root / "manifest.json").read_bytes()).hexdigest(),
+        "data_manifest.json": hashlib.sha256(
+            (sweep_root / "data_manifest.json").read_bytes()
+        ).hexdigest(),
+    }
+    evidence = SimpleNamespace(
+        metadata={
+            "source_sweep_id": sweep_root.name,
+            "source_hashes": hashes,
+            "source_point": {"ell": 48, "seed": 42, "q": record.point.q},
+            "modulus": record.point.q,
+            "selected_step": 60,
+            "diagnostic_rng_mode": "reproducibility_only",
+            "deployment_security": False,
+            "result_equivalence": {
+                "comparison": "dtype_shape_and_array_equal",
+                "fields": [
+                    "time",
+                    "reference",
+                    "output_ideal",
+                    "output_secure",
+                    "control_ideal",
+                    "control_secure",
+                    "control_error",
+                    "output_error",
+                ],
+                "all_equal": True,
+            },
+        }
+    )
+    profile = load_evidence_report_profile(PROFILE_V2)
+    _validate_inputs(sweep, evidence, profile)
+    evidence.metadata["source_hashes"] = {**hashes, "manifest.json": "0" * 64}
+    with pytest.raises(ValueError, match="actual verified sweep"):
+        _validate_inputs(sweep, evidence, profile)
 
 
 def test_resource_figure_requires_exact_counts_across_all_three_seeds(tmp_path: Path) -> None:

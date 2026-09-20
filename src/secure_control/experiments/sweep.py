@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -43,7 +44,7 @@ class SweepPointDefinition:
 
 @dataclass(frozen=True, slots=True)
 class PrecisionSweepDefinition:
-    """保存正式扫描的来源、哈希、参数网格与执行约束。"""
+    """保存历史 schema v1 的来源 pin、参数网格与执行约束。"""
 
     scenario_id: str
     source_config: Path
@@ -81,6 +82,81 @@ class PrecisionSweepDefinition:
             for ell in self.fractional_bits
             for seed in self.seeds
         )
+
+
+@dataclass(frozen=True, slots=True)
+class BaselineSourceRequest:
+    """保存调用者显式提供的 baseline 路径与预期内容身份。"""
+
+    config_path: Path
+    expected_baseline_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedBaselineSource:
+    """保存经过场景 resolver 验证的来源；绝对路径只在进程内使用。"""
+
+    config_path: Path
+    identity_scheme: str
+    baseline_id: str
+    source_hashes: Mapping[str, str]
+    effective_config_sha256: str
+    finite_horizon_certificate_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReusablePrecisionSweepDefinition:
+    """保存不含具体 baseline 身份的 schema v2 可复用实验定义。"""
+
+    definition_path: Path
+    scenario_id: str
+    source_requirements: Mapping[str, Any]
+    stability_policy: Mapping[str, Any]
+    prime_evidence_path: Path
+    prime_evidence_hash: str
+    fractional_bits: tuple[int, ...]
+    integer_headroom_bits: int
+    security_parameter: int
+    seeds: tuple[int, ...]
+    primary_seed: int
+    allowed_variable_fields: tuple[str, ...]
+    timeout_seconds: int
+    max_protocol1_triples_per_point: int
+    max_protocol2_truncations_per_point: int
+    max_certified_integer_bit_length: int
+    max_artifact_bytes: int
+    q: int
+    modulus_evidence: Mapping[str, Any]
+
+    @property
+    def points(self) -> tuple[SweepPointDefinition, ...]:
+        """按与 v1 相同的规则生成唯一十二点实验矩阵。"""
+        kappa = self.q.bit_length() - self.security_parameter - 2
+        return tuple(
+            SweepPointDefinition(
+                ell,
+                ell + self.integer_headroom_bits,
+                self.security_parameter,
+                self.q,
+                kappa,
+                seed,
+            )
+            for ell in self.fractional_bits
+            for seed in self.seeds
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedPrecisionSweepPlan:
+    """组合稳定定义与已验证来源，作为唯一 runner/worker 输入。"""
+
+    definition: ReusablePrecisionSweepDefinition
+    source: ResolvedBaselineSource
+    stability_report: Mapping[str, Any]
+    stability_report_sha256: str
+    prime_evidence_passed: bool
+    points: tuple[SweepPointDefinition, ...]
+    provenance: Mapping[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +230,18 @@ def canonical_file_sha256(path: str | Path) -> str:
     return sha256(source).hexdigest()
 
 
+def canonical_mapping_sha256(value: Mapping[str, Any]) -> str:
+    """按规范 JSON 序列化映射并计算稳定 SHA-256。"""
+    serialized = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return sha256(serialized).hexdigest()
+
+
 def _integer_sequence(value: object, name: str) -> tuple[int, ...]:
     """读取非空、无重复且不接受布尔值的正整数序列。"""
     if not isinstance(value, list) or not value:
@@ -166,8 +254,10 @@ def _integer_sequence(value: object, name: str) -> tuple[int, ...]:
     return result
 
 
-def load_precision_sweep_definition(path: str | Path) -> PrecisionSweepDefinition:
-    """严格读取扫描定义和独立素数证据，并冻结全部十二个点。"""
+def load_precision_sweep_definition(
+    path: str | Path,
+) -> PrecisionSweepDefinition | ReusablePrecisionSweepDefinition:
+    """严格读取历史 v1 或 source-independent v2 定义，并冻结点矩阵。"""
     definition_path = Path(path).resolve()
     try:
         loaded = yaml.safe_load(definition_path.read_text(encoding="utf-8"))
@@ -175,12 +265,12 @@ def load_precision_sweep_definition(path: str | Path) -> PrecisionSweepDefinitio
         raise ValueError("无法读取 precision sweep 定义") from error
     if not isinstance(loaded, Mapping):
         raise TypeError("precision sweep 根节点必须是映射")
-    required = {
+    schema_version = loaded.get("schema_version")
+    if schema_version not in {1, 2}:
+        raise ValueError("precision sweep schema_version 无效")
+    common_required = {
         "schema_version",
         "scenario_id",
-        "source_config",
-        "source_hashes",
-        "stability_report_hash",
         "prime_evidence_path",
         "prime_evidence_hash",
         "fractional_bits",
@@ -195,9 +285,14 @@ def load_precision_sweep_definition(path: str | Path) -> PrecisionSweepDefinitio
         "max_certified_integer_bit_length",
         "max_artifact_bytes",
     }
-    if set(loaded) != required or loaded["schema_version"] != 1:
+    v1_source_fields = {"source_config", "source_hashes", "stability_report_hash"}
+    v2_source_fields = {"source_requirements", "stability_policy"}
+    required = common_required | (v1_source_fields if schema_version == 1 else v2_source_fields)
+    if set(loaded) != required:
         raise ValueError("precision sweep 字段或 schema_version 无效")
-    source_config = (definition_path.parent / str(loaded["source_config"])).resolve()
+    forbidden = v2_source_fields if schema_version == 1 else v1_source_fields
+    if set(loaded).intersection(forbidden):
+        raise ValueError("precision sweep 混入了另一 schema 的来源字段")
     evidence_path = (definition_path.parent / str(loaded["prime_evidence_path"])).resolve()
     try:
         prime = yaml.safe_load(evidence_path.read_text(encoding="utf-8"))
@@ -238,9 +333,6 @@ def load_precision_sweep_definition(path: str | Path) -> PrecisionSweepDefinitio
         or any(item <= 0 for item in resource_limits[2:])
     ):
         raise ValueError("resource limits 必须满足正值约束")
-    hashes = loaded["source_hashes"]
-    if not isinstance(hashes, Mapping) or set(hashes) != {"wrapper", "baseline", "plant"}:
-        raise ValueError("source_hashes 必须冻结 wrapper/baseline/plant")
     allowed = loaded["allowed_variable_fields"]
     if not isinstance(allowed, list) or not allowed or any(not isinstance(x, str) for x in allowed):
         raise TypeError("allowed_variable_fields 必须是非空字符串数组")
@@ -253,46 +345,87 @@ def load_precision_sweep_definition(path: str | Path) -> PrecisionSweepDefinitio
     )
     if tuple(allowed) != expected_allowed:
         raise ValueError("allowed_variable_fields 不得扩大冻结扫描变量集合")
-    return PrecisionSweepDefinition(
-        scenario_id=str(loaded["scenario_id"]),
-        source_config=source_config,
-        source_hashes={str(key): str(value) for key, value in hashes.items()},
-        stability_report_hash=str(loaded["stability_report_hash"]),
-        prime_evidence_path=evidence_path,
-        prime_evidence_hash=str(loaded["prime_evidence_hash"]),
-        fractional_bits=fractional_bits,
-        integer_headroom_bits=headroom,
-        security_parameter=security_parameter,
-        seeds=seeds,
-        primary_seed=primary_seed,
-        allowed_variable_fields=expected_allowed,
-        timeout_seconds=timeout,
-        max_protocol1_triples_per_point=resource_limits[0],
-        max_protocol2_truncations_per_point=resource_limits[1],
-        max_certified_integer_bit_length=resource_limits[2],
-        max_artifact_bytes=resource_limits[3],
-        q=q,
-        modulus_evidence=dict(evidence),
+    common = {
+        "scenario_id": str(loaded["scenario_id"]),
+        "prime_evidence_path": evidence_path,
+        "prime_evidence_hash": str(loaded["prime_evidence_hash"]),
+        "fractional_bits": fractional_bits,
+        "integer_headroom_bits": headroom,
+        "security_parameter": security_parameter,
+        "seeds": seeds,
+        "primary_seed": primary_seed,
+        "allowed_variable_fields": expected_allowed,
+        "timeout_seconds": timeout,
+        "max_protocol1_triples_per_point": resource_limits[0],
+        "max_protocol2_truncations_per_point": resource_limits[1],
+        "max_certified_integer_bit_length": resource_limits[2],
+        "max_artifact_bytes": resource_limits[3],
+        "q": q,
+        "modulus_evidence": dict(evidence),
+    }
+    if schema_version == 1:
+        hashes = loaded["source_hashes"]
+        if not isinstance(hashes, Mapping) or set(hashes) != {"wrapper", "baseline", "plant"}:
+            raise ValueError("source_hashes 必须冻结 wrapper/baseline/plant")
+        return PrecisionSweepDefinition(
+            source_config=(definition_path.parent / str(loaded["source_config"])).resolve(),
+            source_hashes={str(key): str(value) for key, value in hashes.items()},
+            stability_report_hash=str(loaded["stability_report_hash"]),
+            **common,
+        )
+    requirements = loaded["source_requirements"]
+    stability_policy = loaded["stability_policy"]
+    if not isinstance(requirements, Mapping) or not isinstance(stability_policy, Mapping):
+        raise TypeError("v2 source_requirements/stability_policy 必须是映射")
+    forbidden_tokens = {
+        "source_config",
+        "source_hashes",
+        "stability_report_hash",
+        "baseline_config",
+        "baseline_id",
+        "sweep_id",
+        "trace_id",
+        "run_id",
+        "manifest_sha256",
+    }
+    if forbidden_tokens.intersection(requirements) or forbidden_tokens.intersection(
+        stability_policy
+    ):
+        raise ValueError("v2 definition 不得保存具体 source/artifact identity")
+    return ReusablePrecisionSweepDefinition(
+        definition_path=definition_path,
+        source_requirements=dict(requirements),
+        stability_policy=dict(stability_policy),
+        **common,
     )
 
 
 def materialize_point_config(
-    definition: PrecisionSweepDefinition,
+    definition: PrecisionSweepDefinition | ResolvedPrecisionSweepPlan,
     point: SweepPointDefinition,
     output_path: str | Path,
 ) -> Path:
     """由唯一 wrapper 物化一个点，仅改写设计许可的 security 字段。"""
-    if point not in definition.points:
+    points = definition.points
+    if point not in points:
         raise ValueError("point 不属于当前冻结扫描定义")
+    source_config = (
+        definition.source_config
+        if isinstance(definition, PrecisionSweepDefinition)
+        else definition.source.config_path
+    )
+    stable_definition = (
+        definition if isinstance(definition, PrecisionSweepDefinition) else definition.definition
+    )
     target = Path(output_path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    loaded = yaml.safe_load(definition.source_config.read_text(encoding="utf-8"))
+    loaded = yaml.safe_load(source_config.read_text(encoding="utf-8"))
     if not isinstance(loaded, dict) or not isinstance(loaded.get("security"), dict):
         raise TypeError("source wrapper 缺少 security 映射")
     baseline = loaded.get("baseline_config")
     if not isinstance(baseline, str):
         raise TypeError("source wrapper baseline_config 无效")
-    baseline_path = (definition.source_config.parent / baseline).resolve()
+    baseline_path = (source_config.parent / baseline).resolve()
     loaded["baseline_config"] = Path(
         os.path.relpath(baseline_path, start=target.parent.resolve())
     ).as_posix()
@@ -303,7 +436,7 @@ def materialize_point_config(
             "integer_bits": point.k,
             "fractional_bits": point.ell,
             "security_parameter": point.lambda_,
-            "modulus_evidence": dict(definition.modulus_evidence),
+            "modulus_evidence": dict(stable_definition.modulus_evidence),
         }
     )
     target.write_text(
@@ -312,3 +445,62 @@ def materialize_point_config(
         newline="\n",
     )
     return target
+
+
+def reusable_definition_from_snapshot(
+    payload: Mapping[str, Any],
+) -> ReusablePrecisionSweepDefinition:
+    """从 manifest 已验证的 v2 definition.json 恢复稳定定义，不读取外部文件。"""
+    expected = {
+        "schema_version",
+        "scenario_id",
+        "source_requirements",
+        "stability_policy",
+        "prime_evidence_path",
+        "prime_evidence_hash",
+        "fractional_bits",
+        "integer_headroom_bits",
+        "security_parameter",
+        "seeds",
+        "primary_seed",
+        "allowed_variable_fields",
+        "timeout_seconds",
+        "max_protocol1_triples_per_point",
+        "max_protocol2_truncations_per_point",
+        "max_certified_integer_bit_length",
+        "max_artifact_bytes",
+        "q",
+        "modulus_evidence",
+        "points",
+    }
+    if (
+        not isinstance(payload, Mapping)
+        or set(payload) != expected
+        or payload["schema_version"] != 2
+    ):
+        raise ValueError("verified v2 definition snapshot 字段无效")
+    definition = ReusablePrecisionSweepDefinition(
+        definition_path=Path(str(payload["prime_evidence_path"])),
+        scenario_id=str(payload["scenario_id"]),
+        source_requirements=dict(payload["source_requirements"]),
+        stability_policy=dict(payload["stability_policy"]),
+        prime_evidence_path=Path(str(payload["prime_evidence_path"])),
+        prime_evidence_hash=str(payload["prime_evidence_hash"]),
+        fractional_bits=tuple(payload["fractional_bits"]),
+        integer_headroom_bits=int(payload["integer_headroom_bits"]),
+        security_parameter=int(payload["security_parameter"]),
+        seeds=tuple(payload["seeds"]),
+        primary_seed=int(payload["primary_seed"]),
+        allowed_variable_fields=tuple(payload["allowed_variable_fields"]),
+        timeout_seconds=int(payload["timeout_seconds"]),
+        max_protocol1_triples_per_point=int(payload["max_protocol1_triples_per_point"]),
+        max_protocol2_truncations_per_point=int(payload["max_protocol2_truncations_per_point"]),
+        max_certified_integer_bit_length=int(payload["max_certified_integer_bit_length"]),
+        max_artifact_bytes=int(payload["max_artifact_bytes"]),
+        q=int(payload["q"]),
+        modulus_evidence=dict(payload["modulus_evidence"]),
+    )
+    declared_points = tuple(SweepPointDefinition(**item) for item in payload["points"])
+    if declared_points != definition.points:
+        raise ValueError("verified v2 definition 的 points 不可由稳定定义重算")
+    return definition

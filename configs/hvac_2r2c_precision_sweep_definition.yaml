@@ -1,0 +1,38 @@
+# Issue #55 的 source-independent precision sweep 定义；具体 baseline 由运行时显式提供。
+schema_version: 2
+scenario_id: hvac_2r2c_pid_v1
+source_requirements:
+  scenario_name: hvac
+  scenario_version: "1"
+  model_kind: second_order_2r2c_cooling
+  sample_count: 180
+  horizon_steps: 180
+  controller_dimensions: {state: 2, input: 1, output: 1}
+  channel_dimensions: {reference: 1, output: 1, control: 1}
+  allowed_security_override_fields:
+    - security.modulus
+    - security.integer_bits
+    - security.fractional_bits
+    - security.security_parameter
+    - security.modulus_evidence
+stability_policy:
+  schur_status: stable
+  equilibrium_applicability: applicable
+prime_evidence_path: hvac_2r2c_sweep_prime.yaml
+prime_evidence_hash: b317a7db4f14fbf77258102d6b09766dc3b5f495252c1e29ed3ae315cb98340c
+fractional_bits: [32, 40, 48, 56]
+integer_headroom_bits: 28
+security_parameter: 80
+seeds: [42, 43, 44]
+primary_seed: 42
+allowed_variable_fields:
+  - security.modulus
+  - security.integer_bits
+  - security.fractional_bits
+  - security.security_parameter
+  - security.modulus_evidence
+timeout_seconds: 300
+max_protocol1_triples_per_point: 1620
+max_protocol2_truncations_per_point: 0
+max_certified_integer_bit_length: 192
+max_artifact_bytes: 1048576

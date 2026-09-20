@@ -5,10 +5,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -20,19 +23,26 @@ import yaml
 
 from secure_control.experiments.artifacts import load_artifacts
 from secure_control.experiments.plotting import PlotDisplay, PlotSelection, render_saved_run
+from secure_control.experiments.provenance import collect_provenance
 from secure_control.scenarios.hvac.integration import HvacSafetyCertificate, HvacScenario
+from secure_control.scenarios.hvac.migration import canonical_hvac_mapping_sha256
 from secure_control.scenarios.hvac.stability import analyze_hvac_closed_loop_stability
 
 from .sweep import (
+    BaselineSourceRequest,
     PrecisionPreflightReport,
     PrecisionSweepDefinition,
     ProtocolCostReport,
     RangeMargin,
+    ResolvedBaselineSource,
+    ResolvedPrecisionSweepPlan,
+    ReusablePrecisionSweepDefinition,
     SweepArtifacts,
     SweepPointDefinition,
     SweepRunRecord,
     SweepRunStatus,
     canonical_file_sha256,
+    canonical_mapping_sha256,
     load_precision_sweep_definition,
     materialize_point_config,
 )
@@ -46,6 +56,8 @@ from .sweep_artifacts import (
     write_json,
     write_manifest,
     write_range_margins,
+    write_resolved_plan,
+    write_resolved_source,
     write_summary,
 )
 from .sweep_plotting import render_sweep_figures
@@ -99,13 +111,37 @@ def _run_child(command: list[str], *, timeout_seconds: int) -> _ChildResult:
     )
 
 
-def _source_paths(definition: PrecisionSweepDefinition) -> tuple[Path, Path, Path]:
-    """解析冻结 wrapper、PID baseline 和 plant 的同仓库来源路径。"""
-    wrapper = yaml.safe_load(definition.source_config.read_text(encoding="utf-8"))
-    baseline = (definition.source_config.parent / wrapper["baseline_config"]).resolve()
+def _safe_source_member(parent: Path, value: object, name: str) -> Path:
+    """只接受同目录普通文件名，拒绝路径逃逸、链接和 reparse source。"""
+    if not isinstance(value, str) or not value or Path(value).name != value:
+        raise ValueError(f"{name} 必须是同目录安全文件名")
+    member = parent / value
+    if not member.is_file() or member.is_symlink():
+        raise ValueError(f"{name} 必须是存在的普通非链接文件")
+    return member.resolve()
+
+
+def _source_paths_from_config(config_path: Path) -> tuple[Path, Path, Path]:
+    """解析 wrapper、PID baseline 和 scenario，并限制配置链不能逃逸目录。"""
+    wrapper_path = config_path.resolve()
+    if not wrapper_path.is_file() or wrapper_path.is_symlink():
+        raise ValueError("baseline_config 必须是存在的普通非链接文件")
+    wrapper = yaml.safe_load(wrapper_path.read_text(encoding="utf-8"))
+    if not isinstance(wrapper, Mapping):
+        raise TypeError("baseline wrapper 根节点必须是映射")
+    baseline = _safe_source_member(
+        wrapper_path.parent, wrapper.get("baseline_config"), "baseline_config"
+    )
     baseline_data = yaml.safe_load(baseline.read_text(encoding="utf-8"))
-    plant = (baseline.parent / baseline_data["plant_config"]).resolve()
-    return definition.source_config, baseline, plant
+    if not isinstance(baseline_data, Mapping):
+        raise TypeError("PID baseline 根节点必须是映射")
+    plant = _safe_source_member(baseline.parent, baseline_data.get("plant_config"), "plant_config")
+    return wrapper_path, baseline, plant
+
+
+def _source_paths(definition: PrecisionSweepDefinition) -> tuple[Path, Path, Path]:
+    """解析历史 v1 definition 内嵌的配置链。"""
+    return _source_paths_from_config(definition.source_config)
 
 
 def stability_report_sha256(plant_path: Path, pid_path: Path) -> tuple[str, dict[str, Any]]:
@@ -118,6 +154,287 @@ def stability_report_sha256(plant_path: Path, pid_path: Path) -> tuple[str, dict
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
     ).encode("utf-8")
     return sha256(serialized).hexdigest(), payload
+
+
+def resolve_hvac_baseline_source(
+    request: BaselineSourceRequest,
+    requirements: Mapping[str, object],
+) -> ResolvedBaselineSource:
+    """验证显式 HVAC baseline 身份与兼容 contract，不依赖具体文件名或 ID。"""
+    if not isinstance(request, BaselineSourceRequest):
+        raise TypeError("source request 必须是 BaselineSourceRequest")
+    if not re.fullmatch(r"[0-9a-f]{64}", request.expected_baseline_id):
+        raise ValueError("expected_baseline_id 必须是小写 SHA-256")
+    required_keys = {
+        "scenario_name",
+        "scenario_version",
+        "model_kind",
+        "sample_count",
+        "horizon_steps",
+        "controller_dimensions",
+        "channel_dimensions",
+        "allowed_security_override_fields",
+    }
+    if not isinstance(requirements, Mapping) or set(requirements) != required_keys:
+        raise ValueError("source_requirements 字段无效")
+    wrapper, baseline, scenario_path = _source_paths_from_config(request.config_path)
+    before = {path: path.read_bytes() for path in (wrapper, baseline, scenario_path)}
+    scenario = HvacScenario(wrapper)
+    snapshot = scenario.effective_config_snapshot()
+    source_hashes = {
+        "wrapper": canonical_file_sha256(wrapper),
+        "baseline": canonical_file_sha256(baseline),
+        "scenario": canonical_file_sha256(scenario_path),
+    }
+    identity = scenario.baseline_identity
+    if identity is None:
+        identity_scheme = "hvac_historical_config_chain_v1"
+        baseline_id = canonical_hvac_mapping_sha256(
+            {"scheme": identity_scheme, "source_hashes": source_hashes}
+        )
+    else:
+        identity_scheme = identity.scheme
+        baseline_id = identity.baseline_id
+        if dict(identity.source_hashes) != source_hashes:
+            raise ValueError("baseline identity 的 source hashes 与实际配置链不一致")
+    if baseline_id != request.expected_baseline_id:
+        raise ValueError("expected_baseline_id 与实际 resolved baseline identity 不一致")
+
+    actual_requirements = _source_requirements(scenario, snapshot)
+    if actual_requirements != dict(requirements):
+        raise ValueError("baseline source 与 reusable definition 的 compatibility contract 不一致")
+    certificate_hash = canonical_hvac_mapping_sha256(snapshot["finite_horizon_certificate"])
+    if identity is not None and identity.finite_horizon_certificate_sha256 != certificate_hash:
+        raise ValueError("baseline identity 的 finite-horizon certificate 摘要不一致")
+    if any(path.read_bytes() != source for path, source in before.items()):
+        raise ValueError("baseline 配置链在 source resolution 期间发生变化")
+    return ResolvedBaselineSource(
+        wrapper,
+        identity_scheme,
+        baseline_id,
+        source_hashes,
+        canonical_mapping_sha256(snapshot),
+        certificate_hash,
+    )
+
+
+def validate_resolved_baseline_source(source: ResolvedBaselineSource) -> None:
+    """复验运行期 source bytes 未偏离 resolver 冻结的配置链。"""
+    wrapper, baseline, scenario = _source_paths_from_config(source.config_path)
+    actual = {
+        "wrapper": canonical_file_sha256(wrapper),
+        "baseline": canonical_file_sha256(baseline),
+        "scenario": canonical_file_sha256(scenario),
+    }
+    if actual != dict(source.source_hashes):
+        raise ValueError("resolved baseline source 在运行期间发生变化")
+
+
+def _source_requirements(scenario: HvacScenario, snapshot: Mapping[str, Any]) -> dict[str, object]:
+    """只抽取下游真正依赖的能力，避免稳定层复制 baseline 内部参数。"""
+    metadata = scenario.metadata
+    return {
+        "scenario_name": metadata.name,
+        "scenario_version": scenario.scenario_version,
+        "model_kind": snapshot["hvac"]["model_semantics"]["kind"],
+        "sample_count": snapshot["hvac"]["timing"]["sample_count"],
+        "horizon_steps": snapshot["wrapper"]["security"]["horizon_steps"],
+        "controller_dimensions": dict(
+            zip(("state", "input", "output"), scenario.controller_dimensions, strict=True)
+        ),
+        "channel_dimensions": {
+            "reference": len(metadata.reference.names),
+            "output": len(metadata.output.names),
+            "control": len(metadata.control.names),
+        },
+        "allowed_security_override_fields": [
+            "security.modulus",
+            "security.integer_bits",
+            "security.fractional_bits",
+            "security.security_parameter",
+            "security.modulus_evidence",
+        ],
+    }
+
+
+def _legacy_requirements(definition: PrecisionSweepDefinition) -> dict[str, object]:
+    """把历史 v1 的隐含兼容条件显式归一化，不复制具体 source identity。"""
+    scenario = HvacScenario(definition.source_config)
+    requirements = _source_requirements(scenario, scenario.effective_config_snapshot())
+    requirements["allowed_security_override_fields"] = list(definition.allowed_variable_fields)
+    return requirements
+
+
+def _adapt_legacy_definition(
+    definition: PrecisionSweepDefinition,
+) -> ReusablePrecisionSweepDefinition:
+    """将 v1 embedded source definition 适配到同一稳定定义模型。"""
+    return ReusablePrecisionSweepDefinition(
+        definition_path=definition.source_config,
+        scenario_id=definition.scenario_id,
+        source_requirements=_legacy_requirements(definition),
+        stability_policy={
+            "schur_status": "stable",
+            "equilibrium_applicability": "applicable",
+        },
+        prime_evidence_path=definition.prime_evidence_path,
+        prime_evidence_hash=definition.prime_evidence_hash,
+        fractional_bits=definition.fractional_bits,
+        integer_headroom_bits=definition.integer_headroom_bits,
+        security_parameter=definition.security_parameter,
+        seeds=definition.seeds,
+        primary_seed=definition.primary_seed,
+        allowed_variable_fields=definition.allowed_variable_fields,
+        timeout_seconds=definition.timeout_seconds,
+        max_protocol1_triples_per_point=definition.max_protocol1_triples_per_point,
+        max_protocol2_truncations_per_point=definition.max_protocol2_truncations_per_point,
+        max_certified_integer_bit_length=definition.max_certified_integer_bit_length,
+        max_artifact_bytes=definition.max_artifact_bytes,
+        q=definition.q,
+        modulus_evidence=definition.modulus_evidence,
+    )
+
+
+def resolve_precision_sweep_plan(
+    definition: ReusablePrecisionSweepDefinition,
+    source_request: BaselineSourceRequest,
+) -> ResolvedPrecisionSweepPlan:
+    """在创建正式 staging/worker 前解析来源、稳定性与 prime trust anchor。"""
+    if not isinstance(definition, ReusablePrecisionSweepDefinition):
+        raise TypeError("definition 必须是 ReusablePrecisionSweepDefinition")
+    source = resolve_hvac_baseline_source(source_request, definition.source_requirements)
+    _, baseline, plant = _source_paths_from_config(source.config_path)
+    stability_hash, stability = stability_report_sha256(plant, baseline)
+    policy = definition.stability_policy
+    if set(policy) != {"schur_status", "equilibrium_applicability"}:
+        raise ValueError("stability_policy 字段无效")
+    stability_passed = stability["schur"]["status"] == policy["schur_status"] and all(
+        item["applicability"] == policy["equilibrium_applicability"]
+        for item in stability["equilibria"]
+    )
+    if not stability_passed:
+        raise ValueError("baseline stability result 不满足 reusable definition policy")
+    prime_passed = (
+        canonical_file_sha256(definition.prime_evidence_path) == definition.prime_evidence_hash
+    )
+    if not prime_passed:
+        raise ValueError("prime evidence SHA-256 与 reusable definition 不一致")
+    provenance = collect_provenance(
+        scenario_name=str(definition.source_requirements["scenario_name"]),
+        scenario_version=str(definition.source_requirements["scenario_version"]),
+        schema_version=2,
+        test_seed=None,
+    )
+    plan = ResolvedPrecisionSweepPlan(
+        definition,
+        source,
+        stability,
+        stability_hash,
+        True,
+        definition.points,
+        provenance,
+    )
+    # 用首个点走正式 HvacScenario parser，确保 q 与 Pocklington 证据真实可验证。
+    with tempfile.TemporaryDirectory(prefix="secure-control-sweep-preflight-") as temporary:
+        point_config = Path(temporary) / "point.yaml"
+        materialize_point_config(plan, plan.points[0], point_config)
+        HvacScenario(point_config)
+    return plan
+
+
+def resolve_verified_precision_sweep_plan(
+    definition: ReusablePrecisionSweepDefinition,
+    source_request: BaselineSourceRequest,
+    resolved_source: Mapping[str, object],
+    resolved_plan: Mapping[str, object],
+) -> ResolvedPrecisionSweepPlan:
+    """以 verified artifact 的 plan 为权威，复验显式 baseline 后供 evidence 重放。"""
+    source = resolve_hvac_baseline_source(source_request, definition.source_requirements)
+    expected_source = {
+        "schema_version": 1,
+        "identity_scheme": source.identity_scheme,
+        "baseline_id": source.baseline_id,
+        "source_hashes": dict(source.source_hashes),
+        "effective_config_sha256": source.effective_config_sha256,
+        "finite_horizon_certificate_sha256": source.finite_horizon_certificate_sha256,
+    }
+    stored_source = dict(resolved_source)
+    stored_config = stored_source.pop("config_path", None)
+    if (
+        not isinstance(stored_config, str)
+        or Path(stored_config).name != stored_config
+        or stored_source != expected_source
+    ):
+        raise ValueError("显式 baseline 与 verified sweep resolved_source 不一致")
+    _, baseline, plant = _source_paths_from_config(source.config_path)
+    stability_hash, stability = stability_report_sha256(plant, baseline)
+    if (
+        resolved_plan.get("stability_report_sha256") != stability_hash
+        or resolved_plan.get("stability_report") != stability
+        or resolved_plan.get("baseline_id") != source.baseline_id
+        or resolved_plan.get("baseline_identity_scheme") != source.identity_scheme
+        or resolved_plan.get("points") != [asdict(point) for point in definition.points]
+        or resolved_plan.get("prime_evidence_passed") is not True
+    ):
+        raise ValueError("显式 baseline 与 verified sweep resolved_plan 不一致")
+    plan = ResolvedPrecisionSweepPlan(
+        definition,
+        source,
+        stability,
+        stability_hash,
+        True,
+        definition.points,
+        dict(resolved_plan.get("provenance", {})),
+    )
+    with tempfile.TemporaryDirectory(prefix="secure-control-evidence-preflight-") as temporary:
+        point_config = Path(temporary) / "point.yaml"
+        materialize_point_config(plan, plan.points[0], point_config)
+        HvacScenario(point_config)
+    return plan
+
+
+def _resolve_definition_plan(
+    definition: PrecisionSweepDefinition | ReusablePrecisionSweepDefinition,
+    *,
+    baseline_config: str | Path | None,
+    expected_baseline_id: str | None,
+) -> ResolvedPrecisionSweepPlan:
+    """将 v1 embedded pins 或 v2 explicit request 归一为同一 resolved plan。"""
+    if isinstance(definition, PrecisionSweepDefinition):
+        if baseline_config is not None or expected_baseline_id is not None:
+            raise ValueError("schema v1 不允许同时提供 v2 source override")
+        actual_hashes = {
+            name: canonical_file_sha256(path)
+            for name, path in zip(
+                ("wrapper", "baseline", "plant"), _source_paths(definition), strict=True
+            )
+        }
+        if actual_hashes != dict(definition.source_hashes):
+            raise ValueError("schema v1 embedded source hashes 不匹配")
+        expected_id = canonical_hvac_mapping_sha256(
+            {
+                "scheme": "hvac_historical_config_chain_v1",
+                "source_hashes": {
+                    "wrapper": definition.source_hashes["wrapper"],
+                    "baseline": definition.source_hashes["baseline"],
+                    "scenario": definition.source_hashes["plant"],
+                },
+            }
+        )
+        plan = resolve_precision_sweep_plan(
+            _adapt_legacy_definition(definition),
+            BaselineSourceRequest(definition.source_config, expected_id),
+        )
+        frozen_passed, _ = _frozen_sources(definition, plan.stability_report_sha256)
+        if not frozen_passed:
+            raise ValueError("schema v1 embedded source/stability/prime pins 不匹配")
+        return plan
+    if baseline_config is None or expected_baseline_id is None:
+        raise ValueError("schema v2 必须同时提供 baseline_config 与 expected_baseline_id")
+    return resolve_precision_sweep_plan(
+        definition,
+        BaselineSourceRequest(Path(baseline_config), expected_baseline_id),
+    )
 
 
 def _margin(name: str, bound: int, limit: int) -> RangeMargin:
@@ -356,16 +673,32 @@ def _artifact_size(path: Path) -> int:
 def run_precision_sweep(
     definition_path: str | Path,
     *,
+    baseline_config: str | Path | None = None,
+    expected_baseline_id: str | None = None,
     output_root: str | Path = "results/sweeps",
 ) -> SweepArtifacts:
     """依次预检并运行十二点，最后以同盘 rename 原子发布完整或部分结果。"""
-    definition = load_precision_sweep_definition(definition_path)
-    _, baseline, plant = _source_paths(definition)
-    stability_hash, stability_payload = stability_report_sha256(plant, baseline)
-    stability_passed = stability_payload["schur"]["status"] == "stable" and all(
-        item["applicability"] == "applicable" for item in stability_payload["equilibria"]
+    loaded_definition = load_precision_sweep_definition(definition_path)
+    plan = _resolve_definition_plan(
+        loaded_definition,
+        baseline_config=baseline_config,
+        expected_baseline_id=expected_baseline_id,
     )
-    frozen_passed, actual_hashes = _frozen_sources(definition, stability_hash)
+    plan = replace(
+        plan,
+        provenance={
+            **plan.provenance,
+            "definition_schema_version": (
+                1 if isinstance(loaded_definition, PrecisionSweepDefinition) else 2
+            ),
+            "definition_source_sha256": canonical_file_sha256(definition_path),
+        },
+    )
+    definition = plan.definition
+    stability_payload = dict(plan.stability_report)
+    stability_passed = True
+    frozen_passed = True
+    actual_hashes = dict(plan.source.source_hashes)
     root = Path(output_root).resolve()
     root.mkdir(parents=True, exist_ok=True)
     sweep_id = _new_sweep_id()
@@ -376,17 +709,31 @@ def run_precision_sweep(
     try:
         write_json(
             stage / "source_hashes.json",
-            {"expected": definition.source_hashes, "actual": actual_hashes},
+            (
+                {
+                    "expected": dict(loaded_definition.source_hashes),
+                    "actual": {
+                        "wrapper": actual_hashes["wrapper"],
+                        "baseline": actual_hashes["baseline"],
+                        "plant": actual_hashes["scenario"],
+                    },
+                }
+                if isinstance(loaded_definition, PrecisionSweepDefinition)
+                else {
+                    "expected_baseline_id": plan.source.baseline_id,
+                    "identity_scheme": plan.source.identity_scheme,
+                    "actual": actual_hashes,
+                }
+            ),
         )
-        prime_passed = (
-            canonical_file_sha256(definition.prime_evidence_path) == definition.prime_evidence_hash
-        )
-        for point in definition.points:
+        prime_passed = plan.prime_evidence_passed
+        for point in plan.points:
+            validate_resolved_baseline_source(plan.source)
             point_root = stage / "points" / point.point_id
-            materialize_point_config(definition, point, point_root / "config.yaml")
+            materialize_point_config(plan, point, point_root / "config.yaml")
             attempt = stage / "work" / point.point_id / secrets.token_hex(8)
             attempt.mkdir(parents=True, exist_ok=False)
-            materialize_point_config(definition, point, attempt / "config.yaml")
+            materialize_point_config(plan, point, attempt / "config.yaml")
             request = {
                 "schema_version": 1,
                 "point": asdict(point),
@@ -472,8 +819,11 @@ def run_precision_sweep(
             records.append(record)
             write_json(point_root / "record.json", record)
             shutil.rmtree(attempt.parent)
+        validate_resolved_baseline_source(plan.source)
         frozen_records = tuple(records)
-        write_definition(stage / "definition.json", definition)
+        write_definition(stage / "definition.json", loaded_definition)
+        write_resolved_source(stage / "resolved_source.json", plan.source)
+        write_resolved_plan(stage / "resolved_plan.json", plan)
         write_summary(stage / "summary.csv", frozen_records)
         write_range_margins(stage / "range_margins.csv", frozen_records)
         write_json(
@@ -490,7 +840,7 @@ def run_precision_sweep(
         write_data_manifest(
             stage / "data_manifest.json",
             sweep_id=sweep_id,
-            definition=definition,
+            definition=loaded_definition,
             records=frozen_records,
         )
         verified = load_verified_sweep_data(stage, manifest_name="data_manifest.json")
@@ -514,7 +864,7 @@ def run_precision_sweep(
         write_manifest(
             stage / "manifest.json",
             sweep_id=sweep_id,
-            definition=definition,
+            definition=loaded_definition,
             records=frozen_records,
         )
         load_verified_sweep_data(stage)
@@ -536,9 +886,16 @@ def main() -> None:
     """运行正式扫描；只要存在失败或不可行点，发布诊断后以非零退出。"""
     parser = argparse.ArgumentParser(description="Run the frozen 2R2C precision sweep")
     parser.add_argument("--definition", required=True)
+    parser.add_argument("--baseline-config")
+    parser.add_argument("--expected-baseline-id")
     parser.add_argument("--output-root", default="results/sweeps")
     args = parser.parse_args()
-    artifacts = run_precision_sweep(args.definition, output_root=args.output_root)
+    artifacts = run_precision_sweep(
+        args.definition,
+        baseline_config=args.baseline_config,
+        expected_baseline_id=args.expected_baseline_id,
+        output_root=args.output_root,
+    )
     print(
         json.dumps(
             {

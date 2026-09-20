@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 from math import isfinite
@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Literal
 
 import numpy as np
+import yaml
 from numpy.typing import NDArray
 
 from secure_control.core import (
@@ -20,6 +21,7 @@ from secure_control.core import (
 )
 
 from .contract import Hvac2R2CModelContract, load_hvac_scenario_contract
+from .migration import load_hvac_pid_baseline_resolution
 from .plant import Hvac2R2CStateSpace, build_hvac_2r2c_state_space
 from .tuning import load_hvac_pid_tuning_contract
 
@@ -120,7 +122,17 @@ def analyze_hvac_closed_loop_stability(
     contract = load_hvac_scenario_contract(plant_path)
     if not isinstance(contract.model, Hvac2R2CModelContract):
         raise TypeError("稳定性分析只接受 2R2C HVAC plant 配置")
-    design, _, _ = load_hvac_pid_tuning_contract(pid_path, contract)
+    try:
+        pid_loaded = yaml.safe_load(pid_source.decode("utf-8"))
+    except (UnicodeDecodeError, yaml.YAMLError) as error:
+        raise ValueError("无法解析 HVAC 稳定性 PID 配置") from error
+    if not isinstance(pid_loaded, Mapping):
+        raise TypeError("HVAC 稳定性 PID 配置根节点必须是映射")
+    # migration baseline 的最终控制器来自可重算选择记录；历史配置仍走原冻结 tuner。
+    if "migration" in pid_loaded:
+        design = load_hvac_pid_baseline_resolution(pid_path, contract).design
+    else:
+        design, _, _ = load_hvac_pid_tuning_contract(pid_path, contract)
     plant = build_hvac_2r2c_state_space(contract.model, contract.timing.sampling_period_seconds)
     controller = design.to_controller_spec()
     matrix = build_hvac_closed_loop_matrix(plant, controller)

@@ -4,6 +4,10 @@
 > 该证据不能自动外推到 25→20→15 正式基线；迁移边界见
 > [hvac_reference_migration.md](hvac_reference_migration.md)。
 
+Issue #55 的 v2 evidence 路径改用 verified sweep 内的 resolved plan，并要求显式 baseline
+path/expected ID；v2 展示 profile 不再复制 sweep/manifest 身份。迁移说明见
+[实验证据输入边界与 schema v2 迁移](evidence_input_boundaries.md)。
+
 ## 目的与边界
 
 Issue #51 为冻结的 2R2C HVAC 精度扫描增加一条显式、默认关闭的诊断路径。它记录真实
@@ -26,6 +30,10 @@ uv run python -m secure_control.experiments.evidence_runner `
   --ell 48 --seed 42 --trace-step 60 `
   --allow-combined-share-diagnostic
 ```
+
+上述命令保留历史 schema v1 行为。v2 sweep 还必须传入 `--baseline-config` 与
+`--expected-baseline-id`，并与 manifest 已验证的 `resolved_source.json`/`resolved_plan.json`
+一致；不会回退到仓库历史 definition 或自动选择来源。
 
 发布前会用 canonical sweep reader 复验来源，并对 `time/reference/output_ideal/output_secure/`
 `control_ideal/control_secure/control_error/output_error` 同时检查 dtype、shape 与 `array_equal`。任一字段

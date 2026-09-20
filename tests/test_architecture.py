@@ -102,6 +102,7 @@ def test_experiment_io_boundary_imports_only_generic_contracts() -> None:
         module for module in sweep_runner_imports if module.startswith("secure_control.scenarios")
     } == {
         "secure_control.scenarios.hvac.integration",
+        "secure_control.scenarios.hvac.migration",
         "secure_control.scenarios.hvac.stability",
     }
     evidence_report_imports = imported_modules(experiments / "evidence_reporting.py")
@@ -127,6 +128,24 @@ def test_2r2c_types_remain_owned_by_hvac_scenario() -> None:
             if "Hvac2R2C" in source or "second_order_2r2c_cooling" in source:
                 violations.append(str(path.relative_to(PACKAGE_ROOT)))
     assert violations == []
+
+
+def test_evidence_input_boundaries_do_not_branch_on_known_instances() -> None:
+    """通用执行/报告路径不得把两个 fixture 的名字、ID 或 reference 变成运行逻辑。"""
+    experiments = PACKAGE_ROOT / "experiments"
+    sources = "\n".join(
+        (experiments / name).read_text(encoding="utf-8")
+        for name in ("sweep_runner.py", "evidence_runner.py", "evidence_reporting.py")
+    )
+    forbidden = (
+        "hvac_2r2c_dual_loop_25_20_15.yaml",
+        "hvac_2r2c_dual_loop.yaml",
+        "2489e5476ad316ea2d9599783e29f2d849ffcf485ca860e0db76c80312c532f9",
+        "f5d1bee247279ff85ba33db12778621724e46b76b880c48d8ee5637838e5aeab",
+        "15_20_25",
+        "25_20_15",
+    )
+    assert all(value not in sources for value in forbidden)
 
 
 def test_hvac_tuning_is_plaintext_only_and_has_no_secure_protocol_dependency() -> None:

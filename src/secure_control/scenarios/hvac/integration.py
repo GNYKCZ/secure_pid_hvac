@@ -341,6 +341,12 @@ class HvacScenario:
         """返回迁移基线身份；历史配置为兼容旧接口返回 ``None``。"""
         return self._baseline_identity
 
+    @property
+    def controller_dimensions(self) -> tuple[int, int, int]:
+        """返回 ``(state, input, output)`` 维数，不创建安全 session。"""
+        spec = self._design.to_controller_spec()
+        return spec.state_dimension, spec.input_dimension, spec.output_dimension
+
     def effective_config_snapshot(self) -> dict[str, Any]:
         """快照实际参与装配的三源配置、调参、品质和范围证书。"""
         self._validate_safety_certificate()

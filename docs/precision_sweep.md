@@ -4,6 +4,10 @@
 > 自动视为 25→20→15 正式基线的精度证据；迁移边界见
 > [hvac_reference_migration.md](hvac_reference_migration.md)。
 
+Issue #55 新增 source-independent schema v2 和显式 baseline source request；历史定义保持不变。
+迁移与 resolved artifact 契约见
+[实验证据输入边界与 schema v2 迁移](evidence_input_boundaries.md)。
+
 ## 冻结定义
 
 Issue #15 在同一份 2R2C plant、位置式 PID、15 → 20 → 25 °C reference、180 步 horizon 和
@@ -60,6 +64,8 @@ range margin、控制/输出误差的 max、mean、RMS、零计数和最小正 b
 
 ```text
 definition.json
+resolved_source.json
+resolved_plan.json
 source_hashes.json
 manifest.json
 data_manifest.json

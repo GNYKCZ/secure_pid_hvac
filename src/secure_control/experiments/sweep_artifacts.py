@@ -17,13 +17,26 @@ from .sweep import (
     PrecisionSweepDefinition,
     ProtocolCostReport,
     RangeMargin,
+    ResolvedBaselineSource,
+    ResolvedPrecisionSweepPlan,
+    ReusablePrecisionSweepDefinition,
     SweepPointDefinition,
     SweepRunRecord,
     SweepRunStatus,
+    reusable_definition_from_snapshot,
 )
 from .sweep_metrics import ErrorMetrics, aggregate_error_metrics
 
 SWEEP_SCHEMA_VERSION = 2
+
+
+def _is_sha256(value: object) -> bool:
+    """判断值是否为小写十六进制 SHA-256。"""
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +47,8 @@ class VerifiedSweepData:
     definition: dict[str, Any]
     records: tuple[SweepRunRecord, ...]
     runs: dict[str, ExperimentRecord]
+    resolved_source: dict[str, Any] | None = None
+    resolved_plan: dict[str, Any] | None = None
 
 
 def _jsonable(value: Any) -> Any:
@@ -301,20 +316,53 @@ def build_summary_payload(
     }
 
 
-def write_definition(path: Path, definition: PrecisionSweepDefinition) -> None:
+def write_definition(
+    path: Path, definition: PrecisionSweepDefinition | ReusablePrecisionSweepDefinition
+) -> None:
     """保存不泄露绝对路径的冻结扫描定义快照。"""
     payload = _jsonable(definition)
-    payload["source_config"] = definition.source_config.name
+    if isinstance(definition, PrecisionSweepDefinition):
+        payload["source_config"] = definition.source_config.name
+    else:
+        payload.pop("definition_path", None)
+        payload["schema_version"] = 2
     payload["prime_evidence_path"] = definition.prime_evidence_path.name
     payload["points"] = [_jsonable(point) for point in definition.points]
     write_json(path, payload)
+
+
+def write_resolved_source(path: Path, source: ResolvedBaselineSource) -> None:
+    """保存不含绝对路径的已验证 baseline 身份与来源摘要。"""
+    payload = _jsonable(source)
+    payload["config_path"] = source.config_path.name
+    payload["schema_version"] = 1
+    write_json(path, payload)
+
+
+def write_resolved_plan(path: Path, plan: ResolvedPrecisionSweepPlan) -> None:
+    """保存 definition+source 后的真实稳定性、点矩阵与运行 provenance。"""
+    write_json(
+        path,
+        {
+            "schema_version": 1,
+            "definition_schema_version": plan.provenance.get("definition_schema_version"),
+            "definition_sha256": plan.provenance.get("definition_source_sha256"),
+            "baseline_identity_scheme": plan.source.identity_scheme,
+            "baseline_id": plan.source.baseline_id,
+            "stability_report": plan.stability_report,
+            "stability_report_sha256": plan.stability_report_sha256,
+            "prime_evidence_passed": plan.prime_evidence_passed,
+            "points": plan.points,
+            "provenance": plan.provenance,
+        },
+    )
 
 
 def write_manifest(
     path: Path,
     *,
     sweep_id: str,
-    definition: PrecisionSweepDefinition,
+    definition: PrecisionSweepDefinition | ReusablePrecisionSweepDefinition,
     records: tuple[SweepRunRecord, ...],
 ) -> None:
     """对已写入的正式文件生成递归 SHA-256 最终清单。"""
@@ -346,7 +394,7 @@ def write_data_manifest(
     path: Path,
     *,
     sweep_id: str,
-    definition: PrecisionSweepDefinition,
+    definition: PrecisionSweepDefinition | ReusablePrecisionSweepDefinition,
     records: tuple[SweepRunRecord, ...],
 ) -> None:
     """在绘图前冻结定义、记录、摘要和原始运行的权威闭包。"""
@@ -444,6 +492,21 @@ def load_verified_sweep_data(
             raise ValueError(f"manifest SHA-256 不匹配：{relative}")
 
     definition = _read_json_object(sweep_root / "definition.json")
+    if definition.get("schema_version") == 2:
+        forbidden = {
+            "source_config",
+            "source_hashes",
+            "stability_report_hash",
+            "baseline_config",
+            "baseline_id",
+            "sweep_id",
+            "trace_id",
+            "run_id",
+            "manifest_sha256",
+        }
+        if forbidden.intersection(definition):
+            raise ValueError("v2 definition 包含具体 source/artifact identity")
+        reusable_definition_from_snapshot(definition)
     point_payloads = definition.get("points")
     if not isinstance(point_payloads, list):
         raise TypeError("definition points 缺失")
@@ -487,4 +550,69 @@ def load_verified_sweep_data(
             if record.point.point_id in runs:
                 raise ValueError("成功点 artifact 重复")
             runs[record.point.point_id] = load_artifacts(path)
-    return VerifiedSweepData(sweep_root, definition, records, runs)
+    source_path = sweep_root / "resolved_source.json"
+    plan_path = sweep_root / "resolved_plan.json"
+    if source_path.is_file() != plan_path.is_file():
+        raise ValueError("resolved source/plan 必须成对出现")
+    resolved_source = _read_json_object(source_path) if source_path.is_file() else None
+    resolved_plan = _read_json_object(plan_path) if plan_path.is_file() else None
+    if definition.get("schema_version") == 2 and (resolved_source is None or resolved_plan is None):
+        raise ValueError("schema v2 sweep 缺少 resolved source/plan")
+    if resolved_source is not None and resolved_plan is not None:
+        source_fields = {
+            "schema_version",
+            "config_path",
+            "identity_scheme",
+            "baseline_id",
+            "source_hashes",
+            "effective_config_sha256",
+            "finite_horizon_certificate_sha256",
+        }
+        plan_fields = {
+            "schema_version",
+            "definition_schema_version",
+            "definition_sha256",
+            "baseline_identity_scheme",
+            "baseline_id",
+            "stability_report",
+            "stability_report_sha256",
+            "prime_evidence_passed",
+            "points",
+            "provenance",
+        }
+        config_name = resolved_source.get("config_path")
+        source_hashes = resolved_source.get("source_hashes")
+        digests = (
+            resolved_source.get("baseline_id"),
+            resolved_source.get("effective_config_sha256"),
+            resolved_source.get("finite_horizon_certificate_sha256"),
+            resolved_plan.get("definition_sha256"),
+            resolved_plan.get("stability_report_sha256"),
+        )
+        if (
+            set(resolved_source) != source_fields
+            or set(resolved_plan) != plan_fields
+            or resolved_source.get("schema_version") != 1
+            or not isinstance(config_name, str)
+            or Path(config_name).name != config_name
+            or resolved_plan.get("schema_version") != 1
+            or not isinstance(source_hashes, dict)
+            or set(source_hashes) != {"wrapper", "baseline", "scenario"}
+            or not all(_is_sha256(value) for value in (*digests, *source_hashes.values()))
+            or resolved_plan.get("definition_schema_version")
+            != (2 if definition.get("schema_version") == 2 else 1)
+            or resolved_plan.get("baseline_identity_scheme")
+            != resolved_source.get("identity_scheme")
+            or resolved_plan.get("baseline_id") != resolved_source.get("baseline_id")
+            or resolved_plan.get("points") != point_payloads
+            or resolved_plan.get("prime_evidence_passed") is not True
+        ):
+            raise ValueError("resolved source/plan identity 或点矩阵不一致")
+    return VerifiedSweepData(
+        sweep_root,
+        definition,
+        records,
+        runs,
+        resolved_source,
+        resolved_plan,
+    )
