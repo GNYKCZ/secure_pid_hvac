@@ -430,12 +430,15 @@ def _safe_member(root: Path, relative: str) -> Path:
     candidate = Path(relative)
     if candidate.is_absolute() or ".." in candidate.parts:
         raise ValueError("manifest 路径逃逸")
-    resolved = (root / candidate).resolve()
+    unresolved = root / candidate
+    resolved = unresolved.resolve()
     try:
         resolved.relative_to(root.resolve())
     except ValueError as error:
         raise ValueError("manifest 路径逃逸") from error
-    if any(item.is_symlink() for item in (root / candidate).parents if item != root.parent):
+    if unresolved.is_symlink() or any(
+        item.is_symlink() for item in unresolved.parents if item != root.parent
+    ):
         raise ValueError("manifest 不允许符号链接")
     return resolved
 

@@ -215,6 +215,17 @@ def test_verified_path_rejects_escape(tmp_path: Path) -> None:
         _safe_member(root, "../outside.json")
 
 
+def test_verified_path_rejects_real_leaf_symlink(tmp_path: Path) -> None:
+    """manifest 成员自身即使指向闭包内普通文件，也不得作为 leaf link 被接受。"""
+    root = tmp_path / "sweep"
+    root.mkdir()
+    target = root / "target.json"
+    target.write_text("{}\n", encoding="utf-8")
+    (root / "member.json").symlink_to(target)
+    with pytest.raises(ValueError, match="符号链接"):
+        _safe_member(root, "member.json")
+
+
 def test_time_series_rejects_primary_seed_time_grid_mismatch(tmp_path: Path) -> None:
     """四个主 seed 精度点必须共享完全一致的时间网格。"""
     data = load_verified_sweep_data(_verified_sweep(tmp_path / "sweep"))

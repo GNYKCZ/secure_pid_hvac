@@ -29,6 +29,7 @@ from secure_control.experiments.sweep_runner import (
     _run_child,
     build_preflight_report,
     derive_protocol_cost,
+    resolve_hvac_baseline_source,
     resolve_precision_sweep_plan,
 )
 from secure_control.scenarios.hvac.integration import HvacSafetyCertificate, HvacScenario
@@ -148,9 +149,7 @@ def test_source_resolution_rejects_path_traversal_without_running_scenario(
         )
 
 
-def test_source_resolution_rejects_missing_and_symlink_source(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_source_resolution_rejects_missing_and_real_symlink_source(tmp_path: Path) -> None:
     """显式 source 必须是存在的普通文件，不能通过链接改变 authority。"""
     definition = load_precision_sweep_definition(V2_DEFINITION_PATH)
     with pytest.raises(ValueError, match="存在的普通非链接文件"):
@@ -159,13 +158,12 @@ def test_source_resolution_rejects_missing_and_symlink_source(
             BaselineSourceRequest(tmp_path / "missing.yaml", HISTORICAL_BASELINE_ID),
         )
 
-    original = Path.is_symlink
-    target = CURRENT_BASELINE.resolve()
-    monkeypatch.setattr(Path, "is_symlink", lambda path: path == target or original(path))
+    link = tmp_path / "baseline-link.yaml"
+    link.symlink_to(CURRENT_BASELINE)
     with pytest.raises(ValueError, match="存在的普通非链接文件"):
-        resolve_precision_sweep_plan(
-            definition,
-            BaselineSourceRequest(CURRENT_BASELINE, CURRENT_BASELINE_ID),
+        resolve_hvac_baseline_source(
+            BaselineSourceRequest(link, CURRENT_BASELINE_ID),
+            definition.source_requirements,
         )
 
 
