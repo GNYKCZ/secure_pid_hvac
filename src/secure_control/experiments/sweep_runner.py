@@ -159,7 +159,10 @@ def stability_report_sha256(plant_path: Path, pid_path: Path) -> tuple[str, dict
     serialized = json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
     ).encode("utf-8")
-    return sha256(serialized).hexdigest(), payload
+    # resolved_plan 经 JSON reader 恢复后，tuple 会成为 list；这里直接返回同一规范形态，
+    # 避免 evidence 重放把等价的持久化载荷误判为 provenance 漂移。
+    canonical_payload = json.loads(serialized)
+    return sha256(serialized).hexdigest(), canonical_payload
 
 
 def resolve_hvac_baseline_source(
