@@ -1,4 +1,4 @@
-"""Issue #53 的 25→20→15 正式基线迁移、门禁与身份回归测试。"""
+"""Issue #53/#57 的正式基线迁移、主动 redesign 与统一身份回归测试。"""
 
 from __future__ import annotations
 
@@ -29,6 +29,8 @@ PROJECT_ROOT = Path(__file__).parents[1]
 CONFIGS = PROJECT_ROOT / "configs"
 WRAPPER = CONFIGS / "hvac_2r2c_dual_loop_25_20_15.yaml"
 BASELINE = CONFIGS / "hvac_2r2c_pid_baseline_25_20_15.yaml"
+REDESIGN_WRAPPER = CONFIGS / "hvac_2r2c_dual_loop_25_20_15_fast_response.yaml"
+REDESIGN_BASELINE = CONFIGS / "hvac_2r2c_pid_baseline_25_20_15_fast_response.yaml"
 SCENARIO = CONFIGS / "hvac_2r2c_scenario_25_20_15.yaml"
 OLD_WRAPPER = CONFIGS / "hvac_2r2c_dual_loop.yaml"
 OLD_BASELINE = CONFIGS / "hvac_2r2c_pid_baseline.yaml"
@@ -40,6 +42,22 @@ def _copy_migration_chain(destination: Path) -> Path:
     for source in (WRAPPER, BASELINE, SCENARIO, OLD_WRAPPER, OLD_BASELINE, OLD_SCENARIO):
         (destination / source.name).write_bytes(source.read_bytes())
     return destination / BASELINE.name
+
+
+def _copy_redesign_chain(destination: Path) -> tuple[Path, Path]:
+    """复制主动 redesign 及其完整 predecessor lineage，供 fail-closed 测试使用。"""
+    for source in (
+        REDESIGN_WRAPPER,
+        REDESIGN_BASELINE,
+        WRAPPER,
+        BASELINE,
+        SCENARIO,
+        OLD_WRAPPER,
+        OLD_BASELINE,
+        OLD_SCENARIO,
+    ):
+        (destination / source.name).write_bytes(source.read_bytes())
+    return destination / REDESIGN_WRAPPER.name, destination / REDESIGN_BASELINE.name
 
 
 def test_new_scenario_changes_only_reference_and_preserves_historical_hashes() -> None:
@@ -237,6 +255,15 @@ def test_formal_dual_loop_identity_is_seed_independent_and_metrics_pass() -> Non
     assert first.baseline_identity is not None
     assert second.baseline_identity is not None
     assert first.baseline_identity.baseline_id == second.baseline_identity.baseline_id
+    assert first.baseline_identity.baseline_id == (
+        "f5d1bee247279ff85ba33db12778621724e46b76b880c48d8ee5637838e5aeab"
+    )
+    assert first.baseline_identity.selection_record_sha256 == (
+        "9f965a4ed4147abcc88e3e8ae2c5727886adc1b9645e877866db04b291246897"
+    )
+    assert first.baseline_identity.finite_horizon_certificate_sha256 == (
+        "ebd7afd4b66466d29dbde897b3daad325c160ea7d4b79dbcaef48ddcaf4f794c"
+    )
     snapshot = first.effective_config_snapshot()
     identity = snapshot["baseline_identity"]
     assert identity["baseline_id"] == first.baseline_identity.baseline_id
@@ -296,3 +323,191 @@ def test_baseline_identity_changes_with_sources_or_certificate() -> None:
         ),
     )
     assert rebuild(source_hashes, changed_certificate) != scenario.baseline_identity.baseline_id
+
+
+def test_explicit_redesign_builds_new_identity_and_preserves_v1_baseline() -> None:
+    """source PID 已通过旧门禁时，显式 redesign 仍执行 tuner 并复用同一 identity scheme。"""
+    predecessor = HvacScenario(WRAPPER)
+    redesigned = HvacScenario(REDESIGN_WRAPPER)
+    assert predecessor.baseline_identity is not None
+    assert redesigned.baseline_identity is not None
+    assert predecessor.baseline_identity.baseline_id == (
+        "f5d1bee247279ff85ba33db12778621724e46b76b880c48d8ee5637838e5aeab"
+    )
+    assert redesigned.baseline_identity.scheme == predecessor.baseline_identity.scheme
+    assert redesigned.baseline_identity.baseline_id == (
+        "e0d0100f0ccf9fac15910c010090113574d9b53b61118fa6ad8a7035116138b7"
+    )
+    assert redesigned.baseline_identity.supersedes_baseline == (
+        predecessor.baseline_identity.baseline_id
+    )
+    snapshot = redesigned.effective_config_snapshot()
+    record = snapshot["hvac"]["pid_redesign"]
+    assert record["method"] == "plaintext_controller_redesign_v1"
+    assert record["tuning_executed"] is True
+    assert record["evaluated_candidate_count"] == 10179
+    assert record["feasible_candidate_count"] == 2392
+    assert record["source_validation"]["passed"] is False
+    assert snapshot["hvac"]["tuning"]["selected_objective"][0] == 540.0
+    assert "pid_selection" not in snapshot["hvac"]
+
+
+def test_redesign_plaintext_and_secure_metrics_meet_frozen_contract() -> None:
+    """最终 gains 冻结后，seed 42 双闭环仅作兼容验证且两支都满足品质门槛。"""
+    comparison = run_hvac_dual_loop(REDESIGN_WRAPPER, test_seed=42)
+    metrics = comparison.comparison_metrics
+    assert metrics is not None and metrics.passed
+    assert [item.settling_time_seconds for item in metrics.ideal.segments] == [540.0] * 3
+    assert min(item.min_signed_deviation_celsius for item in metrics.ideal.segments) >= -0.3
+    assert max(item.tail_mae_celsius for item in metrics.ideal.segments) <= 0.5
+    assert max(item.saturation_fraction for item in metrics.ideal.segments) <= 0.15
+    assert metrics.ideal.global_max_abs_applied_control_kw <= 12.0
+    assert metrics.max_control_error_kw <= 0.01
+    assert metrics.max_temperature_error_celsius <= 0.01
+    assert comparison.safety_certificate.horizon_steps == 180
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda value: value["baseline_creation"]["source_baseline_identity"].__setitem__(
+                "baseline_id", "0" * 64
+            ),
+            "source baseline identity",
+        ),
+        (
+            lambda value: value["baseline_creation"]["selection"].__setitem__(
+                "evaluated_candidate_count", 1
+            ),
+            "selection 声明",
+        ),
+        (
+            lambda value: value["controller"].__setitem__(
+                "proportional_gain_kw_per_celsius", -1.45
+            ),
+            "final gains",
+        ),
+    ],
+)
+def test_redesign_tampering_fails_closed(tmp_path: Path, mutate, message: str) -> None:
+    """source identity、selection 或 final gains 任一伪造都不能形成 baseline。"""
+    wrapper, baseline = _copy_redesign_chain(tmp_path)
+    loaded = yaml.safe_load(baseline.read_text(encoding="utf-8"))
+    mutate(loaded)
+    baseline.write_text(yaml.safe_dump(loaded, sort_keys=False), encoding="utf-8")
+    wrapper_loaded = yaml.safe_load(wrapper.read_text(encoding="utf-8"))
+    wrapper_loaded["baseline_sha256"] = canonical_hvac_source_sha256(baseline.read_bytes())
+    wrapper.write_text(yaml.safe_dump(wrapper_loaded, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        HvacScenario(wrapper)
+
+
+def test_redesign_lineage_cycle_and_toctou_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """递归 source 与调参期间 predecessor 漂移必须在 identity 发布前拒绝。"""
+    wrapper, baseline = _copy_redesign_chain(tmp_path)
+    loaded = yaml.safe_load(baseline.read_text(encoding="utf-8"))
+    loaded["baseline_creation"]["source_wrapper_config"] = wrapper.name
+    loaded["baseline_creation"]["source_wrapper_sha256"] = "0" * 64
+    baseline.write_text(yaml.safe_dump(loaded, sort_keys=False), encoding="utf-8")
+    wrapper_loaded = yaml.safe_load(wrapper.read_text(encoding="utf-8"))
+    wrapper_loaded["baseline_sha256"] = canonical_hvac_source_sha256(baseline.read_bytes())
+    wrapper.write_text(yaml.safe_dump(wrapper_loaded, sort_keys=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="cycle"):
+        HvacScenario(wrapper)
+
+    wrapper, _ = _copy_redesign_chain(tmp_path)
+    original = migration_module.tune_hvac_pid
+
+    def mutate_predecessor(*args: object, **kwargs: object) -> HvacPidTuningResult:
+        result = original(*args, **kwargs)
+        scenario = tmp_path / SCENARIO.name
+        scenario.write_text(
+            scenario.read_text(encoding="utf-8") + "\n# changed\n", encoding="utf-8"
+        )
+        return result
+
+    monkeypatch.setattr(migration_module, "tune_hvac_pid", mutate_predecessor)
+    with pytest.raises(ValueError, match="解析期间发生变化"):
+        HvacScenario(wrapper)
+
+
+@pytest.mark.parametrize("mutation_target", ["current_wrapper", "predecessor_scenario"])
+def test_redesign_certificate_stage_toctou_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation_target: str
+) -> None:
+    """证书生成期间 current 或 predecessor 漂移时不得发布 baseline identity。"""
+    wrapper, _ = _copy_redesign_chain(tmp_path)
+    original = integration_module.HvacScenario._derive_safety_certificate
+
+    def mutate_during_certificate(scenario: HvacScenario):
+        certificate = original(scenario)
+        if scenario._wrapper_filename == wrapper.name:
+            target = wrapper if mutation_target == "current_wrapper" else tmp_path / SCENARIO.name
+            target.write_text(
+                target.read_text(encoding="utf-8") + "\n# changed\n", encoding="utf-8"
+            )
+        return certificate
+
+    monkeypatch.setattr(
+        integration_module.HvacScenario,
+        "_derive_safety_certificate",
+        mutate_during_certificate,
+    )
+    with pytest.raises(ValueError, match="解析期间发生变化"):
+        HvacScenario(wrapper)
+
+
+def test_redesign_baseline_aba_switch_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """跨 integration/loader 切换 PID 为 B 再恢复 A 时不得生成混合身份。"""
+    wrapper, baseline = _copy_redesign_chain(tmp_path)
+    original_source = baseline.read_bytes()
+    alternate = yaml.safe_load(original_source.decode("utf-8"))
+    alternate["baseline_creation"]["start_commit"] = "0" * 40
+    alternate_source = yaml.safe_dump(alternate, sort_keys=False).encode("utf-8")
+    original_loader = integration_module.load_hvac_pid_redesign_resolution
+
+    def switch_baseline_during_loader(*args: object, **kwargs: object):
+        baseline.write_bytes(alternate_source)
+        try:
+            return original_loader(*args, **kwargs)
+        finally:
+            baseline.write_bytes(original_source)
+
+    monkeypatch.setattr(
+        integration_module,
+        "load_hvac_pid_redesign_resolution",
+        switch_baseline_during_loader,
+    )
+    with pytest.raises(ValueError, match="解析期间发生变化"):
+        HvacScenario(wrapper)
+
+
+def test_redesign_predecessor_rejects_path_traversal_and_real_symlink(tmp_path: Path) -> None:
+    """前驱 wrapper 必须是同目录普通文件，不能用 traversal 或 leaf link 改变 authority。"""
+    wrapper, baseline = _copy_redesign_chain(tmp_path)
+    loaded = yaml.safe_load(baseline.read_text(encoding="utf-8"))
+    loaded["baseline_creation"]["source_wrapper_config"] = "../outside.yaml"
+    baseline.write_text(yaml.safe_dump(loaded, sort_keys=False), encoding="utf-8")
+    wrapper_loaded = yaml.safe_load(wrapper.read_text(encoding="utf-8"))
+    wrapper_loaded["baseline_sha256"] = canonical_hvac_source_sha256(baseline.read_bytes())
+    wrapper.write_text(yaml.safe_dump(wrapper_loaded, sort_keys=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="安全文件名"):
+        HvacScenario(wrapper)
+
+    wrapper, baseline = _copy_redesign_chain(tmp_path)
+    source_link = tmp_path / "source-link.yaml"
+    source_link.symlink_to(tmp_path / WRAPPER.name)
+    loaded = yaml.safe_load(baseline.read_text(encoding="utf-8"))
+    loaded["baseline_creation"]["source_wrapper_config"] = source_link.name
+    baseline.write_text(yaml.safe_dump(loaded, sort_keys=False), encoding="utf-8")
+    wrapper_loaded = yaml.safe_load(wrapper.read_text(encoding="utf-8"))
+    wrapper_loaded["baseline_sha256"] = canonical_hvac_source_sha256(baseline.read_bytes())
+    wrapper.write_text(yaml.safe_dump(wrapper_loaded, sort_keys=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="普通非链接文件"):
+        HvacScenario(wrapper)

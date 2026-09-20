@@ -1,4 +1,4 @@
-"""HVAC reference 迁移的明文 PID 门禁、可审计选择记录与基线身份。"""
+"""HVAC baseline 迁移/redesign 的明文门禁、可审计记录与统一身份。"""
 
 from __future__ import annotations
 
@@ -32,6 +32,7 @@ from .tuning import (
 )
 
 _METHOD = "validate_current_then_conditionally_tune_v1"
+_REDESIGN_METHOD = "plaintext_controller_redesign_v1"
 _IDENTITY_SCHEME = "hvac_baseline_identity_v1"
 
 
@@ -101,13 +102,79 @@ class HvacPidSelectionRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class HvacPidRedesignRecord:
+    """冻结主动明文 redesign 的来源、重算结果与选择证据。"""
+
+    method: Literal["plaintext_controller_redesign_v1"]
+    source_baseline_scheme: str
+    source_baseline_id: str
+    source_hashes: Mapping[str, str]
+    old_design: HvacPidDesign
+    final_design: HvacPidDesign
+    source_validation: HvacPidValidationResult
+    tuning_executed: Literal[True]
+    search_space_candidate_count: int
+    evaluated_candidate_count: int
+    feasible_candidate_count: int
+    selected_objective: tuple[float, ...]
+    rejection_counts: Mapping[str, int]
+    tuning_contract_sha256: str
+    quality_contract_sha256: str
+
+    def __post_init__(self) -> None:
+        """拒绝伪造来源或不完整搜索统计，并冻结所有映射。"""
+        if self.method != _REDESIGN_METHOD:
+            raise ValueError(f"PID redesign method 必须为 {_REDESIGN_METHOD}")
+        if self.source_baseline_scheme != _IDENTITY_SCHEME:
+            raise ValueError(f"source baseline scheme 必须为 {_IDENTITY_SCHEME}")
+        _require_hash(self.source_baseline_id, "source_baseline_id", 64)
+        copied_hashes = {str(key): str(value) for key, value in self.source_hashes.items()}
+        if set(copied_hashes) != {"wrapper", "baseline", "scenario"}:
+            raise ValueError("PID redesign source hashes 必须绑定 wrapper/baseline/scenario")
+        for name, value in copied_hashes.items():
+            _require_hash(value, f"source_hashes.{name}", 64)
+        object.__setattr__(self, "source_hashes", MappingProxyType(copied_hashes))
+        if self.tuning_executed is not True:
+            raise ValueError("主动 redesign 必须完整执行 deterministic tuner")
+        if self.source_validation.design != self.old_design:
+            raise ValueError("PID redesign source validation 与 old design 不一致")
+        counts = (
+            self.search_space_candidate_count,
+            self.evaluated_candidate_count,
+            self.feasible_candidate_count,
+        )
+        if any(type(value) is not int or value < 0 for value in counts):
+            raise ValueError("PID redesign candidate count 必须是非负整数")
+        if (
+            self.search_space_candidate_count <= 0
+            or self.evaluated_candidate_count != self.search_space_candidate_count
+            or self.feasible_candidate_count <= 0
+            or self.feasible_candidate_count > self.evaluated_candidate_count
+        ):
+            raise ValueError("PID redesign candidate count 不自洽")
+        objective = tuple(float(value) for value in self.selected_objective)
+        if len(objective) != 10 or not all(isfinite(value) for value in objective):
+            raise ValueError("PID redesign selected objective 必须是 10 维有限 tuple")
+        object.__setattr__(self, "selected_objective", objective)
+        copied_rejections = {str(key): int(value) for key, value in self.rejection_counts.items()}
+        if any(value < 0 for value in copied_rejections.values()):
+            raise ValueError("PID redesign rejection counts 不得为负数")
+        object.__setattr__(self, "rejection_counts", MappingProxyType(copied_rejections))
+        for name in ("tuning_contract_sha256", "quality_contract_sha256"):
+            _require_hash(getattr(self, name), name, 64)
+
+
+HvacPidProvenanceRecord = HvacPidSelectionRecord | HvacPidRedesignRecord
+
+
+@dataclass(frozen=True, slots=True)
 class HvacPidBaselineResolution:
-    """保存迁移后最终 PID、质量契约、选择记录与 lineage。"""
+    """保存 baseline creation 后的最终 PID、质量契约、记录与 lineage。"""
 
     design: HvacPidDesign
     tuning_contract: HvacPidTuningContract
     quality_contract: HvacControlQualityContract
-    selection: HvacPidSelectionRecord
+    selection: HvacPidProvenanceRecord
     tuning_result: HvacPidTuningResult | None
     start_commit: str
     supersedes_baseline: str
@@ -120,11 +187,21 @@ class HvacPidBaselineResolution:
             raise ValueError("resolution design 与 selection final design 不一致")
         if (self.tuning_result is not None) != self.selection.tuning_executed:
             raise ValueError("resolution tuning result 与 selection 状态不一致")
+        if self.tuning_result is not None and (
+            self.tuning_result.selected_design != self.design
+            or self.tuning_result.evaluated_candidate_count
+            != self.selection.evaluated_candidate_count
+            or self.tuning_result.feasible_candidate_count
+            != self.selection.feasible_candidate_count
+            or self.tuning_result.selected_objective != self.selection.selected_objective
+            or dict(self.tuning_result.rejection_counts) != dict(self.selection.rejection_counts)
+        ):
+            raise ValueError("resolution tuning result 与 provenance record 不一致")
 
 
 @dataclass(frozen=True, slots=True)
 class HvacBaselineIdentity:
-    """保存跨运行稳定的新 HVAC baseline 内容身份与迁移 lineage。"""
+    """保存跨运行稳定的新 HVAC baseline 内容身份与 creation lineage。"""
 
     scheme: Literal["hvac_baseline_identity_v1"]
     baseline_id: str
@@ -156,6 +233,46 @@ class HvacBaselineIdentity:
         ):
             _require_hash(getattr(self, name), name, 64)
         _require_hash(self.start_commit, "start_commit", 40)
+
+
+@dataclass(frozen=True, slots=True)
+class HvacVerifiedBaselinePredecessor:
+    """保存 integration 从实际配置链验证出的 redesign 前驱事实。"""
+
+    wrapper_path: Path
+    identity: HvacBaselineIdentity
+    design: HvacPidDesign
+    source_snapshots: tuple[tuple[str, Path, bytes], ...]
+
+    def __post_init__(self) -> None:
+        """校验快照覆盖完整配置链，且摘要与前驱 identity 一致。"""
+        if not isinstance(self.wrapper_path, Path):
+            raise TypeError("predecessor wrapper_path 必须是 Path")
+        snapshots = {name: (path, source) for name, path, source in self.source_snapshots}
+        if len(self.source_snapshots) != 3 or set(snapshots) != {
+            "wrapper",
+            "baseline",
+            "scenario",
+        }:
+            raise ValueError("predecessor snapshots 必须覆盖 wrapper/baseline/scenario")
+        for name, (path, source) in snapshots.items():
+            if not isinstance(path, Path) or not isinstance(source, bytes):
+                raise TypeError("predecessor snapshot path/source 类型无效")
+            if canonical_hvac_source_sha256(source) != self.identity.source_hashes[name]:
+                raise ValueError(f"predecessor {name} snapshot 与 baseline identity 不一致")
+        if snapshots["wrapper"][0] != self.wrapper_path:
+            raise ValueError("predecessor wrapper snapshot path 不一致")
+
+    def revalidate(self) -> None:
+        """重读前驱三配置链，任何 TOCTOU 变化都 fail closed。"""
+        try:
+            unchanged = all(
+                path.read_bytes() == source for _, path, source in self.source_snapshots
+            )
+        except OSError as error:
+            raise ValueError("无法复验 redesign predecessor 配置链") from error
+        if not unchanged:
+            raise ValueError("redesign predecessor 配置链在解析期间发生变化")
 
 
 def canonical_hvac_mapping_sha256(value: Mapping[str, object]) -> str:
@@ -303,11 +420,107 @@ def load_hvac_pid_baseline_resolution(
     )
 
 
+def load_hvac_pid_redesign_resolution(
+    path: str | Path,
+    plant_contract: HvacScenarioContract,
+    predecessor: HvacVerifiedBaselinePredecessor,
+    *,
+    config_source: bytes | None = None,
+) -> HvacPidBaselineResolution:
+    """从同一份 PID bytes 验证前驱并重跑 v2 tuner，生成 redesign resolution。"""
+    if not isinstance(predecessor, HvacVerifiedBaselinePredecessor):
+        raise TypeError("predecessor 必须是 HvacVerifiedBaselinePredecessor")
+    current = _load_hvac_pid_config_inputs(
+        path,
+        plant_contract,
+        config_source=config_source,
+    )
+    if "migration" in current.loaded:
+        raise ValueError("PID baseline 不得同时声明 migration 与 baseline_creation")
+    if current.tuning.algorithm != "deterministic_exhaustive_grid_settling_v2":
+        raise ValueError("主动 PID redesign 必须使用 settling-first v2 tuning contract")
+    if (
+        canonical_hvac_source_sha256(current.plant_source)
+        != predecessor.identity.source_hashes["scenario"]
+    ):
+        raise ValueError("主动 PID redesign 不得改变 predecessor plant/reference contract")
+    creation = _mapping(current.loaded, "baseline_creation")
+    if set(creation) != {
+        "schema_version",
+        "method",
+        "start_commit",
+        "source_wrapper_config",
+        "source_wrapper_sha256",
+        "source_baseline_identity",
+        "tuning_contract_sha256",
+        "quality_contract_sha256",
+        "selection",
+    }:
+        raise ValueError("PID baseline_creation schema 字段无效")
+    if _integer(creation, "schema_version") != 1 or _string(creation, "method") != _REDESIGN_METHOD:
+        raise ValueError("PID baseline_creation schema/method 无效")
+    start_commit = _string(creation, "start_commit")
+    _require_hash(start_commit, "start_commit", 40)
+
+    source_wrapper_name = _string(creation, "source_wrapper_config")
+    _safe_filename(source_wrapper_name, "source_wrapper_config")
+    if predecessor.wrapper_path.name != source_wrapper_name:
+        raise ValueError("baseline_creation source wrapper 与 verified predecessor 不一致")
+    wrapper_snapshot = next(
+        source for name, _, source in predecessor.source_snapshots if name == "wrapper"
+    )
+    if canonical_hvac_source_sha256(wrapper_snapshot) != _string(creation, "source_wrapper_sha256"):
+        raise ValueError("baseline_creation source wrapper SHA-256 不一致")
+    source_identity = _mapping(creation, "source_baseline_identity")
+    if set(source_identity) != {"scheme", "baseline_id"}:
+        raise ValueError("source_baseline_identity schema 字段无效")
+    if (
+        _string(source_identity, "scheme") != predecessor.identity.scheme
+        or _string(source_identity, "baseline_id") != predecessor.identity.baseline_id
+    ):
+        raise ValueError("声明的 source baseline identity 与实际前驱不一致")
+
+    tuning_hash = canonical_hvac_mapping_sha256(asdict(current.tuning))
+    quality_hash = canonical_hvac_mapping_sha256(asdict(current.quality))
+    if tuning_hash != _string(creation, "tuning_contract_sha256"):
+        raise ValueError("tuning contract SHA-256 与重算结果不一致")
+    if quality_hash != _string(creation, "quality_contract_sha256"):
+        raise ValueError("quality contract SHA-256 与重算结果不一致")
+
+    source_validation = validate_hvac_pid_design(
+        plant_contract, predecessor.design, current.quality
+    )
+    tuning_result = tune_hvac_pid(plant_contract, current.tuning, current.quality)
+    if current.design != tuning_result.selected_design:
+        raise ValueError("配置 final gains 与主动 PID redesign 重算结果不一致")
+    selection = _redesign_record(
+        _mapping(creation, "selection"),
+        predecessor=predecessor,
+        final_design=current.design,
+        validation=source_validation,
+        tuning=current.tuning,
+        tuning_result=tuning_result,
+        tuning_hash=tuning_hash,
+        quality_hash=quality_hash,
+    )
+    _revalidate_pid_config_inputs(current)
+    predecessor.revalidate()
+    return HvacPidBaselineResolution(
+        current.design,
+        current.tuning,
+        current.quality,
+        selection,
+        tuning_result,
+        start_commit,
+        predecessor.identity.baseline_id,
+    )
+
+
 def build_hvac_baseline_identity(
     *,
     source_hashes: Mapping[str, str],
     quality_contract: HvacControlQualityContract,
-    selection: HvacPidSelectionRecord,
+    selection: HvacPidProvenanceRecord,
     controller_spec: ControllerSpec,
     safety_certificate: object,
     supersedes_baseline: str,
@@ -318,7 +531,7 @@ def build_hvac_baseline_identity(
     quality_hash = canonical_hvac_mapping_sha256(asdict(quality_contract))
     if quality_hash != selection.quality_contract_sha256:
         raise ValueError("baseline identity 的 quality contract 与 PID selection 不一致")
-    selection_hash = canonical_hvac_mapping_sha256(_selection_payload(selection))
+    selection_hash = canonical_hvac_mapping_sha256(pid_provenance_record_payload(selection))
     controller_hash = canonical_hvac_mapping_sha256(_controller_payload(controller_spec))
     selected_controller_hash = canonical_hvac_mapping_sha256(
         _controller_payload(selection.final_design.to_controller_spec())
@@ -348,11 +561,18 @@ def build_hvac_baseline_identity(
     )
 
 
-def selection_record_payload(value: HvacPidSelectionRecord) -> dict[str, object]:
-    """返回可写入 effective config 的 JSON-safe 选择记录副本。"""
-    if not isinstance(value, HvacPidSelectionRecord):
-        raise TypeError("value 必须是 HvacPidSelectionRecord")
-    return _selection_payload(value)
+def selection_record_payload(value: HvacPidProvenanceRecord) -> dict[str, object]:
+    """兼容返回可写入 effective config 的 JSON-safe provenance 副本。"""
+    return pid_provenance_record_payload(value)
+
+
+def pid_provenance_record_payload(value: HvacPidProvenanceRecord) -> dict[str, object]:
+    """按 creation method 分派 canonical payload，同时保持历史 selection bytes。"""
+    if isinstance(value, HvacPidSelectionRecord):
+        return _selection_payload(value)
+    if isinstance(value, HvacPidRedesignRecord):
+        return _redesign_payload(value)
+    raise TypeError("value 必须是 HVAC PID provenance record")
 
 
 def baseline_identity_payload(value: HvacBaselineIdentity) -> dict[str, object]:
@@ -430,6 +650,57 @@ def _selection_record(
     return record
 
 
+def _redesign_record(
+    declared: Mapping[str, Any],
+    *,
+    predecessor: HvacVerifiedBaselinePredecessor,
+    final_design: HvacPidDesign,
+    validation: HvacPidValidationResult,
+    tuning: HvacPidTuningContract,
+    tuning_result: HvacPidTuningResult,
+    tuning_hash: str,
+    quality_hash: str,
+) -> HvacPidRedesignRecord:
+    """从实际 plaintext 重算结果构造 redesign record，并核对 YAML 声明。"""
+    expected_keys = {
+        "old_gains",
+        "final_gains",
+        "source_validation",
+        "source_validation_rejection_reasons",
+        "tuning_executed",
+        "search_space_candidate_count",
+        "evaluated_candidate_count",
+        "feasible_candidate_count",
+        "selected_objective",
+        "rejection_counts",
+    }
+    if set(declared) != expected_keys:
+        raise ValueError("PID redesign selection 声明字段无效")
+    record = HvacPidRedesignRecord(
+        _REDESIGN_METHOD,
+        predecessor.identity.scheme,
+        predecessor.identity.baseline_id,
+        predecessor.identity.source_hashes,
+        predecessor.design,
+        final_design,
+        validation,
+        True,
+        tuning.candidate_count,
+        tuning_result.evaluated_candidate_count,
+        tuning_result.feasible_candidate_count,
+        tuning_result.selected_objective,
+        tuning_result.rejection_counts,
+        tuning_hash,
+        quality_hash,
+    )
+    payload = _redesign_payload(record)
+    expected = {key: payload[key] for key in expected_keys}
+    declared_normalized = _canonical_value(declared, ())
+    if declared_normalized != _canonical_value(expected, ()):
+        raise ValueError("PID redesign selection 声明与 plaintext tuner 重算结果不一致")
+    return record
+
+
 def _selection_payload(value: HvacPidSelectionRecord) -> dict[str, object]:
     """按冻结字段生成 selection 的 canonical/快照共同载荷。"""
     metrics = asdict(value.current_validation.metrics)
@@ -450,6 +721,28 @@ def _selection_payload(value: HvacPidSelectionRecord) -> dict[str, object]:
             None if value.selected_objective is None else list(value.selected_objective)
         ),
         "rejection_counts": dict(value.rejection_counts),
+        "quality_contract_sha256": value.quality_contract_sha256,
+    }
+
+
+def _redesign_payload(value: HvacPidRedesignRecord) -> dict[str, object]:
+    """生成主动 redesign 的 canonical/快照共同载荷。"""
+    return {
+        "method": value.method,
+        "source_baseline_scheme": value.source_baseline_scheme,
+        "source_baseline_id": value.source_baseline_id,
+        "source_hashes": dict(value.source_hashes),
+        "old_gains": _gains(value.old_design),
+        "final_gains": _gains(value.final_design),
+        "source_validation": asdict(value.source_validation.metrics),
+        "source_validation_rejection_reasons": list(value.source_validation.rejection_reasons),
+        "tuning_executed": value.tuning_executed,
+        "search_space_candidate_count": value.search_space_candidate_count,
+        "evaluated_candidate_count": value.evaluated_candidate_count,
+        "feasible_candidate_count": value.feasible_candidate_count,
+        "selected_objective": list(value.selected_objective),
+        "rejection_counts": dict(value.rejection_counts),
+        "tuning_contract_sha256": value.tuning_contract_sha256,
         "quality_contract_sha256": value.quality_contract_sha256,
     }
 

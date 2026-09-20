@@ -21,6 +21,10 @@ from secure_control.scenarios.hvac import (
 PROJECT_ROOT = Path(__file__).parents[1]
 PLANT_CONFIG = PROJECT_ROOT / "configs" / "hvac_2r2c_plant.yaml"
 PID_CONFIG = PROJECT_ROOT / "configs" / "hvac_2r2c_pid_baseline.yaml"
+REDESIGN_PLANT_CONFIG = PROJECT_ROOT / "configs" / "hvac_2r2c_scenario_25_20_15.yaml"
+REDESIGN_PID_CONFIG = (
+    PROJECT_ROOT / "configs" / "hvac_2r2c_pid_baseline_25_20_15_fast_response.yaml"
+)
 
 
 def _frozen_components():
@@ -193,3 +197,13 @@ def test_thin_runner_emits_complete_standard_json(capsys: pytest.CaptureFixture[
         "applicable",
         "applicable",
     ]
+
+
+def test_redesigned_pid_uses_standard_stability_path_and_is_schur_stable() -> None:
+    """新配置继续由标准 tuning result 重算 final design，不复制 lineage 或稳定性数学。"""
+    report = analyze_hvac_closed_loop_stability(REDESIGN_PLANT_CONFIG, REDESIGN_PID_CONFIG)
+
+    assert report.schur.status == "stable"
+    assert report.schur.spectral_radius < 1.0
+    assert [item.reference_celsius for item in report.equilibria] == [25.0, 20.0, 15.0]
+    assert all(item.applicability == "applicable" for item in report.equilibria)

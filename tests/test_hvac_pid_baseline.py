@@ -32,6 +32,10 @@ from secure_control.simulation import SimulationResult
 PID_CONFIG_PATH = Path(__file__).parents[1] / "configs" / "hvac_pid_baseline.yaml"
 PLANT_2R2C_PATH = Path(__file__).parents[1] / "configs" / "hvac_2r2c_plant.yaml"
 PID_2R2C_PATH = Path(__file__).parents[1] / "configs" / "hvac_2r2c_pid_baseline.yaml"
+REDESIGN_SCENARIO_PATH = Path(__file__).parents[1] / "configs" / "hvac_2r2c_scenario_25_20_15.yaml"
+REDESIGN_PID_PATH = (
+    Path(__file__).parents[1] / "configs" / "hvac_2r2c_pid_baseline_25_20_15_fast_response.yaml"
+)
 
 
 def _contract_and_design():
@@ -381,5 +385,78 @@ def test_tuner_reports_explicit_infeasible_result_without_relaxing_thresholds(
     with pytest.raises(HvacTuningInfeasibleError) as captured:
         tune_hvac_pid.__wrapped__(contract, search, quality)  # type: ignore[attr-defined]
     assert captured.value.evaluated_candidate_count == 10179
+    assert captured.value.feasible_candidate_count == 0
+    assert captured.value.rejection_counts == {"segment_0:mae_celsius": 10179}
     assert captured.value.best_failed_design is not None
     assert captured.value.violations == ("segment_0:mae_celsius",)
+
+
+def test_settling_first_v2_contract_is_versioned_and_resource_bounded() -> None:
+    """v2 目标必须显式版本化，并在物化候选前拒绝过大的笛卡尔积。"""
+    objective = (
+        "maximum_segment_settling_time_seconds",
+        "maximum_segment_tail_mae_celsius",
+        "mean_segment_mae_celsius",
+        "global_saturation_fraction",
+    )
+    tie_break = (
+        "absolute_derivative_gain",
+        "absolute_integral_gain",
+        "absolute_proportional_gain",
+        "proportional_gain",
+        "integral_gain",
+        "derivative_gain",
+    )
+    contract = HvacPidTuningContract(
+        HvacGainSearchAxis(-1.5, -0.2, 27),
+        HvacGainSearchAxis(-0.0015, -0.0001, 29),
+        HvacGainSearchAxis(-6.0, 0.0, 13),
+        "deterministic_exhaustive_grid_settling_v2",
+        objective,
+        tie_break,
+    )
+    assert contract.candidate_count == 10179
+
+    with pytest.raises(ValueError, match="objective_order"):
+        HvacPidTuningContract(
+            contract.proportional,
+            contract.integral,
+            contract.derivative,
+            contract.algorithm,
+            objective[1:],
+            tie_break,
+        )
+    with pytest.raises(ValueError, match="资源上限"):
+        HvacPidTuningContract(
+            HvacGainSearchAxis(-2.0, -0.1, 1000),
+            HvacGainSearchAxis(-0.01, -0.0001, 1000),
+            HvacGainSearchAxis(-10.0, 0.0, 2),
+            "deterministic_exhaustive_grid_settling_v2",
+            objective,
+            tie_break,
+        )
+
+
+def test_settling_first_v2_reproduces_frozen_stage1_selection() -> None:
+    """现有 10,179 点 Stage 1 应唯一重算出满足全部 hard constraints 的 final PID。"""
+    contract = load_hvac_scenario_contract(REDESIGN_SCENARIO_PATH)
+    design, tuning, quality = load_hvac_pid_tuning_contract(REDESIGN_PID_PATH, contract)
+    result = tune_hvac_pid(contract, tuning, quality)
+
+    assert design == HvacPidDesign(-1.5, -0.0014, 0.0, 60, 0.0, 0.0, 600, 0.5)
+    assert result.evaluated_candidate_count == 10179
+    assert result.feasible_candidate_count == 2392
+    assert result.selected_objective == pytest.approx(
+        (540.0, 0.032560191776974536, 0.383411569571839, 0.0, 0.0, 0.0014, 1.5, -1.5, -0.0014, 0.0)
+    )
+    baseline = run_plaintext_hvac_baseline(contract, design)
+    metrics = evaluate_hvac_branch_metrics(
+        time=baseline.time,
+        reference=baseline.reference,
+        air_temperature=baseline.output_ideal,
+        applied_control=baseline.control_ideal,
+        contract=contract,
+        quality_contract=quality,
+    )
+    assert metrics.passed
+    assert [item.settling_time_seconds for item in metrics.segments] == [540.0] * 3

@@ -39,8 +39,10 @@ DEFINITION_PATH = PROJECT_ROOT / "configs" / "hvac_2r2c_precision_sweep.yaml"
 V2_DEFINITION_PATH = PROJECT_ROOT / "configs" / "hvac_2r2c_precision_sweep_definition.yaml"
 HISTORICAL_BASELINE = PROJECT_ROOT / "configs" / "hvac_2r2c_dual_loop.yaml"
 CURRENT_BASELINE = PROJECT_ROOT / "configs" / "hvac_2r2c_dual_loop_25_20_15.yaml"
+REDESIGN_BASELINE = PROJECT_ROOT / "configs" / "hvac_2r2c_dual_loop_25_20_15_fast_response.yaml"
 HISTORICAL_BASELINE_ID = "2489e5476ad316ea2d9599783e29f2d849ffcf485ca860e0db76c80312c532f9"
 CURRENT_BASELINE_ID = "f5d1bee247279ff85ba33db12778621724e46b76b880c48d8ee5637838e5aeab"
+REDESIGN_BASELINE_ID = "e0d0100f0ccf9fac15910c010090113574d9b53b61118fa6ad8a7035116138b7"
 
 
 def test_v2_definition_is_source_independent_and_preserves_historical_files() -> None:
@@ -98,6 +100,23 @@ def test_same_v2_definition_resolves_both_real_baselines() -> None:
     assert historical.stability_report_sha256 != current.stability_report_sha256
     assert historical.source.finite_horizon_certificate_sha256
     assert current.source.finite_horizon_certificate_sha256
+
+
+def test_same_v2_definition_accepts_redesigned_baseline_without_runner_changes() -> None:
+    """第三个兼容 baseline 只产生新 provenance，不要求 resolver 增加实例特例。"""
+    definition = load_precision_sweep_definition(V2_DEFINITION_PATH)
+    assert isinstance(definition, ReusablePrecisionSweepDefinition)
+    redesigned = resolve_precision_sweep_plan(
+        definition,
+        BaselineSourceRequest(REDESIGN_BASELINE, REDESIGN_BASELINE_ID),
+    )
+
+    assert redesigned.points == definition.points
+    assert redesigned.source.identity_scheme == "hvac_baseline_identity_v1"
+    assert redesigned.source.baseline_id == REDESIGN_BASELINE_ID
+    assert redesigned.source.finite_horizon_certificate_sha256 == (
+        "9719cde72bf67a004cb2c995327cc8124142fef255add8f38c2226aaca7039ac"
+    )
 
 
 def test_v2_source_request_and_v1_adapter_fail_closed_before_worker() -> None:

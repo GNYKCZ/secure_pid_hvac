@@ -49,10 +49,13 @@ from .contract import Hvac2R2CModelContract, HvacModelContract, load_hvac_scenar
 from .migration import (
     HvacBaselineIdentity,
     HvacPidBaselineResolution,
+    HvacPidRedesignRecord,
+    HvacVerifiedBaselinePredecessor,
     baseline_identity_payload,
     build_hvac_baseline_identity,
     canonical_hvac_source_sha256,
     load_hvac_pid_baseline_resolution,
+    load_hvac_pid_redesign_resolution,
     selection_record_payload,
 )
 from .pid import load_hvac_pid_design
@@ -70,6 +73,7 @@ _MAX_WRAPPER_YAML_NODES = 4096
 _MAX_POCKLINGTON_PARSE_DEPTH = 32
 _MAX_POCKLINGTON_PARSE_NODES = 256
 _MAX_POCKLINGTON_INTEGER_BITS = 4096
+_MAX_BASELINE_LINEAGE_DEPTH = 8
 
 
 class _BoundedSafeLoader(yaml.SafeLoader):
@@ -182,6 +186,53 @@ class HvacComparison:
         return self.legacy_segment_metrics_secure
 
 
+def _safe_lineage_member(parent: Path, value: object, name: str) -> Path:
+    """只接受同目录普通非链接文件，避免 lineage 路径改变 source authority。"""
+    if not isinstance(value, str) or not value or Path(value).name != value:
+        raise ValueError(f"{name} 必须是同目录安全文件名")
+    candidate = parent / value
+    if (
+        not candidate.is_file()
+        or candidate.is_symlink()
+        or any(item.is_symlink() for item in candidate.parents)
+    ):
+        raise ValueError(f"{name} 必须是存在的普通非链接文件")
+    return candidate.resolve()
+
+
+def _snapshot_hvac_config_chain(wrapper_path: Path) -> tuple[tuple[str, Path, bytes], ...]:
+    """读取 redesign 前驱的 wrapper/PID/scenario bytes，供构造后和调参后复验。"""
+    try:
+        wrapper_source = wrapper_path.read_bytes()
+        wrapper = _load_bounded_wrapper_yaml(wrapper_source)
+    except (OSError, yaml.YAMLError) as error:
+        raise ValueError("无法读取 redesign predecessor wrapper") from error
+    if not isinstance(wrapper, Mapping):
+        raise TypeError("redesign predecessor wrapper 根节点必须是映射")
+    baseline_path = _safe_lineage_member(
+        wrapper_path.parent, wrapper.get("baseline_config"), "source baseline_config"
+    )
+    try:
+        baseline_source = baseline_path.read_bytes()
+        baseline = yaml.safe_load(baseline_source.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as error:
+        raise ValueError("无法读取 redesign predecessor PID baseline") from error
+    if not isinstance(baseline, Mapping):
+        raise TypeError("redesign predecessor PID baseline 根节点必须是映射")
+    scenario_path = _safe_lineage_member(
+        baseline_path.parent, baseline.get("plant_config"), "source plant_config"
+    )
+    try:
+        scenario_source = scenario_path.read_bytes()
+    except OSError as error:
+        raise ValueError("无法读取 redesign predecessor scenario") from error
+    return (
+        ("wrapper", wrapper_path, wrapper_source),
+        ("baseline", baseline_path, baseline_source),
+        ("scenario", scenario_path, scenario_source),
+    )
+
+
 class HvacScenario:
     """以冻结 HVAC/PID 配置装配两支独立闭环并交给通用 runner。"""
 
@@ -194,9 +245,18 @@ class HvacScenario:
         test_seed: int | None = None,
         trace_policy: SecureTracePolicy | None = None,
         trace_collector: SecureTraceCollector | None = None,
+        _lineage_paths: frozenset[Path] | None = None,
+        _lineage_depth: int = 0,
     ) -> None:
         """读取 wrapper/PID/plant 配置并在创建安全资源前完成全部校验。"""
         path = Path(config_path)
+        canonical_path = path.resolve()
+        visited = frozenset() if _lineage_paths is None else _lineage_paths
+        if canonical_path in visited:
+            raise ValueError("HVAC baseline lineage 存在 cycle")
+        if _lineage_depth > _MAX_BASELINE_LINEAGE_DEPTH:
+            raise ValueError("HVAC baseline lineage 超出最大深度")
+        lineage_paths = visited | {canonical_path}
         try:
             wrapper_source = path.read_bytes()
             loaded = _load_bounded_wrapper_yaml(wrapper_source)
@@ -229,8 +289,12 @@ class HvacScenario:
             raise ValueError(f"无法读取 HVAC PID 基线配置：{baseline_path}") from error
         if not isinstance(baseline_loaded, Mapping):
             raise TypeError("HVAC PID 基线配置根节点必须是映射。")
-        if "migration" in baseline_loaded and not baseline_hash_declared:
-            raise TypeError("migration wrapper 的 baseline_sha256 必须是非空字符串。")
+        has_migration = "migration" in baseline_loaded
+        has_redesign = "baseline_creation" in baseline_loaded
+        if has_migration and has_redesign:
+            raise ValueError("PID baseline 不得同时声明 migration 与 baseline_creation。")
+        if (has_migration or has_redesign) and not baseline_hash_declared:
+            raise TypeError("正式 baseline wrapper 的 baseline_sha256 必须是非空字符串。")
         security = loaded.get("security")
         if not isinstance(security, Mapping):
             raise TypeError("security 必须是映射。")
@@ -246,8 +310,10 @@ class HvacScenario:
         self._quality_contract: HvacControlQualityContract | None = None
         self._tuning_contract: HvacPidTuningContract | None = None
         self._tuning_result: HvacPidTuningResult | None = None
-        self._migration_resolution: HvacPidBaselineResolution | None = None
+        self._baseline_resolution: HvacPidBaselineResolution | None = None
         self._baseline_identity: HvacBaselineIdentity | None = None
+        plant_path: Path | None = None
+        predecessor: HvacVerifiedBaselinePredecessor | None = None
         plant_name = baseline_loaded.get("plant_config")
         if plant_name is None:
             self._contract = load_hvac_scenario_contract(baseline_path)
@@ -266,9 +332,44 @@ class HvacScenario:
                 raise ValueError(f"无法读取 HVAC plant 配置：{plant_path}") from error
             self._plant_filename = plant_path.name
             self._contract = load_hvac_scenario_contract(plant_path)
-            if "migration" in baseline_loaded:
+            if has_migration:
                 resolution = load_hvac_pid_baseline_resolution(baseline_path, self._contract)
-                self._migration_resolution = resolution
+                self._baseline_resolution = resolution
+                self._design = resolution.design
+                self._tuning_contract = resolution.tuning_contract
+                self._quality_contract = resolution.quality_contract
+                self._tuning_result = resolution.tuning_result
+            elif has_redesign:
+                creation = baseline_loaded.get("baseline_creation")
+                if not isinstance(creation, Mapping):
+                    raise TypeError("baseline_creation 必须是映射。")
+                predecessor_path = _safe_lineage_member(
+                    baseline_path.parent,
+                    creation.get("source_wrapper_config"),
+                    "source_wrapper_config",
+                )
+                predecessor_snapshots = _snapshot_hvac_config_chain(predecessor_path)
+                predecessor_scenario = HvacScenario(
+                    predecessor_path,
+                    _lineage_paths=lineage_paths,
+                    _lineage_depth=_lineage_depth + 1,
+                )
+                if predecessor_scenario.baseline_identity is None:
+                    raise ValueError("主动 redesign predecessor 必须具有正式 baseline identity")
+                predecessor = HvacVerifiedBaselinePredecessor(
+                    predecessor_path,
+                    predecessor_scenario.baseline_identity,
+                    predecessor_scenario._design,
+                    predecessor_snapshots,
+                )
+                predecessor.revalidate()
+                resolution = load_hvac_pid_redesign_resolution(
+                    baseline_path,
+                    self._contract,
+                    predecessor,
+                    config_source=baseline_source,
+                )
+                self._baseline_resolution = resolution
                 self._design = resolution.design
                 self._tuning_contract = resolution.tuning_contract
                 self._quality_contract = resolution.quality_contract
@@ -314,21 +415,29 @@ class HvacScenario:
             raise ValueError("horizon_steps 必须等于 HVAC sample_count。")
         self._required_safety_certificate = self._derive_safety_certificate()
         self.safety_certificate = self._required_safety_certificate
-        if self._migration_resolution is not None:
-            if self._plant_source is None:
-                raise RuntimeError("migration baseline 缺少 scenario source")
+        if self._baseline_resolution is not None:
+            if self._plant_source is None or plant_path is None:
+                raise RuntimeError("正式 baseline 缺少 scenario source")
+            if (
+                path.read_bytes() != wrapper_source
+                or baseline_path.read_bytes() != baseline_source
+                or plant_path.read_bytes() != self._plant_source
+            ):
+                raise ValueError("HVAC 配置在解析期间发生变化，拒绝生成不可信身份。")
+            if predecessor is not None:
+                predecessor.revalidate()
             self._baseline_identity = build_hvac_baseline_identity(
                 source_hashes={
                     "wrapper": canonical_hvac_source_sha256(wrapper_source),
                     "baseline": canonical_hvac_source_sha256(baseline_source),
                     "scenario": canonical_hvac_source_sha256(self._plant_source),
                 },
-                quality_contract=self._migration_resolution.quality_contract,
-                selection=self._migration_resolution.selection,
+                quality_contract=self._baseline_resolution.quality_contract,
+                selection=self._baseline_resolution.selection,
                 controller_spec=self._design.to_controller_spec(),
                 safety_certificate=self.safety_certificate,
-                supersedes_baseline=self._migration_resolution.supersedes_baseline,
-                start_commit=self._migration_resolution.start_commit,
+                supersedes_baseline=self._baseline_resolution.supersedes_baseline,
+                start_commit=self._baseline_resolution.start_commit,
             )
 
     @property
@@ -338,7 +447,7 @@ class HvacScenario:
 
     @property
     def baseline_identity(self) -> HvacBaselineIdentity | None:
-        """返回迁移基线身份；历史配置为兼容旧接口返回 ``None``。"""
+        """返回正式 creation 基线身份；历史配置为兼容旧接口返回 ``None``。"""
         return self._baseline_identity
 
     @property
@@ -446,8 +555,8 @@ class HvacScenario:
                 "selected_objective": self._tuning_result.selected_objective,
             }
             snapshot["hvac"]["quality"] = asdict(self._quality_contract)
-        if self._migration_resolution is not None:
-            resolution = self._migration_resolution
+        if self._baseline_resolution is not None:
+            resolution = self._baseline_resolution
             selection = resolution.selection
             snapshot["hvac"]["tuning"] = {
                 "algorithm": resolution.tuning_contract.algorithm,
@@ -464,9 +573,12 @@ class HvacScenario:
                 "selected_objective": selection.selected_objective,
             }
             snapshot["hvac"]["quality"] = asdict(resolution.quality_contract)
-            snapshot["hvac"]["pid_selection"] = selection_record_payload(selection)
+            provenance_name = (
+                "pid_redesign" if isinstance(selection, HvacPidRedesignRecord) else "pid_selection"
+            )
+            snapshot["hvac"][provenance_name] = selection_record_payload(selection)
             if self._baseline_identity is None:
-                raise RuntimeError("migration baseline identity 尚未构造")
+                raise RuntimeError("正式 baseline identity 尚未构造")
             snapshot["baseline_identity"] = baseline_identity_payload(self._baseline_identity)
         return snapshot
 

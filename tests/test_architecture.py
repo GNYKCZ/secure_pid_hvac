@@ -139,9 +139,11 @@ def test_evidence_input_boundaries_do_not_branch_on_known_instances() -> None:
     )
     forbidden = (
         "hvac_2r2c_dual_loop_25_20_15.yaml",
+        "hvac_2r2c_dual_loop_25_20_15_fast_response.yaml",
         "hvac_2r2c_dual_loop.yaml",
         "2489e5476ad316ea2d9599783e29f2d849ffcf485ca860e0db76c80312c532f9",
         "f5d1bee247279ff85ba33db12778621724e46b76b880c48d8ee5637838e5aeab",
+        "e0d0100f0ccf9fac15910c010090113574d9b53b61118fa6ad8a7035116138b7",
         "15_20_25",
         "25_20_15",
     )
