@@ -461,6 +461,33 @@ def test_redesign_certificate_stage_toctou_fails_closed(
         HvacScenario(wrapper)
 
 
+def test_redesign_baseline_aba_switch_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """跨 integration/loader 切换 PID 为 B 再恢复 A 时不得生成混合身份。"""
+    wrapper, baseline = _copy_redesign_chain(tmp_path)
+    original_source = baseline.read_bytes()
+    alternate = yaml.safe_load(original_source.decode("utf-8"))
+    alternate["baseline_creation"]["start_commit"] = "0" * 40
+    alternate_source = yaml.safe_dump(alternate, sort_keys=False).encode("utf-8")
+    original_loader = integration_module.load_hvac_pid_redesign_resolution
+
+    def switch_baseline_during_loader(*args: object, **kwargs: object):
+        baseline.write_bytes(alternate_source)
+        try:
+            return original_loader(*args, **kwargs)
+        finally:
+            baseline.write_bytes(original_source)
+
+    monkeypatch.setattr(
+        integration_module,
+        "load_hvac_pid_redesign_resolution",
+        switch_baseline_during_loader,
+    )
+    with pytest.raises(ValueError, match="解析期间发生变化"):
+        HvacScenario(wrapper)
+
+
 def test_redesign_predecessor_rejects_path_traversal_and_real_symlink(tmp_path: Path) -> None:
     """前驱 wrapper 必须是同目录普通文件，不能用 traversal 或 leaf link 改变 authority。"""
     wrapper, baseline = _copy_redesign_chain(tmp_path)

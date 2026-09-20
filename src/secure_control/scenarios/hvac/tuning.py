@@ -197,16 +197,21 @@ def load_hvac_pid_tuning_contract(
 
 
 def _load_hvac_pid_config_inputs(
-    path: str | Path, plant_contract: HvacScenarioContract
+    path: str | Path,
+    plant_contract: HvacScenarioContract,
+    *,
+    config_source: bytes | None = None,
 ) -> _HvacPidConfigInputs:
-    """严格解析共享 PID/tuning/quality 字段，但不运行 exhaustive tuner。"""
+    """严格解析同一份 PID bytes 的共享字段，但不运行 exhaustive tuner。"""
     if not isinstance(plant_contract, HvacScenarioContract) or not isinstance(
         plant_contract.model, Hvac2R2CModelContract
     ):
         raise TypeError("plant_contract 必须是 2R2C HvacScenarioContract")
     config_path = Path(path)
+    if config_source is not None and not isinstance(config_source, bytes):
+        raise TypeError("config_source 必须是 bytes 或 None")
     try:
-        source = config_path.read_bytes()
+        source = config_path.read_bytes() if config_source is None else config_source
         loaded = yaml.safe_load(source.decode("utf-8"))
     except (OSError, yaml.YAMLError) as error:
         raise ValueError(f"无法读取 2R2C PID 配置：{config_path}") from error

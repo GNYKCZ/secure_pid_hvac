@@ -424,11 +424,17 @@ def load_hvac_pid_redesign_resolution(
     path: str | Path,
     plant_contract: HvacScenarioContract,
     predecessor: HvacVerifiedBaselinePredecessor,
+    *,
+    config_source: bytes | None = None,
 ) -> HvacPidBaselineResolution:
-    """验证真实前驱并无条件重跑 v2 plaintext tuner，生成主动 redesign resolution。"""
+    """从同一份 PID bytes 验证前驱并重跑 v2 tuner，生成 redesign resolution。"""
     if not isinstance(predecessor, HvacVerifiedBaselinePredecessor):
         raise TypeError("predecessor 必须是 HvacVerifiedBaselinePredecessor")
-    current = _load_hvac_pid_config_inputs(path, plant_contract)
+    current = _load_hvac_pid_config_inputs(
+        path,
+        plant_contract,
+        config_source=config_source,
+    )
     if "migration" in current.loaded:
         raise ValueError("PID baseline 不得同时声明 migration 与 baseline_creation")
     if current.tuning.algorithm != "deterministic_exhaustive_grid_settling_v2":

@@ -364,7 +364,10 @@ class HvacScenario:
                 )
                 predecessor.revalidate()
                 resolution = load_hvac_pid_redesign_resolution(
-                    baseline_path, self._contract, predecessor
+                    baseline_path,
+                    self._contract,
+                    predecessor,
+                    config_source=baseline_source,
                 )
                 self._baseline_resolution = resolution
                 self._design = resolution.design
