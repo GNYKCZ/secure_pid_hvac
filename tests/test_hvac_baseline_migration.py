@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 import yaml
 
+import secure_control.scenarios.hvac.integration as integration_module
 import secure_control.scenarios.hvac.migration as migration_module
 from secure_control.scenarios.hvac import (
     HvacPidSelectionRecord,
@@ -190,6 +191,27 @@ def test_migration_wrapper_rejects_preexisting_baseline_drift(tmp_path: Path) ->
     wrapper_loaded["baseline_sha256"] = canonical_hvac_source_sha256(baseline.read_bytes())
     wrapper.write_text(yaml.safe_dump(wrapper_loaded, sort_keys=False), encoding="utf-8")
     baseline.write_bytes(baseline.read_bytes() + b"\n# post-freeze drift\n")
+
+    with pytest.raises(ValueError, match="baseline.*SHA-256"):
+        HvacScenario(wrapper)
+
+
+def test_migration_wrapper_rejects_legacy_baseline_replacement_before_downstream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """wrapper 信任锚必须在分支判定前拒绝被整体替换的合法 legacy baseline。"""
+    baseline = _copy_migration_chain(tmp_path)
+    wrapper = tmp_path / WRAPPER.name
+    baseline.write_bytes(OLD_BASELINE.read_bytes())
+
+    def unexpected_downstream(*args: object, **kwargs: object) -> None:
+        """哈希不匹配时不得进入调参或范围证书派生路径。"""
+        raise AssertionError("baseline 摘要校验必须先于下游装配")
+
+    monkeypatch.setattr(integration_module, "load_hvac_pid_tuning_contract", unexpected_downstream)
+    monkeypatch.setattr(
+        integration_module.HvacScenario, "_derive_safety_certificate", unexpected_downstream
+    )
 
     with pytest.raises(ValueError, match="baseline.*SHA-256"):
         HvacScenario(wrapper)

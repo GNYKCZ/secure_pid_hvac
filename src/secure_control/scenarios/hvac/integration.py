@@ -213,17 +213,24 @@ class HvacScenario:
         baseline_path = path.parent / baseline_name
         try:
             baseline_source = baseline_path.read_bytes()
+        except OSError as error:
+            raise ValueError(f"无法读取 HVAC PID 基线配置：{baseline_path}") from error
+        baseline_hash_declared = "baseline_sha256" in loaded
+        expected_baseline_hash = loaded.get("baseline_sha256")
+        if baseline_hash_declared:
+            if not isinstance(expected_baseline_hash, str) or not expected_baseline_hash.strip():
+                raise TypeError("wrapper 的 baseline_sha256 必须是非空字符串。")
+            # 信任锚来自已读取的 wrapper，不能由尚未验证的 baseline 内容决定是否启用。
+            if canonical_hvac_source_sha256(baseline_source) != expected_baseline_hash:
+                raise ValueError("wrapper 的 PID baseline SHA-256 不一致。")
+        try:
             baseline_loaded = yaml.safe_load(baseline_source.decode("utf-8"))
-        except (OSError, yaml.YAMLError) as error:
+        except yaml.YAMLError as error:
             raise ValueError(f"无法读取 HVAC PID 基线配置：{baseline_path}") from error
         if not isinstance(baseline_loaded, Mapping):
             raise TypeError("HVAC PID 基线配置根节点必须是映射。")
-        if "migration" in baseline_loaded:
-            expected_baseline_hash = loaded.get("baseline_sha256")
-            if not isinstance(expected_baseline_hash, str) or not expected_baseline_hash.strip():
-                raise TypeError("migration wrapper 的 baseline_sha256 必须是非空字符串。")
-            if canonical_hvac_source_sha256(baseline_source) != expected_baseline_hash:
-                raise ValueError("migration wrapper 的 PID baseline SHA-256 不一致。")
+        if "migration" in baseline_loaded and not baseline_hash_declared:
+            raise TypeError("migration wrapper 的 baseline_sha256 必须是非空字符串。")
         security = loaded.get("security")
         if not isinstance(security, Mapping):
             raise TypeError("security 必须是映射。")
