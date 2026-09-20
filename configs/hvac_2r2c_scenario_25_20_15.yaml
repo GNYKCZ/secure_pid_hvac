@@ -1,0 +1,142 @@
+# Issue #53 的正式 25→20→15 参考迁移；除 reference 外保持 Issue #41 2R2C plant 契约不变。
+scenario:
+  name: hvac
+  hvac:
+    timing:
+      sampling_period_seconds: 60
+      horizon_seconds: 10800
+      sample_count: 180
+      terminal_sample_included: false
+      update_order: measure_adapt_control_plant_record
+      output_log_time_index: pre_plant_step
+
+    model:
+      kind: second_order_2r2c_cooling
+      continuous_model_version: hvac_2r2c_no_internal_gains_v1
+      discretization: exact_zero_order_hold
+      air_wall_thermal_resistance_celsius_per_kw: 2.78
+      wall_outdoor_thermal_resistance_celsius_per_kw: 7.05
+      air_thermal_capacitance_kj_per_celsius: 400.0
+      wall_thermal_capacitance_kj_per_celsius: 48800.0
+      cooling_coefficient: 1.0
+      ambient_temperature_celsius: 30.0
+      initial_air_temperature_celsius: 30.0
+      initial_wall_temperature_celsius: 30.0
+      control:
+        unit: kW_thermal_cooling
+        positive_direction: cooling
+        lower_bound_kw: 0.0
+        upper_bound_kw: 12.0
+
+      # R/C 取自下列文献；其余值是项目场景假设，不能描述为建筑标定结果。
+      parameter_provenance:
+        - parameter_name: air_wall_thermal_resistance_celsius_per_kw
+          source_kind: literature
+          reference: "Coccia et al., Experimental Assessment of an Air-to-Water Heat Pump Driven by a Demand Response Strategy, DOI 10.18280/ti-ijes.652-413"
+          source_version: "2021, Table 1"
+          original_value: 0.00278
+          original_unit: K/W
+          configured_value: 2.78
+          conversion_note: "乘以 1000 W/kW；温差 1 K 等于温差 1 degC"
+        - parameter_name: wall_outdoor_thermal_resistance_celsius_per_kw
+          source_kind: literature
+          reference: "Coccia et al., Experimental Assessment of an Air-to-Water Heat Pump Driven by a Demand Response Strategy, DOI 10.18280/ti-ijes.652-413"
+          source_version: "2021, Table 1"
+          original_value: 0.00705
+          original_unit: K/W
+          configured_value: 7.05
+          conversion_note: "乘以 1000 W/kW；温差 1 K 等于温差 1 degC"
+        - parameter_name: air_thermal_capacitance_kj_per_celsius
+          source_kind: literature
+          reference: "Coccia et al., Experimental Assessment of an Air-to-Water Heat Pump Driven by a Demand Response Strategy, DOI 10.18280/ti-ijes.652-413"
+          source_version: "2021, Table 1"
+          original_value: 0.40
+          original_unit: MJ/K
+          configured_value: 400.0
+          conversion_note: "乘以 1000 kJ/MJ；温差 1 K 等于温差 1 degC"
+        - parameter_name: wall_thermal_capacitance_kj_per_celsius
+          source_kind: literature
+          reference: "Coccia et al., Experimental Assessment of an Air-to-Water Heat Pump Driven by a Demand Response Strategy, DOI 10.18280/ti-ijes.652-413"
+          source_version: "2021, Table 1"
+          original_value: 48.80
+          original_unit: MJ/K
+          configured_value: 48800.0
+          conversion_note: "乘以 1000 kJ/MJ；温差 1 K 等于温差 1 degC"
+        - parameter_name: cooling_coefficient
+          source_kind: project_assumption
+          reference: "secure_pid_hvac Issue #41 modelling definition"
+          source_version: "plant-only baseline v1"
+          original_value: 1.0
+          original_unit: dimensionless
+          configured_value: 1.0
+          conversion_note: "u 已定义为送达的 thermal cooling kW，因此 eta=1，无需换算"
+        - parameter_name: ambient_temperature_celsius
+          source_kind: project_assumption
+          reference: "secure_pid_hvac Issue #41 scenario assumption"
+          source_version: "plant-only baseline v1"
+          original_value: 30.0
+          original_unit: degC
+          configured_value: 30.0
+          conversion_note: "项目固定环境温度假设，数值与单位不变"
+        - parameter_name: initial_air_temperature_celsius
+          source_kind: project_assumption
+          reference: "secure_pid_hvac Issue #41 scenario assumption"
+          source_version: "plant-only baseline v1"
+          original_value: 30.0
+          original_unit: degC
+          configured_value: 30.0
+          conversion_note: "项目初始空气温度假设，数值与单位不变"
+        - parameter_name: initial_wall_temperature_celsius
+          source_kind: project_assumption
+          reference: "secure_pid_hvac Issue #41 scenario assumption"
+          source_version: "plant-only baseline v1"
+          original_value: 30.0
+          original_unit: degC
+          configured_value: 30.0
+          conversion_note: "项目初始墙体温度假设，数值与单位不变"
+        - parameter_name: lower_control_bound_kw
+          source_kind: project_assumption
+          reference: "secure_pid_hvac Issue #41 actuator assumption"
+          source_version: "plant-only baseline v1"
+          original_value: 0.0
+          original_unit: kW_thermal_cooling
+          configured_value: 0.0
+          conversion_note: "项目执行器下界假设，数值与单位不变"
+        - parameter_name: upper_control_bound_kw
+          source_kind: project_assumption
+          reference: "secure_pid_hvac Issue #41 actuator assumption"
+          source_version: "plant-only baseline v1"
+          original_value: 12.0
+          original_unit: kW_thermal_cooling
+          configured_value: 12.0
+          conversion_note: "项目执行器上界假设；不是来源文献中的 2 kW 热泵额定值"
+
+    reference:
+      unit: degC
+      endpoint_value_celsius: 15.0
+      segments:
+        - start_seconds: 0
+          end_seconds: 3600
+          target_temperature_celsius: 25.0
+        - start_seconds: 3600
+          end_seconds: 7200
+          target_temperature_celsius: 20.0
+        - start_seconds: 7200
+          end_seconds: 10800
+          target_temperature_celsius: 15.0
+
+    signal_adapter:
+      kind: reference_minus_temperature
+      output_unit: degC
+      controller_input_unit: degC
+
+    channels:
+      reference:
+        names: [target_temperature]
+        units: [degC]
+      output:
+        names: [air_temperature]
+        units: [degC]
+      control:
+        names: [cooling_power]
+        units: [kW_thermal_cooling]

@@ -22,6 +22,7 @@ from secure_control.experiments.runner import (
 )
 from secure_control.scenarios.hvac import (
     evaluate_hvac_comparison_metrics,
+    load_hvac_pid_baseline_resolution,
     load_hvac_pid_tuning_contract,
     load_hvac_scenario_contract,
 )
@@ -37,8 +38,11 @@ PROJECT_ROOT = Path(__file__).parents[1]
 CONFIG_PATH = PROJECT_ROOT / "configs" / "hvac_dual_loop.yaml"
 BASELINE_PATH = PROJECT_ROOT / "configs" / "hvac_pid_baseline.yaml"
 CONFIG_2R2C_PATH = PROJECT_ROOT / "configs" / "hvac_2r2c_dual_loop.yaml"
+CONFIG_2R2C_MIGRATED_PATH = PROJECT_ROOT / "configs" / "hvac_2r2c_dual_loop_25_20_15.yaml"
 BASELINE_2R2C_PATH = PROJECT_ROOT / "configs" / "hvac_2r2c_pid_baseline.yaml"
+BASELINE_2R2C_MIGRATED_PATH = PROJECT_ROOT / "configs" / "hvac_2r2c_pid_baseline_25_20_15.yaml"
 PLANT_2R2C_PATH = PROJECT_ROOT / "configs" / "hvac_2r2c_plant.yaml"
+SCENARIO_2R2C_MIGRATED_PATH = PROJECT_ROOT / "configs" / "hvac_2r2c_scenario_25_20_15.yaml"
 
 
 def test_selector_accepts_only_explicit_hvac_and_rejects_unimplemented_names(
@@ -236,6 +240,29 @@ def test_2r2c_saved_run_has_three_source_hashes_and_reader_recomputes_same_metri
     assert record.effective_config["hvac"]["tuning"]["evaluated_candidate_count"] == 10179
     assert record.effective_config["hvac"]["tuning"]["feasible_candidate_count"] == 679
     assert record.effective_config["finite_horizon_certificate"]["state_truncation_bits"] == 0
+
+
+def test_migrated_2r2c_run_preserves_identity_and_reader_recomputes_metrics(
+    tmp_path: Path,
+) -> None:
+    """新代表 run 沿用 schema v1，保存稳定身份并可由 canonical reader 重算指标。"""
+    published = run_experiment(
+        CONFIG_2R2C_MIGRATED_PATH,
+        test_seed=42,
+        output_root=tmp_path / "migrated 2R2C results",
+    )
+    record = load_artifacts(published.run_dir)
+    contract = load_hvac_scenario_contract(SCENARIO_2R2C_MIGRATED_PATH)
+    resolution = load_hvac_pid_baseline_resolution(BASELINE_2R2C_MIGRATED_PATH, contract)
+    metrics = evaluate_hvac_comparison_metrics(record.result, contract, resolution.quality_contract)
+    identity = record.effective_config["baseline_identity"]
+    scenario_identity = HvacScenario(CONFIG_2R2C_MIGRATED_PATH).baseline_identity
+    assert scenario_identity is not None
+    assert metrics.passed
+    assert identity["baseline_id"] == scenario_identity.baseline_id
+    assert record.effective_config["hvac"]["pid_selection"]["pid_reused"] is True
+    assert record.effective_config["hvac"]["pid_selection"]["tuning_executed"] is False
+    assert record.effective_config["hvac"]["pid_selection"]["evaluated_candidate_count"] == 0
 
 
 def test_default_randomness_is_recorded_without_inventing_seed(tmp_path: Path) -> None:

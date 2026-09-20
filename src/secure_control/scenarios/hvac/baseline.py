@@ -156,6 +156,20 @@ class HvacComparisonMetrics:
 
 
 @dataclass(frozen=True, slots=True)
+class HvacPidValidationResult:
+    """保存单个 PID 在纯明文闭环上的指标与稳定拒绝原因。"""
+
+    design: HvacPidDesign
+    metrics: HvacBranchMetrics
+    rejection_reasons: tuple[str, ...]
+
+    @property
+    def passed(self) -> bool:
+        """仅当全部区段门槛通过且没有拒绝原因时返回真。"""
+        return self.metrics.passed and not self.rejection_reasons
+
+
+@dataclass(frozen=True, slots=True)
 class HvacPlaintextBaseline:
     """明文 HVAC 闭环的通用命名轨迹与场景专属 tracking 指标。"""
 
@@ -503,3 +517,32 @@ def evaluate_hvac_comparison_metrics(
         and secure.passed
         and all(value <= limit for value, limit in zip(values, limits)),
     )
+
+
+def validate_hvac_pid_design(
+    contract: HvacScenarioContract,
+    design: HvacPidDesign,
+    quality_contract: HvacControlQualityContract,
+) -> HvacPidValidationResult:
+    """只用明文闭环验证一个 PID，并按区段顺序返回稳定拒绝原因。"""
+    if not isinstance(contract, HvacScenarioContract):
+        raise TypeError("contract 必须是 HvacScenarioContract")
+    if not isinstance(design, HvacPidDesign):
+        raise TypeError("design 必须是 HvacPidDesign")
+    if not isinstance(quality_contract, HvacControlQualityContract):
+        raise TypeError("quality_contract 必须是 HvacControlQualityContract")
+    baseline = run_plaintext_hvac_baseline(contract, design)
+    metrics = evaluate_hvac_branch_metrics(
+        time=baseline.time,
+        reference=baseline.reference,
+        air_temperature=baseline.output_ideal,
+        applied_control=baseline.control_ideal,
+        contract=contract,
+        quality_contract=quality_contract,
+    )
+    reasons = tuple(
+        f"segment_{metric.start_seconds}:{violation}"
+        for metric in metrics.segments
+        for violation in metric.violations
+    )
+    return HvacPidValidationResult(design, metrics, reasons)

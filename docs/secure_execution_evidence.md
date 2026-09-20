@@ -1,5 +1,9 @@
 # 安全执行证据与增强中文报告
 
+> 历史证据说明：现有执行证据绑定旧 15→20→25 sweep 的代表点。Issue #53 不重跑 evidence，
+> 该证据不能自动外推到 25→20→15 正式基线；迁移边界见
+> [hvac_reference_migration.md](hvac_reference_migration.md)。
+
 ## 目的与边界
 
 Issue #51 为冻结的 2R2C HVAC 精度扫描增加一条显式、默认关闭的诊断路径。它记录真实
