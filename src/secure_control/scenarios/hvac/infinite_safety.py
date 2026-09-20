@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 from fractions import Fraction
@@ -71,6 +72,15 @@ class HvacInfiniteSafetyProfile:
 
 
 @dataclass(frozen=True, slots=True)
+class HvacInfiniteSafetyBaselineIdentity:
+    """冻结 schema v2 assumptions 绑定的正式 baseline 身份与三源摘要。"""
+
+    scheme: str
+    baseline_id: str
+    source_hashes: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True, slots=True)
 class HvacInfiniteSafetyBundle:
     """保存四个冻结精度点和共同的适用假设及声明边界。"""
 
@@ -81,6 +91,7 @@ class HvacInfiniteSafetyBundle:
     stability_report_sha256: str
     assumptions: tuple[str, ...]
     claim_boundary: str
+    baseline_identity: HvacInfiniteSafetyBaselineIdentity | None = None
 
 
 def load_hvac_infinite_safety_bundle(
@@ -100,7 +111,7 @@ def load_hvac_infinite_safety_bundle(
         raise ValueError("HVAC 无限时域安全配置不是有效 UTF-8 YAML") from error
     if not isinstance(loaded, Mapping):
         raise TypeError("HVAC 无限时域安全配置根节点必须是映射")
-    required = {
+    common_required = {
         "schema_version",
         "scenario_id",
         "sources",
@@ -110,11 +121,18 @@ def load_hvac_infinite_safety_bundle(
         "witnesses",
         "claim_boundary",
     }
-    if set(loaded) != required or loaded["schema_version"] != 1:
+    schema_version = loaded.get("schema_version")
+    required = common_required | ({"baseline_identity"} if schema_version == 2 else set())
+    if schema_version not in {1, 2} or set(loaded) != required:
         raise ValueError("HVAC 无限时域安全配置字段或 schema_version 无效")
     scenario_id = _nonempty_string(loaded["scenario_id"], "scenario_id")
     claim_boundary = _nonempty_string(loaded["claim_boundary"], "claim_boundary")
     source_paths, source_hashes = _validated_sources(path.parent, loaded["sources"])
+    baseline_identity = (
+        _baseline_identity(loaded["baseline_identity"], source_hashes)
+        if schema_version == 2
+        else None
+    )
 
     stability_source = _mapping(loaded["upstream_stability"], "upstream_stability")
     if set(stability_source) != {
@@ -127,8 +145,15 @@ def load_hvac_infinite_safety_bundle(
         _fraction(value, "upstream_stability.references_celsius")
         for value in stability_source["references_celsius"]
     )
-    if stability_references != (Fraction(15), Fraction(20), Fraction(25)):
-        raise ValueError("#37 stability references 必须冻结为 15/20/25°C")
+    if schema_version == 1:
+        if stability_references != (Fraction(15), Fraction(20), Fraction(25)):
+            raise ValueError("#38 stability references 必须冻结为 15/20/25°C")
+    elif len(stability_references) != 3 or set(stability_references) != {
+        Fraction(15),
+        Fraction(20),
+        Fraction(25),
+    }:
+        raise ValueError("stability references 必须逐项覆盖 15/20/25°C")
     boundary_tolerance = _fraction(
         stability_source["boundary_tolerance"],
         "upstream_stability.boundary_tolerance",
@@ -202,10 +227,12 @@ def load_hvac_infinite_safety_bundle(
         raise ValueError("continues_forever 必须明确为 true")
     if assumptions.get("strictly_unsaturated") is not True:
         raise ValueError("strictly_unsaturated 必须明确为 true")
-    if reference != 25 or ambient != 30:
-        raise ValueError("#38 冻结工作点必须是 reference=25°C、ambient=30°C")
+    if reference not in stability_references or ambient != 30:
+        raise ValueError("无限时域工作点必须来自稳定性报告且 ambient=30°C")
     if Fraction.from_float(contract.model.ambient_temperature_celsius) != ambient:
         raise ValueError("配置 ambient 与冻结 plant 不一致")
+    if Fraction.from_float(contract.endpoint_reference_celsius) != reference:
+        raise ValueError("无限持续 reference 必须等于冻结场景的 endpoint reference")
 
     security = _mapping(loaded["security"], "security")
     if set(security) != {
@@ -274,6 +301,16 @@ def load_hvac_infinite_safety_bundle(
             raise ValueError(f"sources.{name} 在证书装配期间发生变化")
     if path.read_bytes() != source:
         raise ValueError("HVAC 无限时域安全配置在解析期间发生变化")
+    reference_text = (
+        str(reference.numerator)
+        if reference.denominator == 1
+        else f"{reference.numerator}/{reference.denominator}"
+    )
+    ambient_text = (
+        str(ambient.numerator)
+        if ambient.denominator == 1
+        else f"{ambient.numerator}/{ambient.denominator}"
+    )
     return HvacInfiniteSafetyBundle(
         scenario_id,
         profiles,
@@ -281,13 +318,14 @@ def load_hvac_infinite_safety_bundle(
         stability_report,
         stability_report_sha256,
         (
-            "reference 固定为 25°C 且从证书初态起无限持续",
-            "ambient 固定为 30°C，2R2C plant 与 PID 来源哈希保持不变",
+            f"reference 固定为 {reference_text}°C 且从证书初态起无限持续",
+            f"ambient 固定为 {ambient_text}°C，2R2C plant 与 PID 来源哈希保持不变",
             "控制始终严格位于 0–12 kW，因而不进入 saturation 切换",
             "输入编码误差不超过半 LSB；整数 A/B 路径的 state Trunc 误差为零",
             "actuation decode 误差受配置界约束，plant binary64 roundoff 在模型中声明为零",
         ),
         claim_boundary,
+        baseline_identity,
     )
 
 
@@ -599,6 +637,35 @@ def _build_profile(
     )
 
 
+def _baseline_identity(
+    value: Any, source_hashes: Mapping[str, str]
+) -> HvacInfiniteSafetyBaselineIdentity:
+    """校验正式 baseline ID，并要求 PID/scenario 摘要与 assumptions 来源同源。"""
+    identity = _mapping(value, "baseline_identity")
+    if set(identity) != {"scheme", "baseline_id", "source_hashes"}:
+        raise ValueError("baseline_identity 字段无效")
+    scheme = _nonempty_string(identity["scheme"], "baseline_identity.scheme")
+    baseline_id = _sha256(identity["baseline_id"], "baseline_identity.baseline_id")
+    hashes = _mapping(identity["source_hashes"], "baseline_identity.source_hashes")
+    if set(hashes) != {"wrapper", "baseline", "scenario"}:
+        raise ValueError("baseline_identity.source_hashes 必须覆盖三份配置")
+    copied = {
+        name: _sha256(digest, f"baseline_identity.source_hashes.{name}")
+        for name, digest in hashes.items()
+    }
+    if scheme != "hvac_baseline_identity_v1":
+        raise ValueError("baseline_identity.scheme 无效")
+    if copied["baseline"] != source_hashes["pid"]:
+        raise ValueError("baseline identity 的 PID 摘要与 assumptions source 不一致")
+    if copied["scenario"] != source_hashes["plant"]:
+        raise ValueError("baseline identity 的 scenario 摘要与 assumptions source 不一致")
+    return HvacInfiniteSafetyBaselineIdentity(
+        scheme,
+        baseline_id,
+        tuple(sorted(copied.items())),
+    )
+
+
 def _validated_sources(base: Path, value: Any):
     """复验 plant/PID/sweep/prime 四个规范文本哈希。"""
     sources = _mapping(value, "sources")
@@ -732,6 +799,14 @@ def _nonempty_string(value: Any, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise TypeError(f"{name} 必须是非空字符串")
     return value
+
+
+def _sha256(value: Any, name: str) -> str:
+    """读取小写 SHA-256，拒绝把任意标签当作内容身份。"""
+    text = _nonempty_string(value, name)
+    if not re.fullmatch(r"[0-9a-f]{64}", text):
+        raise ValueError(f"{name} 必须是小写 SHA-256")
+    return text
 
 
 def _integer(value: Any, name: str) -> int:

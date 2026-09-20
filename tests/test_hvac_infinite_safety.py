@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from fractions import Fraction
+from hashlib import sha256
 from pathlib import Path
 
 import numpy as np
@@ -24,12 +25,19 @@ from secure_control.scenarios.hvac.tuning import load_hvac_pid_tuning_contract
 
 PROJECT_ROOT = Path(__file__).parents[1]
 CONFIG = PROJECT_ROOT / "configs" / "hvac_2r2c_infinite_safety.yaml"
+FINAL_CONFIG = PROJECT_ROOT / "configs" / "hvac_2r2c_infinite_safety_25_20_15_fast_response.yaml"
 
 
 @pytest.fixture(scope="module")
 def bundle():
     """只执行一次较昂贵的 256-bit 素数证据与四点精确复验。"""
     return load_hvac_infinite_safety_bundle(CONFIG)
+
+
+@pytest.fixture(scope="module")
+def final_bundle():
+    """复验最终 PID 在固定 15°C 工作点的四精度有理证书。"""
+    return load_hvac_infinite_safety_bundle(FINAL_CONFIG)
 
 
 def test_four_verified_precision_profiles_are_exactly_certified(bundle) -> None:
@@ -44,6 +52,31 @@ def test_four_verified_precision_profiles_are_exactly_certified(bundle) -> None:
         assert profile.controller.scale_metadata.state == profile.fractional_bits
         assert profile.controller.scale_metadata.output == 2 * profile.fractional_bits
         assert profile.prime_verification.status == "verified"
+
+
+def test_final_fast_response_fixed_15_profiles_bind_formal_baseline(final_bundle) -> None:
+    """最终证书必须绑定 #57 baseline，并逐 ell 得到 certified 结论。"""
+    identity = final_bundle.baseline_identity
+    assert identity is not None
+    assert identity.scheme == "hvac_baseline_identity_v1"
+    assert identity.baseline_id == (
+        "e0d0100f0ccf9fac15910c010090113574d9b53b61118fa6ad8a7035116138b7"
+    )
+    assert final_bundle.stability_report_sha256 == (
+        "6f7340c765e5947787fb74f726c6793d262a9bea8251843a744585a63fe512e7"
+    )
+    assert {profile.invariant_report.status for profile in final_bundle.profiles} == {"certified"}
+    assert final_bundle.assumptions[0].startswith("reference 固定为 15°C")
+    assert "25→20→15°C" in final_bundle.claim_boundary
+
+
+def test_historical_v1_assumptions_bytes_and_loader_remain_compatible(bundle) -> None:
+    """新增 schema v2 不得改写历史 #38 assumptions 或强制其声明 baseline identity。"""
+    canonical = CONFIG.read_bytes().replace(b"\r\n", b"\n")
+    assert sha256(canonical).hexdigest() == (
+        "23eeb2231d8aed3c26b46ec9189079fdde998a966db72a1aae507ea8a7732fa3"
+    )
+    assert bundle.baseline_identity is None
 
 
 def test_protocol_reverifies_evidence_before_any_share(bundle, monkeypatch) -> None:

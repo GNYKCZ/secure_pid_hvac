@@ -390,7 +390,9 @@ def render_saved_run(
     render_id = _new_render_id()
     if not _RENDER_ID_PATTERN.fullmatch(render_id):
         raise ValueError("render_id 格式无效。")
-    stage = parent / f".incomplete-{render_id}"
+    # 正式 render_id 仍保留完整时间戳；临时目录只需要随机 nonce 区分并发调用，
+    # 避免 sweep staging + run_id + figure staging 在 Windows 上超过路径预算。
+    stage = parent / f".incomplete-{render_id.rsplit('-', 1)[1]}"
     final = parent / render_id
     if os.path.lexists(final):
         raise FileExistsError(f"render ID 已存在：{render_id}")

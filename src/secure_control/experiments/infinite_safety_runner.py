@@ -102,13 +102,16 @@ def _validate_sweep(bundle: HvacInfiniteSafetyBundle, verified) -> None:
     if len(verified.records) != 12:
         raise ValueError("verified sweep 必须完整包含四个 ell 与三个冻结 seed")
     source_hashes = dict(bundle.source_hashes)
-    sweep_sources = definition.get("source_hashes")
-    if not isinstance(sweep_sources, dict):
-        raise TypeError("verified sweep 缺少 source_hashes")
-    if sweep_sources.get("plant") != source_hashes["plant"]:
-        raise ValueError("verified sweep 的 plant source hash 与 #38 不一致")
-    if sweep_sources.get("baseline") != source_hashes["pid"]:
-        raise ValueError("verified sweep 的 PID source hash 与 #38 不一致")
+    if definition.get("schema_version") == 2:
+        _validate_v2_sweep_source(bundle, verified, source_hashes)
+    else:
+        sweep_sources = definition.get("source_hashes")
+        if not isinstance(sweep_sources, dict):
+            raise TypeError("verified sweep 缺少 source_hashes")
+        if sweep_sources.get("plant") != source_hashes["plant"]:
+            raise ValueError("verified sweep 的 plant source hash 与 #38 不一致")
+        if sweep_sources.get("baseline") != source_hashes["pid"]:
+            raise ValueError("verified sweep 的 PID source hash 与 #38 不一致")
     profiles = {profile.fractional_bits: profile for profile in bundle.profiles}
     for record in verified.records:
         if record.status is not SweepRunStatus.SUCCESS or record.cost is None:
@@ -128,6 +131,43 @@ def _validate_sweep(bundle: HvacInfiniteSafetyBundle, verified) -> None:
         raise ValueError("verified sweep 未完整覆盖四个 ell")
     if {record.point.seed for record in verified.records} != {42, 43, 44}:
         raise ValueError("verified sweep 未完整覆盖三个冻结 seed")
+
+
+def _validate_v2_sweep_source(bundle, verified, source_hashes: dict[str, str]) -> None:
+    """把 v2 resolved provenance 与 assumptions 的正式 baseline 和稳定性逐项绑定。"""
+    identity = bundle.baseline_identity
+    resolved_source = verified.resolved_source
+    resolved_plan = verified.resolved_plan
+    if identity is None:
+        raise ValueError("schema v2 sweep 必须由 schema v2 assumptions 声明 baseline identity")
+    if not isinstance(resolved_source, dict) or not isinstance(resolved_plan, dict):
+        raise TypeError("schema v2 sweep 缺少 verified resolved source/plan")
+    expected_hashes = dict(identity.source_hashes)
+    if (
+        resolved_source.get("identity_scheme") != identity.scheme
+        or resolved_source.get("baseline_id") != identity.baseline_id
+        or resolved_source.get("source_hashes") != expected_hashes
+        or expected_hashes["baseline"] != source_hashes["pid"]
+        or expected_hashes["scenario"] != source_hashes["plant"]
+    ):
+        raise ValueError("schema v2 sweep 的 baseline/source identity 与 assumptions 不一致")
+    if (
+        resolved_plan.get("baseline_identity_scheme") != identity.scheme
+        or resolved_plan.get("baseline_id") != identity.baseline_id
+        or resolved_plan.get("stability_report_sha256") != bundle.stability_report_sha256
+        or resolved_plan.get("stability_report") != asdict(bundle.stability_report)
+        or resolved_plan.get("points") != _definition_points(verified.definition)
+        or verified.definition.get("prime_evidence_hash") != source_hashes["prime"]
+    ):
+        raise ValueError("schema v2 sweep 的 resolved plan 与 assumptions 不一致")
+
+
+def _definition_points(definition: dict[str, Any]) -> list[dict[str, Any]]:
+    """读取 canonical reader 已验证的十二点载荷，供 source plan 再绑定。"""
+    points = definition.get("points")
+    if not isinstance(points, list) or not all(isinstance(item, dict) for item in points):
+        raise TypeError("verified sweep definition points 无效")
+    return points
 
 
 def _certificate_payload(
@@ -175,7 +215,7 @@ def _certificate_payload(
                 "witness": _exact_payload(evidence.witness),
             }
         )
-    return {
+    payload = {
         "schema_version": 2,
         "scenario_id": bundle.scenario_id,
         "quantifier": "for_all_integer_k_greater_than_or_equal_to_zero",
@@ -195,6 +235,13 @@ def _certificate_payload(
         "default_180_step_baseline_covered": False,
         "profiles": profiles,
     }
+    if bundle.baseline_identity is not None:
+        payload["baseline_identity"] = {
+            "scheme": bundle.baseline_identity.scheme,
+            "baseline_id": bundle.baseline_identity.baseline_id,
+            "source_hashes": dict(bundle.baseline_identity.source_hashes),
+        }
+    return payload
 
 
 def _sweep_manifest_hashes(sweep_root: Path) -> dict[str, str]:
@@ -238,7 +285,7 @@ def _markdown_report(bundle: HvacInfiniteSafetyBundle, certificate: dict[str, An
             "## 不覆盖项",
             "",
             f"- {bundle.claim_boundary}",
-            "- 默认 180 步 15→20→25°C 基线首步会进入饱和，因此不能引用本证书。",
+            "- 本证书不覆盖 180 步切换轨迹；切换仿真与固定参考条件定理必须分别解释。",
             "- 本报告没有重新运行 sweep、仿真或绘图，也不扩展到一般切换系统。",
             "",
         ]
