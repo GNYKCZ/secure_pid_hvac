@@ -1,0 +1,11 @@
+# Issue #57 的快速响应 PID 明文/安全双闭环正式入口。
+scenario:
+  name: hvac
+baseline_config: hvac_2r2c_pid_baseline_25_20_15_fast_response.yaml
+baseline_sha256: 1af8217e600a37110c0a74e2baf2b42ee196fdc0591e5d835b5aa09201421945
+security:
+  modulus: 2305843009213693951
+  integer_bits: 48
+  fractional_bits: 20
+  security_parameter: 8
+  horizon_steps: 180

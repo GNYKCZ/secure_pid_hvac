@@ -37,6 +37,12 @@ core ───────→ 标准库和基础数组类型
   composition root 解析，通用 artifact reader 仍不导入场景实现。详见
   [实验证据输入边界与 schema v2 迁移](evidence_input_boundaries.md)。
 
+HVAC baseline creation 在场景层区分兼容迁移和显式 plaintext controller redesign。两者各自
+维护 method-specific provenance invariant，但归一为同一个 `HvacPidBaselineResolution`，继续
+使用同一 `hvac_baseline_identity_v1` builder、finite-horizon certificate 和下游显式 source
+boundary。redesign 前驱由实际配置链验证；调参模块仍为 plaintext-only，不依赖 secure runtime
+或 experiments。详见 [2R2C HVAC 主动 PID redesign](hvac_pid_redesign.md)。
+
 低层模块不得反向导入 `scenarios`。具体场景名称、单位或控制器调参字段不得进入
 `core`、`crypto`、`protocol`、`execution` 或 `simulation`。
 

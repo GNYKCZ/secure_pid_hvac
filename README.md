@@ -100,6 +100,17 @@ Issue #53 将正式参考迁移为 25→20→15 °C；当前 PID 先经独立 pl
 [2R2C HVAC 参考迁移](docs/hvac_reference_migration.md)。旧 15→20→25 配置及其下游报告继续作为
 历史证据保留，不自动代表新正式基线。
 
+Issue #57 在同一 plant/reference/actuator/PID realization 上增加显式 plaintext redesign，
+用冻结的 10,179 点 Stage 1 网格选择更快响应 PID，并形成独立 lineage、有限时域证书和
+baseline identity。运行入口为：
+
+```powershell
+uv run python -m secure_control.scenarios.hvac.runner --config configs/hvac_2r2c_dual_loop_25_20_15_fast_response.yaml --seed 42
+```
+
+设计契约、old/new 指标、哈希与声明边界见
+[2R2C HVAC 主动 PID redesign](docs/hvac_pid_redesign.md)。
+
 保存正式八字段实验产物使用独立入口，不改变上面的场景级摘要 CLI：
 
 ```powershell

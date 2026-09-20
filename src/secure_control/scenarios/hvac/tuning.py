@@ -25,8 +25,15 @@ from .baseline import (
 from .contract import Hvac2R2CModelContract, HvacScenarioContract, load_hvac_scenario_contract
 from .pid import HvacPidDesign
 
-_ALGORITHM = "deterministic_exhaustive_grid_v1"
-_OBJECTIVE_ORDER = (
+_ALGORITHM_V1 = "deterministic_exhaustive_grid_v1"
+_ALGORITHM_V2 = "deterministic_exhaustive_grid_settling_v2"
+_OBJECTIVE_ORDER_V1 = (
+    "maximum_segment_tail_mae_celsius",
+    "mean_segment_mae_celsius",
+    "global_saturation_fraction",
+)
+_OBJECTIVE_ORDER_V2 = (
+    "maximum_segment_settling_time_seconds",
     "maximum_segment_tail_mae_celsius",
     "mean_segment_mae_celsius",
     "global_saturation_fraction",
@@ -39,6 +46,7 @@ _TIE_BREAK_ORDER = (
     "integral_gain",
     "derivative_gain",
 )
+_MAX_CANDIDATE_COUNT = 100_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,19 +83,28 @@ class HvacPidTuningContract:
     proportional: HvacGainSearchAxis
     integral: HvacGainSearchAxis
     derivative: HvacGainSearchAxis
-    algorithm: Literal["deterministic_exhaustive_grid_v1"]
+    algorithm: Literal[
+        "deterministic_exhaustive_grid_v1",
+        "deterministic_exhaustive_grid_settling_v2",
+    ]
     objective_order: tuple[str, ...]
     tie_break_order: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        if self.algorithm != _ALGORITHM:
-            raise ValueError(f"tuning algorithm 必须为 {_ALGORITHM}")
-        if self.objective_order != _OBJECTIVE_ORDER:
+        expected_objective = {
+            _ALGORITHM_V1: _OBJECTIVE_ORDER_V1,
+            _ALGORITHM_V2: _OBJECTIVE_ORDER_V2,
+        }.get(self.algorithm)
+        if expected_objective is None:
+            raise ValueError("tuning algorithm 不受支持")
+        if self.objective_order != expected_objective:
             raise ValueError("tuning objective_order 与冻结设计不一致")
         if self.tie_break_order != _TIE_BREAK_ORDER:
             raise ValueError("tuning tie_break_order 与冻结设计不一致")
-        if self.candidate_count != 10179:
+        if self.algorithm == _ALGORITHM_V1 and self.candidate_count != 10179:
             raise ValueError("冻结 tuning grid 必须恰好包含 10179 个候选")
+        if self.candidate_count > _MAX_CANDIDATE_COUNT:
+            raise ValueError("tuning grid 超出冻结资源上限")
         if self.proportional.maximum >= 0 or self.integral.maximum >= 0:
             raise ValueError("HVAC tuning 的 Kp/Ki 候选必须全部为负数")
         if self.derivative.maximum > 0:
@@ -138,9 +155,13 @@ class HvacTuningInfeasibleError(ValueError):
         evaluated_candidate_count: int,
         best_failed_design: HvacPidDesign | None,
         violations: tuple[str, ...],
+        rejection_counts: Mapping[str, int] | None = None,
     ) -> None:
         super().__init__("冻结 HVAC PID 网格没有满足全部品质门槛的候选")
         self.evaluated_candidate_count = evaluated_candidate_count
+        self.feasible_candidate_count = 0
+        copied = {str(key): int(value) for key, value in (rejection_counts or {}).items()}
+        self.rejection_counts = MappingProxyType(copied)
         self.best_failed_design = best_failed_design
         self.violations = violations
 
@@ -303,10 +324,26 @@ def tune_hvac_pid(
                 best_failed = diagnostic
             continue
         feasible_count += 1
+        metric_objective = (
+            (
+                max(
+                    metric.settling_time_seconds
+                    for metric in branch.segments
+                    if metric.settling_time_seconds is not None
+                ),
+                max(metric.tail_mae_celsius for metric in branch.segments),
+                float(np.mean([metric.mae_celsius for metric in branch.segments])),
+                branch.global_saturation_fraction,
+            )
+            if tuning_contract.algorithm == _ALGORITHM_V2
+            else (
+                max(metric.tail_mae_celsius for metric in branch.segments),
+                float(np.mean([metric.mae_celsius for metric in branch.segments])),
+                branch.global_saturation_fraction,
+            )
+        )
         objective = (
-            max(metric.tail_mae_celsius for metric in branch.segments),
-            float(np.mean([metric.mae_celsius for metric in branch.segments])),
-            branch.global_saturation_fraction,
+            *metric_objective,
             abs(kd),
             abs(ki),
             abs(kp),
@@ -321,6 +358,7 @@ def tune_hvac_pid(
             tuning_contract.candidate_count,
             None if best_failed is None else best_failed[2],
             () if best_failed is None else best_failed[1],
+            rejection_counts,
         )
     return HvacPidTuningResult(
         selected[1],
