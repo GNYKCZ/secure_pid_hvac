@@ -1,0 +1,31 @@
+# Issue #55 的 source-independent evidence 展示配置；来源身份取自显式 verified artifacts。
+schema_version: 2
+locale: zh-CN
+base_profile: hvac_2r2c_report_zh.yaml
+representative_ell: 48
+representative_seed: 42
+selected_step: 60
+time_unit: min
+segments_minutes:
+  - [0, 60]
+  - [60, 120]
+  - [120, 180]
+fig3_control_semantics: applied
+diagnostic_rng_mode: reproducibility_only
+deployment_security: false
+main_order:
+  - dual_path_architecture
+  - selected_secure_trace
+  - integer_decode_applied
+  - controller_state_transition
+  - tracking
+  - applied_control
+  - fig3_adapted
+  - normalized_precision
+  - quantitative_table
+  - resource_and_timing
+limitations_zh:
+  - combined-share 文件只用于显式离线组合诊断，不代表部署参与方可同时看见两份 share
+  - Adapted 2R2C HVAC 不是论文原 Numerical Example 的逐项数值复现
+  - Protocol 2 count 为 0 只说明当前整数 A/B 正式路径未触发截断，不代表完整 HVAC 闭环验证了 Protocol 2
+  - 正式 Fig. 3 adapted 使用 applied control；raw control error 仅为数值机制诊断

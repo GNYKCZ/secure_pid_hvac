@@ -3,10 +3,14 @@
 from .evidence_artifacts import EvidenceArtifacts, VerifiedEvidenceData
 from .evidence_reporting import EvidenceReportArtifacts, EvidenceReportProfile
 from .sweep import (
+    BaselineSourceRequest,
     PrecisionPreflightReport,
     PrecisionSweepDefinition,
     ProtocolCostReport,
     RangeMargin,
+    ResolvedBaselineSource,
+    ResolvedPrecisionSweepPlan,
+    ReusablePrecisionSweepDefinition,
     SweepArtifacts,
     SweepPointDefinition,
     SweepRunRecord,
@@ -17,6 +21,7 @@ from .sweep import (
 from .sweep_metrics import ErrorMetrics, aggregate_error_metrics, compute_error_metrics
 
 __all__ = [
+    "BaselineSourceRequest",
     "ErrorMetrics",
     "EvidenceArtifacts",
     "EvidenceReportArtifacts",
@@ -25,6 +30,9 @@ __all__ = [
     "PrecisionSweepDefinition",
     "ProtocolCostReport",
     "RangeMargin",
+    "ResolvedBaselineSource",
+    "ResolvedPrecisionSweepPlan",
+    "ReusablePrecisionSweepDefinition",
     "SweepArtifacts",
     "SweepPointDefinition",
     "SweepRunRecord",

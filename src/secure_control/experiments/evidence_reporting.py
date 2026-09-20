@@ -71,12 +71,13 @@ _RESULT_FIELDS = (
 
 @dataclass(frozen=True, slots=True)
 class EvidenceReportProfile:
-    """冻结增强报告来源、分钟轴、选定 step、分段与声明边界。"""
+    """冻结展示语义；v1 可带历史 pin，v2 的来源完全由显式 artifact 提供。"""
 
+    schema_version: int
     locale: str
-    source_sweep_id: str
-    source_manifest_sha256: str
-    source_data_manifest_sha256: str
+    source_sweep_id: str | None
+    source_manifest_sha256: str | None
+    source_data_manifest_sha256: str | None
     base_profile_path: Path
     representative_ell: int
     representative_seed: int
@@ -105,17 +106,14 @@ class EvidenceReportArtifacts:
 
 
 def load_evidence_report_profile(path: str | Path) -> EvidenceReportProfile:
-    """严格读取 Issue #51 profile，并相对配置目录解析复用的 #48 profile。"""
+    """严格读取 historical v1 或 source-independent v2 evidence display profile。"""
     source = Path(path)
     loaded = yaml.safe_load(source.read_text(encoding="utf-8"))
     if not isinstance(loaded, Mapping):
         raise TypeError("evidence report profile 必须是映射。")
-    required = {
+    common_required = {
         "schema_version",
         "locale",
-        "source_sweep_id",
-        "source_manifest_sha256",
-        "source_data_manifest_sha256",
         "base_profile",
         "representative_ell",
         "representative_seed",
@@ -128,7 +126,10 @@ def load_evidence_report_profile(path: str | Path) -> EvidenceReportProfile:
         "main_order",
         "limitations_zh",
     }
-    if set(loaded) != required or loaded["schema_version"] != 1:
+    schema_version = loaded.get("schema_version")
+    pins = {"source_sweep_id", "source_manifest_sha256", "source_data_manifest_sha256"}
+    required = common_required | (pins if schema_version == 1 else set())
+    if schema_version not in {1, 2} or set(loaded) != required:
         raise ValueError("evidence report profile 字段或 schema_version 无效。")
     if (
         loaded["locale"] != "zh-CN"
@@ -138,19 +139,25 @@ def load_evidence_report_profile(path: str | Path) -> EvidenceReportProfile:
         or loaded["deployment_security"] is not False
     ):
         raise ValueError("evidence report 的 locale/time/control/RNG/security 语义无效。")
-    for name in ("source_manifest_sha256", "source_data_manifest_sha256"):
-        if not _is_sha256(loaded[name]):
-            raise ValueError(f"{name} 必须是 SHA-256。")
-    source_sweep_id = loaded["source_sweep_id"]
-    if (
-        not isinstance(source_sweep_id, str)
-        or not source_sweep_id
-        or source_sweep_id in {".", ".."}
-        or Path(source_sweep_id).name != source_sweep_id
-        or "/" in source_sweep_id
-        or "\\" in source_sweep_id
-    ):
-        raise ValueError("source_sweep_id 必须是安全的单级目录名。")
+    source_sweep_id: str | None = None
+    source_manifest_sha256: str | None = None
+    source_data_manifest_sha256: str | None = None
+    if schema_version == 1:
+        for name in ("source_manifest_sha256", "source_data_manifest_sha256"):
+            if not _is_sha256(loaded[name]):
+                raise ValueError(f"{name} 必须是 SHA-256。")
+        source_sweep_id = loaded["source_sweep_id"]
+        if (
+            not isinstance(source_sweep_id, str)
+            or not source_sweep_id
+            or source_sweep_id in {".", ".."}
+            or Path(source_sweep_id).name != source_sweep_id
+            or "/" in source_sweep_id
+            or "\\" in source_sweep_id
+        ):
+            raise ValueError("source_sweep_id 必须是安全的单级目录名。")
+        source_manifest_sha256 = loaded["source_manifest_sha256"]
+        source_data_manifest_sha256 = loaded["source_data_manifest_sha256"]
     integers = (
         loaded["representative_ell"],
         loaded["representative_seed"],
@@ -187,10 +194,11 @@ def load_evidence_report_profile(path: str | Path) -> EvidenceReportProfile:
     if not isinstance(base, str) or Path(base).name != base:
         raise ValueError("base_profile 必须是同目录安全文件名。")
     return EvidenceReportProfile(
+        schema_version=schema_version,
         locale="zh-CN",
         source_sweep_id=source_sweep_id,
-        source_manifest_sha256=loaded["source_manifest_sha256"],
-        source_data_manifest_sha256=loaded["source_data_manifest_sha256"],
+        source_manifest_sha256=source_manifest_sha256,
+        source_data_manifest_sha256=source_data_manifest_sha256,
         base_profile_path=source.parent / base,
         representative_ell=integers[0],
         representative_seed=integers[1],
@@ -239,7 +247,8 @@ def render_evidence_report(
     )
     source_snapshot = _source_snapshot(verified_sweep, verified_evidence, profile)
     report_id = _new_report_id()
-    parent = Path(output_root) / profile.source_sweep_id
+    actual_sweep_id = verified_sweep.root.name
+    parent = Path(output_root) / actual_sweep_id
     parent.mkdir(parents=True, exist_ok=True)
     stage, final = parent / f".incomplete-{report_id}", parent / report_id
     if os.path.lexists(final):
@@ -335,9 +344,9 @@ def render_evidence_report(
         manifest = {
             "schema_version": 1,
             "report_id": report_id,
-            "source_sweep_id": profile.source_sweep_id,
-            "source_manifest_sha256": profile.source_manifest_sha256,
-            "source_data_manifest_sha256": profile.source_data_manifest_sha256,
+            "source_sweep_id": actual_sweep_id,
+            "source_manifest_sha256": source_snapshot["sweep_manifest"],
+            "source_data_manifest_sha256": source_snapshot["sweep_data_manifest"],
             "source_evidence": {
                 "trace_id": verified_evidence.metadata["trace_id"],
                 "manifest_sha256": source_snapshot["evidence_manifest"],
@@ -410,20 +419,23 @@ def _validate_inputs(
     profile: EvidenceReportProfile,
 ) -> None:
     """绑定 sweep/evidence/profile lineage，并拒绝缺失 point、step 或 raw-share 泄漏。"""
-    if sweep.root.name != profile.source_sweep_id:
-        raise ValueError("profile source_sweep_id 与 verified sweep 不一致。")
-    if _digest(sweep.root / "manifest.json") != profile.source_manifest_sha256:
-        raise ValueError("profile source_manifest_sha256 与 verified sweep 不一致。")
-    if _digest(sweep.root / "data_manifest.json") != profile.source_data_manifest_sha256:
-        raise ValueError("profile source_data_manifest_sha256 与 verified sweep 不一致。")
-    if evidence.metadata.get("source_sweep_id") != profile.source_sweep_id:
+    actual_sweep_id = sweep.root.name
+    actual_manifest = _digest(sweep.root / "manifest.json")
+    actual_data_manifest = _digest(sweep.root / "data_manifest.json")
+    if profile.schema_version == 1 and (
+        actual_sweep_id != profile.source_sweep_id
+        or actual_manifest != profile.source_manifest_sha256
+        or actual_data_manifest != profile.source_data_manifest_sha256
+    ):
+        raise ValueError("historical profile source pins 与 verified sweep 不一致。")
+    if evidence.metadata.get("source_sweep_id") != actual_sweep_id:
         raise ValueError("evidence lineage 与 verified sweep 不一致。")
     source_hashes = evidence.metadata.get("source_hashes")
     if not isinstance(source_hashes, dict) or (
         source_hashes.get("manifest.json"),
         source_hashes.get("data_manifest.json"),
-    ) != (profile.source_manifest_sha256, profile.source_data_manifest_sha256):
-        raise ValueError("evidence source hashes 与冻结 profile 不一致。")
+    ) != (actual_manifest, actual_data_manifest):
+        raise ValueError("evidence source hashes 与 actual verified sweep 不一致。")
     point = evidence.metadata.get("source_point")
     representative = next(
         (

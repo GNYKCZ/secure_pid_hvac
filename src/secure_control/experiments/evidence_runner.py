@@ -19,11 +19,17 @@ from secure_control.simulation import SimulationBranch, compare_closed_loops
 from .evidence_artifacts import EvidenceArtifacts, write_evidence_artifacts
 from .provenance import collect_provenance
 from .sweep import (
+    BaselineSourceRequest,
     SweepRunStatus,
     load_precision_sweep_definition,
     materialize_point_config,
+    reusable_definition_from_snapshot,
 )
 from .sweep_artifacts import load_verified_sweep_data
+from .sweep_runner import (
+    resolve_verified_precision_sweep_plan,
+    validate_resolved_baseline_source,
+)
 
 ISSUE51_START_COMMIT = "3dfbd05fdc63ee2ddab91c42f3999f39a13e6d48"
 _RESULT_FIELDS = (
@@ -75,6 +81,8 @@ def run_evidence_diagnostic(
     output_root: Path,
     allow_combined_share_diagnostic: bool = False,
     definition_path: Path = Path("configs/hvac_2r2c_precision_sweep.yaml"),
+    baseline_config: Path | None = None,
+    expected_baseline_id: str | None = None,
     start_commit: str = ISSUE51_START_COMMIT,
 ) -> EvidenceArtifacts:
     """复现唯一冻结点，严格比对八字段后原子发布独立 evidence。
@@ -107,19 +115,39 @@ def run_evidence_diagnostic(
     if selected_step >= verified.runs[record.point.point_id].result.time.size:
         raise ValueError("selected_step 超出 source run sample 范围。")
 
-    definition = load_precision_sweep_definition(definition_path)
+    if verified.definition.get("schema_version") == 2:
+        if baseline_config is None or expected_baseline_id is None:
+            raise ValueError(
+                "v2 sweep evidence 必须显式提供 baseline_config 与 expected_baseline_id"
+            )
+        if verified.resolved_source is None or verified.resolved_plan is None:
+            raise ValueError("v2 sweep 缺少 verified resolved source/plan")
+        definition = reusable_definition_from_snapshot(verified.definition)
+        materialization = resolve_verified_precision_sweep_plan(
+            definition,
+            BaselineSourceRequest(baseline_config, expected_baseline_id),
+            verified.resolved_source,
+            verified.resolved_plan,
+        )
+        definition_hash = sha256((source / "definition.json").read_bytes()).hexdigest()
+    else:
+        if baseline_config is not None or expected_baseline_id is not None:
+            raise ValueError("v1 sweep evidence 不允许 v2 baseline override")
+        definition = load_precision_sweep_definition(definition_path)
+        materialization = definition
+        definition_hash = sha256(Path(definition_path).read_bytes()).hexdigest()
     point = next(
-        (item for item in definition.points if item.ell == ell and item.seed == seed),
-        None,
+        (item for item in materialization.points if item.ell == ell and item.seed == seed), None
     )
     if point is None:
         raise ValueError("指定 ell/seed 不属于冻结 precision sweep definition。")
-    _validate_definition(verified.definition, definition, point.q)
+    if verified.definition.get("schema_version") != 2:
+        _validate_definition(verified.definition, definition, point.q)
     source_record = verified.runs[record.point.point_id]
 
     with tempfile.TemporaryDirectory(prefix="secure-control-evidence-") as temporary:
         point_config = Path(temporary) / f"ell-{ell}-seed-{seed}.yaml"
-        materialize_point_config(definition, point, point_config)
+        materialize_point_config(materialization, point, point_config)
         point_config_sha256 = sha256(point_config.read_bytes()).hexdigest()
         collector = SecureTraceCollector()
         policy = SecureTracePolicy(
@@ -150,6 +178,8 @@ def run_evidence_diagnostic(
             if snapshot != _source_snapshot(source, ell, seed):
                 raise ValueError("source sweep/run 在诊断期间发生变化。")
             load_verified_sweep_data(source, manifest_name="manifest.json")
+            if verified.definition.get("schema_version") == 2:
+                validate_resolved_baseline_source(materialization.source)
 
         validate_source()
         ledger = plan.secure.runtime.scale_ledger
@@ -169,7 +199,15 @@ def run_evidence_diagnostic(
             },
             "source_hashes": snapshot,
             "point_config_sha256": point_config_sha256,
-            "sweep_definition_sha256": sha256(Path(definition_path).read_bytes()).hexdigest(),
+            "sweep_definition_sha256": definition_hash,
+            "resolved_baseline": (
+                None
+                if verified.resolved_source is None
+                else {
+                    "identity_scheme": verified.resolved_source["identity_scheme"],
+                    "baseline_id": verified.resolved_source["baseline_id"],
+                }
+            ),
             "result_equivalence": {
                 "comparison": "dtype_shape_and_array_equal",
                 "fields": list(_RESULT_FIELDS),
@@ -316,6 +354,8 @@ def main() -> None:
         "--definition",
         default="configs/hvac_2r2c_precision_sweep.yaml",
     )
+    parser.add_argument("--baseline-config")
+    parser.add_argument("--expected-baseline-id")
     parser.add_argument(
         "--allow-combined-share-diagnostic",
         action="store_true",
@@ -330,6 +370,8 @@ def main() -> None:
         output_root=Path(args.output_root),
         allow_combined_share_diagnostic=args.allow_combined_share_diagnostic,
         definition_path=Path(args.definition),
+        baseline_config=(None if args.baseline_config is None else Path(args.baseline_config)),
+        expected_baseline_id=args.expected_baseline_id,
     )
     print(
         json.dumps(

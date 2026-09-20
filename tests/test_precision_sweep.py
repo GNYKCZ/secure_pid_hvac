@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, replace
+from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,8 +13,11 @@ import yaml
 
 from secure_control.experiments import _sweep_worker, sweep_runner
 from secure_control.experiments.sweep import (
+    BaselineSourceRequest,
     PrecisionPreflightReport,
     RangeMargin,
+    ResolvedBaselineSource,
+    ReusablePrecisionSweepDefinition,
     SweepPointDefinition,
     SweepRunStatus,
     load_precision_sweep_definition,
@@ -21,14 +25,224 @@ from secure_control.experiments.sweep import (
 )
 from secure_control.experiments.sweep_artifacts import record_from_payload, write_json
 from secure_control.experiments.sweep_runner import (
+    _resolve_definition_plan,
     _run_child,
     build_preflight_report,
     derive_protocol_cost,
+    resolve_hvac_baseline_source,
+    resolve_precision_sweep_plan,
 )
 from secure_control.scenarios.hvac.integration import HvacSafetyCertificate, HvacScenario
 
 PROJECT_ROOT = Path(__file__).parents[1]
 DEFINITION_PATH = PROJECT_ROOT / "configs" / "hvac_2r2c_precision_sweep.yaml"
+V2_DEFINITION_PATH = PROJECT_ROOT / "configs" / "hvac_2r2c_precision_sweep_definition.yaml"
+HISTORICAL_BASELINE = PROJECT_ROOT / "configs" / "hvac_2r2c_dual_loop.yaml"
+CURRENT_BASELINE = PROJECT_ROOT / "configs" / "hvac_2r2c_dual_loop_25_20_15.yaml"
+HISTORICAL_BASELINE_ID = "2489e5476ad316ea2d9599783e29f2d849ffcf485ca860e0db76c80312c532f9"
+CURRENT_BASELINE_ID = "f5d1bee247279ff85ba33db12778621724e46b76b880c48d8ee5637838e5aeab"
+
+
+def test_v2_definition_is_source_independent_and_preserves_historical_files() -> None:
+    """v2 只保存稳定实验策略，历史 v1 definition/profile 的 bytes 不变。"""
+    definition = load_precision_sweep_definition(V2_DEFINITION_PATH)
+    assert isinstance(definition, ReusablePrecisionSweepDefinition)
+    assert len(definition.points) == 12
+    payload = yaml.safe_load(V2_DEFINITION_PATH.read_text(encoding="utf-8"))
+    forbidden = {
+        "source_config",
+        "source_hashes",
+        "stability_report_hash",
+        "baseline_config",
+        "baseline_id",
+        "sweep_id",
+        "trace_id",
+        "run_id",
+        "manifest_sha256",
+    }
+    assert forbidden.isdisjoint(payload)
+    assert (
+        sha256(DEFINITION_PATH.read_bytes()).hexdigest()
+        == "87e20bf25c445849acf3ca15c8a7b6f9848f1fbd1b739aaab3cfd51a35a10e83"
+    )
+    legacy_profile = PROJECT_ROOT / "configs" / "hvac_2r2c_evidence_report_zh.yaml"
+    assert (
+        sha256(legacy_profile.read_bytes()).hexdigest()
+        == "bf3166c51ad3f87373618d2379730dbdfe0e6c7fa8178c9cb55fa0b1032cb20e"
+    )
+
+
+def test_same_v2_definition_resolves_both_real_baselines() -> None:
+    """两个真实 baseline 只改变 resolved provenance，不改变十二点实验矩阵。"""
+    definition = load_precision_sweep_definition(V2_DEFINITION_PATH)
+    assert isinstance(definition, ReusablePrecisionSweepDefinition)
+    historical = resolve_precision_sweep_plan(
+        definition,
+        BaselineSourceRequest(HISTORICAL_BASELINE, HISTORICAL_BASELINE_ID),
+    )
+    current = resolve_precision_sweep_plan(
+        definition,
+        BaselineSourceRequest(CURRENT_BASELINE, CURRENT_BASELINE_ID),
+    )
+    assert historical.points == current.points == definition.points
+    assert (historical.source.identity_scheme, historical.source.baseline_id) == (
+        "hvac_historical_config_chain_v1",
+        HISTORICAL_BASELINE_ID,
+    )
+    assert (current.source.identity_scheme, current.source.baseline_id) == (
+        "hvac_baseline_identity_v1",
+        CURRENT_BASELINE_ID,
+    )
+    assert historical.source.source_hashes != current.source.source_hashes
+    assert historical.source.effective_config_sha256 != current.source.effective_config_sha256
+    assert historical.stability_report_sha256 != current.stability_report_sha256
+    assert historical.source.finite_horizon_certificate_sha256
+    assert current.source.finite_horizon_certificate_sha256
+
+
+def test_v2_source_request_and_v1_adapter_fail_closed_before_worker() -> None:
+    """缺少 v2 trust anchor、错误 ID 或 v1 override 均不能形成 execution plan。"""
+    v2 = load_precision_sweep_definition(V2_DEFINITION_PATH)
+    v1 = load_precision_sweep_definition(DEFINITION_PATH)
+    with pytest.raises(ValueError, match="必须同时提供"):
+        _resolve_definition_plan(v2, baseline_config=CURRENT_BASELINE, expected_baseline_id=None)
+    with pytest.raises(ValueError, match="不允许"):
+        _resolve_definition_plan(
+            v1,
+            baseline_config=HISTORICAL_BASELINE,
+            expected_baseline_id=HISTORICAL_BASELINE_ID,
+        )
+    with pytest.raises(ValueError, match="expected_baseline_id"):
+        resolve_precision_sweep_plan(
+            v2,
+            BaselineSourceRequest(CURRENT_BASELINE, HISTORICAL_BASELINE_ID),
+        )
+
+
+def test_v2_definition_rejects_instance_identity_fields(tmp_path: Path) -> None:
+    """稳定 definition 即使收到合法外观的实例 pin 也必须按 schema 拒绝。"""
+    payload = yaml.safe_load(V2_DEFINITION_PATH.read_text(encoding="utf-8"))
+    payload["baseline_id"] = CURRENT_BASELINE_ID
+    target = tmp_path / "definition.yaml"
+    target.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    (tmp_path / "hvac_2r2c_sweep_prime.yaml").write_bytes(
+        (PROJECT_ROOT / "configs" / "hvac_2r2c_sweep_prime.yaml").read_bytes()
+    )
+    with pytest.raises(ValueError, match="字段"):
+        load_precision_sweep_definition(target)
+
+
+def test_source_resolution_rejects_path_traversal_without_running_scenario(
+    tmp_path: Path,
+) -> None:
+    """source request 不得借 wrapper 的相对路径逃逸显式配置目录。"""
+    wrapper = tmp_path / "wrapper.yaml"
+    wrapper.write_text(
+        "scenario: {name: hvac}\nbaseline_config: ../outside.yaml\nsecurity: {}\n",
+        encoding="utf-8",
+    )
+    definition = load_precision_sweep_definition(V2_DEFINITION_PATH)
+    with pytest.raises(ValueError, match="安全文件名"):
+        resolve_precision_sweep_plan(
+            definition,
+            BaselineSourceRequest(wrapper, HISTORICAL_BASELINE_ID),
+        )
+
+
+def test_source_resolution_rejects_missing_and_real_symlink_source(tmp_path: Path) -> None:
+    """显式 source 必须是存在的普通文件，不能通过链接改变 authority。"""
+    definition = load_precision_sweep_definition(V2_DEFINITION_PATH)
+    with pytest.raises(ValueError, match="存在的普通非链接文件"):
+        resolve_precision_sweep_plan(
+            definition,
+            BaselineSourceRequest(tmp_path / "missing.yaml", HISTORICAL_BASELINE_ID),
+        )
+
+    link = tmp_path / "baseline-link.yaml"
+    link.symlink_to(CURRENT_BASELINE)
+    with pytest.raises(ValueError, match="存在的普通非链接文件"):
+        resolve_hvac_baseline_source(
+            BaselineSourceRequest(link, CURRENT_BASELINE_ID),
+            definition.source_requirements,
+        )
+
+
+def test_source_resolution_rejects_real_symlink_source_ancestor(tmp_path: Path) -> None:
+    """显式 source 的祖先目录也不能通过链接改变 path authority。"""
+    definition = load_precision_sweep_definition(V2_DEFINITION_PATH)
+    linked_configs = tmp_path / "linked-configs"
+    linked_configs.symlink_to(CURRENT_BASELINE.parent, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="存在的普通非链接文件"):
+        resolve_hvac_baseline_source(
+            BaselineSourceRequest(linked_configs / CURRENT_BASELINE.name, CURRENT_BASELINE_ID),
+            definition.source_requirements,
+        )
+
+
+def test_source_resolution_rejects_tampered_current_config_chain(tmp_path: Path) -> None:
+    """scenario bytes 被改写时，PID→scenario trust anchor 必须先于 worker 失败。"""
+    names = (
+        "hvac_2r2c_dual_loop_25_20_15.yaml",
+        "hvac_2r2c_pid_baseline_25_20_15.yaml",
+        "hvac_2r2c_scenario_25_20_15.yaml",
+    )
+    for name in names:
+        (tmp_path / name).write_bytes((PROJECT_ROOT / "configs" / name).read_bytes())
+    scenario = tmp_path / names[-1]
+    scenario.write_text(
+        scenario.read_text(encoding="utf-8") + "\n# tampered\n",
+        encoding="utf-8",
+    )
+    definition = load_precision_sweep_definition(V2_DEFINITION_PATH)
+    with pytest.raises(ValueError, match="SHA-256"):
+        resolve_precision_sweep_plan(
+            definition,
+            BaselineSourceRequest(tmp_path / names[0], CURRENT_BASELINE_ID),
+        )
+
+
+def test_plan_rejects_stability_and_prime_policy_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """resolved source 合法也不能绕过动态 stability 与固定 q 的 prime trust anchor。"""
+    definition = load_precision_sweep_definition(V2_DEFINITION_PATH)
+    source = ResolvedBaselineSource(
+        CURRENT_BASELINE,
+        "fixture",
+        CURRENT_BASELINE_ID,
+        {"wrapper": "1" * 64, "baseline": "2" * 64, "scenario": "3" * 64},
+        "4" * 64,
+        "5" * 64,
+    )
+    monkeypatch.setattr(sweep_runner, "resolve_hvac_baseline_source", lambda *_args: source)
+    monkeypatch.setattr(
+        sweep_runner,
+        "stability_report_sha256",
+        lambda *_args: (
+            "6" * 64,
+            {"schur": {"status": "unstable"}, "equilibria": []},
+        ),
+    )
+    with pytest.raises(ValueError, match="stability"):
+        resolve_precision_sweep_plan(
+            definition,
+            BaselineSourceRequest(CURRENT_BASELINE, CURRENT_BASELINE_ID),
+        )
+
+    monkeypatch.setattr(
+        sweep_runner,
+        "stability_report_sha256",
+        lambda *_args: (
+            "7" * 64,
+            {"schur": {"status": "stable"}, "equilibria": []},
+        ),
+    )
+    with pytest.raises(ValueError, match="prime evidence"):
+        resolve_precision_sweep_plan(
+            replace(definition, prime_evidence_hash="0" * 64),
+            BaselineSourceRequest(CURRENT_BASELINE, CURRENT_BASELINE_ID),
+        )
 
 
 def test_definition_freezes_twelve_points_and_security_invariants() -> None:
@@ -137,7 +351,7 @@ def test_runner_publishes_success_infeasible_and_failed_points_atomically(
 
     monkeypatch.setattr(sweep_runner, "load_precision_sweep_definition", lambda _path: definition)
     monkeypatch.setattr(
-        sweep_runner, "stability_report_sha256", lambda _plant, _pid: ("hash", stable)
+        sweep_runner, "stability_report_sha256", lambda _plant, _pid: ("a" * 64, stable)
     )
     monkeypatch.setattr(sweep_runner, "_frozen_sources", lambda _definition, _hash: (True, {}))
     monkeypatch.setattr(sweep_runner, "_run_child", fake_child)

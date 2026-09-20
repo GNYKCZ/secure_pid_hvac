@@ -32,7 +32,10 @@ core ───────→ 标准库和基础数组类型
   `sweep_figure_runner` 不运行实验，中文 HVAC 语义不进入通用 reader 或 simulation。
   Issue #51 的 `evidence_runner` 是唯一可装配场景与 trace 的诊断 composition root；
   `evidence_artifacts` 保持领域无关。`evidence_reporting` 只消费两个 verified reader 的内存结果，
-  不导入场景、runtime、仿真执行器或诊断 runner。
+  不导入场景、runtime、仿真执行器或诊断 runner。Issue #55 进一步把稳定 definition、显式
+  source request、resolved provenance 和 display profile 分离；兼容 baseline 只在 HVAC
+  composition root 解析，通用 artifact reader 仍不导入场景实现。详见
+  [实验证据输入边界与 schema v2 迁移](evidence_input_boundaries.md)。
 
 低层模块不得反向导入 `scenarios`。具体场景名称、单位或控制器调参字段不得进入
 `core`、`crypto`、`protocol`、`execution` 或 `simulation`。

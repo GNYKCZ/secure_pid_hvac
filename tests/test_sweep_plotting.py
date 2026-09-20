@@ -12,6 +12,9 @@ from secure_control.experiments.artifacts import SCHEMA_VERSION, write_artifacts
 from secure_control.experiments.sweep import (
     PrecisionPreflightReport,
     ProtocolCostReport,
+    ResolvedBaselineSource,
+    ResolvedPrecisionSweepPlan,
+    ReusablePrecisionSweepDefinition,
     SweepRunRecord,
     SweepRunStatus,
     load_precision_sweep_definition,
@@ -25,6 +28,8 @@ from secure_control.experiments.sweep_artifacts import (
     write_json,
     write_manifest,
     write_range_margins,
+    write_resolved_plan,
+    write_resolved_source,
     write_summary,
 )
 from secure_control.experiments.sweep_metrics import compute_error_metrics
@@ -33,6 +38,7 @@ from secure_control.simulation import ChannelMetadata, ScenarioMetadata, Simulat
 
 PROJECT_ROOT = Path(__file__).parents[1]
 DEFINITION_PATH = PROJECT_ROOT / "configs" / "hvac_2r2c_precision_sweep.yaml"
+V2_DEFINITION_PATH = PROJECT_ROOT / "configs" / "hvac_2r2c_precision_sweep_definition.yaml"
 
 
 def _verified_sweep(root: Path) -> Path:
@@ -155,12 +161,69 @@ def test_verified_reader_rejects_missing_or_extra_authoritative_file(
         load_verified_sweep_data(root)
 
 
+def test_v2_sweep_manifest_closes_definition_resolved_source_and_plan(tmp_path: Path) -> None:
+    """v2 artifact 将稳定定义和运行实例 provenance 分开保存并一起纳入清单。"""
+    root = _verified_sweep(tmp_path / "sweep")
+    v2 = load_precision_sweep_definition(V2_DEFINITION_PATH)
+    assert isinstance(v2, ReusablePrecisionSweepDefinition)
+    v2 = replace(v2, seeds=(42,), primary_seed=42)
+    source = ResolvedBaselineSource(
+        PROJECT_ROOT / "configs" / "hvac_2r2c_dual_loop_25_20_15.yaml",
+        "fixture_identity_v1",
+        "1" * 64,
+        {"wrapper": "2" * 64, "baseline": "3" * 64, "scenario": "4" * 64},
+        "5" * 64,
+        "6" * 64,
+    )
+    plan = ResolvedPrecisionSweepPlan(
+        v2,
+        source,
+        {"schur": {"status": "stable"}, "equilibria": []},
+        "7" * 64,
+        True,
+        v2.points,
+        {"definition_schema_version": 2, "definition_source_sha256": "8" * 64},
+    )
+    records = load_verified_sweep_data(root).records
+    (root / "manifest.json").unlink()
+    (root / "data_manifest.json").unlink()
+    write_definition(root / "definition.json", v2)
+    write_resolved_source(root / "resolved_source.json", source)
+    write_resolved_plan(root / "resolved_plan.json", plan)
+    write_data_manifest(
+        root / "data_manifest.json", sweep_id=root.name, definition=v2, records=records
+    )
+    write_manifest(root / "manifest.json", sweep_id=root.name, definition=v2, records=records)
+
+    verified = load_verified_sweep_data(root)
+    assert verified.definition["schema_version"] == 2
+    assert verified.resolved_source["baseline_id"] == "1" * 64
+    assert verified.resolved_plan["points"] == verified.definition["points"]
+    assert str(PROJECT_ROOT) not in (root / "resolved_source.json").read_text(encoding="utf-8")
+
+    with (root / "resolved_plan.json").open("a", encoding="utf-8") as target:
+        target.write(" ")
+    with pytest.raises(ValueError, match="SHA-256"):
+        load_verified_sweep_data(root)
+
+
 def test_verified_path_rejects_escape(tmp_path: Path) -> None:
     """manifest 和 worker 提供的相对路径均不能用父目录片段逃逸。"""
     root = tmp_path / "sweep"
     root.mkdir()
     with pytest.raises(ValueError, match="逃逸"):
         _safe_member(root, "../outside.json")
+
+
+def test_verified_path_rejects_real_leaf_symlink(tmp_path: Path) -> None:
+    """manifest 成员自身即使指向闭包内普通文件，也不得作为 leaf link 被接受。"""
+    root = tmp_path / "sweep"
+    root.mkdir()
+    target = root / "target.json"
+    target.write_text("{}\n", encoding="utf-8")
+    (root / "member.json").symlink_to(target)
+    with pytest.raises(ValueError, match="符号链接"):
+        _safe_member(root, "member.json")
 
 
 def test_time_series_rejects_primary_seed_time_grid_mismatch(tmp_path: Path) -> None:

@@ -134,6 +134,9 @@ PNG/PDF。无同单位 reference 的输出误差可用可重复的 `--output-err
 uv run python -m secure_control.experiments.sweep_runner --definition configs/hvac_2r2c_precision_sweep.yaml
 ```
 
+source-independent schema v2 通过显式 baseline path/expected ID 解析运行来源；使用方式和
+兼容边界见[实验证据输入边界与 schema v2 迁移](docs/evidence_input_boundaries.md)。
+
 扫描固定 plant、PID、reference、horizon、执行器、256-bit 素数与 `lambda=80`，只比较
 `ell={32,40,48,56}`（对应 `k=ell+28`）和三个测试材料 seed。每点先验证来源摘要、
 Pocklington 证据、局部稳定性报告与有限时域整数范围，再发布原始八字段结果、标准图、跨精度图、
