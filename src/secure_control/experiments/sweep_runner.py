@@ -124,8 +124,12 @@ def _safe_source_member(parent: Path, value: object, name: str) -> Path:
 def _source_paths_from_config(config_path: Path) -> tuple[Path, Path, Path]:
     """解析 wrapper、PID baseline 和 scenario，并限制配置链不能逃逸目录。"""
     requested_path = Path(config_path)
-    # 必须在 canonicalize 前检查 leaf；resolve() 会折叠链接并丢失调用者选择的 path authority。
-    if not requested_path.is_file() or requested_path.is_symlink():
+    # 必须在 canonicalize 前检查 leaf 和祖先；resolve() 会折叠链接并丢失调用者选择的 path authority。
+    if (
+        not requested_path.is_file()
+        or requested_path.is_symlink()
+        or any(parent.is_symlink() for parent in requested_path.parents)
+    ):
         raise ValueError("baseline_config 必须是存在的普通非链接文件")
     wrapper_path = requested_path.resolve()
     wrapper = yaml.safe_load(wrapper_path.read_text(encoding="utf-8"))

@@ -167,6 +167,19 @@ def test_source_resolution_rejects_missing_and_real_symlink_source(tmp_path: Pat
         )
 
 
+def test_source_resolution_rejects_real_symlink_source_ancestor(tmp_path: Path) -> None:
+    """显式 source 的祖先目录也不能通过链接改变 path authority。"""
+    definition = load_precision_sweep_definition(V2_DEFINITION_PATH)
+    linked_configs = tmp_path / "linked-configs"
+    linked_configs.symlink_to(CURRENT_BASELINE.parent, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="存在的普通非链接文件"):
+        resolve_hvac_baseline_source(
+            BaselineSourceRequest(linked_configs / CURRENT_BASELINE.name, CURRENT_BASELINE_ID),
+            definition.source_requirements,
+        )
+
+
 def test_source_resolution_rejects_tampered_current_config_chain(tmp_path: Path) -> None:
     """scenario bytes 被改写时，PID→scenario trust anchor 必须先于 worker 失败。"""
     names = (
