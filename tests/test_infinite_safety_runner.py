@@ -196,7 +196,7 @@ def test_schema_v2_sweep_binds_resolved_baseline_sources_and_stability() -> None
         "baseline_identity_scheme": identity.scheme,
         "baseline_id": identity.baseline_id,
         "stability_report_sha256": bundle.stability_report_sha256,
-        "stability_report": asdict(bundle.stability_report),
+        "stability_report": infinite_safety_runner._json_value(asdict(bundle.stability_report)),
         "points": points,
     }
     verified = SimpleNamespace(

@@ -155,7 +155,7 @@ def _validate_v2_sweep_source(bundle, verified, source_hashes: dict[str, str]) -
         resolved_plan.get("baseline_identity_scheme") != identity.scheme
         or resolved_plan.get("baseline_id") != identity.baseline_id
         or resolved_plan.get("stability_report_sha256") != bundle.stability_report_sha256
-        or resolved_plan.get("stability_report") != asdict(bundle.stability_report)
+        or resolved_plan.get("stability_report") != _json_value(asdict(bundle.stability_report))
         or resolved_plan.get("points") != _definition_points(verified.definition)
         or verified.definition.get("prime_evidence_hash") != source_hashes["prime"]
     ):
@@ -168,6 +168,11 @@ def _definition_points(definition: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(points, list) or not all(isinstance(item, dict) for item in points):
         raise TypeError("verified sweep definition points 无效")
     return points
+
+
+def _json_value(value: Any) -> Any:
+    """按工件 JSON 语义规范化 tuple，避免内存表示差异导致误拒绝。"""
+    return json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False))
 
 
 def _certificate_payload(
