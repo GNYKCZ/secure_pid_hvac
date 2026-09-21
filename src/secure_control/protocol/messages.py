@@ -25,6 +25,8 @@ from secure_control.crypto import (
     TruncationAuxiliaryShare,
 )
 
+_PROTOCOL3_TERM_ORDER = ("C", "D", "A", "B")
+
 PartyIndex = Literal[0, 1]
 RangeProofMode = Literal[
     "finite_horizon",

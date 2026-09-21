@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from math import isfinite
@@ -23,6 +23,7 @@ from secure_control.crypto import (
     verify_prime_modulus,
 )
 from secure_control.execution import (
+    ControllerRuntime,
     PlaintextStateSpaceRuntime,
     SecureStateSpaceRuntime,
     SecureTraceCollector,
@@ -245,6 +246,7 @@ class HvacScenario:
         test_seed: int | None = None,
         trace_policy: SecureTracePolicy | None = None,
         trace_collector: SecureTraceCollector | None = None,
+        secure_runtime_builder: Callable[..., ControllerRuntime] | None = None,
         _lineage_paths: frozenset[Path] | None = None,
         _lineage_depth: int = 0,
     ) -> None:
@@ -304,6 +306,10 @@ class HvacScenario:
             raise TypeError("test_seed 必须是整数或 None。")
         if (trace_policy is None) != (trace_collector is None):
             raise ValueError("trace_policy 与 trace_collector 必须同时提供或同时省略。")
+        if secure_runtime_builder is not None and not callable(secure_runtime_builder):
+            raise TypeError("secure_runtime_builder 必须是可调用对象或 None。")
+        if secure_runtime_builder is not None and trace_policy is not None:
+            raise ValueError("自定义安全 runtime builder 不接收单进程诊断 trace。")
 
         self._plant_source: bytes | None = None
         self._plant_filename: str | None = None
@@ -409,6 +415,7 @@ class HvacScenario:
         self._test_seed = test_seed
         self._trace_policy = trace_policy
         self._trace_collector = trace_collector
+        self._secure_runtime_builder = secure_runtime_builder
         if self._contract.timing.terminal_sample_included:
             raise ValueError("当前双闭环仅支持 terminal_sample_included=false。")
         if self._horizon_steps != self._contract.timing.sample_count:
@@ -597,10 +604,8 @@ class HvacScenario:
             HvacSignalAdapter(contract),
             PlaintextStateSpaceRuntime(plain_spec),
         )
-        secure = SimulationBranch(
-            build_hvac_plant(contract),
-            HvacSignalAdapter(contract),
-            SecureStateSpaceRuntime(
+        if self._secure_runtime_builder is None:
+            secure_runtime: ControllerRuntime = SecureStateSpaceRuntime(
                 secure_spec,
                 self._fixed_point,
                 range_contract,
@@ -609,7 +614,22 @@ class HvacScenario:
                 test_seed=self._test_seed,
                 trace_policy=self._trace_policy,
                 trace_collector=self._trace_collector,
-            ),
+            )
+        else:
+            secure_runtime = self._secure_runtime_builder(
+                secure_spec,
+                self._fixed_point,
+                range_contract,
+                security_parameter=self._security_parameter,
+                modulus_evidence=self._modulus_evidence,
+                test_seed=self._test_seed,
+            )
+            if not isinstance(secure_runtime, ControllerRuntime):
+                raise TypeError("secure_runtime_builder 必须返回 ControllerRuntime。")
+        secure = SimulationBranch(
+            build_hvac_plant(contract),
+            HvacSignalAdapter(contract),
+            secure_runtime,
         )
         return SimulationPlan(
             metadata=contract.metadata,

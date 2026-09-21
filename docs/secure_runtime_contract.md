@@ -29,6 +29,12 @@ runtime.scale_ledger -> ControllerScaleLedger
 runtime.range_verification -> ControllerRangeVerification
 ```
 
+Issue #16 另提供显式选择的 `MultiprocessingSecureStateSpaceRuntime`，保持上述 spec、输入、输出、
+scale ledger、范围验证、step 和 reset 语义，并增加 `close()`、上下文管理器和只读 `topology`。
+它固定使用 Windows 兼容的 `spawn` 三进程拓扑；默认 `SecureStateSpaceRuntime` 不切换后端。
+超时或工作进程错误采用 fail-closed 清理，不尝试在提交状态不确定时继续。完整进程边界见
+[多进程安全执行](multiprocessing_execution.md)。
+
 Issue #51 另提供可选的 `trace_policy` 与 `trace_collector`。二者必须同时给出，且只允许配合显式
 `test_seed` 的诊断复现；默认均为 `None`，因此既有调用不会创建、复制或暴露 trace。启用后记录的
 是实际 step 路径产生的 sanitized 证据和真实资源生命周期，不增加协议运算或 RNG 消耗。只有 policy
@@ -113,10 +119,9 @@ rounding error。整数 A/B 测试使用可精确表示输入，容差为 `1 / 2
 transcript 相互隔离的确定性测试；安全运行必须使用默认的 `None`，由 crypto 层取得安全随机性。
 session/round identity 始终由独立安全随机源生成。
 
-当前 backend 固定为 `SingleProcessCoordinator`。这验证协议消息流、资源生命周期与算术语义，
-不声明进程/主机隔离、网络认证、抗恶意安全或生产级端到端安全。multiprocessing、socket、
-transport abstraction、双 plant simulation 和任何场景集成都不属于 Issue #11；Issue #12
-仅通过场景层装配完成 HVAC 双闭环，不让本 runtime 依赖 HVAC。
+默认 backend 固定为 `SingleProcessCoordinator`。Issue #16 的可选多进程 runtime 提供本机角色
+进程隔离，但不声明主机隔离、网络认证、抗恶意安全或生产级端到端安全；socket 和通用网络
+transport 仍不在范围内。Issue #12 仅通过场景层装配完成 HVAC 双闭环，不让 runtime 依赖 HVAC。
 
 诊断 trace 不改变上述安全声明。公开导出不得包含 raw shares；显式 combined-share 文件只属于本地
 离线审计，标记 `deployment_security=false` 并与公开 evidence manifest 物理隔离。完整发布契约见

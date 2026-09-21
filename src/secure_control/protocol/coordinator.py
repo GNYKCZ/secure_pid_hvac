@@ -8,6 +8,7 @@ from secure_control.crypto import AdditiveShare, BeaverMultiplier, SecureTruncat
 
 from .evidence import ProtocolStepSnapshot, copy_share
 from .messages import (
+    _PROTOCOL3_TERM_ORDER,
     ControllerScaleLedger,
     ControlShareMessage,
     MaskedExchangeMessage,
@@ -100,31 +101,18 @@ class SingleProcessCoordinator:
                 zip(online.p1_resources.product_resources, online.p2_resources.product_resources)
             )
 
-            c_state = self._matrix_vector_products(
-                "C", p1, p2, p1.state_value, p2.state_value, products
-            )
-            d_input = self._matrix_vector_products(
-                "D",
-                p1,
-                p2,
-                lambda index: p1.input_value(first_input, index),
-                lambda index: p2.input_value(second_input, index),
-                products,
-            )
-            output = self._add_vectors(p1, p2, c_state, d_input)
-
-            a_state = self._matrix_vector_products(
-                "A", p1, p2, p1.state_value, p2.state_value, products
-            )
-            b_input = self._matrix_vector_products(
-                "B",
-                p1,
-                p2,
-                lambda index: p1.input_value(first_input, index),
-                lambda index: p2.input_value(second_input, index),
-                products,
-            )
-            raw_next_state = self._add_vectors(p1, p2, a_state, b_input)
+            term_results: dict[str, tuple[AdditiveShare, AdditiveShare]] = {}
+            for term in _PROTOCOL3_TERM_ORDER:
+                if term in {"A", "C"}:
+                    first_right, second_right = p1.state_value, p2.state_value
+                else:
+                    first_right = lambda index: p1.input_value(first_input, index)
+                    second_right = lambda index: p2.input_value(second_input, index)
+                term_results[term] = self._matrix_vector_products(
+                    term, p1, p2, first_right, second_right, products
+                )
+            output = self._add_vectors(p1, p2, term_results["C"], term_results["D"])
+            raw_next_state = self._add_vectors(p1, p2, term_results["A"], term_results["B"])
             if next(products, None) is not None:
                 raise ValueError("本轮乘法资源计划包含未被消费的矩阵项。")
             next_state = self._truncate_state_rows(p1, p2, raw_next_state, online)

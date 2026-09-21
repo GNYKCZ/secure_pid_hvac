@@ -34,6 +34,7 @@ from .evidence import (
     ProtocolStepSnapshot,
 )
 from .messages import (
+    _PROTOCOL3_TERM_ORDER,
     ClosedLoopRangeEvidence,
     ControllerLayout,
     ControllerRangeContract,
@@ -975,7 +976,7 @@ class Client:
         }
         products: list[ResourceMetadata] = []
         ledger = layout.scale_ledger
-        for term in ("C", "D", "A", "B"):
+        for term in _PROTOCOL3_TERM_ORDER:
             rows, columns = shapes[term]
             right_scale = ledger.state if term in {"A", "C"} else ledger.input
             left_scale = getattr(ledger, term)
