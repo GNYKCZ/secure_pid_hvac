@@ -2,23 +2,572 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
+from typing import Protocol, runtime_checkable
 
-from secure_control.crypto import AdditiveShare, BeaverMultiplier, SecureTruncation, TwoPartySharing
+import numpy as np
+
+from secure_control.crypto import (
+    AdditiveShare,
+    BeaverMultiplier,
+    MaskedDifferenceShare,
+    MaskedTruncationShare,
+    P2MaskedMessage,
+    PublicMaskedDifferences,
+    SecureTruncation,
+    TwoPartySharing,
+)
 
 from .evidence import ProtocolStepSnapshot, copy_share
 from .messages import (
     _PROTOCOL3_TERM_ORDER,
-    ControllerScaleLedger,
     ControlShareMessage,
-    MaskedExchangeMessage,
     OnlineRound,
-    OpenedMaskedMessage,
+    P2TruncationPayload,
+    PartyOnlineRound,
+    PartyResources,
+    ProductMaskPayload,
     ProductResourceShare,
+    Protocol3StageReceipt,
+    ResourceMetadata,
     StateTruncationResourceShare,
-    TruncationMaskedMessage,
+    StepResourcePlan,
+    TruncationMaskPayload,
 )
 from .roles import P1, P2, _Server, _vector_from_scalars
+
+
+@runtime_checkable
+class Protocol3PartyEndpoint(Protocol):
+    """Protocol 3 唯一调度所需的最小单方 endpoint contract。"""
+
+    @property
+    def party(self) -> int: ...
+
+    @property
+    def session_id(self) -> str: ...
+
+    @property
+    def plan(self) -> StepResourcePlan: ...
+
+    def mask_product(self, metadata: ResourceMetadata) -> ProductMaskPayload: ...
+
+    def finish_product(self, metadata: ResourceMetadata, peer: ProductMaskPayload) -> None: ...
+
+    def complete_product(self, metadata: ResourceMetadata) -> None: ...
+
+    def finish_products(self) -> None: ...
+
+    def mask_truncation(self, metadata: ResourceMetadata) -> TruncationMaskPayload: ...
+
+    def p2_truncation_message(
+        self, metadata: ResourceMetadata, peer: TruncationMaskPayload
+    ) -> P2TruncationPayload: ...
+
+    def finish_truncation_p1(
+        self,
+        metadata: ResourceMetadata,
+        peer: TruncationMaskPayload,
+        message: P2TruncationPayload,
+    ) -> None: ...
+
+    def finish_truncation_p2(self, metadata: ResourceMetadata) -> None: ...
+
+    def complete_truncation(self, metadata: ResourceMetadata) -> None: ...
+
+    def stage_output(self) -> Protocol3StageReceipt: ...
+
+    def commit(self) -> None: ...
+
+
+class Protocol3Orchestrator:
+    """唯一的 transport-neutral Protocol 3 操作与消息顺序。"""
+
+    def stage(
+        self,
+        p1: Protocol3PartyEndpoint,
+        p2: Protocol3PartyEndpoint,
+        plan: StepResourcePlan,
+    ) -> tuple[Protocol3StageReceipt, Protocol3StageReceipt]:
+        """驱动两方完成乘法、可选截断并暂存 output/state，不提交 state。"""
+        self._validate_endpoints(p1, p2, plan)
+        for metadata in plan.product_resources:
+            first = p1.mask_product(metadata)
+            second = p2.mask_product(metadata)
+            p1.finish_product(metadata, second)
+            p2.finish_product(metadata, first)
+            p1.complete_product(metadata)
+            p2.complete_product(metadata)
+        p1.finish_products()
+        p2.finish_products()
+        for metadata in plan.state_truncation_resources:
+            first = p1.mask_truncation(metadata)
+            second = p2.mask_truncation(metadata)
+            message = p2.p2_truncation_message(metadata, first)
+            p1.finish_truncation_p1(metadata, second, message)
+            p2.finish_truncation_p2(metadata)
+            p1.complete_truncation(metadata)
+            p2.complete_truncation(metadata)
+        receipts = p1.stage_output(), p2.stage_output()
+        expected = (
+            plan.session_id,
+            plan.round_id,
+            plan.step,
+            plan.triple_count,
+            plan.truncation_count,
+        )
+        if any(
+            receipt.party != party
+            or (
+                receipt.session_id,
+                receipt.round_id,
+                receipt.step,
+                receipt.products,
+                receipt.truncations,
+            )
+            != expected
+            for party, receipt in enumerate(receipts)
+        ):
+            raise ValueError("Protocol 3 暂存回执与资源计划不匹配。")
+        return receipts
+
+    def commit(self, p1: Protocol3PartyEndpoint, p2: Protocol3PartyEndpoint) -> None:
+        """在调用方完成输出验证后按固定 P1/P2 顺序提交两方 state。"""
+        p1.commit()
+        p2.commit()
+
+    @staticmethod
+    def _validate_endpoints(
+        p1: Protocol3PartyEndpoint,
+        p2: Protocol3PartyEndpoint,
+        plan: StepResourcePlan,
+    ) -> None:
+        if not isinstance(plan, StepResourcePlan):
+            raise TypeError("Protocol 3 调度需要 StepResourcePlan。")
+        if (p1.party, p2.party) != (0, 1):
+            raise ValueError("Protocol 3 endpoint 必须按 P1/P2 顺序提供。")
+        if p1.session_id != plan.session_id or p2.session_id != plan.session_id:
+            raise ValueError("Protocol 3 endpoint 与资源计划的 session 不匹配。")
+        if p1.plan != plan or p2.plan != plan:
+            raise ValueError("Protocol 3 endpoint 必须绑定同一资源计划。")
+
+
+class LocalProtocol3PartyEndpoint:
+    """把现有 P1/P2 本地角色操作适配到统一 Protocol 3 endpoint。"""
+
+    def __init__(
+        self,
+        role: _Server,
+        online: PartyOnlineRound,
+        control_sender: Callable[[ControlShareMessage], None],
+    ) -> None:
+        """安装单方 round，并只信任本地 metadata 与 lifecycle registry。"""
+        if not isinstance(online, PartyOnlineRound):
+            raise TypeError("online 必须是单方 PartyOnlineRound。")
+        resources = online.resources
+        if resources.recipient not in {0, 1} or resources.recipient != role._party:
+            raise ValueError("单方在线资源的角色路由错误。")
+        plan = resources.plan
+        if role.session_id != plan.session_id:
+            raise ValueError("角色与在线资源不属于同一 session。")
+        if (plan.state_shape, plan.input_shape, plan.output_shape) != (
+            (role.layout.state_dimension,),
+            (role.layout.input_dimension,),
+            (role.layout.output_dimension,),
+        ) or plan.scale_ledger != role.layout.scale_ledger:
+            raise ValueError("在线资源计划的 shape 或 scale ledger 不匹配。")
+        if (
+            len(resources.product_resources) != plan.triple_count
+            or len(resources.state_truncation_resources) != plan.truncation_count
+        ):
+            raise ValueError("单方在线资源数量与计划不匹配。")
+        self._role = role
+        self._resources = resources
+        self._plan = plan
+        self._input = role.input_share(
+            online.input_message,
+            session_id=plan.session_id,
+            round_id=plan.round_id,
+            step=plan.step,
+        )
+        self._control_sender = control_sender
+        self._products = {item.metadata.resource_id: item for item in resources.product_resources}
+        self._truncations = {
+            item.metadata.resource_id: item for item in resources.state_truncation_resources
+        }
+        if (
+            len(self._products) != plan.triple_count
+            or len(self._truncations) != plan.truncation_count
+        ):
+            raise ValueError("Protocol 3 资源 ID 必须在当前 round 内唯一。")
+        self._product_state: dict[
+            str, tuple[ProductResourceShare, BeaverMultiplier, MaskedDifferenceShare]
+        ] = {}
+        self._truncation_state: dict[
+            str,
+            tuple[
+                StateTruncationResourceShare,
+                SecureTruncation,
+                MaskedTruncationShare,
+                AdditiveShare,
+            ],
+        ] = {}
+        self._completed_products: set[str] = set()
+        self._completed_truncations: set[str] = set()
+        rows = {
+            "C": role.layout.output_dimension,
+            "D": role.layout.output_dimension,
+            "A": role.layout.state_dimension,
+            "B": role.layout.state_dimension,
+        }
+        self._sums = {
+            (term, row): AdditiveShare(0)
+            for term in _PROTOCOL3_TERM_ORDER
+            for row in range(rows[term])
+        }
+        self._sharing = self._resolve_sharing(resources)
+        self._output: AdditiveShare | None = None
+        self._raw_state: AdditiveShare | None = None
+        self._next_state: AdditiveShare | None = None
+        self._truncated_values: dict[int, AdditiveShare] = {}
+        self._staged = False
+
+    @property
+    def party(self) -> int:
+        return self._resources.recipient
+
+    @property
+    def session_id(self) -> str:
+        return self._plan.session_id
+
+    @property
+    def plan(self) -> StepResourcePlan:
+        return self._plan
+
+    @property
+    def input_share(self) -> AdditiveShare:
+        return self._input
+
+    @property
+    def output_share(self) -> AdditiveShare:
+        if self._output is None:
+            raise RuntimeError("Protocol 3 尚未形成 output share。")
+        return self._output
+
+    @property
+    def raw_state_share(self) -> AdditiveShare:
+        if self._raw_state is None:
+            raise RuntimeError("Protocol 3 尚未形成 state accumulator。")
+        return self._raw_state
+
+    @property
+    def next_state_share(self) -> AdditiveShare:
+        if self._next_state is None:
+            raise RuntimeError("Protocol 3 尚未形成 next state share。")
+        return self._next_state
+
+    def mask_product(self, metadata: ResourceMetadata) -> ProductMaskPayload:
+        resource = self._product_resource(metadata)
+        if metadata.resource_id in self._product_state:
+            raise ValueError("同一乘法资源不得重复开始。")
+        multiplier = resource.triple._lifecycle.owner
+        right = (
+            self._role.state_value(metadata.index[1])
+            if metadata.term in {"A", "C"}
+            else self._role.input_value(self._input, metadata.index[1])
+        )
+        masked = self._role.start_product(
+            multiplier,
+            self._role.matrix_value(metadata.term, *metadata.index),
+            right,
+            resource,
+        )
+        self._product_state[metadata.resource_id] = (resource, multiplier, masked)
+        return ProductMaskPayload(masked.d, masked.e, self.party)
+
+    def finish_product(self, metadata: ResourceMetadata, peer: ProductMaskPayload) -> None:
+        resource, multiplier, masked = self._product_entry(metadata)
+        other = 1 - self.party
+        if not isinstance(peer, ProductMaskPayload) or peer.party != other:
+            raise ValueError("Protocol 1 对端遮蔽消息的角色错误。")
+        lifecycle = masked._lifecycle
+        if other not in lifecycle.masked_parties:
+            lifecycle.claim_masking(other)
+        rebound = MaskedDifferenceShare(peer.d, peer.e, peer.party, lifecycle)
+        if lifecycle.opened:
+            d = self._scalar(self._sharing.reconstruct(masked.d, rebound.d), "d")
+            e = self._scalar(self._sharing.reconstruct(masked.e, rebound.e), "e")
+            opened = PublicMaskedDifferences(d, e, lifecycle)
+        else:
+            opened = multiplier.open_masked_differences(masked, rebound)
+        product = self._role.finish_product(multiplier, resource, opened)
+        row = metadata.index[0]
+        key = (metadata.term, row)
+        self._sums[key] = self._role.add(self._sharing, self._sums[key], product)
+
+    def complete_product(self, metadata: ResourceMetadata) -> None:
+        resource, _, masked = self._product_entry(metadata)
+        lifecycle = masked._lifecycle
+        if not lifecycle.consumed and 1 - self.party not in lifecycle.finished_parties:
+            lifecycle.claim_finish(1 - self.party)
+        if not lifecycle.consumed:
+            raise ValueError("Protocol 1 两方尚未完成同一资源。")
+        if resource._lifecycle.status == "prepared":
+            if 1 - self.party not in resource._lifecycle.claimed_by:
+                resource._lifecycle.claim(1 - self.party)
+            resource._lifecycle.complete()
+        elif resource._lifecycle.status != "consumed":
+            raise ValueError("乘法资源未处于可完成状态。")
+        self._completed_products.add(metadata.resource_id)
+
+    def finish_products(self) -> None:
+        if len(self._completed_products) != self._plan.triple_count:
+            raise ValueError("Protocol 3 尚未完成全部乘法资源。")
+        self._output = self._role.add(
+            self._sharing,
+            self._term_vector("C", self._role.layout.output_dimension),
+            self._term_vector("D", self._role.layout.output_dimension),
+        )
+        self._raw_state = self._role.add(
+            self._sharing,
+            self._term_vector("A", self._role.layout.state_dimension),
+            self._term_vector("B", self._role.layout.state_dimension),
+        )
+        if self._plan.truncation_count == 0:
+            self._next_state = self._raw_state
+
+    def mask_truncation(self, metadata: ResourceMetadata) -> TruncationMaskPayload:
+        if self._raw_state is None:
+            raise RuntimeError("必须先完成 state accumulator 才能截断。")
+        resource = self._truncation_resource(metadata)
+        if metadata.resource_id in self._truncation_state:
+            raise ValueError("同一截断资源不得重复开始。")
+        truncation = resource.truncation._lifecycle.owner
+        raw = self._scalar_share(self._raw_state, metadata.index[0])
+        masked = self._role.mask_truncation(truncation, raw, resource)
+        self._truncation_state[metadata.resource_id] = (
+            resource,
+            truncation,
+            masked,
+            raw,
+        )
+        return TruncationMaskPayload(masked.value, self.party)
+
+    def p2_truncation_message(
+        self, metadata: ResourceMetadata, peer: TruncationMaskPayload
+    ) -> P2TruncationPayload:
+        if self.party != 1:
+            raise ValueError("只有 P2 endpoint 可以发送截断消息。")
+        _, truncation, masked, _ = self._truncation_entry(metadata)
+        self._bind_truncation_peer(masked, peer)
+        message = truncation.p2_send_masked(masked)
+        return P2TruncationPayload(message.value)
+
+    def finish_truncation_p1(
+        self,
+        metadata: ResourceMetadata,
+        peer: TruncationMaskPayload,
+        message: P2TruncationPayload,
+    ) -> None:
+        if self.party != 0 or not isinstance(message, P2TruncationPayload):
+            raise ValueError("P1 endpoint 截断消息的角色或类型错误。")
+        resource, truncation, masked, raw = self._truncation_entry(metadata)
+        self._bind_truncation_peer(masked, peer)
+        lifecycle = masked._lifecycle
+        if not lifecycle.p2_sent:
+            lifecycle.claim_p2_send()
+        rebound = P2MaskedMessage(message.value, lifecycle)
+        masked_value = truncation.p1_reconstruct_masked(masked, rebound)
+        self._truncated_values[metadata.index[0]] = self._role.finish_truncation_p1(
+            truncation, raw, resource, masked_value
+        )
+
+    def finish_truncation_p2(self, metadata: ResourceMetadata) -> None:
+        if self.party != 1:
+            raise ValueError("只有 P2 endpoint 可以完成 P2 截断分支。")
+        resource, truncation, masked, raw = self._truncation_entry(metadata)
+        lifecycle = masked._lifecycle
+        if not lifecycle.p1_reconstructed:
+            lifecycle.claim_p1_reconstruction()
+        self._truncated_values[metadata.index[0]] = self._role.finish_truncation_p2(
+            truncation, raw, resource
+        )
+
+    def complete_truncation(self, metadata: ResourceMetadata) -> None:
+        resource, _, masked, _ = self._truncation_entry(metadata)
+        lifecycle = masked._lifecycle
+        if not lifecycle.consumed and 1 - self.party not in lifecycle.finished_parties:
+            lifecycle.claim_finish(1 - self.party)
+        if not lifecycle.consumed:
+            raise ValueError("Protocol 2 两方尚未完成同一资源。")
+        if resource._lifecycle.status == "prepared":
+            if 1 - self.party not in resource._lifecycle.claimed_by:
+                resource._lifecycle.claim(1 - self.party)
+            resource._lifecycle.complete()
+        elif resource._lifecycle.status != "consumed":
+            raise ValueError("截断资源未处于可完成状态。")
+        self._completed_truncations.add(metadata.resource_id)
+
+    def stage_output(self) -> Protocol3StageReceipt:
+        if self._output is None or self._raw_state is None:
+            raise RuntimeError("Protocol 3 尚未完成乘法阶段。")
+        if self._plan.truncation_count:
+            if len(self._completed_truncations) != self._plan.truncation_count:
+                raise ValueError("Protocol 3 尚未完成全部截断资源。")
+            self._next_state = _vector_from_scalars(
+                [self._truncated_values[row] for row in range(self._role.layout.state_dimension)]
+            )
+        if self._next_state is None:
+            raise RuntimeError("Protocol 3 尚未形成待提交 state。")
+        self._control_sender(
+            ControlShareMessage(
+                self.party,
+                self._plan.session_id,
+                self._plan.round_id,
+                self._plan.step,
+                self._role.layout.scale_ledger.output,
+                self._output,
+            )
+        )
+        self._staged = True
+        return Protocol3StageReceipt(
+            self.party,
+            self._plan.session_id,
+            self._plan.round_id,
+            self._plan.step,
+            self._plan.triple_count,
+            self._plan.truncation_count,
+        )
+
+    def commit(self) -> None:
+        if not self._staged or self._next_state is None:
+            raise RuntimeError("Protocol 3 state 尚未暂存。")
+        self._role.commit_state(self._next_state)
+        self._staged = False
+
+    def abort(self) -> None:
+        """废弃本 endpoint 尚未完成的 protocol 资源，不提交 state。"""
+        for resource in (*self._products.values(), *self._truncations.values()):
+            resource._lifecycle.abort()
+        self._staged = False
+
+    def _product_resource(self, metadata: ResourceMetadata) -> ProductResourceShare:
+        resource = self._products.get(metadata.resource_id)
+        if not isinstance(resource, ProductResourceShare) or resource.metadata != metadata:
+            raise ValueError("乘法资源与 Protocol 3 计划不匹配。")
+        right_scale = (
+            self._plan.scale_ledger.state
+            if metadata.term in {"A", "C"}
+            else self._plan.scale_ledger.input
+        )
+        left_scale = getattr(self._plan.scale_ledger, metadata.term)
+        if (
+            metadata.kind != "multiplication"
+            or metadata.index not in self._expected_product_indices(metadata.term)
+            or (
+                metadata.left_fractional_bits,
+                metadata.right_fractional_bits,
+                metadata.output_fractional_bits,
+            )
+            != (left_scale, right_scale, left_scale + right_scale)
+        ):
+            raise ValueError("乘法资源的 term、index 或 scale 错误。")
+        return resource
+
+    def _truncation_resource(self, metadata: ResourceMetadata) -> StateTruncationResourceShare:
+        resource = self._truncations.get(metadata.resource_id)
+        ledger = self._plan.scale_ledger
+        if (
+            not isinstance(resource, StateTruncationResourceShare)
+            or resource.metadata != metadata
+            or metadata.kind != "state_truncation"
+            or metadata.term != "state"
+            or metadata.index not in {(row,) for row in range(self._role.layout.state_dimension)}
+            or (
+                metadata.left_fractional_bits,
+                metadata.right_fractional_bits,
+                metadata.output_fractional_bits,
+            )
+            != (ledger.state_accumulator, None, ledger.state)
+        ):
+            raise ValueError("截断资源的 row 或 scale 错误。")
+        return resource
+
+    def _product_entry(
+        self, metadata: ResourceMetadata
+    ) -> tuple[ProductResourceShare, BeaverMultiplier, MaskedDifferenceShare]:
+        self._product_resource(metadata)
+        entry = self._product_state.get(metadata.resource_id)
+        if entry is None:
+            raise RuntimeError("乘法资源尚未开始。")
+        resource, multiplier, masked = entry
+        if not isinstance(resource, ProductResourceShare):
+            raise TypeError("乘法 endpoint 内部资源类型错误。")
+        return resource, multiplier, masked
+
+    def _truncation_entry(
+        self, metadata: ResourceMetadata
+    ) -> tuple[
+        StateTruncationResourceShare,
+        SecureTruncation,
+        MaskedTruncationShare,
+        AdditiveShare,
+    ]:
+        self._truncation_resource(metadata)
+        entry = self._truncation_state.get(metadata.resource_id)
+        if entry is None:
+            raise RuntimeError("截断资源尚未开始。")
+        resource, truncation, masked, raw = entry
+        if not isinstance(resource, StateTruncationResourceShare):
+            raise TypeError("截断 endpoint 内部资源类型错误。")
+        return resource, truncation, masked, raw
+
+    def _bind_truncation_peer(
+        self, masked: MaskedTruncationShare, peer: TruncationMaskPayload
+    ) -> None:
+        other = 1 - self.party
+        if not isinstance(peer, TruncationMaskPayload) or peer.party != other:
+            raise ValueError("Protocol 2 对端遮蔽消息的角色错误。")
+        lifecycle = masked._lifecycle
+        if other not in lifecycle.masked_parties:
+            lifecycle.claim_mask(other)
+
+    def _term_vector(self, term: str, rows: int) -> AdditiveShare:
+        return _vector_from_scalars([self._sums[(term, row)] for row in range(rows)])
+
+    def _expected_product_indices(self, term: str) -> set[tuple[int, int]]:
+        shapes = {
+            "A": (self._role.layout.state_dimension, self._role.layout.state_dimension),
+            "B": (self._role.layout.state_dimension, self._role.layout.input_dimension),
+            "C": (self._role.layout.output_dimension, self._role.layout.state_dimension),
+            "D": (self._role.layout.output_dimension, self._role.layout.input_dimension),
+        }
+        try:
+            rows, columns = shapes[term]
+        except KeyError as error:
+            raise ValueError("矩阵项必须是通用 A、B、C 或 D。") from error
+        return {(row, column) for row in range(rows) for column in range(columns)}
+
+    @staticmethod
+    def _resolve_sharing(resources: PartyResources) -> TwoPartySharing:
+        products = resources.product_resources
+        if not products:
+            raise ValueError("Protocol 3 资源计划缺少必须存在的 D 项乘法。")
+        multiplier = products[0].triple._lifecycle.owner
+        if not isinstance(multiplier, BeaverMultiplier):
+            raise TypeError("乘法资源未绑定 BeaverMultiplier。")
+        return multiplier.sharing
+
+    @staticmethod
+    def _scalar_share(vector: AdditiveShare, row: int) -> AdditiveShare:
+        value = np.asarray(vector.value, dtype=object)[row]
+        return AdditiveShare(value.item() if isinstance(value, np.generic) else value)
+
+    @staticmethod
+    def _scalar(value: object, name: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} 必须是标量整数。")
+        return value
 
 
 class SingleProcessCoordinator:
@@ -78,6 +627,8 @@ class SingleProcessCoordinator:
         ProtocolStepSnapshot | None,
     ]:
         """共享普通/诊断执行实现，确保两条入口使用完全相同的协议顺序。"""
+        first_endpoint: LocalProtocol3PartyEndpoint | None = None
+        second_endpoint: LocalProtocol3PartyEndpoint | None = None
         try:
             self._validate_round(p1, p2, online)
             state_before = (
@@ -85,59 +636,29 @@ class SingleProcessCoordinator:
                 if capture_evidence
                 else None
             )
-            first_input = p1.input_share(
-                online.p1_input,
-                session_id=online.session_id,
-                round_id=online.round_id,
-                step=online.step,
+            output_messages: list[ControlShareMessage] = []
+            first_endpoint = LocalProtocol3PartyEndpoint(
+                p1,
+                PartyOnlineRound(online.p1_input, online.p1_resources),
+                output_messages.append,
             )
-            second_input = p2.input_share(
-                online.p2_input,
-                session_id=online.session_id,
-                round_id=online.round_id,
-                step=online.step,
+            second_endpoint = LocalProtocol3PartyEndpoint(
+                p2,
+                PartyOnlineRound(online.p2_input, online.p2_resources),
+                output_messages.append,
             )
-            products = iter(
-                zip(online.p1_resources.product_resources, online.p2_resources.product_resources)
+            orchestrator = Protocol3Orchestrator()
+            orchestrator.stage(
+                first_endpoint,
+                second_endpoint,
+                online.p1_resources.plan,
             )
-
-            term_results: dict[str, tuple[AdditiveShare, AdditiveShare]] = {}
-            for term in _PROTOCOL3_TERM_ORDER:
-                if term in {"A", "C"}:
-                    first_right, second_right = p1.state_value, p2.state_value
-                else:
-                    first_right = lambda index: p1.input_value(first_input, index)
-                    second_right = lambda index: p2.input_value(second_input, index)
-                term_results[term] = self._matrix_vector_products(
-                    term, p1, p2, first_right, second_right, products
-                )
-            output = self._add_vectors(p1, p2, term_results["C"], term_results["D"])
-            raw_next_state = self._add_vectors(p1, p2, term_results["A"], term_results["B"])
-            if next(products, None) is not None:
-                raise ValueError("本轮乘法资源计划包含未被消费的矩阵项。")
-            next_state = self._truncate_state_rows(p1, p2, raw_next_state, online)
-            p1.commit_state(next_state[0])
-            p2.commit_state(next_state[1])
-            output_messages = (
-                ControlShareMessage(
-                    0,
-                    online.session_id,
-                    online.round_id,
-                    online.step,
-                    p1.layout.scale_ledger.output,
-                    output[0],
-                ),
-                ControlShareMessage(
-                    1,
-                    online.session_id,
-                    online.round_id,
-                    online.step,
-                    p2.layout.scale_ledger.output,
-                    output[1],
-                ),
-            )
+            orchestrator.commit(first_endpoint, second_endpoint)
+            if len(output_messages) != 2:
+                raise RuntimeError("Protocol 3 未生成两条 control share 消息。")
+            output = output_messages[0], output_messages[1]
             if not capture_evidence:
-                return output_messages, None
+                return output, None
             if state_before is None:
                 raise RuntimeError("诊断执行缺少更新前 state 快照。")
             snapshot = ProtocolStepSnapshot(
@@ -145,209 +666,25 @@ class SingleProcessCoordinator:
                 round_id=online.round_id,
                 step=online.step,
                 plan=online.p1_resources.plan,
-                input_p1=copy_share(first_input),
-                input_p2=copy_share(second_input),
-                output_p1=copy_share(output[0]),
-                output_p2=copy_share(output[1]),
+                input_p1=copy_share(first_endpoint.input_share),
+                input_p2=copy_share(second_endpoint.input_share),
+                output_p1=copy_share(first_endpoint.output_share),
+                output_p2=copy_share(second_endpoint.output_share),
                 state_before_p1=state_before[0],
                 state_before_p2=state_before[1],
-                state_accumulator_p1=copy_share(raw_next_state[0]),
-                state_accumulator_p2=copy_share(raw_next_state[1]),
-                state_after_p1=copy_share(next_state[0]),
-                state_after_p2=copy_share(next_state[1]),
+                state_accumulator_p1=copy_share(first_endpoint.raw_state_share),
+                state_accumulator_p2=copy_share(second_endpoint.raw_state_share),
+                state_after_p1=copy_share(first_endpoint.next_state_share),
+                state_after_p2=copy_share(second_endpoint.next_state_share),
             )
-            return output_messages, snapshot
+            return output, snapshot
         except Exception:
+            if first_endpoint is not None:
+                first_endpoint.abort()
+            if second_endpoint is not None:
+                second_endpoint.abort()
             self._abort_round(online)
             raise
-
-    def _matrix_vector_products(
-        self,
-        term: str,
-        p1: P1,
-        p2: P2,
-        first_right: Callable[[int], AdditiveShare],
-        second_right: Callable[[int], AdditiveShare],
-        products: Iterator[tuple[ProductResourceShare, ProductResourceShare]],
-    ) -> tuple[AdditiveShare, AdditiveShare]:
-        """以逐标量 Beaver 乘法形成 ledger 尺度的矩阵/向量积，绝不逐项截断。"""
-        rows, columns = self._term_shape(term, p1)
-        first_values: list[AdditiveShare] = []
-        second_values: list[AdditiveShare] = []
-        for row in range(rows):
-            first_sum = AdditiveShare(0)
-            second_sum = AdditiveShare(0)
-            for column in range(columns):
-                first_resource, second_resource = next(products)
-                self._validate_product_pair(
-                    first_resource,
-                    second_resource,
-                    term,
-                    (row, column),
-                    p1.layout.scale_ledger,
-                )
-                product = self._scalar_product(
-                    p1.matrix_value(term, row, column),
-                    first_right(column),
-                    p2.matrix_value(term, row, column),
-                    second_right(column),
-                    p1,
-                    p2,
-                    first_resource,
-                    second_resource,
-                )
-                first_sum = p1.add(self._sharing, first_sum, product[0])
-                second_sum = p2.add(self._sharing, second_sum, product[1])
-            first_values.append(first_sum)
-            second_values.append(second_sum)
-        return _vector_from_scalars(first_values), _vector_from_scalars(second_values)
-
-    def _scalar_product(
-        self,
-        first_left: AdditiveShare,
-        first_right: AdditiveShare,
-        second_left: AdditiveShare,
-        second_right: AdditiveShare,
-        p1: P1,
-        p2: P2,
-        first_resource: ProductResourceShare,
-        second_resource: ProductResourceShare,
-    ) -> tuple[AdditiveShare, AdditiveShare]:
-        """执行一个 ledger 尺度 Beaver 乘法，并模拟绑定 session/round 的双向遮蔽消息。"""
-        first_masked = p1.start_product(self._multiplier, first_left, first_right, first_resource)
-        second_masked = p2.start_product(
-            self._multiplier, second_left, second_right, second_resource
-        )
-        metadata = first_resource.metadata
-        to_p2 = MaskedExchangeMessage(
-            0,
-            1,
-            metadata.session_id,
-            metadata.round_id,
-            metadata.step,
-            metadata.resource_id,
-            first_masked,
-        )
-        to_p1 = MaskedExchangeMessage(
-            1,
-            0,
-            metadata.session_id,
-            metadata.round_id,
-            metadata.step,
-            metadata.resource_id,
-            second_masked,
-        )
-        opened = self._multiplier.open_masked_differences(to_p2.value, to_p1.value)
-        opened_message = OpenedMaskedMessage(
-            (0, 1),
-            metadata.session_id,
-            metadata.round_id,
-            metadata.step,
-            metadata.resource_id,
-            opened,
-        )
-        first_product = p1.finish_product(self._multiplier, first_resource, opened_message.value)
-        second_product = p2.finish_product(self._multiplier, second_resource, opened_message.value)
-        first_resource._lifecycle.complete()
-        return first_product, second_product
-
-    def _truncate_state_rows(
-        self,
-        p1: P1,
-        p2: P2,
-        raw_state: tuple[AdditiveShare, AdditiveShare],
-        online: OnlineRound,
-    ) -> tuple[AdditiveShare, AdditiveShare]:
-        """按 ledger 对聚合 state 行不截断，或恰好调用一次 Protocol 2。"""
-        if online.p1_resources.plan.scale_ledger.state_truncation_bits == 0:
-            return raw_state
-        first_values: list[AdditiveShare] = []
-        second_values: list[AdditiveShare] = []
-        for row, (first_resource, second_resource) in enumerate(
-            zip(
-                online.p1_resources.state_truncation_resources,
-                online.p2_resources.state_truncation_resources,
-                strict=True,
-            )
-        ):
-            self._validate_truncation_pair(
-                first_resource,
-                second_resource,
-                row,
-                online.p1_resources.plan.scale_ledger,
-            )
-            first_raw = AdditiveShare(raw_state[0].value[row])
-            second_raw = AdditiveShare(raw_state[1].value[row])
-            first_masked = p1.mask_truncation(self._truncation, first_raw, first_resource)
-            second_masked = p2.mask_truncation(self._truncation, second_raw, second_resource)
-            p2_message = self._truncation.p2_send_masked(second_masked)
-            metadata = first_resource.metadata
-            message = TruncationMaskedMessage(
-                1,
-                0,
-                metadata.session_id,
-                metadata.round_id,
-                metadata.step,
-                metadata.resource_id,
-                p2_message,
-            )
-            first_masked_value = self._truncation.p1_reconstruct_masked(first_masked, message.value)
-            first_values.append(
-                p1.finish_truncation_p1(
-                    self._truncation, first_raw, first_resource, first_masked_value
-                )
-            )
-            second_values.append(
-                p2.finish_truncation_p2(self._truncation, second_raw, second_resource)
-            )
-            first_resource._lifecycle.complete()
-        return _vector_from_scalars(first_values), _vector_from_scalars(second_values)
-
-    def _add_vectors(
-        self,
-        p1: _Server,
-        p2: _Server,
-        left: tuple[AdditiveShare, AdditiveShare],
-        right: tuple[AdditiveShare, AdditiveShare],
-    ) -> tuple[AdditiveShare, AdditiveShare]:
-        """逐项线性相加同 shape 的两组本地向量 share，不建立明文向量。"""
-        first_left, second_left = left
-        first_right, second_right = right
-        if len(first_left.value) != len(first_right.value) or len(second_left.value) != len(
-            second_right.value
-        ):
-            raise ValueError("待相加的共享向量必须同形。")
-        first_values = [
-            p1.add(
-                self._sharing,
-                AdditiveShare(first_left.value[index]),
-                AdditiveShare(first_right.value[index]),
-            )
-            for index in range(len(first_left.value))
-        ]
-        second_values = [
-            p2.add(
-                self._sharing,
-                AdditiveShare(second_left.value[index]),
-                AdditiveShare(second_right.value[index]),
-            )
-            for index in range(len(second_left.value))
-        ]
-        return _vector_from_scalars(first_values), _vector_from_scalars(second_values)
-
-    def _term_shape(self, term: str, server: _Server) -> tuple[int, int]:
-        """从公开 layout 返回通用矩阵 shape，拒绝任何场景特定矩阵名称。"""
-        layout = server.layout
-        shapes = {
-            "A": (layout.state_dimension, layout.state_dimension),
-            "B": (layout.state_dimension, layout.input_dimension),
-            "C": (layout.output_dimension, layout.state_dimension),
-            "D": (layout.output_dimension, layout.input_dimension),
-        }
-        try:
-            return shapes[term]
-        except KeyError as error:
-            raise ValueError("矩阵项必须是通用 A、B、C 或 D。") from error
 
     def _validate_round(self, p1: P1, p2: P2, online: OnlineRound) -> None:
         """在资源 claim 前验证角色、session、round、shape、scale 及两方资源配对。"""
@@ -394,6 +731,22 @@ class SingleProcessCoordinator:
             online.p2_resources.state_truncation_resources,
             plan.state_truncation_resources,
         )
+        if any(
+            resource.triple._lifecycle.owner is not self._multiplier
+            for resource in (
+                *online.p1_resources.product_resources,
+                *online.p2_resources.product_resources,
+            )
+        ):
+            raise ValueError("乘法资源不属于当前 coordinator 的 BeaverMultiplier。")
+        if any(
+            resource.truncation._lifecycle.owner is not self._truncation
+            for resource in (
+                *online.p1_resources.state_truncation_resources,
+                *online.p2_resources.state_truncation_resources,
+            )
+        ):
+            raise ValueError("截断资源不属于当前 coordinator 的 SecureTruncation。")
 
     def _validate_resource_collection(
         self, first: tuple[object, ...], second: tuple[object, ...], metadata: tuple[object, ...]
@@ -411,64 +764,6 @@ class SingleProcessCoordinator:
                 or getattr(first_item, "_lifecycle", None).status != "prepared"
             ):
                 raise ValueError("在线资源必须成对、同元数据且尚未使用。")
-
-    def _validate_product_pair(
-        self,
-        first: ProductResourceShare,
-        second: ProductResourceShare,
-        term: str,
-        index: tuple[int, int],
-        ledger: ControllerScaleLedger,
-    ) -> None:
-        """确认当前 triple pair 属于指定矩阵元素并符合 ledger operand/result 尺度。"""
-        metadata = first.metadata
-        # 资源 metadata 自身携带两侧 operand；期望值由当前 term 与 server layout 唯一确定。
-        right_scale = ledger.state if term in {"A", "C"} else ledger.input
-        left_scale = getattr(ledger, term)
-        if (
-            first.owner != 0
-            or second.owner != 1
-            or metadata != second.metadata
-            or first._lifecycle is not second._lifecycle
-            or metadata.kind != "multiplication"
-            or metadata.term != term
-            or metadata.index != index
-            or (
-                metadata.left_fractional_bits,
-                metadata.right_fractional_bits,
-                metadata.output_fractional_bits,
-            )
-            != (left_scale, right_scale, left_scale + right_scale)
-            or first._lifecycle.status != "prepared"
-        ):
-            raise ValueError("矩阵项不能使用错配、错误尺度或已消费的乘法资源。")
-
-    def _validate_truncation_pair(
-        self,
-        first: StateTruncationResourceShare,
-        second: StateTruncationResourceShare,
-        row: int,
-        ledger: ControllerScaleLedger,
-    ) -> None:
-        """确认截断资源对应聚合 state 第 row 行，并恢复 ledger 的 state 尺度。"""
-        metadata = first.metadata
-        if (
-            first.owner != 0
-            or second.owner != 1
-            or metadata != second.metadata
-            or first._lifecycle is not second._lifecycle
-            or metadata.kind != "state_truncation"
-            or metadata.term != "state"
-            or metadata.index != (row,)
-            or (
-                metadata.left_fractional_bits,
-                metadata.right_fractional_bits,
-                metadata.output_fractional_bits,
-            )
-            != (ledger.state_accumulator, None, ledger.state)
-            or first._lifecycle.status != "prepared"
-        ):
-            raise ValueError("state 行不能使用错配、错误尺度或已消费的截断资源。")
 
     def _abort_round(self, online: OnlineRound) -> None:
         """在任意失败路径废弃本轮全部未完成 triples/masks，阻止残留材料重放。"""

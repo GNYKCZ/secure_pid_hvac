@@ -9,27 +9,22 @@ from dataclasses import dataclass
 from multiprocessing.connection import Connection
 from typing import Any, Literal
 
-import numpy as np
-
 from secure_control.core import ControllerSpec
 from secure_control.crypto import (
-    AdditiveShare,
     FixedPointContext,
-    MaskedDifferenceShare,
-    P2MaskedMessage,
     PrimeModulusEvidence,
     TwoPartySharing,
 )
 from secure_control.protocol import P1, P2, Client, ControllerRangeContract
+from secure_control.protocol.coordinator import LocalProtocol3PartyEndpoint
 from secure_control.protocol.messages import (
-    _PROTOCOL3_TERM_ORDER,
-    ControlShareMessage,
-    InputShareMessage,
     OnlineRound,
-    PartyResources,
-    StepResourcePlan,
+    P2TruncationPayload,
+    PartyOnlineRound,
+    ProductMaskPayload,
+    ResourceMetadata,
+    TruncationMaskPayload,
 )
-from secure_control.protocol.roles import _Server, _vector_from_scalars
 
 _PROTOCOL_VERSION = 1
 
@@ -49,52 +44,6 @@ class IpcEnvelope:
     error_type: str | None = None
     error_message: str | None = None
     error_traceback: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class RoundPartyPayload:
-    """Client 通过私有 Pipe 交给单个 Server 的本方在线材料。"""
-
-    input_message: InputShareMessage
-    resources: PartyResources
-
-
-@dataclass(frozen=True, slots=True)
-class PeerEnvelope:
-    """P1/P2 私有 Pipe 上绑定 round 与资源身份的消息。"""
-
-    protocol_version: int
-    sender: int
-    operation: str
-    session_id: str
-    round_id: str
-    step: int
-    resource_id: str
-    payload: Any
-
-
-@dataclass(frozen=True, slots=True)
-class ProductMaskPayload:
-    """不携带对象身份的单方 Beaver 遮蔽差值传输表示。"""
-
-    d: AdditiveShare
-    e: AdditiveShare
-    party: int
-
-
-@dataclass(frozen=True, slots=True)
-class TruncationMaskPayload:
-    """不携带对象身份的单方截断遮蔽份额传输表示。"""
-
-    value: AdditiveShare
-    party: int
-
-
-@dataclass(frozen=True, slots=True)
-class P2TruncationPayload:
-    """P2 发给 P1 的截断消息传输表示，不跨进程传递 lifecycle。"""
-
-    value: AdditiveShare
 
 
 def _reply(request: IpcEnvelope, payload: Any = None) -> IpcEnvelope:
@@ -194,8 +143,8 @@ def client_worker(
                         step=request.step if request.step is not None else -1,
                         rng=material_rng,
                     )
-                    p1_channel.send(RoundPartyPayload(current.p1_input, current.p1_resources))
-                    p2_channel.send(RoundPartyPayload(current.p2_input, current.p2_resources))
+                    p1_channel.send(PartyOnlineRound(current.p1_input, current.p1_resources))
+                    p2_channel.send(PartyOnlineRound(current.p2_input, current.p2_resources))
                     control.send(_reply(request, current.p1_resources.plan))
                     continue
                 if request.operation == "reconstruct":
@@ -246,15 +195,13 @@ def role_worker(
     party: int,
     control: Connection,
     client_channel: Connection,
-    peer_channel: Connection,
 ) -> None:
     """运行一个 Server 角色；任何时候都只持有本方 share。"""
     role_name: Literal["P1", "P2"] = "P1" if party == 0 else "P2"
-    staged_state: AdditiveShare | None = None
-    staged_identity: tuple[str, int] | None = None
+    endpoint: LocalProtocol3PartyEndpoint | None = None
     try:
         offline = client_channel.recv()
-        role: _Server = P1(offline) if party == 0 else P2(offline)
+        role: P1 | P2 = P1(offline) if party == 0 else P2(offline)
         control.send(
             IpcEnvelope(
                 _PROTOCOL_VERSION,
@@ -275,29 +222,46 @@ def role_worker(
                 if request.operation == "shutdown":
                     control.send(_reply(request, {"pid": os.getpid()}))
                     return
-                if request.operation == "execute":
-                    if staged_state is not None:
+                if request.operation == "begin":
+                    if endpoint is not None:
                         raise RuntimeError("前一 round 尚未提交。")
                     payload = client_channel.recv()
-                    if not isinstance(payload, RoundPartyPayload):
+                    if not isinstance(payload, PartyOnlineRound):
                         raise TypeError("Server 在线消息类型错误。")
                     plan = payload.resources.plan
                     if (request.round_id, request.step) != (plan.round_id, plan.step):
-                        raise ValueError("execute 请求与在线材料的 round 或 step identity 不匹配。")
-                    output, staged_state, counts = _execute_role_round(role, payload, peer_channel)
-                    staged_identity = (plan.round_id, plan.step)
-                    client_channel.send(output)
-                    control.send(_reply(request, counts))
-                    continue
-                if request.operation == "commit":
-                    if staged_state is None or staged_identity is None:
-                        raise RuntimeError("没有待提交的 state。")
-                    if (request.round_id, request.step) != staged_identity:
-                        raise ValueError("commit 请求的 round 或 step identity 不匹配。")
-                    role.commit_state(staged_state)
-                    staged_state = None
-                    staged_identity = None
+                        raise ValueError("begin 请求与在线材料的 round 或 step identity 不匹配。")
+                    endpoint = LocalProtocol3PartyEndpoint(
+                        role,
+                        payload,
+                        client_channel.send,
+                    )
                     control.send(_reply(request))
+                    continue
+                if endpoint is None:
+                    raise RuntimeError("当前没有已开始的 Protocol 3 round。")
+                if (request.round_id, request.step) != (
+                    endpoint.plan.round_id,
+                    endpoint.plan.step,
+                ):
+                    raise ValueError("角色请求的 round 或 step identity 不匹配。")
+                result = _dispatch_endpoint(endpoint, request.operation, request.payload)
+                if request.operation == "commit":
+                    endpoint = None
+                control.send(_reply(request, result))
+                if request.operation in {
+                    "mask_product",
+                    "finish_product",
+                    "complete_product",
+                    "finish_products",
+                    "mask_truncation",
+                    "p2_truncation_message",
+                    "finish_truncation_p1",
+                    "finish_truncation_p2",
+                    "complete_truncation",
+                    "stage_output",
+                    "commit",
+                }:
                     continue
                 raise ValueError(f"{role_name} 不支持操作：{request.operation}")
             except Exception as error:  # noqa: BLE001 - IPC 边界必须回传任意工作进程错误
@@ -323,224 +287,54 @@ def role_worker(
     finally:
         control.close()
         client_channel.close()
-        peer_channel.close()
 
 
-def _execute_role_round(
-    role: _Server,
-    payload: RoundPartyPayload,
-    peer: Connection,
-) -> tuple[ControlShareMessage, AdditiveShare, dict[str, int]]:
-    resources = payload.resources
-    plan = resources.plan
-    party = resources.recipient
-    other = 1 - party
-    if (
-        party not in {0, 1}
-        or len(resources.product_resources) != len(plan.product_resources)
-        or len(resources.state_truncation_resources) != len(plan.state_truncation_resources)
+def _dispatch_endpoint(endpoint: LocalProtocol3PartyEndpoint, operation: str, payload: Any) -> Any:
+    """把单个已验证 IPC 操作映射到 protocol-owned endpoint，不编排操作顺序。"""
+    if operation == "mask_product" and isinstance(payload, ResourceMetadata):
+        return endpoint.mask_product(payload)
+    if operation == "finish_product" and _payload_types(
+        payload, ResourceMetadata, ProductMaskPayload
     ):
-        raise ValueError("Server 在线资源数量或角色路由不匹配。")
-    if role.session_id != plan.session_id:
-        raise ValueError("Server 与资源计划不属于同一 session。")
-    input_share = role.input_share(
-        payload.input_message,
-        session_id=plan.session_id,
-        round_id=plan.round_id,
-        step=plan.step,
-    )
-    sums = _empty_term_sums(role)
-    sharing: TwoPartySharing | None = None
-    for resource, expected in zip(resources.product_resources, plan.product_resources, strict=True):
-        if resource.metadata != expected or resource.owner != party:
-            raise ValueError("乘法资源与公开计划不匹配。")
-        multiplier = resource.triple._lifecycle.owner
-        sharing = multiplier.sharing
-        term = expected.term
-        row, column = expected.index
-        right = (
-            role.state_value(column)
-            if term in {"A", "C"}
-            else role.input_value(input_share, column)
-        )
-        masked = role.start_product(
-            multiplier,
-            role.matrix_value(term, row, column),
-            right,
-            resource,
-        )
-        _send_peer(
-            peer,
-            party,
-            "product_mask",
-            expected.resource_id,
-            plan,
-            ProductMaskPayload(masked.d, masked.e, party),
-        )
-        remote = _recv_peer(peer, other, "product_mask", expected.resource_id, plan)
-        if not isinstance(remote, ProductMaskPayload) or remote.party != other:
-            raise TypeError("对端 Beaver 遮蔽消息类型或角色错误。")
-        lifecycle = masked._lifecycle
-        lifecycle.claim_masking(other)
-        rebound = MaskedDifferenceShare(remote.d, remote.e, remote.party, lifecycle)
-        opened = multiplier.open_masked_differences(masked, rebound)
-        product = role.finish_product(multiplier, resource, opened)
-        lifecycle.claim_finish(other)
-        resource._lifecycle.claim(other)
-        resource._lifecycle.complete()
-        sums[(term, row)] = role.add(sharing, sums[(term, row)], product)
-    if sharing is None:  # ControllerSpec 保证 D 至少包含一个标量乘法。
-        raise RuntimeError("资源计划缺少必须存在的 D 项乘法。")
-    c_state = _term_vector(sums, "C", role.layout.output_dimension)
-    d_input = _term_vector(sums, "D", role.layout.output_dimension)
-    output = role.add(sharing, c_state, d_input)
-    a_state = _term_vector(sums, "A", role.layout.state_dimension)
-    b_input = _term_vector(sums, "B", role.layout.state_dimension)
-    raw_state = role.add(sharing, a_state, b_input)
-    next_state = _truncate_state(role, raw_state, resources, peer)
-    message = ControlShareMessage(
-        party,
-        plan.session_id,
-        plan.round_id,
-        plan.step,
-        role.layout.scale_ledger.output,
-        output,
-    )
+        endpoint.finish_product(payload[0], payload[1])
+        return None
+    if operation == "complete_product" and isinstance(payload, ResourceMetadata):
+        endpoint.complete_product(payload)
+        return None
+    if operation == "finish_products" and payload is None:
+        endpoint.finish_products()
+        return None
+    if operation == "mask_truncation" and isinstance(payload, ResourceMetadata):
+        return endpoint.mask_truncation(payload)
+    if operation == "p2_truncation_message" and _payload_types(
+        payload, ResourceMetadata, TruncationMaskPayload
+    ):
+        return endpoint.p2_truncation_message(payload[0], payload[1])
+    if operation == "finish_truncation_p1" and _payload_types(
+        payload,
+        ResourceMetadata,
+        TruncationMaskPayload,
+        P2TruncationPayload,
+    ):
+        endpoint.finish_truncation_p1(payload[0], payload[1], payload[2])
+        return None
+    if operation == "finish_truncation_p2" and isinstance(payload, ResourceMetadata):
+        endpoint.finish_truncation_p2(payload)
+        return None
+    if operation == "complete_truncation" and isinstance(payload, ResourceMetadata):
+        endpoint.complete_truncation(payload)
+        return None
+    if operation == "stage_output" and payload is None:
+        return endpoint.stage_output()
+    if operation == "commit" and payload is None:
+        endpoint.commit()
+        return None
+    raise ValueError(f"Protocol 3 endpoint 不支持操作或 payload 类型错误：{operation}")
+
+
+def _payload_types(payload: Any, *types: type[object]) -> bool:
     return (
-        message,
-        next_state,
-        {
-            "products": len(resources.product_resources),
-            "truncations": len(resources.state_truncation_resources),
-        },
+        isinstance(payload, tuple)
+        and len(payload) == len(types)
+        and all(isinstance(value, expected) for value, expected in zip(payload, types, strict=True))
     )
-
-
-def _empty_term_sums(role: _Server) -> dict[tuple[str, int], AdditiveShare]:
-    rows = {
-        "C": role.layout.output_dimension,
-        "D": role.layout.output_dimension,
-        "A": role.layout.state_dimension,
-        "B": role.layout.state_dimension,
-    }
-    return {
-        (term, row): AdditiveShare(0) for term in _PROTOCOL3_TERM_ORDER for row in range(rows[term])
-    }
-
-
-def _term_vector(sums: dict[tuple[str, int], AdditiveShare], term: str, rows: int) -> AdditiveShare:
-    return _vector_from_scalars([sums[(term, row)] for row in range(rows)])
-
-
-def _truncate_state(
-    role: _Server,
-    raw_state: AdditiveShare,
-    resources: PartyResources,
-    peer: Connection,
-) -> AdditiveShare:
-    plan = resources.plan
-    party = resources.recipient
-    other = 1 - party
-    if not resources.state_truncation_resources:
-        return raw_state
-    values: list[AdditiveShare] = []
-    for row, resource in enumerate(resources.state_truncation_resources):
-        expected = plan.state_truncation_resources[row]
-        if resource.metadata != expected or resource.owner != party:
-            raise ValueError("截断资源与公开计划不匹配。")
-        truncation = resource.truncation._lifecycle.owner
-        raw_value = np.asarray(raw_state.value, dtype=object)[row]
-        raw = AdditiveShare(raw_value.item() if isinstance(raw_value, np.generic) else raw_value)
-        masked = role.mask_truncation(truncation, raw, resource)
-        _send_peer(
-            peer,
-            party,
-            "truncation_mask",
-            expected.resource_id,
-            plan,
-            TruncationMaskPayload(masked.value, party),
-        )
-        remote = _recv_peer(peer, other, "truncation_mask", expected.resource_id, plan)
-        if not isinstance(remote, TruncationMaskPayload) or remote.party != other:
-            raise TypeError("对端截断遮蔽消息类型或角色错误。")
-        lifecycle = masked._lifecycle
-        lifecycle.claim_mask(other)
-        if party == 1:
-            p2_message = truncation.p2_send_masked(masked)
-            _send_peer(
-                peer,
-                party,
-                "p2_truncation",
-                expected.resource_id,
-                plan,
-                P2TruncationPayload(p2_message.value),
-            )
-            _recv_peer(peer, other, "p1_truncation_ack", expected.resource_id, plan)
-            lifecycle.claim_p1_reconstruction()
-            value = role.finish_truncation_p2(truncation, raw, resource)
-            lifecycle.claim_finish(0)
-        else:
-            remote_message = _recv_peer(peer, other, "p2_truncation", expected.resource_id, plan)
-            if not isinstance(remote_message, P2TruncationPayload):
-                raise TypeError("P2 截断消息类型错误。")
-            lifecycle.claim_p2_send()
-            rebound = P2MaskedMessage(remote_message.value, lifecycle)
-            masked_value = truncation.p1_reconstruct_masked(masked, rebound)
-            value = role.finish_truncation_p1(truncation, raw, resource, masked_value)
-            _send_peer(peer, party, "p1_truncation_ack", expected.resource_id, plan, True)
-            lifecycle.claim_finish(1)
-        resource._lifecycle.claim(other)
-        resource._lifecycle.complete()
-        values.append(value)
-    return _vector_from_scalars(values)
-
-
-def _send_peer(
-    channel: Connection,
-    sender: int,
-    operation: str,
-    resource_id: str,
-    plan: StepResourcePlan,
-    payload: Any,
-) -> None:
-    channel.send(
-        PeerEnvelope(
-            _PROTOCOL_VERSION,
-            sender,
-            operation,
-            plan.session_id,
-            plan.round_id,
-            plan.step,
-            resource_id,
-            payload,
-        )
-    )
-
-
-def _recv_peer(
-    channel: Connection,
-    sender: int,
-    operation: str,
-    resource_id: str,
-    plan: StepResourcePlan,
-) -> Any:
-    message = channel.recv()
-    if not isinstance(message, PeerEnvelope) or (
-        message.protocol_version,
-        message.sender,
-        message.operation,
-        message.session_id,
-        message.round_id,
-        message.step,
-        message.resource_id,
-    ) != (
-        _PROTOCOL_VERSION,
-        sender,
-        operation,
-        plan.session_id,
-        plan.round_id,
-        plan.step,
-        resource_id,
-    ):
-        raise ValueError("P1/P2 消息的版本、路由或资源身份不匹配。")
-    return message.payload

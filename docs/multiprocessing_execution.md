@@ -11,11 +11,13 @@ Issue #16 增加可显式选择的 `MultiprocessingSecureStateSpaceRuntime`。�
 
 - Client 持有明文 `ControllerSpec`、明文输入、预处理材料生成能力和最终输出重构能力；
 - P1/P2 各自只接收本方 controller、state、input、Beaver 与 Trunc share；
-- P1/P2 通过私有 Pipe 交换现有 Protocol 1/2 的遮蔽消息；
+- protocol 层的唯一调度器经角色 endpoint 路由现有 Protocol 1/2 遮蔽消息；
 - 父进程只传递公开 session/round/step、操作状态和最终解码输出，不接收原始双方份额。
 
 IPC 使用固定版本的不可变信封，并逐项校验 request、role、operation、session、round、step 和
 resource id。它是本机进程适配协议，不是 Issue #17 的网络 wire schema，也不提供网络认证。
+`protocol.coordinator.Protocol3Orchestrator` 是两种 backend 共用的唯一操作顺序；单进程 endpoint
+直接调用既有角色，多进程 endpoint 只把同一调用映射为 IPC，worker 不再实现另一套协议循环。
 
 ## 生命周期
 

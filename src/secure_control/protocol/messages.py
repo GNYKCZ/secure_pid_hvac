@@ -495,6 +495,50 @@ class OnlineRound:
 
 
 @dataclass(frozen=True, slots=True)
+class PartyOnlineRound:
+    """Client 交给单个角色的输入与本方资源，不包含对方任何 share。"""
+
+    input_message: InputShareMessage
+    resources: PartyResources
+
+
+@dataclass(frozen=True, slots=True)
+class ProductMaskPayload:
+    """Protocol 1 单方遮蔽差值的 transport-neutral 表示。"""
+
+    d: AdditiveShare
+    e: AdditiveShare
+    party: PartyIndex
+
+
+@dataclass(frozen=True, slots=True)
+class TruncationMaskPayload:
+    """Protocol 2 单方遮蔽份额的 transport-neutral 表示。"""
+
+    value: AdditiveShare
+    party: PartyIndex
+
+
+@dataclass(frozen=True, slots=True)
+class P2TruncationPayload:
+    """P2 发给 P1 的截断消息表示，不携带进程内 lifecycle identity。"""
+
+    value: AdditiveShare
+
+
+@dataclass(frozen=True, slots=True)
+class Protocol3StageReceipt:
+    """角色完成 Protocol 3 暂存后返回的公开、无 share 回执。"""
+
+    party: PartyIndex
+    session_id: str
+    round_id: str
+    step: int
+    products: int
+    truncations: int
+
+
+@dataclass(frozen=True, slots=True)
 class MaskedExchangeMessage:
     """模拟 P1↔P2 的 Beaver 遮蔽差值发送，绑定 session、round、step 与资源。"""
 

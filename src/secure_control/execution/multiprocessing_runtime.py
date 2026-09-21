@@ -20,6 +20,15 @@ from secure_control.protocol import (
     ControllerRangeVerification,
     ControllerScaleLedger,
 )
+from secure_control.protocol.coordinator import Protocol3Orchestrator
+from secure_control.protocol.messages import (
+    P2TruncationPayload,
+    ProductMaskPayload,
+    Protocol3StageReceipt,
+    ResourceMetadata,
+    StepResourcePlan,
+    TruncationMaskPayload,
+)
 
 from ._inputs import normalize_step_input
 from ._multiprocessing_workers import IpcEnvelope, client_worker, role_worker
@@ -191,6 +200,100 @@ class _ProcessSession:
         return response.payload
 
 
+class _RemoteProtocol3Endpoint:
+    """把统一 Protocol 3 endpoint 调用映射为单个角色的 IPC 请求。"""
+
+    def __init__(
+        self,
+        session: _ProcessSession,
+        party: Literal[0, 1],
+        plan: StepResourcePlan,
+        timeout: float,
+    ) -> None:
+        self._session = session
+        self._party = party
+        self._role: Literal["P1", "P2"] = "P1" if party == 0 else "P2"
+        self._plan = plan
+        self._timeout = timeout
+
+    @property
+    def party(self) -> int:
+        return self._party
+
+    @property
+    def session_id(self) -> str:
+        return self._session.session_id
+
+    @property
+    def plan(self) -> StepResourcePlan:
+        return self._plan
+
+    def begin(self) -> None:
+        self._request("begin")
+
+    def mask_product(self, metadata: ResourceMetadata) -> ProductMaskPayload:
+        result = self._request("mask_product", metadata)
+        if not isinstance(result, ProductMaskPayload):
+            raise ProcessProtocolError(f"{self._role} 返回了非法乘法遮蔽消息。")
+        return result
+
+    def finish_product(self, metadata: ResourceMetadata, peer: ProductMaskPayload) -> None:
+        self._request("finish_product", (metadata, peer))
+
+    def complete_product(self, metadata: ResourceMetadata) -> None:
+        self._request("complete_product", metadata)
+
+    def finish_products(self) -> None:
+        self._request("finish_products")
+
+    def mask_truncation(self, metadata: ResourceMetadata) -> TruncationMaskPayload:
+        result = self._request("mask_truncation", metadata)
+        if not isinstance(result, TruncationMaskPayload):
+            raise ProcessProtocolError(f"{self._role} 返回了非法截断遮蔽消息。")
+        return result
+
+    def p2_truncation_message(
+        self, metadata: ResourceMetadata, peer: TruncationMaskPayload
+    ) -> P2TruncationPayload:
+        result = self._request("p2_truncation_message", (metadata, peer))
+        if not isinstance(result, P2TruncationPayload):
+            raise ProcessProtocolError("P2 返回了非法截断消息。")
+        return result
+
+    def finish_truncation_p1(
+        self,
+        metadata: ResourceMetadata,
+        peer: TruncationMaskPayload,
+        message: P2TruncationPayload,
+    ) -> None:
+        self._request("finish_truncation_p1", (metadata, peer, message))
+
+    def finish_truncation_p2(self, metadata: ResourceMetadata) -> None:
+        self._request("finish_truncation_p2", metadata)
+
+    def complete_truncation(self, metadata: ResourceMetadata) -> None:
+        self._request("complete_truncation", metadata)
+
+    def stage_output(self) -> Protocol3StageReceipt:
+        result = self._request("stage_output")
+        if not isinstance(result, Protocol3StageReceipt):
+            raise ProcessProtocolError(f"{self._role} 返回了非法暂存回执。")
+        return result
+
+    def commit(self) -> None:
+        self._request("commit")
+
+    def _request(self, operation: str, payload: Any = None) -> Any:
+        return self._session.request(
+            self._role,
+            operation,
+            self._timeout,
+            round_id=self._plan.round_id,
+            step=self._plan.step,
+            payload=payload,
+        )
+
+
 class MultiprocessingSecureStateSpaceRuntime:
     """在 Client/P1/P2 三个持久 ``spawn`` 进程中执行安全控制器。"""
 
@@ -289,19 +392,14 @@ class MultiprocessingSecureStateSpaceRuntime:
                 step=self._step_index,
                 payload=input_vector,
             )
-            requests = {
-                role: session.send(
-                    role,
-                    "execute",
-                    round_id=plan.round_id,
-                    step=self._step_index,
-                )
-                for role in ("P1", "P2")
-            }
-            counts = {
-                role: session.receive(role, request, self._timeouts.step)
-                for role, request in requests.items()
-            }
+            if not isinstance(plan, StepResourcePlan):
+                raise ProcessProtocolError("Client 返回了非法资源计划。")
+            first = _RemoteProtocol3Endpoint(session, 0, plan, self._timeouts.step)
+            second = _RemoteProtocol3Endpoint(session, 1, plan, self._timeouts.step)
+            first.begin()
+            second.begin()
+            orchestrator = Protocol3Orchestrator()
+            receipts = orchestrator.stage(first, second, plan)
             output = session.request(
                 "Client",
                 "reconstruct",
@@ -309,19 +407,12 @@ class MultiprocessingSecureStateSpaceRuntime:
                 round_id=plan.round_id,
                 step=self._step_index,
             )
-            commits = {
-                role: session.send(role, "commit", round_id=plan.round_id, step=self._step_index)
-                for role in ("P1", "P2")
-            }
-            for role, request in commits.items():
-                session.receive(role, request, self._timeouts.step)
+            orchestrator.commit(first, second)
             result = np.array(output, dtype=float, copy=True)
             if result.shape != (self._spec.output_dimension,) or not np.isfinite(result).all():
                 raise ProcessProtocolError("Client 返回的控制输出 shape 或有限性不合法。")
-            if counts["P1"] != counts["P2"]:
-                raise ProcessProtocolError("P1/P2 报告的资源消费数量不一致。")
-            self._product_count += counts["P1"]["products"]
-            self._truncation_count += counts["P1"]["truncations"]
+            self._product_count += receipts[0].products
+            self._truncation_count += receipts[0].truncations
             self._step_index += 1
             return result
         except Exception:
@@ -367,7 +458,6 @@ class MultiprocessingSecureStateSpaceRuntime:
             controls[role], child_controls[role] = context.Pipe()
         client_p1, p1_client = context.Pipe()
         client_p2, p2_client = context.Pipe()
-        p1_peer, p2_peer = context.Pipe()
         processes: dict[str, BaseProcess] = {
             "Client": context.Process(
                 name="secure-control-Client",
@@ -387,12 +477,12 @@ class MultiprocessingSecureStateSpaceRuntime:
             "P1": context.Process(
                 name="secure-control-P1",
                 target=role_worker,
-                args=(0, child_controls["P1"], p1_client, p1_peer),
+                args=(0, child_controls["P1"], p1_client),
             ),
             "P2": context.Process(
                 name="secure-control-P2",
                 target=role_worker,
-                args=(1, child_controls["P2"], p2_client, p2_peer),
+                args=(1, child_controls["P2"], p2_client),
             ),
         }
         all_child_connections = (
@@ -401,8 +491,6 @@ class MultiprocessingSecureStateSpaceRuntime:
             p1_client,
             client_p2,
             p2_client,
-            p1_peer,
-            p2_peer,
         )
         try:
             for process in processes.values():
