@@ -19,6 +19,7 @@ from secure_control.core import (
 )
 from secure_control.crypto import TwoPartySharing
 from secure_control.protocol import Client
+from secure_control.scenarios.hvac import infinite_safety as infinite_safety_module
 from secure_control.scenarios.hvac.contract import load_hvac_scenario_contract
 from secure_control.scenarios.hvac.infinite_safety import load_hvac_infinite_safety_bundle
 from secure_control.scenarios.hvac.tuning import load_hvac_pid_tuning_contract
@@ -182,6 +183,42 @@ def test_configuration_rejects_mismatched_upstream_stability_report(tmp_path: Pa
     path.write_text(yaml.safe_dump(source, allow_unicode=True, sort_keys=False), encoding="utf-8")
 
     with pytest.raises(ValueError, match="stability report SHA-256"):
+        load_hvac_infinite_safety_bundle(path)
+
+
+def test_final_certificate_rejects_pid_aba_switch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PID 在内层解析时切换为 B 再恢复 A，不得生成跨快照证书。"""
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir()
+    assumptions = yaml.safe_load(FINAL_CONFIG.read_text(encoding="utf-8"))
+    for item in assumptions["sources"].values():
+        name = item["path"]
+        (config_dir / name).write_bytes((PROJECT_ROOT / "configs" / name).read_bytes())
+    path = config_dir / FINAL_CONFIG.name
+    path.write_bytes(FINAL_CONFIG.read_bytes())
+
+    pid_path = config_dir / assumptions["sources"]["pid"]["path"]
+    original_source = pid_path.read_bytes()
+    alternate = yaml.safe_load(original_source.decode("utf-8"))
+    alternate["baseline_creation"]["start_commit"] = "0" * 40
+    alternate_source = yaml.safe_dump(alternate, sort_keys=False).encode("utf-8")
+    original_loader = infinite_safety_module.load_hvac_pid_tuning_contract
+
+    def switch_pid_during_loader(*args: object, **kwargs: object):
+        pid_path.write_bytes(alternate_source)
+        try:
+            return original_loader(*args, **kwargs)
+        finally:
+            pid_path.write_bytes(original_source)
+
+    monkeypatch.setattr(
+        infinite_safety_module,
+        "load_hvac_pid_tuning_contract",
+        switch_pid_during_loader,
+    )
+    with pytest.raises(ValueError, match="解析期间发生变化"):
         load_hvac_infinite_safety_bundle(path)
 
 

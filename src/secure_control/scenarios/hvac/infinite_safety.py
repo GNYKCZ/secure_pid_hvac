@@ -127,7 +127,9 @@ def load_hvac_infinite_safety_bundle(
         raise ValueError("HVAC 无限时域安全配置字段或 schema_version 无效")
     scenario_id = _nonempty_string(loaded["scenario_id"], "scenario_id")
     claim_boundary = _nonempty_string(loaded["claim_boundary"], "claim_boundary")
-    source_paths, source_hashes = _validated_sources(path.parent, loaded["sources"])
+    source_paths, source_hashes, source_snapshots = _validated_sources(
+        path.parent, loaded["sources"]
+    )
     baseline_identity = (
         _baseline_identity(loaded["baseline_identity"], source_hashes)
         if schema_version == 2
@@ -165,14 +167,14 @@ def load_hvac_infinite_safety_bundle(
         source_paths["pid"],
         references_celsius=tuple(float(value) for value in stability_references),
         boundary_tolerance=float(boundary_tolerance),
+        plant_source=source_snapshots["plant"],
+        pid_source=source_snapshots["pid"],
     )
     if (
         raw_stability_report.schur.status != "stable"
         or any(item.applicability != "applicable" for item in raw_stability_report.equilibria)
-        or raw_stability_report.plant_source_sha256
-        != sha256(source_paths["plant"].read_bytes()).hexdigest()
-        or raw_stability_report.pid_source_sha256
-        != sha256(source_paths["pid"].read_bytes()).hexdigest()
+        or raw_stability_report.plant_source_sha256 != sha256(source_snapshots["plant"]).hexdigest()
+        or raw_stability_report.pid_source_sha256 != sha256(source_snapshots["pid"]).hexdigest()
     ):
         raise ValueError("#37 完整 stability report 与 #38 来源或适用性不一致")
     # #37 报告原始哈希忠实记录本地文件字节；#38 的长期内容身份改用已验证的规范文本
@@ -195,10 +197,18 @@ def load_hvac_infinite_safety_bundle(
     ):
         raise ValueError("#37 完整 stability report SHA-256 不匹配")
 
-    contract = load_hvac_scenario_contract(source_paths["plant"])
+    contract = load_hvac_scenario_contract(
+        source_paths["plant"],
+        config_source=source_snapshots["plant"],
+    )
     if not isinstance(contract.model, Hvac2R2CModelContract):
         raise TypeError("无限时域 HVAC 证书只接受冻结 2R2C plant")
-    design, _, _ = load_hvac_pid_tuning_contract(source_paths["pid"], contract)
+    design, _, _ = load_hvac_pid_tuning_contract(
+        source_paths["pid"],
+        contract,
+        config_source=source_snapshots["pid"],
+        plant_source=source_snapshots["plant"],
+    )
     plant = build_hvac_2r2c_state_space(contract.model, contract.timing.sampling_period_seconds)
     base_controller = design.to_controller_spec()
 
@@ -263,7 +273,7 @@ def load_hvac_infinite_safety_bundle(
     ):
         raise ValueError("证书 actuator bounds 与冻结 plant 不一致")
 
-    prime_loaded = yaml.safe_load(source_paths["prime"].read_text(encoding="utf-8"))
+    prime_loaded = yaml.safe_load(source_snapshots["prime"].decode("utf-8"))
     prime_mapping = _mapping(prime_loaded, "prime source")
     if set(prime_mapping) != {"modulus", "evidence"}:
         raise ValueError("prime source 字段无效")
@@ -673,6 +683,7 @@ def _validated_sources(base: Path, value: Any):
         raise ValueError("sources 必须冻结 plant/pid/sweep/prime")
     paths: dict[str, Path] = {}
     hashes: dict[str, str] = {}
+    snapshots: dict[str, bytes] = {}
     for name, raw in sources.items():
         item = _mapping(raw, f"sources.{name}")
         if set(item) != {"path", "sha256"}:
@@ -681,12 +692,14 @@ def _validated_sources(base: Path, value: Any):
         if source_path.parent != base.resolve():
             raise ValueError("source 路径不得逃逸配置目录")
         expected = _nonempty_string(item["sha256"], f"sources.{name}.sha256")
-        actual = sha256(source_path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+        snapshot = source_path.read_bytes()
+        actual = sha256(snapshot.replace(b"\r\n", b"\n")).hexdigest()
         if actual != expected:
             raise ValueError(f"sources.{name} SHA-256 不匹配")
         paths[name] = source_path
         hashes[name] = actual
-    return paths, hashes
+        snapshots[name] = snapshot
+    return paths, hashes, snapshots
 
 
 def _shape_matrix(template: Mapping[str, Any]):
