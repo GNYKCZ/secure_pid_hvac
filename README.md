@@ -139,10 +139,10 @@ PNG/PDF。无同单位 reference 的输出误差可用可重复的 `--output-err
 路径、单位、log 零值与追溯清单见
 [已保存结果绘图契约](docs/figure_contract.md)。普通生成图片默认不提交 Git。
 
-运行冻结的 2R2C 定点精度扫描：
+使用最终快速响应 baseline 运行 source-independent 2R2C 定点精度扫描：
 
 ```powershell
-uv run python -m secure_control.experiments.sweep_runner --definition configs/hvac_2r2c_precision_sweep.yaml
+uv run python -m secure_control.experiments.sweep_runner --definition configs/hvac_2r2c_precision_sweep_definition.yaml --baseline-config configs/hvac_2r2c_dual_loop_25_20_15_fast_response.yaml --expected-baseline-id e0d0100f0ccf9fac15910c010090113574d9b53b61118fa6ad8a7035116138b7
 ```
 
 source-independent schema v2 通过显式 baseline path/expected ID 解析运行来源；使用方式和
@@ -167,14 +167,16 @@ uv run python -m secure_control.experiments.sweep_figure_runner --sweep-dir resu
 为冻结代表点生成默认关闭的真实安全执行证据，并从 verified sweep/evidence 只读生成增强报告：
 
 ```powershell
-uv run python -m secure_control.experiments.evidence_runner --source-sweep-id 20260917T141734484659Z-0b0eb456cc01 --ell 48 --seed 42 --trace-step 60 --allow-combined-share-diagnostic
-uv run python -m secure_control.experiments.evidence_report_runner --source-sweep-id 20260917T141734484659Z-0b0eb456cc01 --trace-id <trace_id>
+uv run python -m secure_control.experiments.evidence_runner --source-sweep-id <verified-sweep-id> --ell 48 --seed 42 --trace-step 60 --baseline-config configs/hvac_2r2c_dual_loop_25_20_15_fast_response.yaml --expected-baseline-id e0d0100f0ccf9fac15910c010090113574d9b53b61118fa6ad8a7035116138b7 --allow-combined-share-diagnostic
+uv run python -m secure_control.experiments.evidence_report_runner --source-sweep-id <verified-sweep-id> --trace-id <trace_id> --display-config configs/hvac_2r2c_evidence_report_profile_zh.yaml
 ```
 
 该路径严格复验正式八字段，不修改已有 sweep。公开 evidence 与短时 combined-share 诊断物理隔离；
 增强报告使用分钟轴、applied-control Fig. 3 adapted、三 seed timing 与 exact 协议资源。完整命令、
 文件闭包、安全声明和 Protocol 2 计数为零的含义见
 [安全执行证据与增强中文报告](docs/secure_execution_evidence.md)。
+Issue #59 的最终 artifact ID、哈希、四精度定量结果、复现命令和声明边界集中记录在
+[最终 HVAC 安全证据链索引](docs/final_hvac_evidence_chain.md)。
 
 ## 安全算术基线
 

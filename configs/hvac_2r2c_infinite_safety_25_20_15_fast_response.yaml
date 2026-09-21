@@ -1,0 +1,95 @@
+# Issue #59：最终快速响应 PID 在固定 15°C 参考下的局部未饱和无限时域假设。
+schema_version: 2
+scenario_id: hvac_2r2c_pid_fast_response_fixed_15_infinite_safety_v1
+sources:
+  plant: {path: hvac_2r2c_scenario_25_20_15.yaml, sha256: 23a4c63930b5ac8c5ffed0c1696700da443afc1c505322f84a9d6cc85c2abe25}
+  pid: {path: hvac_2r2c_pid_baseline_25_20_15_fast_response.yaml, sha256: 1af8217e600a37110c0a74e2baf2b42ee196fdc0591e5d835b5aa09201421945}
+  sweep: {path: hvac_2r2c_precision_sweep_definition.yaml, sha256: d22213607204c8bbb39ecad1b84c07618d10c9fc1dd52409da17f6b70ce7d3a5}
+  prime: {path: hvac_2r2c_sweep_prime.yaml, sha256: b317a7db4f14fbf77258102d6b09766dc3b5f495252c1e29ed3ae315cb98340c}
+
+baseline_identity:
+  scheme: hvac_baseline_identity_v1
+  baseline_id: e0d0100f0ccf9fac15910c010090113574d9b53b61118fa6ad8a7035116138b7
+  source_hashes:
+    wrapper: 286713a356c805453d0517bf0a341b65ca522d1ed68adebf71569ce7ce1e82e9
+    baseline: 1af8217e600a37110c0a74e2baf2b42ee196fdc0591e5d835b5aa09201421945
+    scenario: 23a4c63930b5ac8c5ffed0c1696700da443afc1c505322f84a9d6cc85c2abe25
+
+upstream_stability:
+  references_celsius: ["25", "20", "15"]
+  boundary_tolerance: "1/1000000000"
+  report_sha256: 6f7340c765e5947787fb74f726c6793d262a9bea8251843a744585a63fe512e7
+
+fixed_assumptions:
+  reference_celsius: "15"
+  ambient_celsius: "30"
+  continues_forever: true
+  strictly_unsaturated: true
+  actuator_lower_kw: "0"
+  actuator_upper_kw: "12"
+  controller_input_abs_bound_celsius: "1/100"
+  controller_state_abs_bounds: ["1100", "1"]
+  air_temperature_bounds_celsius: ["14", "16"]
+  wall_temperature_bounds_celsius: ["18", "21"]
+  initial_half_width: "1/1000000000"
+  actuation_decode_abs_error_kw: "1/281474976710656"
+  plant_roundoff_abs_error_celsius: ["0", "0"]
+  state_truncation_abs_error: "0"
+
+security:
+  fractional_bits: [32, 40, 48, 56]
+  integer_headroom_bits: 28
+  security_parameter: 80
+
+# 每个 ell 的 P 均由实际量化 ControllerSpec 求解缩放离散 Lyapunov 方程，
+# 再以 10^9 分母冻结；最终接受与否只由精确有理 verifier 决定。
+witnesses:
+  "32":
+    shape_denominator: 1000000000
+    shape_numerators:
+      - [13380333037, 0, -2534962508851, -193037497211]
+      - [0, 1000000000, 0, 0]
+      - [-2534962508851, 0, 576731533147603, 557547692851444]
+      - [-193037497211, 0, 557547692851444, 287048739399093856]
+    contraction_bound: "1999/2000"
+    disturbance_norm_bounds: ["97", "111"]
+    radius: "1/10000"
+    constraint_dual_norm_bounds: ["1", "1", "1", "1", "1", "1", "1"]
+  "40":
+    shape_denominator: 1000000000
+    shape_numerators:
+      - [13380332636, 0, -2534962419491, -193037462036]
+      - [0, 1000000000, 0, 0]
+      - [-2534962419491, 0, 576731513332942, 557547652172557]
+      - [-193037462036, 0, 557547652172557, 287048718749419520]
+    contraction_bound: "1999/2000"
+    disturbance_norm_bounds: ["97", "111"]
+    radius: "1/10000"
+    constraint_dual_norm_bounds: ["1", "1", "1", "1", "1", "1", "1"]
+  "48":
+    shape_denominator: 1000000000
+    shape_numerators:
+      - [13380332637, 0, -2534962419675, -193037462108]
+      - [0, 1000000000, 0, 0]
+      - [-2534962419675, 0, 576731513373754, 557547652256343]
+      - [-193037462108, 0, 557547652256343, 287048718791951072]
+    contraction_bound: "1999/2000"
+    disturbance_norm_bounds: ["97", "111"]
+    radius: "1/10000"
+    constraint_dual_norm_bounds: ["1", "1", "1", "1", "1", "1", "1"]
+  "56":
+    shape_denominator: 1000000000
+    shape_numerators:
+      - [13380332637, 0, -2534962419675, -193037462108]
+      - [0, 1000000000, 0, 0]
+      - [-2534962419675, 0, 576731513373869, 557547652256580]
+      - [-193037462108, 0, 557547652256580, 287048718792071584]
+    contraction_bound: "1999/2000"
+    disturbance_norm_bounds: ["97", "111"]
+    radius: "1/10000"
+    constraint_dual_norm_bounds: ["1", "1", "1", "1", "1", "1", "1"]
+
+claim_boundary: >-
+  只证明最终快速响应 baseline 在固定 reference=15°C、固定 ambient=30°C、局部初始盒、
+  严格未饱和且扰动不超过声明界时的无限时域量化闭环安全；不覆盖 25→20→15°C 的
+  180 步切换轨迹，也不证明一般饱和切换系统。

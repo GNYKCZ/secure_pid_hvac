@@ -2,10 +2,11 @@
 
 ## 定理与量词
 
-Issue #38 的结论不是“默认仿真永远安全”，而是一个带明确前提的条件定理。对每个
-`ell ∈ {32,40,48,56}`，若 reference 从证书初态起固定为 25°C 并无限持续、ambient 固定为
-30°C、初态属于配置中的局部盒、量化和解码扰动不超过声明界、plant 二进制矩阵及来源哈希
-不变，且 raw control 始终严格位于 `(0,12) kW`，则对所有整数 `k >= 0`：
+Issue #38 的结论不是“默认仿真永远安全”，而是一个带明确前提的条件定理。历史 v1 配置的
+reference 固定为 25°C；Issue #59 为最终快速响应 PID 新增的 schema v2 配置固定为 15°C。
+对每个 `ell ∈ {32,40,48,56}`，若 reference 从证书初态起固定为对应配置声明的工作点并无限
+持续、ambient 固定为 30°C、初态属于配置中的局部盒、量化和解码扰动不超过声明界、plant
+二进制矩阵及来源哈希不变，且 raw control 始终严格位于 `(0,12) kW`，则对所有整数 `k >= 0`：
 
 - 增广状态 `[I,e_previous,T_air,T_wall]` 留在已验证的鲁棒正不变椭球内；
 - controller state/input payload 与 state/output accumulator 不发生已排除的越界；
@@ -71,16 +72,18 @@ Client 在创建参数 share、Beaver triple 或 mask 前重新验证：
 
 ## 来源与发布
 
-权威假设在 `configs/hvac_2r2c_infinite_safety.yaml`。它冻结 plant、PID、precision sweep 和
-Pocklington prime 证据的规范文本 SHA-256、#37 完整稳定性报告参数与内容摘要，以及四个精度点
-各自的有理 witness。发布证书保存完整 #37 报告，并同时保存 #15 final/data manifest 的
-SHA-256；原子发布前会重读两个 manifest，任一发生变化即删除临时目录并拒绝发布。
+历史权威假设保留在 `configs/hvac_2r2c_infinite_safety.yaml`；最终快速响应 PID 的独立假设在
+`configs/hvac_2r2c_infinite_safety_25_20_15_fast_response.yaml`。两者均冻结 plant、PID、
+precision sweep 和 Pocklington prime 证据的规范文本 SHA-256、完整稳定性报告参数与内容摘要，
+以及四个精度点各自的有理 witness。schema v2 还绑定 verified `resolved_source.json` 和
+`resolved_plan.json` 中的 baseline ID、三源摘要、稳定性报告和 12 点矩阵。发布证书同时保存
+上游 final/data manifest 的 SHA-256；原子发布前会重读两个 manifest，任一变化都拒绝发布。
 
 报告命令只读取已经由正式 reader 完整复验的 sweep，不运行实验、仿真或绘图：
 
 ```text
 uv run python -m secure_control.experiments.infinite_safety_runner \
-  --assumptions configs/hvac_2r2c_infinite_safety.yaml \
+  --assumptions configs/hvac_2r2c_infinite_safety_25_20_15_fast_response.yaml \
   --sweep-dir results/sweeps/<verified-sweep-id> \
   --output-root results/safety
 ```
@@ -89,6 +92,7 @@ uv run python -m secure_control.experiments.infinite_safety_runner \
 
 ## 不覆盖项
 
-默认 180 步基线以 15°C reference 和 30°C 初温启动，首步 raw control 为 12.875 kW，超过
-12 kW 上界并进入饱和。因此它明确不在本局部未饱和证书覆盖内。本 Issue 不证明一般切换或
-饱和非线性系统，不重新整定 PID，不重跑 sweep/仿真，不修改密码算法，也不声称真实建筑标定。
+历史 fixed-25 证书与最终 fixed-15 证书是两个独立条件定理，不能互换 witness 或来源身份。最终
+`25→20→15°C` 的 180 步切换轨迹也不属于 fixed-15 局部未饱和证书；前者由有限时域仿真与范围
+证书支持，后者才具有 `k >= 0` 的量词。本契约不证明一般切换或饱和非线性系统，不修改密码
+算法，也不声称真实建筑标定。

@@ -167,10 +167,19 @@ class HvacTuningInfeasibleError(ValueError):
 
 
 def load_hvac_pid_tuning_contract(
-    path: str | Path, plant_contract: HvacScenarioContract
+    path: str | Path,
+    plant_contract: HvacScenarioContract,
+    *,
+    config_source: bytes | None = None,
+    plant_source: bytes | None = None,
 ) -> tuple[HvacPidDesign, HvacPidTuningContract, HvacControlQualityContract]:
     """读取 2R2C PID 配置并校验 plant 引用、hash、策略与冻结调参规则。"""
-    inputs = _load_hvac_pid_config_inputs(path, plant_contract)
+    inputs = _load_hvac_pid_config_inputs(
+        path,
+        plant_contract,
+        config_source=config_source,
+        plant_source=plant_source,
+    )
     report = _mapping(_mapping(inputs.loaded, "tuning"), "result")
     rerun = tune_hvac_pid(plant_contract, inputs.tuning, inputs.quality)
     if rerun.selected_design != inputs.design:
@@ -201,6 +210,7 @@ def _load_hvac_pid_config_inputs(
     plant_contract: HvacScenarioContract,
     *,
     config_source: bytes | None = None,
+    plant_source: bytes | None = None,
 ) -> _HvacPidConfigInputs:
     """严格解析同一份 PID bytes 的共享字段，但不运行 exhaustive tuner。"""
     if not isinstance(plant_contract, HvacScenarioContract) or not isinstance(
@@ -210,6 +220,8 @@ def _load_hvac_pid_config_inputs(
     config_path = Path(path)
     if config_source is not None and not isinstance(config_source, bytes):
         raise TypeError("config_source 必须是 bytes 或 None")
+    if plant_source is not None and not isinstance(plant_source, bytes):
+        raise TypeError("plant_source 必须是 bytes 或 None")
     try:
         source = config_path.read_bytes() if config_source is None else config_source
         loaded = yaml.safe_load(source.decode("utf-8"))
@@ -223,14 +235,17 @@ def _load_hvac_pid_config_inputs(
     plant_name = _string(loaded, "plant_config")
     plant_path = config_path.parent / plant_name
     try:
-        plant_source = plant_path.read_bytes()
+        resolved_plant_source = plant_path.read_bytes() if plant_source is None else plant_source
     except OSError as error:
         raise ValueError(f"无法读取引用的 2R2C plant 配置：{plant_path}") from error
     # Git 可按平台转换工作树换行；引用 hash 统一按 LF 规范化，保证跨平台配置身份稳定。
-    canonical_plant_source = plant_source.replace(b"\r\n", b"\n")
+    canonical_plant_source = resolved_plant_source.replace(b"\r\n", b"\n")
     if sha256(canonical_plant_source).hexdigest() != _string(loaded, "plant_sha256"):
         raise ValueError("2R2C plant 配置 SHA-256 与冻结引用不一致")
-    if load_hvac_scenario_contract(plant_path) != plant_contract:
+    if (
+        load_hvac_scenario_contract(plant_path, config_source=resolved_plant_source)
+        != plant_contract
+    ):
         raise ValueError("传入 plant contract 与 PID 配置引用的 plant 不一致")
 
     controller = _mapping(loaded, "controller")
@@ -259,7 +274,7 @@ def _load_hvac_pid_config_inputs(
         source,
         loaded,
         plant_path,
-        plant_source,
+        resolved_plant_source,
         selected,
         tuning,
         quality,

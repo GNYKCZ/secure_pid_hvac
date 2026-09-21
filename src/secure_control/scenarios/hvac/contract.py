@@ -240,13 +240,20 @@ class HvacScenarioContract:
             raise ValueError("HVAC 场景 metadata.name 必须为 hvac")
 
 
-def load_hvac_scenario_contract(path: str | Path) -> HvacScenarioContract:
+def load_hvac_scenario_contract(
+    path: str | Path,
+    *,
+    config_source: bytes | None = None,
+) -> HvacScenarioContract:
     """读取并严格校验 ``scenario.name: hvac`` 的 YAML 配置，不执行任何控制计算。"""
     config_path = Path(path)
+    if config_source is not None and not isinstance(config_source, bytes):
+        raise TypeError("config_source 必须是 bytes 或 None")
     try:
-        loaded = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        source = config_path.read_bytes() if config_source is None else config_source
     except OSError as error:
         raise ValueError(f"无法读取 HVAC 配置文件：{config_path}") from error
+    loaded = yaml.safe_load(source.decode("utf-8"))
     if not isinstance(loaded, Mapping):
         raise TypeError("HVAC 配置根节点必须是映射")
 

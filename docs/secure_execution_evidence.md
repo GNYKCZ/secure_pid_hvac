@@ -1,8 +1,8 @@
 # 安全执行证据与增强中文报告
 
-> 历史证据说明：现有执行证据绑定旧 15→20→25 sweep 的代表点。Issue #53 不重跑 evidence，
-> 该证据不能自动外推到 25→20→15 正式基线；迁移边界见
-> [hvac_reference_migration.md](hvac_reference_migration.md)。
+> 历史 schema v1 证据仍绑定旧 15→20→25 sweep，不能自动外推。Issue #59 已用最终快速响应
+> `25→20→15°C` baseline 生成新的 schema v2 证据链；具体 ID、哈希和结果见
+> [最终 HVAC 安全证据链索引](final_hvac_evidence_chain.md)。
 
 Issue #55 的 v2 evidence 路径改用 verified sweep 内的 resolved plan，并要求显式 baseline
 path/expected ID；v2 展示 profile 不再复制 sweep/manifest 身份。迁移说明见
@@ -26,14 +26,16 @@ manifest，也不代表部署中的任一参与方可以同时取得两份 share
 
 ```powershell
 uv run python -m secure_control.experiments.evidence_runner `
-  --source-sweep-id 20260917T141734484659Z-0b0eb456cc01 `
+  --source-sweep-id <verified-sweep-id> `
   --ell 48 --seed 42 --trace-step 60 `
+  --baseline-config configs/hvac_2r2c_dual_loop_25_20_15_fast_response.yaml `
+  --expected-baseline-id e0d0100f0ccf9fac15910c010090113574d9b53b61118fa6ad8a7035116138b7 `
   --allow-combined-share-diagnostic
 ```
 
-上述命令保留历史 schema v1 行为。v2 sweep 还必须传入 `--baseline-config` 与
-`--expected-baseline-id`，并与 manifest 已验证的 `resolved_source.json`/`resolved_plan.json`
-一致；不会回退到仓库历史 definition 或自动选择来源。
+schema v2 必须显式传入 `--baseline-config` 与 `--expected-baseline-id`，并与 manifest 已验证的
+`resolved_source.json`/`resolved_plan.json` 一致；不会回退到仓库历史 definition 或自动选择
+来源。历史 schema v1 命令仍可省略这两个参数。
 
 发布前会用 canonical sweep reader 复验来源，并对 `time/reference/output_ideal/output_secure/`
 `control_ideal/control_secure/control_error/output_error` 同时检查 dtype、shape 与 `array_equal`。任一字段
@@ -57,9 +59,9 @@ uv run python -m secure_control.experiments.evidence_runner `
 
 ```powershell
 uv run python -m secure_control.experiments.evidence_report_runner `
-  --source-sweep-id 20260917T141734484659Z-0b0eb456cc01 `
+  --source-sweep-id <verified-sweep-id> `
   --trace-id <trace_id> `
-  --display-config configs/hvac_2r2c_evidence_report_zh.yaml
+  --display-config configs/hvac_2r2c_evidence_report_profile_zh.yaml
 ```
 
 输出位于 `results/figures/evidence_reports/<sweep_id>/<report_id>/`。主汇报依次展示双路径、选定 step、

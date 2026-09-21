@@ -364,3 +364,26 @@ def test_collision_and_mid_batch_failure_preserve_user_data_and_no_partial_succe
     assert not list(parent.glob(".incomplete-*"))
     assert (user_dir / "keep.txt").read_text(encoding="utf-8") == "保留"
     assert sha256(first.manifest_path.read_bytes()).hexdigest() == first_hash
+
+
+def test_render_staging_name_preserves_windows_path_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """临时目录只使用随机 nonce，避免嵌套 sweep 路径超过 Windows 上限。"""
+    published = _published(tmp_path, vector=False)
+    fixed_id = "20260916T010203123456Z-abcdef123456"
+    monkeypatch.setattr(plotting, "_new_render_id", lambda: fixed_id)
+    original_savefig = Figure.savefig
+    staging_names: list[str] = []
+
+    def capture_staging_name(figure: Figure, path: Path, *args: object, **kwargs: object) -> None:
+        staging_names.append(Path(path).parent.name)
+        original_savefig(figure, path, *args, **kwargs)
+
+    monkeypatch.setattr(Figure, "savefig", capture_staging_name)
+    plotting.render_saved_run(
+        published.run_dir,
+        plotting.PlotSelection(((0, 0),), (0,)),
+        output_root=tmp_path / "nested" / "standard" / "32-42",
+    )
+    assert set(staging_names) == {".incomplete-abcdef123456"}

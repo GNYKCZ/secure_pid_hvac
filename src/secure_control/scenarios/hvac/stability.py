@@ -109,21 +109,30 @@ def analyze_hvac_closed_loop_stability(
     *,
     references_celsius: Sequence[float] | None = None,
     boundary_tolerance: float = 1e-9,
+    plant_source: bytes | None = None,
+    pid_source: bytes | None = None,
 ) -> HvacClosedLoopStabilityReport:
     """从冻结配置生成局部、未饱和、明文实数闭环的完整只读报告。"""
     plant_path = Path(plant_config)
     pid_path = Path(pid_config)
+    if plant_source is not None and not isinstance(plant_source, bytes):
+        raise TypeError("plant_source 必须是 bytes 或 None")
+    if pid_source is not None and not isinstance(pid_source, bytes):
+        raise TypeError("pid_source 必须是 bytes 或 None")
     try:
-        plant_source = plant_path.read_bytes()
-        pid_source = pid_path.read_bytes()
+        resolved_plant_source = plant_path.read_bytes() if plant_source is None else plant_source
+        resolved_pid_source = pid_path.read_bytes() if pid_source is None else pid_source
     except OSError as error:
         raise ValueError("无法读取 HVAC 稳定性分析配置") from error
 
-    contract = load_hvac_scenario_contract(plant_path)
+    contract = load_hvac_scenario_contract(
+        plant_path,
+        config_source=resolved_plant_source,
+    )
     if not isinstance(contract.model, Hvac2R2CModelContract):
         raise TypeError("稳定性分析只接受 2R2C HVAC plant 配置")
     try:
-        pid_loaded = yaml.safe_load(pid_source.decode("utf-8"))
+        pid_loaded = yaml.safe_load(resolved_pid_source.decode("utf-8"))
     except (UnicodeDecodeError, yaml.YAMLError) as error:
         raise ValueError("无法解析 HVAC 稳定性 PID 配置") from error
     if not isinstance(pid_loaded, Mapping):
@@ -132,14 +141,20 @@ def analyze_hvac_closed_loop_stability(
     if "migration" in pid_loaded:
         design = load_hvac_pid_baseline_resolution(pid_path, contract).design
     else:
-        design, _, _ = load_hvac_pid_tuning_contract(pid_path, contract)
+        design, _, _ = load_hvac_pid_tuning_contract(
+            pid_path,
+            contract,
+            config_source=resolved_pid_source,
+            plant_source=resolved_plant_source,
+        )
     plant = build_hvac_2r2c_state_space(contract.model, contract.timing.sampling_period_seconds)
     controller = design.to_controller_spec()
     matrix = build_hvac_closed_loop_matrix(plant, controller)
     schur = check_discrete_schur_stability(matrix, boundary_tolerance=boundary_tolerance)
     try:
         sources_unchanged = (
-            plant_path.read_bytes() == plant_source and pid_path.read_bytes() == pid_source
+            plant_path.read_bytes() == resolved_plant_source
+            and pid_path.read_bytes() == resolved_pid_source
         )
     except OSError as error:
         raise ValueError("无法复验 HVAC 稳定性配置") from error
@@ -165,8 +180,8 @@ def analyze_hvac_closed_loop_stability(
         closed_loop_matrix=tuple(tuple(float(value) for value in row) for row in matrix),
         schur=schur,
         equilibria=equilibria,
-        plant_source_sha256=sha256(plant_source).hexdigest(),
-        pid_source_sha256=sha256(pid_source).hexdigest(),
+        plant_source_sha256=sha256(resolved_plant_source).hexdigest(),
+        pid_source_sha256=sha256(resolved_pid_source).hexdigest(),
         assumptions=(
             "2R2C exact-ZOH plant 参数与采样周期固定不变",
             "位置式 PID 使用更新前状态且 reference 与 ambient 在工作点附近固定",

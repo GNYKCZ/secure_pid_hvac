@@ -117,6 +117,9 @@ def test_same_v2_definition_accepts_redesigned_baseline_without_runner_changes()
     assert redesigned.source.finite_horizon_certificate_sha256 == (
         "9719cde72bf67a004cb2c995327cc8124142fef255add8f38c2226aaca7039ac"
     )
+    assert redesigned.stability_report == json.loads(
+        json.dumps(redesigned.stability_report, ensure_ascii=False, allow_nan=False)
+    )
 
 
 def test_v2_source_request_and_v1_adapter_fail_closed_before_worker() -> None:
