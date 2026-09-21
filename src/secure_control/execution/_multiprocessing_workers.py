@@ -143,9 +143,11 @@ def client_worker(
                         step=request.step if request.step is not None else -1,
                         rng=material_rng,
                     )
+                    # 先开放父进程发送 begin，再写可能超过 Pipe 缓冲区的在线材料；
+                    # 角色只有收到 begin 后才读取材料，反向顺序会形成循环等待。
+                    control.send(_reply(request, current.p1_resources.plan))
                     p1_channel.send(PartyOnlineRound(current.p1_input, current.p1_resources))
                     p2_channel.send(PartyOnlineRound(current.p2_input, current.p2_resources))
-                    control.send(_reply(request, current.p1_resources.plan))
                     continue
                 if request.operation == "reconstruct":
                     if current is None:

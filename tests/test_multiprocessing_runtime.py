@@ -223,6 +223,33 @@ def test_vector_and_zero_state_controllers_match_single_process() -> None:
         np.testing.assert_array_equal(actual, expected)
 
 
+def test_large_legal_online_material_does_not_block_prepare_pipe() -> None:
+    dimension = 10
+    spec = ControllerSpec(
+        A=np.zeros((dimension, dimension)),
+        B=np.zeros((dimension, dimension)),
+        C=np.zeros((dimension, dimension)),
+        D=np.zeros((dimension, dimension)),
+        x0=np.zeros(dimension),
+    )
+    runtime = MultiprocessingSecureStateSpaceRuntime(
+        spec,
+        FixedPointContext(2_147_483_647, integer_bits=20, fractional_bits=8),
+        ControllerRangeContract(
+            state_payload_bounds=(512,) * dimension,
+            input_payload_bounds=(512,) * dimension,
+            horizon_steps=1,
+        ),
+        security_parameter=8,
+        test_seed=301,
+        timeouts=ProcessTimeouts(startup=10.0, step=15.0, shutdown=5.0),
+    )
+
+    with runtime:
+        np.testing.assert_array_equal(runtime.step(np.zeros(dimension)), np.zeros(dimension))
+        assert runtime.resource_counts["products_consumed"] == 400
+
+
 def test_integer_scale_no_truncation_reset_and_close_are_bounded() -> None:
     spec = ControllerSpec(
         A=np.array([[0.0]]),
