@@ -193,6 +193,7 @@ def test_schema_v2_sweep_binds_resolved_baseline_sources_and_stability() -> None
         "source_hashes": dict(identity.source_hashes),
     }
     resolved_plan = {
+        "definition_sha256": dict(bundle.source_hashes)["sweep"],
         "baseline_identity_scheme": identity.scheme,
         "baseline_id": identity.baseline_id,
         "stability_report_sha256": bundle.stability_report_sha256,
@@ -208,6 +209,11 @@ def test_schema_v2_sweep_binds_resolved_baseline_sources_and_stability() -> None
 
     infinite_safety_runner._validate_sweep(bundle, verified)
 
+    verified.resolved_plan["definition_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="resolved plan"):
+        infinite_safety_runner._validate_sweep(bundle, verified)
+
+    verified.resolved_plan["definition_sha256"] = dict(bundle.source_hashes)["sweep"]
     verified.resolved_source["baseline_id"] = "0" * 64
     with pytest.raises(ValueError, match="baseline/source identity"):
         infinite_safety_runner._validate_sweep(bundle, verified)

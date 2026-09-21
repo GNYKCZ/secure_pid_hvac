@@ -152,7 +152,8 @@ def _validate_v2_sweep_source(bundle, verified, source_hashes: dict[str, str]) -
     ):
         raise ValueError("schema v2 sweep 的 baseline/source identity 与 assumptions 不一致")
     if (
-        resolved_plan.get("baseline_identity_scheme") != identity.scheme
+        resolved_plan.get("definition_sha256") != source_hashes["sweep"]
+        or resolved_plan.get("baseline_identity_scheme") != identity.scheme
         or resolved_plan.get("baseline_id") != identity.baseline_id
         or resolved_plan.get("stability_report_sha256") != bundle.stability_report_sha256
         or resolved_plan.get("stability_report") != _json_value(asdict(bundle.stability_report))
