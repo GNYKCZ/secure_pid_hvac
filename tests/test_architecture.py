@@ -221,3 +221,16 @@ def test_private_diagnostics_are_ignored_and_not_uploaded_by_ci() -> None:
             if path.is_file() and "results/diagnostics/private" in path.read_text(encoding="utf-8")
         ]
         assert violations == []
+
+
+def test_multiprocessing_worker_is_transport_adapter_not_protocol3_copy() -> None:
+    """execution worker 只能分派 endpoint，协议数学、顺序与 lifecycle 必须归 protocol。"""
+    worker = PACKAGE_ROOT / "execution" / "_multiprocessing_workers.py"
+    source = worker.read_text(encoding="utf-8")
+    assert "_execute_role_round" not in source
+    assert "_truncate_state" not in source
+    assert "_lifecycle" not in source
+    assert "_vector_from_scalars" not in source
+    assert "for metadata in plan.product_resources" not in source
+    assert "secure_control.protocol.roles" not in imported_modules(worker)
+    assert "LocalProtocol3PartyEndpoint" in source

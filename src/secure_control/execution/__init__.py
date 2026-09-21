@@ -9,12 +9,32 @@ from secure_control.execution.evidence import (
     SecureTracePolicy,
     StateTransitionEvidence,
 )
+from secure_control.execution.multiprocessing_runtime import (
+    MultiprocessingSecureStateSpaceRuntime,
+    ProcessExecutionError,
+    ProcessExecutionTimeout,
+    ProcessProtocolError,
+    ProcessRoleInfo,
+    ProcessStateError,
+    ProcessTimeouts,
+    ProcessTopology,
+    ProcessWorkerError,
+)
 from secure_control.execution.runtime import PlaintextStateSpaceRuntime
 from secure_control.execution.secure_runtime import SecureStateSpaceRuntime
 
 __all__ = [
     "ControllerRuntime",
+    "MultiprocessingSecureStateSpaceRuntime",
     "PlaintextStateSpaceRuntime",
+    "ProcessExecutionError",
+    "ProcessExecutionTimeout",
+    "ProcessProtocolError",
+    "ProcessRoleInfo",
+    "ProcessStateError",
+    "ProcessTimeouts",
+    "ProcessTopology",
+    "ProcessWorkerError",
     "ProtocolResourceSnapshot",
     "ResourceOperationCounts",
     "SecureStateSpaceRuntime",

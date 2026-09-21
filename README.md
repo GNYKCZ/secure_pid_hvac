@@ -10,7 +10,7 @@ GitHub 仓库和发行包继续使用 `secure_pid_hvac` / `secure-pid-hvac`，Py
 
 当前已完成架构基础、一阶与 2R2C HVAC 明文基线、安全算术原语与组合验证门、通用
 Client/P1/P2 单进程协议核心、与明文接口兼容的通用安全状态空间运行时，以及领域无关 simulation engine 和
-180 步 HVAC 明文/安全双闭环。尚未实现 multiprocessing 或网络通信。
+180 步 HVAC 明文/安全双闭环。现已提供显式选择的本机 multiprocessing 后端；尚未实现网络通信。
 现已提供显式场景选择的实验入口与通用 CSV/metadata/config 产物。
 
 ## 架构边界
@@ -218,6 +218,11 @@ Protocol 3 以 `ControllerScaleLedger` 明确每类 operand、accumulator、Trun
 Client/P1/P2、share 或一次性资源。输入 shape、更新顺序和输出 shape 与明文 runtime 对齐；
 尺度、事务式失败语义、数值容差和当前 backend 限制见
 [通用安全状态空间运行时契约](docs/secure_runtime_contract.md)。
+
+需要验证本机角色进程隔离时，可显式使用 `MultiprocessingSecureStateSpaceRuntime`。它以
+Windows 兼容的 `spawn` 建立独立 Client/P1/P2 PID，保持同一 runtime 与仿真接口，并提供有界
+超时、fail-closed 清理、reset 换组和上下文管理器；默认后端不变。运行与安全边界见
+[多进程安全执行](docs/multiprocessing_execution.md)。
 
 仿真产生的大量 CSV、图片、扫描与诊断工件应分别写入 `results/csv/`、`results/figures/`、
 `results/sweeps/` 和 `results/diagnostics/`；这些输出默认不会提交到 Git。

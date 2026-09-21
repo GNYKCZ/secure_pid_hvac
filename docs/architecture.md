@@ -90,6 +90,12 @@ fixed-point A/B 的逐聚合 state 行 Trunc，或 integer A/B 的 no-Trunc 路�
 控制器类型。失败 step 回滚 state share 且不推进 step，reset 通过新建 session 恢复 x0。
 具体尺度、资源和安全边界见[安全运行时契约](secure_runtime_contract.md)。
 
+Issue #16 的 `MultiprocessingSecureStateSpaceRuntime` 在不改变该契约的前提下，以固定 `spawn`
+启动独立 Client/P1/P2 进程。进程模块仍位于 `execution`，不得导入任何场景；HVAC 只通过一个
+runtime builder 注入点显式选择该后端，默认装配保持不变。单进程与多进程 endpoint 由 protocol
+层同一个 Protocol 3 orchestrator 调度，execution worker 仅做 IPC 分派。详见
+[多进程安全执行](multiprocessing_execution.md)。
+
 依赖素数域前提的 Protocol 2 统一调用 `crypto.primes`。该模块对 64 位范围执行确定性 MR64，
 对更大模数只接受本地可复核的递归 Pocklington 证据；它不读取 YAML 或访问网络。证据只沿
 `scenario -> execution -> protocol -> crypto` 单向传递，场景层仅映射配置 schema，不能复制
