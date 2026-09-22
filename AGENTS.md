@@ -1724,12 +1724,9 @@ uv run python --version
 
 ### If parallel development is required
 
-优先使用：
+每台机器保持一个 active source tree；同一工作目录同一时刻只让一个实现任务修改代码。不同任务用 Git branch 隔离，跨机器并行时各自 checkout 对应 branch，并通过 Issue、commit、PR 交接。当前项目不为 Issue 创建 worktree 或仓库副本。
 
-- Git branch；
-- Git worktree；
-
-不要复制仓库目录。不要通过目录名称表达开发状态。
+不要通过目录名称表达开发状态。
 开发状态由 Git branch、commit、PR 表达。
 
 

@@ -32,7 +32,7 @@ Describe the externally observable engineering consequence.
 
 Describe the preferred remediation direction based on the repository's existing architecture, canonical implementation, or ownership model.
 
-Do not prescribe an exact patch unless the repository clearly permits only one correct implementation.
+Do not prescribe an exact patch or implementation code. If more than one repair is plausible, state the decision criteria.
 
 **Constraints / Non-goals**
 

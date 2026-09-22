@@ -13,7 +13,7 @@ Reviewer 对照的核心位置：
 Review 标签：
 - **Exact**：代码语义按论文对应定义；
 - **Equivalent**：写法不同但数学/协议语义可验证等价；
-- **Adapted**：为 HVAC tracking 有意改变输入/plant/reference；
+- **Adapted**：为当前实验场景有意改变输入、plant 或 reference；
 - **Simplified**：保留功能性效果但省略论文安全步骤；
 - **Missing**：代码/文档声称存在但实际上没有对应路径。
 
