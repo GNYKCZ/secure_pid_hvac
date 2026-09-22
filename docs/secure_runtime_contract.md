@@ -35,6 +35,12 @@ scale ledger、范围验证、step 和 reset 语义，并增加 `close()`、上�
 超时或工作进程错误采用 fail-closed 清理，不尝试在提交状态不确定时继续。完整进程边界见
 [多进程安全执行](multiprocessing_execution.md)。
 
+Issue #17 另提供显式选择的 `LocalhostSecureStateSpaceRuntime`。它在三个 `spawn` 角色和父进程间
+使用仅限 `127.0.0.1` 的固定 schema TCP 传输，仍复用同一 Protocol 3 orchestrator，并保持本节
+的 spec、shape、scale、step/reset 和数值语义。网络或协议 identity 失败会关闭当前 session；
+该后端不改变默认 runtime，也不声明 TLS、认证或生产安全。完整 wire 与生命周期边界见
+[localhost 通信传输](localhost_transport.md)。
+
 Issue #51 另提供可选的 `trace_policy` 与 `trace_collector`。二者必须同时给出，且只允许配合显式
 `test_seed` 的诊断复现；默认均为 `None`，因此既有调用不会创建、复制或暴露 trace。启用后记录的
 是实际 step 路径产生的 sanitized 证据和真实资源生命周期，不增加协议运算或 RNG 消耗。只有 policy

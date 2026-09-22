@@ -9,6 +9,18 @@ from secure_control.execution.evidence import (
     SecureTracePolicy,
     StateTransitionEvidence,
 )
+from secure_control.execution.localhost_runtime import (
+    LocalhostExecutionError,
+    LocalhostPeerError,
+    LocalhostProtocolError,
+    LocalhostRoleInfo,
+    LocalhostSecureStateSpaceRuntime,
+    LocalhostStateError,
+    LocalhostTimeoutError,
+    LocalhostTimeouts,
+    LocalhostTopology,
+    LocalhostTransportConfig,
+)
 from secure_control.execution.multiprocessing_runtime import (
     MultiprocessingSecureStateSpaceRuntime,
     ProcessExecutionError,
@@ -25,6 +37,16 @@ from secure_control.execution.secure_runtime import SecureStateSpaceRuntime
 
 __all__ = [
     "ControllerRuntime",
+    "LocalhostExecutionError",
+    "LocalhostPeerError",
+    "LocalhostProtocolError",
+    "LocalhostRoleInfo",
+    "LocalhostSecureStateSpaceRuntime",
+    "LocalhostStateError",
+    "LocalhostTimeoutError",
+    "LocalhostTimeouts",
+    "LocalhostTopology",
+    "LocalhostTransportConfig",
     "MultiprocessingSecureStateSpaceRuntime",
     "PlaintextStateSpaceRuntime",
     "ProcessExecutionError",

@@ -10,7 +10,8 @@ GitHub 仓库和发行包继续使用 `secure_pid_hvac` / `secure-pid-hvac`，Py
 
 当前已完成架构基础、一阶与 2R2C HVAC 明文基线、安全算术原语与组合验证门、通用
 Client/P1/P2 单进程协议核心、与明文接口兼容的通用安全状态空间运行时，以及领域无关 simulation engine 和
-180 步 HVAC 明文/安全双闭环。现已提供显式选择的本机 multiprocessing 后端；尚未实现网络通信。
+180 步 HVAC 明文/安全双闭环。现已提供显式选择的本机 multiprocessing 后端与仅绑定 loopback
+的 localhost TCP 后端；默认安全运行时不变。
 现已提供显式场景选择的实验入口与通用 CSV/metadata/config 产物。
 
 ## 架构边界
@@ -223,6 +224,11 @@ Client/P1/P2、share 或一次性资源。输入 shape、更新顺序和输出 s
 Windows 兼容的 `spawn` 建立独立 Client/P1/P2 PID，保持同一 runtime 与仿真接口，并提供有界
 超时、fail-closed 清理、reset 换组和上下文管理器；默认后端不变。运行与安全边界见
 [多进程安全执行](docs/multiprocessing_execution.md)。
+
+需要验证本机 TCP wire schema、framing 与故障清理时，可显式使用
+`LocalhostSecureStateSpaceRuntime`。它保持同一 runtime/simulation 接口，并与 multiprocessing
+后端复用唯一 Protocol 3 orchestrator；不提供 TLS、认证或生产安全声明。运行和对照命令见
+[localhost 通信传输](docs/localhost_transport.md)。
 
 仿真产生的大量 CSV、图片、扫描与诊断工件应分别写入 `results/csv/`、`results/figures/`、
 `results/sweeps/` 和 `results/diagnostics/`；这些输出默认不会提交到 Git。

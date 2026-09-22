@@ -16,14 +16,14 @@ from secure_control.crypto import (
     TwoPartySharing,
 )
 from secure_control.protocol import P1, P2, Client, ControllerRangeContract
-from secure_control.protocol.coordinator import LocalProtocol3PartyEndpoint
+from secure_control.protocol.coordinator import (
+    LocalProtocol3PartyEndpoint,
+    dispatch_protocol3_command,
+)
 from secure_control.protocol.messages import (
     OnlineRound,
-    P2TruncationPayload,
     PartyOnlineRound,
-    ProductMaskPayload,
-    ResourceMetadata,
-    TruncationMaskPayload,
+    Protocol3EndpointCommand,
 )
 
 _PROTOCOL_VERSION = 1
@@ -247,25 +247,15 @@ def role_worker(
                     endpoint.plan.step,
                 ):
                     raise ValueError("角色请求的 round 或 step identity 不匹配。")
-                result = _dispatch_endpoint(endpoint, request.operation, request.payload)
-                if request.operation == "commit":
+                if request.operation != "endpoint" or not isinstance(
+                    request.payload, Protocol3EndpointCommand
+                ):
+                    raise ValueError(f"{role_name} 不支持操作或 endpoint command 类型错误。")
+                result = dispatch_protocol3_command(endpoint, request.payload)
+                if request.payload.operation == "commit":
                     endpoint = None
                 control.send(_reply(request, result))
-                if request.operation in {
-                    "mask_product",
-                    "finish_product",
-                    "complete_product",
-                    "finish_products",
-                    "mask_truncation",
-                    "p2_truncation_message",
-                    "finish_truncation_p1",
-                    "finish_truncation_p2",
-                    "complete_truncation",
-                    "stage_output",
-                    "commit",
-                }:
-                    continue
-                raise ValueError(f"{role_name} 不支持操作：{request.operation}")
+                continue
             except Exception as error:  # noqa: BLE001 - IPC 边界必须回传任意工作进程错误
                 control.send(_error(request, error))
     except Exception as error:  # noqa: BLE001 - 启动失败必须结构化通知父进程
@@ -289,54 +279,3 @@ def role_worker(
     finally:
         control.close()
         client_channel.close()
-
-
-def _dispatch_endpoint(endpoint: LocalProtocol3PartyEndpoint, operation: str, payload: Any) -> Any:
-    """把单个已验证 IPC 操作映射到 protocol-owned endpoint，不编排操作顺序。"""
-    if operation == "mask_product" and isinstance(payload, ResourceMetadata):
-        return endpoint.mask_product(payload)
-    if operation == "finish_product" and _payload_types(
-        payload, ResourceMetadata, ProductMaskPayload
-    ):
-        endpoint.finish_product(payload[0], payload[1])
-        return None
-    if operation == "complete_product" and isinstance(payload, ResourceMetadata):
-        endpoint.complete_product(payload)
-        return None
-    if operation == "finish_products" and payload is None:
-        endpoint.finish_products()
-        return None
-    if operation == "mask_truncation" and isinstance(payload, ResourceMetadata):
-        return endpoint.mask_truncation(payload)
-    if operation == "p2_truncation_message" and _payload_types(
-        payload, ResourceMetadata, TruncationMaskPayload
-    ):
-        return endpoint.p2_truncation_message(payload[0], payload[1])
-    if operation == "finish_truncation_p1" and _payload_types(
-        payload,
-        ResourceMetadata,
-        TruncationMaskPayload,
-        P2TruncationPayload,
-    ):
-        endpoint.finish_truncation_p1(payload[0], payload[1], payload[2])
-        return None
-    if operation == "finish_truncation_p2" and isinstance(payload, ResourceMetadata):
-        endpoint.finish_truncation_p2(payload)
-        return None
-    if operation == "complete_truncation" and isinstance(payload, ResourceMetadata):
-        endpoint.complete_truncation(payload)
-        return None
-    if operation == "stage_output" and payload is None:
-        return endpoint.stage_output()
-    if operation == "commit" and payload is None:
-        endpoint.commit()
-        return None
-    raise ValueError(f"Protocol 3 endpoint 不支持操作或 payload 类型错误：{operation}")
-
-
-def _payload_types(payload: Any, *types: type[object]) -> bool:
-    return (
-        isinstance(payload, tuple)
-        and len(payload) == len(types)
-        and all(isinstance(value, expected) for value, expected in zip(payload, types, strict=True))
-    )

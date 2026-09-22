@@ -503,6 +503,91 @@ class PartyOnlineRound:
 
 
 @dataclass(frozen=True, slots=True)
+class PartyOfflineMaterial:
+    """可经显式 transport 发送的单方离线材料，不包含另一方 share。"""
+
+    recipient: PartyIndex
+    session_id: str
+    controller: ControllerShare
+    initial_state: AdditiveShare
+    layout: ControllerLayout
+
+    @classmethod
+    def from_message(cls, message: OfflineControllerMessage) -> PartyOfflineMaterial:
+        """从既有单方离线消息投影网络安全字段，排除运行时对象 identity。"""
+        if not isinstance(message, OfflineControllerMessage):
+            raise TypeError("message 必须是 OfflineControllerMessage。")
+        return cls(
+            message.recipient,
+            message.session_id,
+            message.controller,
+            message.initial_state,
+            message.layout,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ProductResourceMaterial:
+    """一个角色的一份 Beaver 数值材料；lifecycle 必须在接收端重新建立。"""
+
+    owner: PartyIndex
+    metadata: ResourceMetadata
+    a: AdditiveShare
+    b: AdditiveShare
+    c: AdditiveShare
+
+
+@dataclass(frozen=True, slots=True)
+class TruncationResourceMaterial:
+    """一个角色的一份 Trunc 数值材料；不信任 wire 上的消费状态。"""
+
+    owner: PartyIndex
+    metadata: ResourceMetadata
+    r: AdditiveShare
+    r_prime: AdditiveShare
+
+
+@dataclass(frozen=True, slots=True)
+class PartyOnlineMaterial:
+    """单方在线 wire DTO，只含输入、公开计划和本方一次性数值材料。"""
+
+    input_message: InputShareMessage
+    plan: StepResourcePlan
+    product_resources: tuple[ProductResourceMaterial, ...]
+    state_truncation_resources: tuple[TruncationResourceMaterial, ...]
+
+    @classmethod
+    def from_round(cls, online: PartyOnlineRound) -> PartyOnlineMaterial:
+        """投影单方在线 round，明确丢弃 Python lifecycle/owner object。"""
+        if not isinstance(online, PartyOnlineRound):
+            raise TypeError("online 必须是 PartyOnlineRound。")
+        resources = online.resources
+        return cls(
+            online.input_message,
+            resources.plan,
+            tuple(
+                ProductResourceMaterial(
+                    item.owner,
+                    item.metadata,
+                    item.triple.a,
+                    item.triple.b,
+                    item.triple.c,
+                )
+                for item in resources.product_resources
+            ),
+            tuple(
+                TruncationResourceMaterial(
+                    item.owner,
+                    item.metadata,
+                    item.truncation.r,
+                    item.truncation.r_prime,
+                )
+                for item in resources.state_truncation_resources
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ProductMaskPayload:
     """Protocol 1 单方遮蔽差值的 transport-neutral 表示。"""
 
@@ -536,6 +621,32 @@ class Protocol3StageReceipt:
     step: int
     products: int
     truncations: int
+
+
+Protocol3Operation = Literal[
+    "mask_product",
+    "finish_product",
+    "complete_product",
+    "finish_products",
+    "mask_truncation",
+    "p2_truncation_message",
+    "finish_truncation_p1",
+    "finish_truncation_p2",
+    "complete_truncation",
+    "stage_output",
+    "commit",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class Protocol3EndpointCommand:
+    """一条 transport-neutral endpoint 命令；完整顺序仍由 orchestrator 拥有。"""
+
+    operation: Protocol3Operation
+    metadata: ResourceMetadata | None = None
+    product_mask: ProductMaskPayload | None = None
+    truncation_mask: TruncationMaskPayload | None = None
+    p2_truncation: P2TruncationPayload | None = None
 
 
 @dataclass(frozen=True, slots=True)
