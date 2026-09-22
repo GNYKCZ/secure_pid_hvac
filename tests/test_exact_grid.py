@@ -276,3 +276,62 @@ def test_sidecar_rejects_non_integer_schema_versions(
             evidence_by_point={(48, 42): evidence},
             expected_source_hashes=expected,
         )
+
+
+@pytest.mark.parametrize(
+    ("target", "path", "invalid_value"),
+    [
+        ("manifest", ("row_count",), 2.0),
+        ("manifest", ("availability", 1, "ell"), 48.0),
+        ("manifest", ("availability", 1, "seed"), 42.0),
+        ("summary", ("primary_seed",), 42.0),
+        ("summary", ("by_fractional_bits", "48", "sample_count"), 2.0),
+        ("summary", ("by_fractional_bits", "48", "float64_zero_count"), 2.0),
+        ("summary", ("by_fractional_bits", "48", "exact_grid_zero_count"), True),
+        ("summary", ("by_fractional_bits", "48", "float64_collision_count"), 1.0),
+        ("summary", ("by_fractional_bits", "48", "maximum_absolute_error_integer"), True),
+    ],
+)
+def test_sidecar_rejects_non_integer_metadata(
+    tmp_path: Path, target: str, path: tuple[str | int, ...], invalid_value: object
+) -> None:
+    """重导值和文件哈希相同也不能让 bool/float 冒充 sidecar 整数字段。"""
+    sweep, evidence, expected = _fixture_sources(tmp_path)
+    artifacts = publish_exact_grid_artifact(
+        verified_sweep=sweep,
+        evidence_by_point={(48, 42): evidence},
+        primary_seed=42,
+        output_root=tmp_path / "exact",
+        expected_source_hashes=expected,
+    )
+    manifest_path = artifacts.directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload_path = manifest_path if target == "manifest" else artifacts.directory / "summary.json"
+    payload = (
+        manifest if target == "manifest" else json.loads(payload_path.read_text(encoding="utf-8"))
+    )
+    selected = payload
+    for key in path[:-1]:
+        selected = selected[key]
+    selected[path[-1]] = invalid_value
+    payload_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    if target == "summary":
+        manifest["files_sha256"]["summary.json"] = hashlib.sha256(
+            payload_path.read_bytes()
+        ).hexdigest()
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+    with pytest.raises(ValueError, match="行数|可用性|summary"):
+        load_verified_exact_grid_artifact(
+            artifacts.directory,
+            verified_sweep=sweep,
+            evidence_by_point={(48, 42): evidence},
+            expected_source_hashes=expected,
+        )

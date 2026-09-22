@@ -1023,7 +1023,7 @@ plotting 应优先读取已保存的实验结果，不要为了画图重新执�
 
 对于程序员错误和不满足协议前提的情况，应尽早失败并给出明确错误信息。
 
-JSON/YAML schema 中声明为整数的 version、count、index 等字段必须使用严格整数类型检查；不得依赖
+JSON/YAML schema 中声明为整数的 version、count、index 等字段（包括嵌套的派生统计值）必须使用严格整数类型检查；不得依赖
 `bool`/`1.0` 与 `1` 的 Python 数值相等语义，`bool` 和浮点数必须被整数 schema 字段拒绝。
 
 ## 12. 防止 AI 常见过度实现

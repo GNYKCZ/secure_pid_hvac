@@ -209,15 +209,36 @@ def _read_exact_grid(
     )
     if rows != expected_rows:
         raise ValueError("exact-grid rows 无法从 verified sources 重导。")
-    if manifest.get("row_count") != len(rows) or manifest.get("availability") != availability:
+    if (
+        type(manifest.get("row_count")) is not int
+        or manifest["row_count"] != len(rows)
+        or manifest.get("availability") != availability
+        or not _same_json_types(manifest.get("availability"), availability)
+    ):
         raise ValueError("exact-grid manifest 行数或可用性不可重导。")
     summary = _read_json(root / "summary.json")
     summary_version = summary.get("schema_version")
     if type(summary_version) is not int or summary_version != EXACT_GRID_SCHEMA_VERSION:
         raise ValueError("exact-grid summary schema_version 无效。")
-    if summary != _build_summary(rows, availability, primary_seed):
+    expected_summary = _build_summary(rows, availability, primary_seed)
+    if summary != expected_summary or not _same_json_types(summary, expected_summary):
         raise ValueError("exact-grid summary 不可重导。")
     return VerifiedExactGridData(root.resolve(), manifest, summary, rows)
+
+
+def _same_json_types(actual: Any, expected: Any) -> bool:
+    """重导值相等后，继续严格比较嵌套 JSON 字段的类型。"""
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return actual.keys() == expected.keys() and all(
+            _same_json_types(actual[key], value) for key, value in expected.items()
+        )
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(
+            _same_json_types(item, value) for item, value in zip(actual, expected, strict=True)
+        )
+    return True
 
 
 def _derive_rows(
