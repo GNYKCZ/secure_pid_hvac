@@ -92,6 +92,44 @@ def test_bigint_scalar_and_object_array_round_trip_without_fixed_width_conversio
     assert np.asarray(decoded.value).dtype == object
 
 
+def test_public_int64_input_array_round_trip_preserves_low_bits() -> None:
+    vector = np.array([(1 << 60) - 1, -((1 << 60) - 1)], dtype=np.int64)
+
+    decoded = decode_wire_value(encode_wire_value(vector))
+
+    assert isinstance(decoded, np.ndarray)
+    assert decoded.dtype == object
+    assert tuple(int(item) for item in decoded) == tuple(int(item) for item in vector)
+
+
+def test_large_legal_int64_step_matches_multiprocessing_backend() -> None:
+    spec = ControllerSpec(
+        A=np.empty((0, 0)),
+        B=np.empty((0, 1)),
+        C=np.empty((1, 0)),
+        D=np.array([[0.0]]),
+        x0=np.empty((0,)),
+    )
+    fixed_point = FixedPointContext((1 << 61) - 1, integer_bits=60, fractional_bits=1)
+    range_contract = ControllerRangeContract(
+        state_payload_bounds=(),
+        input_payload_bounds=((1 << 59) - 2,),
+        horizon_steps=1,
+    )
+    input_vector = np.array([(1 << 58) - 1], dtype=np.int64)
+    process = MultiprocessingSecureStateSpaceRuntime(
+        spec, fixed_point, range_contract, security_parameter=8, test_seed=704
+    )
+    localhost = LocalhostSecureStateSpaceRuntime(
+        spec, fixed_point, range_contract, security_parameter=8, test_seed=704
+    )
+    with process, localhost:
+        expected = process.step(input_vector)
+        actual = localhost.step(input_vector)
+
+    np.testing.assert_array_equal(actual, expected)
+
+
 def test_wire_envelope_round_trip_preserves_version_direction_and_identity() -> None:
     message = WireEnvelope(
         1,

@@ -250,7 +250,9 @@ def _encode_value(value: object) -> object:
         return {"type": "remote_error", "error_type": value.error_type, "message": value.message}
     if isinstance(value, np.ndarray):
         array = np.asarray(value)
-        if array.dtype.kind not in "fiu" or not np.isfinite(array.astype(float)).all():
+        if array.dtype.kind in "iu":
+            return _encode_integer_value(array)
+        if array.dtype.kind != "f" or not np.isfinite(array.astype(float)).all():
             raise TypeError("wire float_array 必须只含有限实数。")
         return {
             "type": "float_array",
@@ -432,6 +434,8 @@ def _decode_value(value: object) -> object:
     if kind == "bigint":
         _exact_fields(mapping, {"type", "decimal"}, kind)
         return _parse_decimal(mapping["decimal"])
+    if kind == "bigint_array":
+        return _decode_integer_value(mapping)
     if kind == "hello":
         _exact_fields(mapping, {"type", "nonce", "pid"}, kind)
         return HelloPayload(_text(mapping["nonce"], "nonce"), _positive(mapping["pid"], "pid"))
