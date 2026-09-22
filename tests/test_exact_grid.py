@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -229,5 +230,49 @@ def test_sidecar_fails_closed_when_actuator_is_not_identity(tmp_path: Path) -> N
             evidence_by_point={(48, 42): evidence},
             primary_seed=42,
             output_root=tmp_path / "exact",
+            expected_source_hashes=expected,
+        )
+
+
+@pytest.mark.parametrize("invalid_version", [True, 1.0])
+@pytest.mark.parametrize("target", ["manifest", "summary"])
+def test_sidecar_rejects_non_integer_schema_versions(
+    tmp_path: Path, target: str, invalid_version: object
+) -> None:
+    """JSON bool/float values must not compare equal to integer schema version 1."""
+    sweep, evidence, expected = _fixture_sources(tmp_path)
+    artifacts = publish_exact_grid_artifact(
+        verified_sweep=sweep,
+        evidence_by_point={(48, 42): evidence},
+        primary_seed=42,
+        output_root=tmp_path / "exact",
+        expected_source_hashes=expected,
+    )
+    manifest_path = artifacts.directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if target == "manifest":
+        manifest["schema_version"] = invalid_version
+    else:
+        summary_path = artifacts.directory / "summary.json"
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        summary["schema_version"] = invalid_version
+        summary_path.write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        manifest["files_sha256"]["summary.json"] = hashlib.sha256(
+            summary_path.read_bytes()
+        ).hexdigest()
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    with pytest.raises(ValueError, match="schema"):
+        load_verified_exact_grid_artifact(
+            artifacts.directory,
+            verified_sweep=sweep,
+            evidence_by_point={(48, 42): evidence},
             expected_source_hashes=expected,
         )

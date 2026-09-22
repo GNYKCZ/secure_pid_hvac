@@ -167,10 +167,12 @@ def _read_exact_grid(
         "files_sha256",
     }
     artifact_id = manifest.get("artifact_id")
+    schema_version = manifest.get("schema_version")
     expected_name = f".incomplete-{artifact_id}" if allow_staging else artifact_id
     if (
         set(manifest) != required
-        or manifest.get("schema_version") != EXACT_GRID_SCHEMA_VERSION
+        or type(schema_version) is not int
+        or schema_version != EXACT_GRID_SCHEMA_VERSION
         or not isinstance(artifact_id, str)
         or not _ARTIFACT_ID_PATTERN.fullmatch(artifact_id)
         or root.name != expected_name
@@ -210,6 +212,9 @@ def _read_exact_grid(
     if manifest.get("row_count") != len(rows) or manifest.get("availability") != availability:
         raise ValueError("exact-grid manifest 行数或可用性不可重导。")
     summary = _read_json(root / "summary.json")
+    summary_version = summary.get("schema_version")
+    if type(summary_version) is not int or summary_version != EXACT_GRID_SCHEMA_VERSION:
+        raise ValueError("exact-grid summary schema_version 无效。")
     if summary != _build_summary(rows, availability, primary_seed):
         raise ValueError("exact-grid summary 不可重导。")
     return VerifiedExactGridData(root.resolve(), manifest, summary, rows)
