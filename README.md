@@ -28,6 +28,9 @@ Client/P1/P2 单进程协议核心、与明文接口兼容的通用安全状态�
 构造 controller input `v`，因此未来场景可以传入完整 state、state error 或 observer output。
 更多说明见 [架构文档](docs/architecture.md)。
 
+论文定义、当前通用机制、HVAC 场景适配和尚未实现的 PID/four-tank 原例之间的可声明边界，见
+[论文复现范围与实现对照](docs/paper_reproduction_matrix.md)。
+
 ## 环境
 
 - Windows
