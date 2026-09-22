@@ -29,3 +29,4 @@ results/sweeps/*
 results/safety/*
 !results/safety/.gitkeep
 results/diagnostics/*
+results/exact_grid/*

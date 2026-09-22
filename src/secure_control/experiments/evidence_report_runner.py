@@ -18,6 +18,16 @@ def main() -> None:
     parser.add_argument("--diagnostics-root", default="results/diagnostics")
     parser.add_argument("--output-root", default="results/figures/evidence_reports")
     parser.add_argument(
+        "--exact-grid-dir",
+        help="Optional already-published exact-grid artifact directory",
+    )
+    parser.add_argument(
+        "--exact-grid-evidence-dir",
+        action="append",
+        default=[],
+        help="Additional verified evidence source required by a multi-point exact-grid sidecar",
+    )
+    parser.add_argument(
         "--display-config",
         default="configs/hvac_2r2c_evidence_report_zh.yaml",
     )
@@ -27,6 +37,8 @@ def main() -> None:
         evidence_dir=Path(args.diagnostics_root) / args.source_sweep_id / args.trace_id,
         profile_path=Path(args.display_config),
         output_root=Path(args.output_root),
+        exact_grid_dir=None if args.exact_grid_dir is None else Path(args.exact_grid_dir),
+        exact_grid_evidence_dirs=tuple(Path(item) for item in args.exact_grid_evidence_dir),
     )
     print(
         json.dumps(
