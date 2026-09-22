@@ -251,6 +251,8 @@ def test_unknown_envelope_fields_are_rejected() -> None:
     ("field", "value"),
     (
         ("schema_version", 2),
+        ("schema_version", True),
+        ("schema_version", 1.0),
         ("kind", "unknown"),
         ("sender", "External"),
         ("operation", "arbitrary"),

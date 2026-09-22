@@ -129,7 +129,7 @@ class WireEnvelope:
     payload: WirePayload = None
 
     def __post_init__(self) -> None:
-        if self.schema_version != SCHEMA_VERSION:
+        if _integer(self.schema_version, "schema_version") != SCHEMA_VERSION:
             raise LocalhostCodecError("不支持的 localhost schema version。")
         if self.kind not in _KINDS or self.sender not in _ROLES or self.recipient not in _ROLES:
             raise LocalhostCodecError("wire kind 或角色非法。")
