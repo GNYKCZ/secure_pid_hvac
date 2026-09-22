@@ -234,3 +234,52 @@ def test_multiprocessing_worker_is_transport_adapter_not_protocol3_copy() -> Non
     assert "for metadata in plan.product_resources" not in source
     assert "secure_control.protocol.roles" not in imported_modules(worker)
     assert "LocalProtocol3PartyEndpoint" in source
+
+
+def test_localhost_layers_preserve_transport_only_boundaries() -> None:
+    """localhost codec/transport/worker 不得感知场景或复制协议算法。"""
+    execution = PACKAGE_ROOT / "execution"
+    paths = tuple(
+        execution / name
+        for name in (
+            "localhost_codec.py",
+            "localhost_transport.py",
+            "_localhost_workers.py",
+            "localhost_runtime.py",
+        )
+    )
+    for path in paths:
+        modules = imported_modules(path)
+        assert not any(module.startswith("secure_control.scenarios") for module in modules)
+        assert FORBIDDEN_DOMAIN_TERMS.search(path.read_text(encoding="utf-8")) is None
+
+    worker_source = (execution / "_localhost_workers.py").read_text(encoding="utf-8")
+    for forbidden in (
+        "_lifecycle",
+        "_vector_from_scalars",
+        "for metadata in plan.product_resources",
+        "BeaverMultiplier",
+        "SecureTruncation",
+    ):
+        assert forbidden not in worker_source
+    assert "dispatch_protocol3_command" in worker_source
+
+
+def test_localhost_and_multiprocessing_share_protocol_authorities() -> None:
+    """两种隔离 backend 复用同一 command dispatcher 和唯一 orchestrator。"""
+    execution = PACKAGE_ROOT / "execution"
+    multiprocessing_worker = (execution / "_multiprocessing_workers.py").read_text(encoding="utf-8")
+    localhost_worker = (execution / "_localhost_workers.py").read_text(encoding="utf-8")
+    multiprocessing_runtime = (execution / "multiprocessing_runtime.py").read_text(encoding="utf-8")
+    localhost_runtime = (execution / "localhost_runtime.py").read_text(encoding="utf-8")
+    assert "dispatch_protocol3_command" in multiprocessing_worker
+    assert "dispatch_protocol3_command" in localhost_worker
+    assert "Protocol3Orchestrator" in multiprocessing_runtime
+    assert "Protocol3Orchestrator" in localhost_runtime
+
+    for path in python_files("protocol"):
+        modules = imported_modules(path)
+        assert "socket" not in modules
+        assert not any(module.startswith("secure_control.execution") for module in modules)
+    for path in python_files("simulation"):
+        assert "localhost" not in path.read_text(encoding="utf-8").lower()

@@ -1671,6 +1671,64 @@ uv run python --version
 - 不得隐藏
 - 不得声称任务完成
 - 应修复，或明确报告阻塞
+## Workspace and Git discipline
+
+### Issue isolation
+
+- Issue、PR、feature 开发必须通过 Git branch、commit、PR 管理。
+- 不允许为了对应 Issue 创建新的源码副本目录。
+- 禁止创建以下类型目录：
+
+  - issue_xxx/
+  - issue-xxx/
+  - feature_xxx/
+  - backup_xxx/
+  - old_xxx/
+  - copy_xxx/
+
+  其中包含仓库源码副本的目录。
+
+### Source of truth
+
+- 仓库中只能存在一个 active source tree。
+- 不允许复制 src、tests、configs 等源码目录用于开发不同任务。
+- 修改必须基于当前 Git branch 的真实文件。
+
+### Temporary files
+
+允许创建临时目录，但必须满足：
+
+- 不包含源码副本；
+- 用于实验输出、日志、分析数据或生成 artifact；
+- 名称必须明确表达用途，例如：
+
+  - tmp/
+  - artifacts/
+  - results/
+  - reports/
+
+- 任务完成后应清理无关临时文件。
+
+### Before modifying files
+
+执行开发前必须确认：
+
+1. 当前 Git branch；
+2. 当前工作区状态；
+3. 当前修改目标文件属于 active source tree。
+
+不得通过复制整个项目目录绕过 Git 状态管理。
+
+### If parallel development is required
+
+优先使用：
+
+- Git branch；
+- Git worktree；
+
+不要复制仓库目录。不要通过目录名称表达开发状态。
+开发状态由 Git branch、commit、PR 表达。
+
 
 ## 17. 任务完成前自检
 

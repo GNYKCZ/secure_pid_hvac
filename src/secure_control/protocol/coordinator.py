@@ -10,29 +10,42 @@ import numpy as np
 from secure_control.crypto import (
     AdditiveShare,
     BeaverMultiplier,
+    BeaverTripleShare,
     MaskedDifferenceShare,
     MaskedTruncationShare,
     P2MaskedMessage,
+    PrimeModulusEvidence,
     PublicMaskedDifferences,
     SecureTruncation,
+    TruncationAuxiliaryShare,
     TwoPartySharing,
 )
+from secure_control.crypto.beaver import _TripleLifecycle
+from secure_control.crypto.truncation import _MaskLifecycle
 
 from .evidence import ProtocolStepSnapshot, copy_share
 from .messages import (
     _PROTOCOL3_TERM_ORDER,
+    ControllerRangeContract,
     ControlShareMessage,
+    OfflineControllerMessage,
     OnlineRound,
     P2TruncationPayload,
+    PartyOfflineMaterial,
+    PartyOnlineMaterial,
     PartyOnlineRound,
     PartyResources,
     ProductMaskPayload,
+    ProductResourceMaterial,
     ProductResourceShare,
+    Protocol3EndpointCommand,
     Protocol3StageReceipt,
     ResourceMetadata,
     StateTruncationResourceShare,
     StepResourcePlan,
     TruncationMaskPayload,
+    TruncationResourceMaterial,
+    _ResourceLifecycle,
 )
 from .roles import P1, P2, _Server, _vector_from_scalars
 
@@ -568,6 +581,177 @@ class LocalProtocol3PartyEndpoint:
         if isinstance(value, bool) or not isinstance(value, int):
             raise TypeError(f"{name} 必须是标量整数。")
         return value
+
+
+def rehydrate_offline_material(
+    material: PartyOfflineMaterial,
+    range_contract: ControllerRangeContract,
+) -> OfflineControllerMessage:
+    """在 protocol 边界把单方 wire DTO 恢复为既有离线消息。"""
+    if not isinstance(material, PartyOfflineMaterial):
+        raise TypeError("material 必须是 PartyOfflineMaterial。")
+    if not isinstance(range_contract, ControllerRangeContract):
+        raise TypeError("range_contract 必须是 ControllerRangeContract。")
+    return OfflineControllerMessage(
+        material.recipient,
+        material.session_id,
+        material.controller,
+        material.initial_state,
+        material.layout,
+        range_contract,
+    )
+
+
+def rehydrate_online_material(
+    material: PartyOnlineMaterial,
+    *,
+    modulus: int,
+    security_parameter: int,
+    modulus_evidence: PrimeModulusEvidence | None = None,
+) -> PartyOnlineRound:
+    """以本地算术 owner 和全新 lifecycle 恢复单方在线材料。
+
+    Wire 只提供数值 share 与不可变 identity；所有 consumed/owner 状态均在接收角色
+    内重新建立，因此对端不能伪造资源已经完成或把旧 lifecycle 带入新 session。
+    """
+    if not isinstance(material, PartyOnlineMaterial):
+        raise TypeError("material 必须是 PartyOnlineMaterial。")
+    party = material.input_message.recipient
+    if party not in {0, 1}:
+        raise ValueError("在线材料 recipient 必须是 P1 或 P2。")
+    plan = material.plan
+    if (
+        material.input_message.session_id,
+        material.input_message.round_id,
+        material.input_message.step,
+    ) != (plan.session_id, plan.round_id, plan.step):
+        raise ValueError("在线输入与资源计划 identity 不匹配。")
+    if (
+        len(material.product_resources) != plan.triple_count
+        or len(material.state_truncation_resources) != plan.truncation_count
+    ):
+        raise ValueError("在线数值材料数量与资源计划不匹配。")
+
+    sharing = TwoPartySharing(modulus)
+    multiplier = BeaverMultiplier(sharing)
+    truncation = SecureTruncation(
+        sharing,
+        ell=plan.scale_ledger.state,
+        security_parameter=security_parameter,
+        modulus_evidence=modulus_evidence,
+    )
+    # protocol 是既有 crypto lifecycle 的拥有边界；execution/wire 不实例化或传输私有对象。
+    products: list[ProductResourceShare] = []
+    for expected, item in zip(plan.product_resources, material.product_resources, strict=True):
+        _validate_product_material(item, expected, party)
+        triple_lifecycle = _TripleLifecycle(multiplier)
+        triple = BeaverTripleShare(item.a, item.b, item.c, party, triple_lifecycle)
+        products.append(ProductResourceShare(party, item.metadata, triple, _ResourceLifecycle()))
+
+    truncations: list[StateTruncationResourceShare] = []
+    for expected, item in zip(
+        plan.state_truncation_resources, material.state_truncation_resources, strict=True
+    ):
+        _validate_truncation_material(item, expected, party)
+        mask_lifecycle = _MaskLifecycle(truncation)
+        auxiliary = TruncationAuxiliaryShare(item.r, item.r_prime, party, mask_lifecycle)
+        truncations.append(
+            StateTruncationResourceShare(party, item.metadata, auxiliary, _ResourceLifecycle())
+        )
+    resources = PartyResources(party, plan, tuple(products), tuple(truncations))
+    return PartyOnlineRound(material.input_message, resources)
+
+
+def _validate_product_material(
+    material: ProductResourceMaterial, expected: ResourceMetadata, party: int
+) -> None:
+    if (
+        not isinstance(material, ProductResourceMaterial)
+        or material.owner != party
+        or material.metadata != expected
+        or expected.kind != "multiplication"
+    ):
+        raise ValueError("乘法 wire 材料的角色或 metadata 不匹配。")
+
+
+def _validate_truncation_material(
+    material: TruncationResourceMaterial, expected: ResourceMetadata, party: int
+) -> None:
+    if (
+        not isinstance(material, TruncationResourceMaterial)
+        or material.owner != party
+        or material.metadata != expected
+        or expected.kind != "state_truncation"
+    ):
+        raise ValueError("截断 wire 材料的角色或 metadata 不匹配。")
+
+
+def dispatch_protocol3_command(
+    endpoint: LocalProtocol3PartyEndpoint,
+    command: Protocol3EndpointCommand,
+) -> object | None:
+    """执行一条已类型化 endpoint 命令，不拥有 Protocol 3 的完整消息顺序。"""
+    if not isinstance(endpoint, LocalProtocol3PartyEndpoint):
+        raise TypeError("endpoint 必须是 LocalProtocol3PartyEndpoint。")
+    if not isinstance(command, Protocol3EndpointCommand):
+        raise TypeError("command 必须是 Protocol3EndpointCommand。")
+    operation = command.operation
+    metadata = command.metadata
+    if operation == "mask_product" and metadata is not None and _only(command, "metadata"):
+        return endpoint.mask_product(metadata)
+    if (
+        operation == "finish_product"
+        and metadata is not None
+        and command.product_mask is not None
+        and _only(command, "metadata", "product_mask")
+    ):
+        endpoint.finish_product(metadata, command.product_mask)
+        return None
+    if operation == "complete_product" and metadata is not None and _only(command, "metadata"):
+        endpoint.complete_product(metadata)
+        return None
+    if operation == "finish_products" and _only(command):
+        endpoint.finish_products()
+        return None
+    if operation == "mask_truncation" and metadata is not None and _only(command, "metadata"):
+        return endpoint.mask_truncation(metadata)
+    if (
+        operation == "p2_truncation_message"
+        and metadata is not None
+        and command.truncation_mask is not None
+        and _only(command, "metadata", "truncation_mask")
+    ):
+        return endpoint.p2_truncation_message(metadata, command.truncation_mask)
+    if (
+        operation == "finish_truncation_p1"
+        and metadata is not None
+        and command.truncation_mask is not None
+        and command.p2_truncation is not None
+        and _only(command, "metadata", "truncation_mask", "p2_truncation")
+    ):
+        endpoint.finish_truncation_p1(metadata, command.truncation_mask, command.p2_truncation)
+        return None
+    if operation == "finish_truncation_p2" and metadata is not None and _only(command, "metadata"):
+        endpoint.finish_truncation_p2(metadata)
+        return None
+    if operation == "complete_truncation" and metadata is not None and _only(command, "metadata"):
+        endpoint.complete_truncation(metadata)
+        return None
+    if operation == "stage_output" and _only(command):
+        return endpoint.stage_output()
+    if operation == "commit" and _only(command):
+        endpoint.commit()
+        return None
+    raise ValueError(f"Protocol 3 endpoint 命令字段与操作不匹配：{operation}")
+
+
+def _only(command: Protocol3EndpointCommand, *names: str) -> bool:
+    populated = {
+        name
+        for name in ("metadata", "product_mask", "truncation_mask", "p2_truncation")
+        if getattr(command, name) is not None
+    }
+    return populated == set(names)
 
 
 class SingleProcessCoordinator:

@@ -24,6 +24,7 @@ from secure_control.protocol.coordinator import Protocol3Orchestrator
 from secure_control.protocol.messages import (
     P2TruncationPayload,
     ProductMaskPayload,
+    Protocol3EndpointCommand,
     Protocol3StageReceipt,
     ResourceMetadata,
     StepResourcePlan,
@@ -229,25 +230,33 @@ class _RemoteProtocol3Endpoint:
         return self._plan
 
     def begin(self) -> None:
-        self._request("begin")
+        self._session.request(
+            self._role,
+            "begin",
+            self._timeout,
+            round_id=self._plan.round_id,
+            step=self._plan.step,
+        )
 
     def mask_product(self, metadata: ResourceMetadata) -> ProductMaskPayload:
-        result = self._request("mask_product", metadata)
+        result = self._request(Protocol3EndpointCommand("mask_product", metadata=metadata))
         if not isinstance(result, ProductMaskPayload):
             raise ProcessProtocolError(f"{self._role} 返回了非法乘法遮蔽消息。")
         return result
 
     def finish_product(self, metadata: ResourceMetadata, peer: ProductMaskPayload) -> None:
-        self._request("finish_product", (metadata, peer))
+        self._request(
+            Protocol3EndpointCommand("finish_product", metadata=metadata, product_mask=peer)
+        )
 
     def complete_product(self, metadata: ResourceMetadata) -> None:
-        self._request("complete_product", metadata)
+        self._request(Protocol3EndpointCommand("complete_product", metadata=metadata))
 
     def finish_products(self) -> None:
-        self._request("finish_products")
+        self._request(Protocol3EndpointCommand("finish_products"))
 
     def mask_truncation(self, metadata: ResourceMetadata) -> TruncationMaskPayload:
-        result = self._request("mask_truncation", metadata)
+        result = self._request(Protocol3EndpointCommand("mask_truncation", metadata=metadata))
         if not isinstance(result, TruncationMaskPayload):
             raise ProcessProtocolError(f"{self._role} 返回了非法截断遮蔽消息。")
         return result
@@ -255,7 +264,11 @@ class _RemoteProtocol3Endpoint:
     def p2_truncation_message(
         self, metadata: ResourceMetadata, peer: TruncationMaskPayload
     ) -> P2TruncationPayload:
-        result = self._request("p2_truncation_message", (metadata, peer))
+        result = self._request(
+            Protocol3EndpointCommand(
+                "p2_truncation_message", metadata=metadata, truncation_mask=peer
+            )
+        )
         if not isinstance(result, P2TruncationPayload):
             raise ProcessProtocolError("P2 返回了非法截断消息。")
         return result
@@ -266,31 +279,38 @@ class _RemoteProtocol3Endpoint:
         peer: TruncationMaskPayload,
         message: P2TruncationPayload,
     ) -> None:
-        self._request("finish_truncation_p1", (metadata, peer, message))
+        self._request(
+            Protocol3EndpointCommand(
+                "finish_truncation_p1",
+                metadata=metadata,
+                truncation_mask=peer,
+                p2_truncation=message,
+            )
+        )
 
     def finish_truncation_p2(self, metadata: ResourceMetadata) -> None:
-        self._request("finish_truncation_p2", metadata)
+        self._request(Protocol3EndpointCommand("finish_truncation_p2", metadata=metadata))
 
     def complete_truncation(self, metadata: ResourceMetadata) -> None:
-        self._request("complete_truncation", metadata)
+        self._request(Protocol3EndpointCommand("complete_truncation", metadata=metadata))
 
     def stage_output(self) -> Protocol3StageReceipt:
-        result = self._request("stage_output")
+        result = self._request(Protocol3EndpointCommand("stage_output"))
         if not isinstance(result, Protocol3StageReceipt):
             raise ProcessProtocolError(f"{self._role} 返回了非法暂存回执。")
         return result
 
     def commit(self) -> None:
-        self._request("commit")
+        self._request(Protocol3EndpointCommand("commit"))
 
-    def _request(self, operation: str, payload: Any = None) -> Any:
+    def _request(self, command: Protocol3EndpointCommand) -> Any:
         return self._session.request(
             self._role,
-            operation,
+            "endpoint",
             self._timeout,
             round_id=self._plan.round_id,
             step=self._plan.step,
-            payload=payload,
+            payload=command,
         )
 
 
