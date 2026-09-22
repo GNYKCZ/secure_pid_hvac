@@ -26,10 +26,21 @@ Git；下列相对路径、ID 和 SHA-256 用于在同一工作区复验，正�
 | safety certificate | 同上 `certificate.json` | `08862de749a9505edf9f07dba9f15c16cea736ff17e753fb8e83a09ba6a7fc88` |
 | public evidence | `results/diagnostics/20260920T163559335539Z-7237a0665cb5/20260920T170705827260Z-f352c60ce775/` | manifest `133a45c4c66fcee5b28a03f2f8b6a41729b502513f1e561df7d670ce28180eed` |
 | 中文报告 | `results/figures/evidence_reports/20260920T163559335539Z-7237a0665cb5/20260920T170810744745Z-3b61790b105c/` | report manifest `6f447f355e2008a0ea92bf789c6ddb9d43dd869fb467dd1eb1dff9f5db686e4d` |
+| exact-grid sidecar | `results/exact_grid/20260920T163559335539Z-7237a0665cb5/20260922T103051436398Z-46e9d0c2fcdd/` | manifest `4ba1af88301f5786248c19d6ca86af14edff8491a2b926f40e1c2fc7a195aa29` |
+| exact-grid 增强报告 | `results/figures/evidence_reports/20260920T163559335539Z-7237a0665cb5/20260922T103228429661Z-6b63c3bbc660/` | report manifest `531d5a4c8687ef0b9b09e4db99089088acdf0663aadf1edcb9ba96e51b852fb2` |
 
 sweep 的 final/data manifest 均通过 canonical reader；12 个点全部为 `success`。public evidence 的
 180 个整数控制行和 180 个资源步骤通过严格 reader，报告 manifest 声明的 29 个图、表和目录均
 逐文件通过 SHA-256 复验，并回链到同一 evidence 与 sweep。
+
+Issue #62 sidecar 同样回链到上述 final/data manifest、`ell=48, seed=42` 的 run/trajectory 和 public
+evidence manifest。现有 public integer evidence 只覆盖 `ell=48`，所以 `ell=32/40/56` 在 sidecar 和
+增强 Fig. 3 中明确为 unavailable，没有从 float 推算，也没有隐式重跑 secure execution。
+
+`ell=48` 的 180 个样本中，binary64 applied error 为零 3 个：`k=0` 同时是 exact-grid zero；`k=26`
+与 `k=60` 是 float64 collision。对应 `s=96` 的 `Δ=M-U` 分别为 `0`、`1_137_144_267_292`、
+`66_080_791_343_908`。这些结论只相对于保存的 ideal binary64 baseline 提升到协议 scale 后的整数网格，
+不声称是无限精度理论真值。
 
 ## 四精度定量结果
 
@@ -82,6 +93,18 @@ uv run python -m secure_control.experiments.evidence_report_runner `
   --source-sweep-id <verified-sweep-id> `
   --trace-id <verified-trace-id> `
   --display-config configs/hvac_2r2c_evidence_report_profile_zh.yaml
+
+uv run python -m secure_control.experiments.exact_grid_runner `
+  --source-sweep-id <verified-sweep-id> `
+  --evidence-dir results/diagnostics/<verified-sweep-id>/<verified-trace-id> `
+  --source-manifest-sha256 <final-manifest-sha256> `
+  --source-data-manifest-sha256 <data-manifest-sha256>
+
+uv run python -m secure_control.experiments.evidence_report_runner `
+  --source-sweep-id <verified-sweep-id> `
+  --trace-id <verified-trace-id> `
+  --display-config configs/hvac_2r2c_evidence_report_profile_zh.yaml `
+  --exact-grid-dir results/exact_grid/<verified-sweep-id>/<exact-grid-artifact-id>
 ```
 
 该证据链支持“冻结 adapted 2R2C HVAC 应用在当前单进程、半诚实协议模型下可严格复现”的结论；

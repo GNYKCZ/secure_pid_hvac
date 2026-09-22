@@ -11,6 +11,7 @@ import pytest
 import yaml
 
 from secure_control.experiments.evidence_reporting import (
+    _fig3_figure,
     _integer_decode_data,
     _integer_decode_figure,
     _quantitative_rows,
@@ -18,6 +19,7 @@ from secure_control.experiments.evidence_reporting import (
     _validate_inputs,
     load_evidence_report_profile,
 )
+from secure_control.experiments.exact_grid import ExactGridControlRow
 from secure_control.experiments.reporting import ResolvedFont, load_report_profile
 from secure_control.experiments.sweep import (
     PrecisionPreflightReport,
@@ -252,3 +254,43 @@ def test_resource_figure_includes_real_cumulative_and_per_step_series(tmp_path: 
     delta = next(axis for axis in figure.axes if axis.get_ylabel() == "实际每步增量")
     assert np.array_equal(lifecycle.lines[0].get_ydata(), np.arange(9, 1621, 9))
     assert set(delta.lines[0].get_ydata()) == {9}
+
+
+def test_fig3_adds_verified_exact_grid_panel_without_changing_float_curves(
+    tmp_path: Path,
+) -> None:
+    """Optional exact-grid input adds a panel and collision markers; float curves remain four."""
+    records = tuple(_record(ell, 42) for ell in (32, 40, 48, 56))
+    runs = {}
+    for record in records:
+        error = np.full((3, 1), 1.0 / record.point.ell)
+        error[0, 0] = 0.0
+        runs[record.point.point_id] = SimpleNamespace(result=SimpleNamespace(control_error=error))
+    sweep = VerifiedSweepData(
+        tmp_path,
+        {"fractional_bits": [32, 40, 48, 56]},
+        records,
+        runs,
+    )
+    exact = SimpleNamespace(
+        rows=(
+            ExactGridControlRow(48, 42, 0, 0, 96, 1, 1, 0, 0.0, "exact_grid_zero"),
+            ExactGridControlRow(48, 42, 1, 0, 96, 2, 1, 1, 0.0, "float64_collision"),
+            ExactGridControlRow(48, 42, 2, 0, 96, 3, 1, 2, 1.0, "nonzero"),
+        ),
+        manifest={
+            "availability": [
+                {"ell": 32, "status": "unavailable"},
+                {"ell": 40, "status": "unavailable"},
+                {"ell": 48, "status": "available"},
+                {"ell": 56, "status": "unavailable"},
+            ]
+        },
+    )
+    base = load_report_profile(BASE_PROFILE)
+    font = ResolvedFont("fixture", tmp_path / "unused.ttf", "0" * 64, "")
+    figure = _fig3_figure(sweep, records, base, font, exact)
+    assert len(figure.axes) == 2
+    assert len(figure.axes[0].lines) == 4
+    assert len(figure.axes[1].lines) == 1
+    assert "unavailable" in " ".join(text.get_text() for text in figure.axes[1].texts)

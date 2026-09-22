@@ -76,6 +76,8 @@ def test_experiment_io_boundary_imports_only_generic_contracts() -> None:
         "sweep_plotting.py",
         "reporting.py",
         "evidence_artifacts.py",
+        "exact_grid.py",
+        "exact_grid_artifacts.py",
     ):
         source = experiments / name
         assert "secure_control.scenarios" not in imported_modules(source)
@@ -117,6 +119,10 @@ def test_experiment_io_boundary_imports_only_generic_contracts() -> None:
         )
         for module in evidence_report_imports
     )
+    exact_grid_runner_imports = imported_modules(experiments / "exact_grid_runner.py")
+    assert "secure_control.simulation.runner" not in exact_grid_runner_imports
+    assert "secure_control.experiments.sweep_runner" not in exact_grid_runner_imports
+    assert "secure_control.experiments.evidence_runner" not in exact_grid_runner_imports
 
 
 def test_2r2c_types_remain_owned_by_hvac_scenario() -> None:

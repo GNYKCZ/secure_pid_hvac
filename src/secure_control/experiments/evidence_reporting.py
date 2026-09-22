@@ -8,7 +8,7 @@ import os
 import re
 import secrets
 import shutil
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -26,6 +26,10 @@ from matplotlib.patches import FancyBboxPatch
 from secure_control.simulation import SimulationResult
 
 from .evidence_artifacts import VerifiedEvidenceData, load_verified_evidence_artifacts
+from .exact_grid_artifacts import (
+    VerifiedExactGridData,
+    load_verified_exact_grid_artifact,
+)
 from .plotting import apply_axis_format
 from .reporting import (
     ReportProfile,
@@ -220,9 +224,10 @@ def render_evidence_report(
     verified_evidence: VerifiedEvidenceData,
     profile: EvidenceReportProfile,
     output_root: Path,
+    verified_exact_grid: VerifiedExactGridData | None = None,
 ) -> EvidenceReportArtifacts:
     """从两个 verified reader 的内存结果生成报告，绝不运行 simulation/runtime。"""
-    _validate_inputs(verified_sweep, verified_evidence, profile)
+    _validate_inputs(verified_sweep, verified_evidence, profile, verified_exact_grid)
     base_profile = replace(load_report_profile(profile.base_profile_path), time_unit="min")
     records = select_primary_records(verified_sweep, profile.representative_seed)
     representative = next(item for item in records if item.point.ell == profile.representative_ell)
@@ -243,9 +248,14 @@ def render_evidence_report(
             "控制器状态更新证据",
             "无量纲精度影响",
             "协议资源累计与逐步增量",
+            "exact-grid 零误差",
+            "binary64 零碰撞",
+            "exact-grid 误差",
         ),
     )
-    source_snapshot = _source_snapshot(verified_sweep, verified_evidence, profile)
+    source_snapshot = _source_snapshot(
+        verified_sweep, verified_evidence, profile, verified_exact_grid
+    )
     report_id = _new_report_id()
     actual_sweep_id = verified_sweep.root.name
     parent = Path(output_root) / actual_sweep_id
@@ -270,6 +280,7 @@ def render_evidence_report(
             records,
             verified_sweep,
             verified_evidence,
+            verified_exact_grid,
             profile,
             base_profile,
             font,
@@ -376,13 +387,24 @@ def render_evidence_report(
             "artifacts": entries,
             "limitations": list(profile.limitations_zh),
         }
+        if verified_exact_grid is not None:
+            manifest["source_exact_grid"] = {
+                "artifact_id": verified_exact_grid.manifest["artifact_id"],
+                "manifest_sha256": source_snapshot["exact_grid_manifest"],
+            }
         (stage / "report_manifest.json").write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False)
             + "\n",
             encoding="utf-8",
             newline="\n",
         )
-        _validate_prepublish(verified_sweep, verified_evidence, profile, source_snapshot)
+        _validate_prepublish(
+            verified_sweep,
+            verified_evidence,
+            profile,
+            source_snapshot,
+            verified_exact_grid,
+        )
         if os.path.lexists(final):
             raise FileExistsError(f"evidence report ID 已存在：{report_id}")
         os.rename(stage, final)
@@ -402,14 +424,51 @@ def render_evidence_report(
 
 
 def render_verified_evidence_report(
-    *, sweep_dir: Path, evidence_dir: Path, profile_path: Path, output_root: Path
+    *,
+    sweep_dir: Path,
+    evidence_dir: Path,
+    profile_path: Path,
+    output_root: Path,
+    exact_grid_dir: Path | None = None,
+    exact_grid_evidence_dirs: Sequence[Path] = (),
 ) -> EvidenceReportArtifacts:
     """CLI 友好的 verified reader 组合入口。"""
+    sweep = load_verified_sweep_data(sweep_dir, manifest_name="manifest.json")
+    evidence = load_verified_evidence_artifacts(evidence_dir)
+    expected_source_hashes = {
+        name: _digest(sweep.root / name) for name in ("manifest.json", "data_manifest.json")
+    }
+    exact_evidence = {
+        (
+            evidence.metadata["source_point"]["ell"],
+            evidence.metadata["source_point"]["seed"],
+        ): evidence
+    }
+    for directory in exact_grid_evidence_dirs:
+        item = load_verified_evidence_artifacts(directory)
+        key = (
+            item.metadata["source_point"]["ell"],
+            item.metadata["source_point"]["seed"],
+        )
+        if key in exact_evidence and item.root != exact_evidence[key].root:
+            raise ValueError(f"exact-grid report 收到重复 evidence point：{key}")
+        exact_evidence[key] = item
+    exact_grid = (
+        None
+        if exact_grid_dir is None
+        else load_verified_exact_grid_artifact(
+            exact_grid_dir,
+            verified_sweep=sweep,
+            evidence_by_point=exact_evidence,
+            expected_source_hashes=expected_source_hashes,
+        )
+    )
     return render_evidence_report(
-        verified_sweep=load_verified_sweep_data(sweep_dir, manifest_name="manifest.json"),
-        verified_evidence=load_verified_evidence_artifacts(evidence_dir),
+        verified_sweep=sweep,
+        verified_evidence=evidence,
         profile=load_evidence_report_profile(profile_path),
         output_root=output_root,
+        verified_exact_grid=exact_grid,
     )
 
 
@@ -417,6 +476,7 @@ def _validate_inputs(
     sweep: VerifiedSweepData,
     evidence: VerifiedEvidenceData,
     profile: EvidenceReportProfile,
+    exact_grid: VerifiedExactGridData | None = None,
 ) -> None:
     """绑定 sweep/evidence/profile lineage，并拒绝缺失 point、step 或 raw-share 泄漏。"""
     actual_sweep_id = sweep.root.name
@@ -481,6 +541,11 @@ def _validate_inputs(
     seeds = {item.point.seed for item in sweep.records if item.status is SweepRunStatus.SUCCESS}
     if seeds != {42, 43, 44}:
         raise ValueError("增强报告必须完整包含 seeds 42/43/44。")
+    if exact_grid is not None and (
+        exact_grid.manifest.get("source_sweep_id") != actual_sweep_id
+        or exact_grid.manifest.get("primary_seed") != profile.representative_seed
+    ):
+        raise ValueError("exact-grid artifact 与报告 sweep/representative seed 不一致。")
 
 
 def _render_main_figures(
@@ -490,6 +555,7 @@ def _render_main_figures(
     records: tuple[SweepRunRecord, ...],
     sweep: VerifiedSweepData,
     evidence: VerifiedEvidenceData,
+    exact_grid: VerifiedExactGridData | None,
     profile: EvidenceReportProfile,
     base: ReportProfile,
     font: ResolvedFont,
@@ -536,9 +602,13 @@ def _render_main_figures(
         ),
         (
             "07_Fig3_adapted_applied_control.png",
-            _fig3_figure(sweep, records, base, font),
+            _fig3_figure(sweep, records, base, font, exact_grid),
             "fig3_adapted",
-            "按真实 k=0..179 比较四精度 applied control error。",
+            (
+                "区分 binary64 applied-control error 与已验证点的 exact-grid error、精确零和零碰撞。"
+                if exact_grid is not None
+                else "按真实 k=0..179 比较四精度 applied control error。"
+            ),
         ),
         (
             "08_无量纲精度影响.png",
@@ -1011,13 +1081,18 @@ def _fig3_figure(
     records: tuple[SweepRunRecord, ...],
     profile: ReportProfile,
     font: ResolvedFont,
+    exact_grid: VerifiedExactGridData | None = None,
 ) -> Figure:
-    """直接读取 #15 applied control_error，保留 k=0..179 与精确零 mask。"""
+    """Plot historical binary64 errors and optional verified exact-grid evidence."""
     figure = Figure(
         figsize=(profile.style.width_inches, profile.style.height_inches), layout="constrained"
     )
     FigureCanvasAgg(figure)
-    axis = figure.subplots()
+    if exact_grid is None:
+        axis = figure.subplots()
+        exact_axis = None
+    else:
+        axis, exact_axis = figure.subplots(2, 1, sharex=True)
     for item in records:
         values = np.abs(sweep.runs[item.point.point_id].result.control_error[:, 0])
         masked = np.ma.masked_where(values == 0.0, values)
@@ -1029,11 +1104,89 @@ def _fig3_figure(
             linestyle=style.linestyle,
             label=f"ell={item.point.ell}",
         )
+    if exact_grid is not None:
+        exact_rows = tuple(row for row in exact_grid.rows if row.channel == 0)
+        available_ells = {row.ell for row in exact_rows}
+        for ell in sorted(available_ells):
+            selected = tuple(row for row in exact_rows if row.ell == ell)
+            steps = np.array([row.step for row in selected], dtype=int)
+            values = np.array(
+                [
+                    abs(row.signed_error_integer) / float(1 << row.output_fractional_bits)
+                    for row in selected
+                ],
+                dtype=float,
+            )
+            style = profile.ell_styles[ell]
+            exact_axis.plot(
+                steps,
+                np.ma.masked_where(values == 0.0, values),
+                color=style.color,
+                linestyle=style.linestyle,
+                label=f"ell={ell} exact-grid",
+            )
+            exact_zero = np.array(
+                [row.step for row in selected if row.classification == "exact_grid_zero"]
+            )
+            collisions = np.array(
+                [row.step for row in selected if row.classification == "float64_collision"]
+            )
+            if exact_zero.size:
+                axis.scatter(
+                    exact_zero,
+                    np.full(exact_zero.size, 0.04),
+                    transform=axis.get_xaxis_transform(),
+                    marker="o",
+                    facecolors="none",
+                    edgecolors=style.color,
+                    label=f"ell={ell} exact-grid 零误差",
+                )
+            if collisions.size:
+                axis.scatter(
+                    collisions,
+                    np.full(collisions.size, 0.09),
+                    transform=axis.get_xaxis_transform(),
+                    marker="x",
+                    color=style.color,
+                    label=f"ell={ell} binary64 零碰撞",
+                )
+        unavailable = [
+            str(item["ell"])
+            for item in exact_grid.manifest["availability"]
+            if item["status"] == "unavailable"
+        ]
+        if unavailable:
+            exact_axis.text(
+                0.01,
+                0.03,
+                f"exact-grid unavailable：ell={','.join(unavailable)}（缺少 verified integer evidence）",
+                transform=exact_axis.transAxes,
+                fontproperties=FontProperties(fname=str(font.path)),
+            )
+        apply_axis_format(exact_axis.yaxis, scale="log", signed=False)
+        exact_axis.set_xlabel("离散步 k", fontproperties=FontProperties(fname=str(font.path)))
+        exact_axis.set_ylabel(
+            "|M-U| / 2^s（kW）", fontproperties=FontProperties(fname=str(font.path))
+        )
+        exact_axis.set_title(
+            "整数 exact-grid 误差（仅显示有 verified integer evidence 的精度）",
+            fontproperties=FontProperties(fname=str(font.path)),
+        )
+        exact_axis.legend(prop=FontProperties(fname=str(font.path)))
+        exact_axis.grid(True, alpha=profile.style.grid_alpha)
     apply_axis_format(axis.yaxis, scale="log", signed=False)
     font_prop = FontProperties(fname=str(font.path))
-    axis.set_xlabel("离散步 k", fontproperties=font_prop)
+    if exact_axis is None:
+        axis.set_xlabel("离散步 k", fontproperties=font_prop)
     axis.set_ylabel("|u_applied(k) - û_applied(k)|（kW）", fontproperties=font_prop)
-    axis.set_title("论文 Fig. 3 adapted：实际施加控制误差", fontproperties=font_prop)
+    axis.set_title(
+        (
+            "论文 Fig. 3 adapted：实际施加控制误差"
+            if exact_grid is None
+            else "论文 Fig. 3 adapted：binary64 实际施加控制误差"
+        ),
+        fontproperties=font_prop,
+    )
     axis.legend(prop=font_prop)
     axis.grid(True, alpha=profile.style.grid_alpha)
     return figure
@@ -1244,16 +1397,24 @@ def _write_quantitative_table(
 
 
 def _source_snapshot(
-    sweep: VerifiedSweepData, evidence: VerifiedEvidenceData, profile: EvidenceReportProfile
+    sweep: VerifiedSweepData,
+    evidence: VerifiedEvidenceData,
+    profile: EvidenceReportProfile,
+    exact_grid: VerifiedExactGridData | None = None,
 ) -> dict[str, str]:
     """冻结 sweep、evidence 和两个 profile 的原始 bytes 摘要。"""
-    return {
+    snapshot = {
         "sweep_manifest": _digest(sweep.root / "manifest.json"),
         "sweep_data_manifest": _digest(sweep.root / "data_manifest.json"),
         "evidence_manifest": _digest(evidence.root / "manifest.json"),
         "evidence_profile": _digest(profile.source_path),
         "base_profile": _digest(profile.base_profile_path),
     }
+    if exact_grid is not None:
+        snapshot["exact_grid_manifest"] = _digest(exact_grid.root / "manifest.json")
+        snapshot["exact_grid_control"] = _digest(exact_grid.root / "exact_grid_control.csv")
+        snapshot["exact_grid_summary"] = _digest(exact_grid.root / "summary.json")
+    return snapshot
 
 
 def _validate_prepublish(
@@ -1261,9 +1422,10 @@ def _validate_prepublish(
     evidence: VerifiedEvidenceData,
     profile: EvidenceReportProfile,
     snapshot: dict[str, str],
+    exact_grid: VerifiedExactGridData | None = None,
 ) -> None:
     """紧邻 rename 重走 canonical readers 并拒绝任一来源/profile 变化。"""
-    if snapshot != _source_snapshot(sweep, evidence, profile):
+    if snapshot != _source_snapshot(sweep, evidence, profile, exact_grid):
         raise ValueError("source sweep/evidence/profile 在报告生成期间发生变化。")
     load_verified_sweep_data(sweep.root, manifest_name="manifest.json")
     load_verified_evidence_artifacts(evidence.root)

@@ -80,6 +80,34 @@ Fig. 3 adapted 只使用正式八字段中的 applied control error；raw contro
 计数；代表点资源子图还直接展示 180 步实际累计消费与逐步增量。报告 manifest 绑定两个来源
 manifest、两个展示 profile、字体和全部输出哈希。
 
+## exact-grid sidecar 与 binary64 零碰撞
+
+Issue #62 不修改八字段 trajectory，也不从已 decode 的 secure float 反推整数。薄入口只消费已经通过
+canonical reader 的 sweep 与 `integer_control.csv`，并要求显式传入 sweep final/data manifest 的预期
+SHA-256：
+
+```powershell
+uv run python -m secure_control.experiments.exact_grid_runner `
+  --source-sweep-id <verified-sweep-id> `
+  --evidence-dir <verified-evidence-directory> `
+  --source-manifest-sha256 <final-manifest-sha256> `
+  --source-data-manifest-sha256 <data-manifest-sha256>
+```
+
+发布前逐 step、逐 channel 证明 `raw_plaintext == applied_plaintext` 且
+`raw_secure == applied_secure`，并复验时间、applied control、error、run ID、trajectory hash 与 evidence
+lineage；actuator 不是恒等映射时 fail closed。sidecar 对 ideal applied binary64 值 `x` 使用
+`M=floor(Fraction.from_float(x)·2^s+1/2)`，直接读取 secure centered integer `U`，保存无损十进制
+`M`、`U`、`Δ=M-U` 与 `s`（CSV 中分别为 `ideal_grid_integer`、`secure_grid_integer`、
+`signed_error_integer`、`output_fractional_bits`）。这里的 exact-grid error 是 `Δ/2^s`；它不同于未量化的
+`Fraction.from_float(x)-U/2^s`，二者都不是“无限精度理论真值”。
+
+分类规则固定为：`Δ=0` 是 `exact_grid_zero`；binary64 applied error 为零而 `Δ!=0` 是
+`float64_collision`；其余是 `nonzero`。原有 `zero_count` 数值与语义不变，sidecar 摘要将其明确命名为
+`float64_zero_count`。报告只有在显式传入 `--exact-grid-dir` 时才增加第二个 exact-grid panel；原有四条
+binary64 曲线和零 mask 保持不变，不插入 epsilon。缺少整数证据的精度明确显示为 unavailable，绝不
+补算或隐式重跑 evidence。
+
 ## Protocol 2 为零的含义
 
 当前冻结 PID 的 `A/B` 是零分数位整数矩阵，state accumulator 已处于 state scale，因此正式路径不需
