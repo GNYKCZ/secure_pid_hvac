@@ -1,10 +1,10 @@
-# HVAC / PID / Discrete-Time Control Review
+# Discrete-Time Control Review
 
 只验证当前代码和声明是否数学自洽，不规定项目应该采用哪一种 PID 或 plant 架构。
 
 ## Time and units
-- 3 小时 horizon、`Ts`、plant time constant/gain 的单位一致；
-- setpoint 声明为 `[0,3600):15°C`, `[3600,7200):20°C`, `[7200,10800):25°C` 时，代码边界和采样定义一致；
+- 使用当前 Issue / 配置实际声明的 horizon、`Ts`、plant time constant/gain，检查单位一致；
+- 使用当前实验的参考轨迹或设定值，检查切换边界和采样定义一致；
 - 若边界不落在 sample 上，实际采用的切换规则与项目声明一致；
 - plot 横轴单位与真实时间一致。
 

@@ -1,4 +1,4 @@
-# Review Router v3 — Pure Review Only
+# Review Router v4 — Read-only Review
 
 ## 0. 先确认任务边界
 本目录只做 Review。若请求同时包含“审查并修复/实现”，本流程只完成审查部分；不要在 Review 流程中编辑代码。
@@ -16,6 +16,8 @@
 ## 1. Review 模式
 - **Target Mode**：用户要求审查当前 `.py`、当前仿真或完整小项目。报告任何会影响当前实验正确性/可信度的问题，不要求证明是最近 diff 新引入。
 - **Diff Mode**：用户明确指定 diff/commit/branch/PR。聚焦本次改动引入、暴露或明显恶化的问题；必要时读取相关未修改代码来验证影响。
+
+Diff Mode 开始时记录 Issue、设计评论（若有）、PR URL、base 与被审 head SHA。若是 re-review，读取上一轮报告并按稳定 Finding ID 核对原问题是否消失，同时检查修复 diff 是否引入新问题；报告必须指明本轮 head SHA。
 
 ## 2. Context ladder
 不要一上来扫完整仓库。按证据需要逐层扩大：
@@ -56,6 +58,7 @@
 7. claim 是否超过代码和证据。
 
 风格、命名、格式化、纯审美重构不属于本包默认 Findings。
+确认的 Finding 应给出有证据支持的修复方向、约束和验收检查；具体边界见 `core/BOUNDARY.md`。
 
 ## 5. “无问题”门槛
 只有在 `core/VERIFICATION_AND_COVERAGE.md` 定义的 scope coverage 为 COMPLETE 时，才能给出“未发现符合门槛的问题”。

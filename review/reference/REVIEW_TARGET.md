@@ -1,13 +1,11 @@
 # Review Target Facts
 
-本文件只记录本次 Review 已知的目标事实，用作验收参照；它不是开发设计文档，也不指定代码结构。
+本文件记录项目级验收边界，不为每个 Issue 预设场景参数或功能范围，也不指定代码结构。
 
-根据当前任务，Reviewer 应验证实现是否与以下声明一致：
-- 这是一个 Python HVAC 温度控制仿真；
-- 总仿真时间为 3 小时；
-- 参考温度分段为第一小时 15°C、第二小时 20°C、第三小时 25°C；
-- 存在 ideal/original 控制结果与论文式 two-party/fixed-point 路径的比较；
-- 主要结果至少包含实际温度随时间变化，以及 ideal 与 secure/control-path 的控制输入差异（类似论文 Fig. 3 的比较目标）；
-- 论文用于协议、fixed-point 和 input-error comparison 的参考；HVAC plant/setpoint 是项目适配，不应自动声称复现论文原始 numerical example。
+Reviewer 应从本轮用户要求、当前 Issue、设计评论（若指定）、PR / diff、`AGENTS.md` 和实际配置提取被审目标，先写出本轮适用的验收事实。用户明确要求与 Issue 冲突时说明冲突，以用户本轮要求为准。设计评论是实施依据，但不得覆盖 Issue、`AGENTS.md` 或当前代码证据。
 
-如果被审仓库中的 authoritative requirement 与这里不同，报告冲突并以用户在本轮明确指定的要求为最高项目验收依据。
+项目级事实：
+- 本仓库研究安全两方动态控制；核心 `secure_control` 应保持场景无关。
+- HVAC + PID 是一个实验场景。其他场景、控制器或多进程启动方式只在对应 Issue 声称或要求时审查。
+- 对数学、协议、安全和实验结论，区分原论文定义、项目有意适配、简化实现和已经获得的证据。
+- 审查实验时使用该实验自己的时长、参考轨迹、配置、指标和输出；不得把旧 HVAC 示例中的固定参数套用于其他 Issue。
