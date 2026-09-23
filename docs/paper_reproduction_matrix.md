@@ -107,8 +107,8 @@ measurement 输入或原始数据。
 
 | 消费者 | 可直接采用 | 必须自行完成，不能从本页继承 |
 | --- | --- | --- |
-| A05/#69 | 论文/当前实现的机制定位、四级声明、四水箱缺口和 [39] 参数账本 | four-tank 场景、plant/observer 公式的源码级核验、测试和原例证据 |
-| A06/#70 | PID Fig. 3 参数、精度文字冲突、`t=0..50` 与 claim boundary | [38] plant、filtered PID、唯一 `q`/seed 的可得性、运行和轨迹对比 |
+| A05/#69 | PID Fig. 3 参数、四级声明与 [38] plant 来源缺口 | 核实 [38] 的 plant realization/初态坐标、filtered PID、明文轨迹和原例证据 |
+| A06/#70 | A05 明文基线、精度文字冲突、`t=0..50` 与 claim boundary | 四精度安全运行、`q`/seed 声明、原始误差轨迹和 Fig. 3 对照 |
 | A09/#73 | Protocol 2 的前提与 `w in {-1,0,1}`、当前 integer A/B 限制 | 任何非整数 controller 的 end-to-end 资源/误差证据 |
 | A11/#75 | Assumption 2/3 的论文含义与当前 HVAC/transport 非等价边界 | 对目标 plant/controller 的完整闭环证明和部署级安全声明 |
 
