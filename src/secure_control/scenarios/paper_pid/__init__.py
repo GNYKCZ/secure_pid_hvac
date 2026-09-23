@@ -1,4 +1,4 @@
-"""论文 §VII 的明文 PID 控制器设计；不包含未经核实的 plant。"""
+"""论文 §VII 明文 PID 及单独标注的 paper-inspired 串联对象基线。"""
 
 from .pid import PaperPidDesign, paper_sec_vii_controller_spec
 
