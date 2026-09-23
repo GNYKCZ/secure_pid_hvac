@@ -1,0 +1,15 @@
+# #69 的 paper-inspired 明文基线；状态坐标和 ZOH 是本项目选择，不是作者原例矩阵。
+schema_version: 1
+claim_level: paper-inspired
+sources:
+  controller: https://arxiv.org/html/2503.02176v3#S7
+  plant: https://doi.org/10.1016/S1474-6670(17)38238-1
+  plant_equation: Eq. (2)
+controller: printed_section_vii
+plant:
+  alpha: 0.2
+  sample_period_seconds: 0.1
+  initial_state: [100.0, 100.0, 100.0, 100.0]
+  realization: four_stage_cascade_outputs
+  discretization: zoh
+sample_count: 51
