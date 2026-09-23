@@ -22,6 +22,9 @@ core ───────→ 标准库和基础数组类型
 - `crypto` 只处理整数、向量/矩阵、定点 scale、模数、公开素数证据、share 和辅助随机量。
 - `protocol` 只编排通用控制器参数、状态、输入和输出的 shares。
 - `execution` 向上提供统一的 `step(v) -> u` 接口，具体 transport 不改变该接口。
+- Issue #68 的 LAN 单步入口由 `experiments.lan_runner` 装配 HVAC 的首个采样；
+  `execution.lan_*` 只处理通用角色、配置、mTLS 与一次协议生命周期，不导入 HVAC。
+  它不是既有 `step(v)` 连续运行时，也不放宽 localhost 裸 socket 的 loopback 限制。
 - `simulation` 只协调 reference、plant output、scenario adapter、runtime 和结果记录。
 - `scenarios` 拥有 plant、reference、controller design、信号适配、单位和场景指标。
 - `experiments` 是独立 I/O/composition root：显式场景选择、通用结果产物与公开 provenance；

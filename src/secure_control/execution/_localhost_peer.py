@@ -28,12 +28,20 @@ Role = Literal["P1", "P2"]
 class LocalhostProtocol3PeerPort:
     """绑定单一 P1/P2 session 的双工在线 peer port。"""
 
-    def __init__(self, connection: socket.socket, role: Role, limit: int, timeout: float) -> None:
+    def __init__(
+        self,
+        connection: socket.socket,
+        role: Role,
+        limit: int,
+        timeout: float,
+        deadline: float | None = None,
+    ) -> None:
         self._connection = connection
         self._role = role
         self._peer: Role = "P2" if role == "P1" else "P1"
         self._limit = limit
         self._timeout = timeout
+        self._deadline = deadline
         self._session_id: str | None = None
         self._send_sequence = 1
         self._receive_sequence = 1
@@ -50,7 +58,9 @@ class LocalhostProtocol3PeerPort:
 
     def receive_product(self, metadata: ResourceMetadata) -> ProductMaskPayload:
         value = self._receive("peer_product", metadata)
-        if not isinstance(value, ProductMaskPayload) or value.party != (1 if self._role == "P1" else 0):
+        if not isinstance(value, ProductMaskPayload) or value.party != (
+            1 if self._role == "P1" else 0
+        ):
             raise ValueError("Protocol 1 peer payload 的接收方错误。")
         return value
 
@@ -74,7 +84,12 @@ class LocalhostProtocol3PeerPort:
             pass
         self._connection.close()
 
-    def _send(self, operation: Literal["peer_product", "peer_truncation"], metadata: ResourceMetadata, payload: object) -> None:
+    def _send(
+        self,
+        operation: Literal["peer_product", "peer_truncation"],
+        metadata: ResourceMetadata,
+        payload: object,
+    ) -> None:
         session_id = self._bound_session(metadata)
         send_envelope(
             self._connection,
@@ -91,7 +106,9 @@ class LocalhostProtocol3PeerPort:
                 metadata.resource_id,
                 payload,  # type: ignore[arg-type]
             ),
-            deadline=deadline_after(self._timeout),
+            deadline=self._deadline
+            if self._deadline is not None
+            else deadline_after(self._timeout),
             limit=self._limit,
         )
         self._send_sequence += 1
@@ -102,7 +119,9 @@ class LocalhostProtocol3PeerPort:
         session_id = self._bound_session(metadata)
         message = receive_envelope(
             self._connection,
-            deadline=deadline_after(self._timeout),
+            deadline=self._deadline
+            if self._deadline is not None
+            else deadline_after(self._timeout),
             limit=self._limit,
         )
         if (

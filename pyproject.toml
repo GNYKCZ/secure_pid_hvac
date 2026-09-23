@@ -11,6 +11,9 @@ dependencies = [
     "scipy>=1.17.1",
 ]
 
+[project.scripts]
+secure-control = "secure_control.experiments.lan_runner:cli"
+
 [build-system]
 requires = ["uv_build>=0.12.13,<0.13"]
 build-backend = "uv_build"
@@ -27,6 +30,7 @@ line-length = 100
 
 [dependency-groups]
 dev = [
+    "cryptography>=50.0.1",
     "pytest>=9.1.1",
     "ruff>=0.16.7",
 ]
