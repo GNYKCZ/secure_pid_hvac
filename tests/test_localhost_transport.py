@@ -212,18 +212,74 @@ def test_peer_port_exchanges_only_protocol_messages_and_parent_reply_rejects_sha
 @pytest.mark.parametrize(
     ("kind", "operation", "sender", "recipient", "payload", "accepted"),
     (
-        ("request", "peer_product", "P1", "P2", ProductMaskPayload(AdditiveShare(1), AdditiveShare(2), 0), True),
-        ("request", "peer_product", "P2", "P1", ProductMaskPayload(AdditiveShare(1), AdditiveShare(2), 1), True),
-        ("request", "peer_product", "P1", "Supervisor", ProductMaskPayload(AdditiveShare(1), AdditiveShare(2), 0), False),
-        ("request", "peer_product", "P1", "Client", ProductMaskPayload(AdditiveShare(1), AdditiveShare(2), 0), False),
-        ("reply", "peer_product", "P1", "P2", ProductMaskPayload(AdditiveShare(1), AdditiveShare(2), 0), False),
+        (
+            "request",
+            "peer_product",
+            "P1",
+            "P2",
+            ProductMaskPayload(AdditiveShare(1), AdditiveShare(2), 0),
+            True,
+        ),
+        (
+            "request",
+            "peer_product",
+            "P2",
+            "P1",
+            ProductMaskPayload(AdditiveShare(1), AdditiveShare(2), 1),
+            True,
+        ),
+        (
+            "request",
+            "peer_product",
+            "P1",
+            "Supervisor",
+            ProductMaskPayload(AdditiveShare(1), AdditiveShare(2), 0),
+            False,
+        ),
+        (
+            "request",
+            "peer_product",
+            "P1",
+            "Client",
+            ProductMaskPayload(AdditiveShare(1), AdditiveShare(2), 0),
+            False,
+        ),
+        (
+            "reply",
+            "peer_product",
+            "P1",
+            "P2",
+            ProductMaskPayload(AdditiveShare(1), AdditiveShare(2), 0),
+            False,
+        ),
         ("request", "peer_truncation", "P2", "P1", P2TruncationPayload(AdditiveShare(1)), True),
         ("request", "peer_truncation", "P1", "P2", P2TruncationPayload(AdditiveShare(1)), False),
-        ("request", "peer_truncation", "P2", "Supervisor", P2TruncationPayload(AdditiveShare(1)), False),
-        ("request", "peer_truncation", "P2", "Client", P2TruncationPayload(AdditiveShare(1)), False),
+        (
+            "request",
+            "peer_truncation",
+            "P2",
+            "Supervisor",
+            P2TruncationPayload(AdditiveShare(1)),
+            False,
+        ),
+        (
+            "request",
+            "peer_truncation",
+            "P2",
+            "Client",
+            P2TruncationPayload(AdditiveShare(1)),
+            False,
+        ),
         ("reply", "peer_truncation", "P2", "P1", P2TruncationPayload(AdditiveShare(1)), False),
         ("request", "peer_product", "P2", "P1", P2TruncationPayload(AdditiveShare(1)), False),
-        ("request", "peer_truncation", "P2", "P1", ProductMaskPayload(AdditiveShare(1), AdditiveShare(2), 1), False),
+        (
+            "request",
+            "peer_truncation",
+            "P2",
+            "P1",
+            ProductMaskPayload(AdditiveShare(1), AdditiveShare(2), 1),
+            False,
+        ),
     ),
 )
 def test_codec_enforces_schema_v2_peer_direction_matrix(
@@ -254,11 +310,46 @@ def test_codec_enforces_schema_v2_peer_direction_matrix(
 @pytest.mark.parametrize(
     ("sequence", "operation", "round_id", "step", "resource_id", "payload"),
     (
-        (0, "peer_product", "round-0", 0, "resource-0", ProductMaskPayload(AdditiveShare(3), AdditiveShare(5), 1)),
-        (2, "peer_product", "round-0", 0, "resource-0", ProductMaskPayload(AdditiveShare(3), AdditiveShare(5), 1)),
-        (1, "peer_product", "other-round", 0, "resource-0", ProductMaskPayload(AdditiveShare(3), AdditiveShare(5), 1)),
-        (1, "peer_product", "round-0", 1, "resource-0", ProductMaskPayload(AdditiveShare(3), AdditiveShare(5), 1)),
-        (1, "peer_product", "round-0", 0, "other-resource", ProductMaskPayload(AdditiveShare(3), AdditiveShare(5), 1)),
+        (
+            0,
+            "peer_product",
+            "round-0",
+            0,
+            "resource-0",
+            ProductMaskPayload(AdditiveShare(3), AdditiveShare(5), 1),
+        ),
+        (
+            2,
+            "peer_product",
+            "round-0",
+            0,
+            "resource-0",
+            ProductMaskPayload(AdditiveShare(3), AdditiveShare(5), 1),
+        ),
+        (
+            1,
+            "peer_product",
+            "other-round",
+            0,
+            "resource-0",
+            ProductMaskPayload(AdditiveShare(3), AdditiveShare(5), 1),
+        ),
+        (
+            1,
+            "peer_product",
+            "round-0",
+            1,
+            "resource-0",
+            ProductMaskPayload(AdditiveShare(3), AdditiveShare(5), 1),
+        ),
+        (
+            1,
+            "peer_product",
+            "round-0",
+            0,
+            "other-resource",
+            ProductMaskPayload(AdditiveShare(3), AdditiveShare(5), 1),
+        ),
         (1, "peer_truncation", "round-0", 0, "resource-0", P2TruncationPayload(AdditiveShare(7))),
     ),
 )
@@ -343,6 +434,17 @@ def test_peer_port_disconnect_and_timeout_are_bounded() -> None:
             disconnected.receive_product(metadata)
     finally:
         disconnected.close()
+
+    receiver, sender = socket.socketpair()
+    half_frame = LocalhostProtocol3PeerPort(receiver, "P1", 1024, 1.0)
+    half_frame.bind(metadata.session_id)
+    sender.sendall(struct.pack("!I", 16) + b"partial")
+    sender.close()
+    try:
+        with pytest.raises(LocalhostTransportDisconnected):
+            half_frame.receive_product(metadata)
+    finally:
+        half_frame.close()
 
     receiver, sender = socket.socketpair()
     timed_out = LocalhostProtocol3PeerPort(receiver, "P1", 1024, 0.02)
@@ -476,7 +578,7 @@ def test_unknown_envelope_fields_are_rejected() -> None:
 @pytest.mark.parametrize(
     ("field", "value"),
     (
-            ("schema_version", 1),
+        ("schema_version", 1),
         ("schema_version", True),
         ("schema_version", 1.0),
         ("kind", "unknown"),
@@ -696,10 +798,14 @@ def test_disconnect_and_step_timeout_fail_closed_and_reap_every_role() -> None:
     )
 
 
-def test_peer_timeout_fails_closed_without_resource_reuse_and_reset_recovers(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("failure", "worker_error"),
+    (("timeout", "LocalhostTransportTimeout"), ("disconnect", "LocalhostTransportDisconnected")),
+)
+def test_peer_failure_fails_closed_without_resource_reuse_and_reset_recovers(
+    monkeypatch: pytest.MonkeyPatch, failure: str, worker_error: str
 ) -> None:
-    """P1 在直连 peer 超时后必须废弃整组角色；只有 reset 可创建全新材料 session。"""
+    """真实 peer timeout/disconnect 由 worker 报告，随后整组角色废弃且仅 reset 可恢复。"""
     runtime = _runtime(
         transport=LocalhostTransportConfig(
             timeouts=LocalhostTimeouts(startup=10.0, step=0.2, shutdown=5.0)
@@ -707,20 +813,28 @@ def test_peer_timeout_fails_closed_without_resource_reuse_and_reset_recovers(
     )
     original_orchestrator = localhost_runtime.Protocol3Orchestrator
     original_pids = {item.pid for item in runtime.topology.roles}
+    original_session_id = runtime._session.session_id
 
-    class _PeerTimeoutOrchestrator:
+    class _PeerFailureOrchestrator:
         def stage(self, p1: object, _: object, plan: object) -> object:
             metadata = plan.product_resources[0]  # type: ignore[union-attr]
             p1.mask_product(metadata)  # type: ignore[union-attr]
+            if failure == "disconnect":
+                p2_process = runtime._session.processes["P2"]
+                p2_process.terminate()
+                p2_process.join(1.0)
+                assert not p2_process.is_alive()
+            # worker 的 peer deadline 仍为 0.2s；仅将父端等待延长，
+            # 使测试必须收到 worker 报告的 peer 错误，不能靠父端自身超时通过。
+            p1._timeout = 2.0  # type: ignore[union-attr]
             return p1.finish_product(metadata)  # type: ignore[union-attr]
 
-    monkeypatch.setattr(localhost_runtime, "Protocol3Orchestrator", _PeerTimeoutOrchestrator)
+    monkeypatch.setattr(localhost_runtime, "Protocol3Orchestrator", _PeerFailureOrchestrator)
     try:
-        # peer 与父端请求共用同一 step deadline；父端可先观察到 timeout，
-        # 但无论先后都必须使本轮和整组角色 fail closed。
-        with pytest.raises(LocalhostExecutionError):
+        with pytest.raises(LocalhostPeerError, match=worker_error):
             runtime.step(0.0)
         assert runtime.resource_counts == {"products_consumed": 0, "truncations_consumed": 0}
+        assert runtime._step_index == 0
         assert all(item.status == "failed" for item in runtime.topology.roles)
         assert original_pids.isdisjoint(
             {process.pid for process in mp.active_children() if process.pid is not None}
@@ -731,7 +845,9 @@ def test_peer_timeout_fails_closed_without_resource_reuse_and_reset_recovers(
         monkeypatch.setattr(localhost_runtime, "Protocol3Orchestrator", original_orchestrator)
         runtime.reset()
         assert original_pids.isdisjoint({item.pid for item in runtime.topology.roles})
-        assert runtime.step(0.0).shape == (1,)
+        assert runtime._session.session_id != original_session_id
+        np.testing.assert_array_equal(runtime.step(0.0), np.array([0.5]))
+        assert runtime.resource_counts == {"products_consumed": 4, "truncations_consumed": 1}
     finally:
         monkeypatch.setattr(localhost_runtime, "Protocol3Orchestrator", original_orchestrator)
         runtime.close()
