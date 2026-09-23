@@ -11,17 +11,21 @@ TCP 消息传输，不提供 TLS、身份认证、多机部署或生产安全保
 controller、state、input 和一次性资源 share，并接收各自的 control share；supervisor 不接收
 这两份原始 share。
 
-P1/P2 的逻辑 masked exchange 仍由父进程内唯一的
-`protocol.coordinator.Protocol3Orchestrator` 在两个远程 endpoint 之间路由。localhost worker 只做
-framing、严格 codec、单条 command 分派和清理，不拥有矩阵遍历、Beaver/Trunc 顺序或 lifecycle。
-一次性 bootstrap nonce 只用于避免启动串线，不能视为密码学认证。
+Issue #66 将在线 P1/P2 消息改为专用全双工 loopback TCP 通道：P1 监听、P2 连接，并在启动时用
+一次性 nonce 确认角色。父进程仍由唯一的 `protocol.coordinator.Protocol3Orchestrator` 调度阶段，
+但 `endpoint` command 与 reply 不携带 share。每个 Protocol 1 资源由 P1/P2 双向交换
+`ProductMaskPayload`；Protocol 2 只发送 P2→P1 的 `P2TruncationPayload`，不发送 P1 的截断
+masked share。localhost worker 只做 framing、严格 codec、单条 command 分派和清理，不拥有矩阵
+遍历、Beaver/Trunc 顺序或 lifecycle。nonce 只用于避免启动串线，不能视为密码学认证。
 
 ## Wire 契约
 
-- schema version 固定为 `1`，未知版本直接失败，不协商降级；
+- schema version 固定为 `2`，未知版本直接失败，不协商降级；
 - envelope 明确 kind、sender、recipient、单调 sequence、operation、session、round、step 与
   resource identity，并拒绝未知、重复、缺失字段和非法组合；
 - payload 为 canonical UTF-8 JSON 的固定类型 union，不使用 pickle、`eval` 或动态类型导入；
+- P1/P2 peer 信封另验证严格方向、单调 sequence、session/round/step/resource identity 和
+  operation/payload 组合；超时、断开或错序会使整个 session fail closed；
 - 任意精度整数使用 canonical 十进制字符串，object array 使用 shape 加扁平整数列表，无 float
   或 fixed-width integer 转换；普通浮点数组只允许有限实数；
 - TCP frame 为 4-byte network-order 无符号长度加 payload，默认上限 8 MiB，先验证长度再读取；

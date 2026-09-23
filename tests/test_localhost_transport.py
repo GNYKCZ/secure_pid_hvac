@@ -25,7 +25,9 @@ from secure_control.execution import (
     LocalhostTimeoutError,
     MultiprocessingSecureStateSpaceRuntime,
 )
+from secure_control.execution._localhost_peer import LocalhostProtocol3PeerPort
 from secure_control.execution.localhost_codec import (
+    SCHEMA_VERSION,
     HelloPayload,
     LocalhostCodecError,
     WireEnvelope,
@@ -45,6 +47,11 @@ from secure_control.execution.localhost_transport import (
 )
 from secure_control.experiments.localhost_runner import run_localhost_comparison
 from secure_control.protocol import ControllerRangeContract
+from secure_control.protocol.messages import (
+    P2TruncationPayload,
+    ProductMaskPayload,
+    ResourceMetadata,
+)
 
 _DEFAULT_TRANSPORT = LocalhostTransportConfig()
 
@@ -132,7 +139,7 @@ def test_large_legal_int64_step_matches_multiprocessing_backend() -> None:
 
 def test_wire_envelope_round_trip_preserves_version_direction_and_identity() -> None:
     message = WireEnvelope(
-        1,
+        SCHEMA_VERSION,
         "hello",
         "P1",
         "Supervisor",
@@ -146,6 +153,57 @@ def test_wire_envelope_round_trip_preserves_version_direction_and_identity() -> 
     )
 
     assert decode_envelope(encode_envelope(message)) == message
+
+
+def test_peer_port_exchanges_only_protocol_messages_and_parent_reply_rejects_shares() -> None:
+    """P1/P2 peer port 直接传递允许的在线 payload，endpoint reply 不可携带 share。"""
+    first_socket, second_socket = socket.socketpair()
+    metadata = ResourceMetadata(
+        "resource-0",
+        "session-0",
+        "round-0",
+        0,
+        "multiplication",
+        "D",
+        (0, 0),
+        (1,),
+        8,
+        8,
+        16,
+    )
+    first = LocalhostProtocol3PeerPort(first_socket, "P1", 1024, 1.0)
+    second = LocalhostProtocol3PeerPort(second_socket, "P2", 1024, 1.0)
+    first.bind(metadata.session_id)
+    second.bind(metadata.session_id)
+    try:
+        first_payload = ProductMaskPayload(AdditiveShare(3), AdditiveShare(5), 0)
+        second_payload = ProductMaskPayload(AdditiveShare(7), AdditiveShare(11), 1)
+        first.send_product(metadata, first_payload)
+        second.send_product(metadata, second_payload)
+        assert second.receive_product(metadata) == first_payload
+        assert first.receive_product(metadata) == second_payload
+        truncation = P2TruncationPayload(AdditiveShare(13))
+        second.send_truncation(metadata, truncation)
+        assert first.receive_truncation(metadata) == truncation
+        with pytest.raises(ValueError, match="只有 P2"):
+            first.send_truncation(metadata, truncation)
+        with pytest.raises(LocalhostCodecError):
+            WireEnvelope(
+                SCHEMA_VERSION,
+                "reply",
+                "P1",
+                "Supervisor",
+                9,
+                "endpoint",
+                metadata.session_id,
+                metadata.round_id,
+                metadata.step,
+                metadata.resource_id,
+                first_payload,
+            )
+    finally:
+        first.close()
+        second.close()
 
 
 @pytest.mark.parametrize(
@@ -228,7 +286,7 @@ def test_unknown_envelope_fields_are_rejected() -> None:
     message = json.loads(
         encode_envelope(
             WireEnvelope(
-                1,
+                SCHEMA_VERSION,
                 "hello",
                 "P1",
                 "Supervisor",
@@ -250,7 +308,7 @@ def test_unknown_envelope_fields_are_rejected() -> None:
 @pytest.mark.parametrize(
     ("field", "value"),
     (
-        ("schema_version", 2),
+            ("schema_version", 1),
         ("schema_version", True),
         ("schema_version", 1.0),
         ("kind", "unknown"),
@@ -266,7 +324,7 @@ def test_envelope_rejects_unknown_version_role_operation_and_negative_identity(
     message = json.loads(
         encode_envelope(
             WireEnvelope(
-                1,
+                SCHEMA_VERSION,
                 "hello",
                 "P1",
                 "Supervisor",

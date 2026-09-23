@@ -63,26 +63,19 @@ class Protocol3PartyEndpoint(Protocol):
     @property
     def plan(self) -> StepResourcePlan: ...
 
-    def mask_product(self, metadata: ResourceMetadata) -> ProductMaskPayload: ...
+    def mask_product(self, metadata: ResourceMetadata) -> None: ...
 
-    def finish_product(self, metadata: ResourceMetadata, peer: ProductMaskPayload) -> None: ...
+    def finish_product(self, metadata: ResourceMetadata) -> None: ...
 
     def complete_product(self, metadata: ResourceMetadata) -> None: ...
 
     def finish_products(self) -> None: ...
 
-    def mask_truncation(self, metadata: ResourceMetadata) -> TruncationMaskPayload: ...
+    def mask_truncation(self, metadata: ResourceMetadata) -> None: ...
 
-    def p2_truncation_message(
-        self, metadata: ResourceMetadata, peer: TruncationMaskPayload
-    ) -> P2TruncationPayload: ...
+    def send_truncation(self, metadata: ResourceMetadata) -> None: ...
 
-    def finish_truncation_p1(
-        self,
-        metadata: ResourceMetadata,
-        peer: TruncationMaskPayload,
-        message: P2TruncationPayload,
-    ) -> None: ...
+    def finish_truncation_p1(self, metadata: ResourceMetadata) -> None: ...
 
     def finish_truncation_p2(self, metadata: ResourceMetadata) -> None: ...
 
@@ -105,19 +98,19 @@ class Protocol3Orchestrator:
         """驱动两方完成乘法、可选截断并暂存 output/state，不提交 state。"""
         self._validate_endpoints(p1, p2, plan)
         for metadata in plan.product_resources:
-            first = p1.mask_product(metadata)
-            second = p2.mask_product(metadata)
-            p1.finish_product(metadata, second)
-            p2.finish_product(metadata, first)
+            p1.mask_product(metadata)
+            p2.mask_product(metadata)
+            p1.finish_product(metadata)
+            p2.finish_product(metadata)
             p1.complete_product(metadata)
             p2.complete_product(metadata)
         p1.finish_products()
         p2.finish_products()
         for metadata in plan.state_truncation_resources:
-            first = p1.mask_truncation(metadata)
-            second = p2.mask_truncation(metadata)
-            message = p2.p2_truncation_message(metadata, first)
-            p1.finish_truncation_p1(metadata, second, message)
+            p1.mask_truncation(metadata)
+            p2.mask_truncation(metadata)
+            p2.send_truncation(metadata)
+            p1.finish_truncation_p1(metadata)
             p2.finish_truncation_p2(metadata)
             p1.complete_truncation(metadata)
             p2.complete_truncation(metadata)
@@ -163,6 +156,120 @@ class Protocol3Orchestrator:
             raise ValueError("Protocol 3 endpoint 与资源计划的 session 不匹配。")
         if p1.plan != plan or p2.plan != plan:
             raise ValueError("Protocol 3 endpoint 必须绑定同一资源计划。")
+
+
+class Protocol3PeerPort(Protocol):
+    """仅承载 P1/P2 在线消息的传输端口，不拥有协议计算或调度。"""
+
+    def send_product(self, metadata: ResourceMetadata, payload: ProductMaskPayload) -> None: ...
+
+    def receive_product(self, metadata: ResourceMetadata) -> ProductMaskPayload: ...
+
+    def send_truncation(self, metadata: ResourceMetadata, payload: P2TruncationPayload) -> None: ...
+
+    def receive_truncation(self, metadata: ResourceMetadata) -> P2TruncationPayload: ...
+
+
+class DirectProtocol3PartyEndpoint:
+    """将既有本地数学内核与 P1↔P2 peer port 组合为无 share 回执的 endpoint。"""
+
+    def __init__(self, endpoint: LocalProtocol3PartyEndpoint, peer: Protocol3PeerPort) -> None:
+        if not isinstance(endpoint, LocalProtocol3PartyEndpoint):
+            raise TypeError("endpoint 必须是 LocalProtocol3PartyEndpoint。")
+        self._endpoint = endpoint
+        self._peer = peer
+
+    @property
+    def party(self) -> int:
+        return self._endpoint.party
+
+    @property
+    def session_id(self) -> str:
+        return self._endpoint.session_id
+
+    @property
+    def plan(self) -> StepResourcePlan:
+        return self._endpoint.plan
+
+    def mask_product(self, metadata: ResourceMetadata) -> None:
+        self._peer.send_product(metadata, self._endpoint.mask_product(metadata))
+
+    def finish_product(self, metadata: ResourceMetadata) -> None:
+        self._endpoint.finish_product(metadata, self._peer.receive_product(metadata))
+
+    def complete_product(self, metadata: ResourceMetadata) -> None:
+        self._endpoint.complete_product(metadata)
+
+    def finish_products(self) -> None:
+        self._endpoint.finish_products()
+
+    def mask_truncation(self, metadata: ResourceMetadata) -> None:
+        self._endpoint.mask_truncation(metadata)
+
+    def send_truncation(self, metadata: ResourceMetadata) -> None:
+        if self.party != 1:
+            raise ValueError("只有 P2 endpoint 可以发送截断消息。")
+        self._peer.send_truncation(
+            metadata, self._endpoint.p2_truncation_message_direct(metadata)
+        )
+
+    def finish_truncation_p1(self, metadata: ResourceMetadata) -> None:
+        if self.party != 0:
+            raise ValueError("只有 P1 endpoint 可以接收截断消息。")
+        self._endpoint.finish_truncation_p1_direct(
+            metadata, self._peer.receive_truncation(metadata)
+        )
+
+    def finish_truncation_p2(self, metadata: ResourceMetadata) -> None:
+        self._endpoint.finish_truncation_p2(metadata)
+
+    def complete_truncation(self, metadata: ResourceMetadata) -> None:
+        self._endpoint.complete_truncation(metadata)
+
+    def stage_output(self) -> Protocol3StageReceipt:
+        return self._endpoint.stage_output()
+
+    def commit(self) -> None:
+        self._endpoint.commit()
+
+
+class _InMemoryProtocol3PeerPort:
+    """单进程基线使用的 peer port；保持与直连 endpoint 相同的消息边界。"""
+
+    def __init__(self, party: int, inbox: dict[tuple[int, str, str], object]) -> None:
+        self._party = party
+        self._inbox = inbox
+
+    def send_product(self, metadata: ResourceMetadata, payload: ProductMaskPayload) -> None:
+        self._send("product", metadata, payload)
+
+    def receive_product(self, metadata: ResourceMetadata) -> ProductMaskPayload:
+        value = self._receive("product", metadata)
+        if not isinstance(value, ProductMaskPayload):
+            raise TypeError("Protocol 1 peer payload 类型错误。")
+        return value
+
+    def send_truncation(self, metadata: ResourceMetadata, payload: P2TruncationPayload) -> None:
+        self._send("truncation", metadata, payload)
+
+    def receive_truncation(self, metadata: ResourceMetadata) -> P2TruncationPayload:
+        value = self._receive("truncation", metadata)
+        if not isinstance(value, P2TruncationPayload):
+            raise TypeError("Protocol 2 peer payload 类型错误。")
+        return value
+
+    def _send(self, kind: str, metadata: ResourceMetadata, payload: object) -> None:
+        key = (1 - self._party, kind, metadata.resource_id)
+        if key in self._inbox:
+            raise ValueError("Protocol 3 peer 消息不得重复发送。")
+        self._inbox[key] = payload
+
+    def _receive(self, kind: str, metadata: ResourceMetadata) -> object:
+        key = (self._party, kind, metadata.resource_id)
+        try:
+            return self._inbox.pop(key)
+        except KeyError as error:
+            raise ValueError("Protocol 3 peer 消息顺序错误。") from error
 
 
 class LocalProtocol3PartyEndpoint:
@@ -376,6 +483,17 @@ class LocalProtocol3PartyEndpoint:
         message = truncation.p2_send_masked(masked)
         return P2TruncationPayload(message.value)
 
+    def p2_truncation_message_direct(self, metadata: ResourceMetadata) -> P2TruncationPayload:
+        """生成唯一 P2→P1 截断消息；直连路径不传输 P1 的 masked share。"""
+        if self.party != 1:
+            raise ValueError("只有 P2 endpoint 可以发送截断消息。")
+        _, truncation, masked, _ = self._truncation_entry(metadata)
+        lifecycle = masked._lifecycle
+        if 0 not in lifecycle.masked_parties:
+            lifecycle.claim_mask(0)
+        message = truncation.p2_send_masked(masked)
+        return P2TruncationPayload(message.value)
+
     def finish_truncation_p1(
         self,
         metadata: ResourceMetadata,
@@ -387,6 +505,24 @@ class LocalProtocol3PartyEndpoint:
         resource, truncation, masked, raw = self._truncation_entry(metadata)
         self._bind_truncation_peer(masked, peer)
         lifecycle = masked._lifecycle
+        if not lifecycle.p2_sent:
+            lifecycle.claim_p2_send()
+        rebound = P2MaskedMessage(message.value, lifecycle)
+        masked_value = truncation.p1_reconstruct_masked(masked, rebound)
+        self._truncated_values[metadata.index[0]] = self._role.finish_truncation_p1(
+            truncation, raw, resource, masked_value
+        )
+
+    def finish_truncation_p1_direct(
+        self, metadata: ResourceMetadata, message: P2TruncationPayload
+    ) -> None:
+        """消费 P2→P1 截断消息；对端 masked 阶段只在本地 lifecycle 中确认。"""
+        if self.party != 0 or not isinstance(message, P2TruncationPayload):
+            raise ValueError("P1 endpoint 截断消息的角色或类型错误。")
+        resource, truncation, masked, raw = self._truncation_entry(metadata)
+        lifecycle = masked._lifecycle
+        if 1 not in lifecycle.masked_parties:
+            lifecycle.claim_mask(1)
         if not lifecycle.p2_sent:
             lifecycle.claim_p2_send()
         rebound = P2MaskedMessage(message.value, lifecycle)
@@ -745,6 +881,52 @@ def dispatch_protocol3_command(
     raise ValueError(f"Protocol 3 endpoint 命令字段与操作不匹配：{operation}")
 
 
+def dispatch_direct_protocol3_command(
+    endpoint: DirectProtocol3PartyEndpoint,
+    command: Protocol3EndpointCommand,
+) -> Protocol3StageReceipt | None:
+    """执行 share-free 调度命令；peer payload 仅由 direct endpoint 的 port 处理。"""
+    if not isinstance(endpoint, DirectProtocol3PartyEndpoint):
+        raise TypeError("endpoint 必须是 DirectProtocol3PartyEndpoint。")
+    if not isinstance(command, Protocol3EndpointCommand):
+        raise TypeError("command 必须是 Protocol3EndpointCommand。")
+    operation = command.operation
+    metadata = command.metadata
+    if operation == "mask_product" and metadata is not None and _only(command, "metadata"):
+        endpoint.mask_product(metadata)
+        return None
+    if operation == "finish_product" and metadata is not None and _only(command, "metadata"):
+        endpoint.finish_product(metadata)
+        return None
+    if operation == "complete_product" and metadata is not None and _only(command, "metadata"):
+        endpoint.complete_product(metadata)
+        return None
+    if operation == "finish_products" and _only(command):
+        endpoint.finish_products()
+        return None
+    if operation == "mask_truncation" and metadata is not None and _only(command, "metadata"):
+        endpoint.mask_truncation(metadata)
+        return None
+    if operation == "send_truncation" and metadata is not None and _only(command, "metadata"):
+        endpoint.send_truncation(metadata)
+        return None
+    if operation == "finish_truncation_p1" and metadata is not None and _only(command, "metadata"):
+        endpoint.finish_truncation_p1(metadata)
+        return None
+    if operation == "finish_truncation_p2" and metadata is not None and _only(command, "metadata"):
+        endpoint.finish_truncation_p2(metadata)
+        return None
+    if operation == "complete_truncation" and metadata is not None and _only(command, "metadata"):
+        endpoint.complete_truncation(metadata)
+        return None
+    if operation == "stage_output" and _only(command):
+        return endpoint.stage_output()
+    if operation == "commit" and _only(command):
+        endpoint.commit()
+        return None
+    raise ValueError(f"直连 Protocol 3 endpoint 命令字段与操作不匹配：{operation}")
+
+
 def _only(command: Protocol3EndpointCommand, *names: str) -> bool:
     populated = {
         name
@@ -831,13 +1013,20 @@ class SingleProcessCoordinator:
                 PartyOnlineRound(online.p2_input, online.p2_resources),
                 output_messages.append,
             )
+            peer_inbox: dict[tuple[int, str, str], object] = {}
+            direct_first = DirectProtocol3PartyEndpoint(
+                first_endpoint, _InMemoryProtocol3PeerPort(0, peer_inbox)
+            )
+            direct_second = DirectProtocol3PartyEndpoint(
+                second_endpoint, _InMemoryProtocol3PeerPort(1, peer_inbox)
+            )
             orchestrator = Protocol3Orchestrator()
             orchestrator.stage(
-                first_endpoint,
-                second_endpoint,
+                direct_first,
+                direct_second,
                 online.p1_resources.plan,
             )
-            orchestrator.commit(first_endpoint, second_endpoint)
+            orchestrator.commit(direct_first, direct_second)
             if len(output_messages) != 2:
                 raise RuntimeError("Protocol 3 未生成两条 control share 消息。")
             output = output_messages[0], output_messages[1]

@@ -201,6 +201,38 @@ class _ProcessSession:
         return response.payload
 
 
+@dataclass(slots=True)
+class _ParentProtocol3Relay:
+    """保留 #16 的 IPC share 转发；不被 localhost 直连路径使用。"""
+
+    products: dict[tuple[int, str], ProductMaskPayload]
+    truncations: dict[tuple[int, str], TruncationMaskPayload]
+    messages: dict[str, P2TruncationPayload]
+
+    def __init__(self) -> None:
+        self.products = {}
+        self.truncations = {}
+        self.messages = {}
+
+    def product(self, party: int, metadata: ResourceMetadata) -> ProductMaskPayload:
+        try:
+            return self.products[(party, metadata.resource_id)]
+        except KeyError as error:
+            raise ProcessProtocolError("乘法 peer 消息顺序错误。") from error
+
+    def truncation(self, party: int, metadata: ResourceMetadata) -> TruncationMaskPayload:
+        try:
+            return self.truncations[(party, metadata.resource_id)]
+        except KeyError as error:
+            raise ProcessProtocolError("截断 peer 消息顺序错误。") from error
+
+    def message(self, metadata: ResourceMetadata) -> P2TruncationPayload:
+        try:
+            return self.messages[metadata.resource_id]
+        except KeyError as error:
+            raise ProcessProtocolError("P2 截断消息顺序错误。") from error
+
+
 class _RemoteProtocol3Endpoint:
     """把统一 Protocol 3 endpoint 调用映射为单个角色的 IPC 请求。"""
 
@@ -210,12 +242,14 @@ class _RemoteProtocol3Endpoint:
         party: Literal[0, 1],
         plan: StepResourcePlan,
         timeout: float,
+        relay: _ParentProtocol3Relay,
     ) -> None:
         self._session = session
         self._party = party
         self._role: Literal["P1", "P2"] = "P1" if party == 0 else "P2"
         self._plan = plan
         self._timeout = timeout
+        self._relay = relay
 
     @property
     def party(self) -> int:
@@ -238,15 +272,19 @@ class _RemoteProtocol3Endpoint:
             step=self._plan.step,
         )
 
-    def mask_product(self, metadata: ResourceMetadata) -> ProductMaskPayload:
+    def mask_product(self, metadata: ResourceMetadata) -> None:
         result = self._request(Protocol3EndpointCommand("mask_product", metadata=metadata))
         if not isinstance(result, ProductMaskPayload):
             raise ProcessProtocolError(f"{self._role} 返回了非法乘法遮蔽消息。")
-        return result
+        self._relay.products[(self.party, metadata.resource_id)] = result
 
-    def finish_product(self, metadata: ResourceMetadata, peer: ProductMaskPayload) -> None:
+    def finish_product(self, metadata: ResourceMetadata) -> None:
         self._request(
-            Protocol3EndpointCommand("finish_product", metadata=metadata, product_mask=peer)
+            Protocol3EndpointCommand(
+                "finish_product",
+                metadata=metadata,
+                product_mask=self._relay.product(1 - self.party, metadata),
+            )
         )
 
     def complete_product(self, metadata: ResourceMetadata) -> None:
@@ -255,36 +293,35 @@ class _RemoteProtocol3Endpoint:
     def finish_products(self) -> None:
         self._request(Protocol3EndpointCommand("finish_products"))
 
-    def mask_truncation(self, metadata: ResourceMetadata) -> TruncationMaskPayload:
+    def mask_truncation(self, metadata: ResourceMetadata) -> None:
         result = self._request(Protocol3EndpointCommand("mask_truncation", metadata=metadata))
         if not isinstance(result, TruncationMaskPayload):
             raise ProcessProtocolError(f"{self._role} 返回了非法截断遮蔽消息。")
-        return result
+        self._relay.truncations[(self.party, metadata.resource_id)] = result
 
-    def p2_truncation_message(
-        self, metadata: ResourceMetadata, peer: TruncationMaskPayload
-    ) -> P2TruncationPayload:
+    def send_truncation(self, metadata: ResourceMetadata) -> None:
+        if self.party != 1:
+            raise ProcessProtocolError("只有 P2 可以发送截断消息。")
         result = self._request(
             Protocol3EndpointCommand(
-                "p2_truncation_message", metadata=metadata, truncation_mask=peer
+                "p2_truncation_message",
+                metadata=metadata,
+                truncation_mask=self._relay.truncation(0, metadata),
             )
         )
         if not isinstance(result, P2TruncationPayload):
             raise ProcessProtocolError("P2 返回了非法截断消息。")
-        return result
+        self._relay.messages[metadata.resource_id] = result
 
-    def finish_truncation_p1(
-        self,
-        metadata: ResourceMetadata,
-        peer: TruncationMaskPayload,
-        message: P2TruncationPayload,
-    ) -> None:
+    def finish_truncation_p1(self, metadata: ResourceMetadata) -> None:
+        if self.party != 0:
+            raise ProcessProtocolError("只有 P1 可以接收截断消息。")
         self._request(
             Protocol3EndpointCommand(
                 "finish_truncation_p1",
                 metadata=metadata,
-                truncation_mask=peer,
-                p2_truncation=message,
+                truncation_mask=self._relay.truncation(1, metadata),
+                p2_truncation=self._relay.message(metadata),
             )
         )
 
@@ -414,8 +451,9 @@ class MultiprocessingSecureStateSpaceRuntime:
             )
             if not isinstance(plan, StepResourcePlan):
                 raise ProcessProtocolError("Client 返回了非法资源计划。")
-            first = _RemoteProtocol3Endpoint(session, 0, plan, self._timeouts.step)
-            second = _RemoteProtocol3Endpoint(session, 1, plan, self._timeouts.step)
+            relay = _ParentProtocol3Relay()
+            first = _RemoteProtocol3Endpoint(session, 0, plan, self._timeouts.step, relay)
+            second = _RemoteProtocol3Endpoint(session, 1, plan, self._timeouts.step, relay)
             first.begin()
             second.begin()
             orchestrator = Protocol3Orchestrator()

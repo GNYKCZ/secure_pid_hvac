@@ -96,10 +96,11 @@ runtime builder 注入点显式选择该后端，默认装配保持不变。单�
 层同一个 Protocol 3 orchestrator 调度，execution worker 仅做 IPC 分派。详见
 [多进程安全执行](multiprocessing_execution.md)。
 
-Issue #17 的 `LocalhostSecureStateSpaceRuntime` 保持相同三角色与唯一 orchestrator，只把角色 RPC
-和 Client 单方材料通道映射到 `127.0.0.1` TCP。固定版本 codec、长度前缀、任意精度整数、绝对
-deadline 与 fail-closed lifecycle 位于 `execution`；`simulation` 不导入或分支判断 socket，
-`protocol` 也不反向依赖网络。详见 [localhost 通信传输](localhost_transport.md)。
+Issue #17/#66 的 `LocalhostSecureStateSpaceRuntime` 保持相同三角色与唯一 orchestrator：角色 RPC
+和 Client 单方材料通道映射到 `127.0.0.1` TCP，P1/P2 在线 Protocol 1/2 消息则经专用 peer TCP
+通道直接交换。固定版本 codec、长度前缀、任意精度整数、绝对 deadline 与 fail-closed lifecycle
+位于 `execution`；`simulation` 不导入或分支判断 socket，`protocol` 也不反向依赖网络。详见
+[localhost 通信传输](localhost_transport.md)。
 
 依赖素数域前提的 Protocol 2 统一调用 `crypto.primes`。该模块对 64 位范围执行确定性 MR64，
 对更大模数只接受本地可复核的递归 Pocklington 证据；它不读取 YAML 或访问网络。证据只沿

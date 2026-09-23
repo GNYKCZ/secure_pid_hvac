@@ -31,7 +31,7 @@ from secure_control.protocol.messages import (
     TruncationResourceMaterial,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _ROLES = {"Supervisor", "Client", "P1", "P2"}
 _KINDS = {"hello", "ready", "request", "reply", "error", "shutdown"}
 _OPERATIONS = {
@@ -44,6 +44,8 @@ _OPERATIONS = {
     "endpoint",
     "reconstruct",
     "control_share",
+    "peer_product",
+    "peer_truncation",
     "shutdown",
 }
 _CANONICAL_INTEGER = re.compile(r"(?:0|-[1-9][0-9]*|[1-9][0-9]*)\Z")
@@ -733,13 +735,11 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
     elif key == ("request", "endpoint"):
         expected = (Protocol3EndpointCommand,)
     elif key == ("reply", "endpoint"):
-        expected = (
-            ProductMaskPayload,
-            TruncationMaskPayload,
-            P2TruncationPayload,
-            Protocol3StageReceipt,
-            type(None),
-        )
+        expected = (Protocol3StageReceipt, type(None))
+    elif key == ("request", "peer_product"):
+        expected = (ProductMaskPayload,)
+    elif key == ("request", "peer_truncation"):
+        expected = (P2TruncationPayload,)
     elif key == ("reply", "reconstruct"):
         expected = (np.ndarray,)
     elif key == ("request", "offline"):

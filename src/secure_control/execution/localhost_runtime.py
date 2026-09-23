@@ -22,18 +22,16 @@ from secure_control.protocol import (
 )
 from secure_control.protocol.coordinator import Protocol3Orchestrator
 from secure_control.protocol.messages import (
-    P2TruncationPayload,
-    ProductMaskPayload,
     Protocol3EndpointCommand,
     Protocol3StageReceipt,
     ResourceMetadata,
     StepResourcePlan,
-    TruncationMaskPayload,
 )
 
 from ._inputs import normalize_step_input
 from ._localhost_workers import localhost_client_worker, localhost_role_worker
 from .localhost_codec import (
+    SCHEMA_VERSION,
     HelloPayload,
     ReadyPayload,
     RemoteErrorPayload,
@@ -170,7 +168,7 @@ class _LocalhostSession:
         self.sequences[role] += 1
         kind: Literal["request", "shutdown"] = "shutdown" if operation == "shutdown" else "request"
         request = WireEnvelope(
-            1,
+            SCHEMA_VERSION,
             kind,
             "Supervisor",
             role,
@@ -282,16 +280,11 @@ class _SocketProtocol3Endpoint:
             step=self._plan.step,
         )
 
-    def mask_product(self, metadata: ResourceMetadata) -> ProductMaskPayload:
-        result = self._request(Protocol3EndpointCommand("mask_product", metadata=metadata))
-        if not isinstance(result, ProductMaskPayload):
-            raise LocalhostProtocolError(f"{self._role} 返回了非法乘法遮蔽消息。")
-        return result
+    def mask_product(self, metadata: ResourceMetadata) -> None:
+        self._request(Protocol3EndpointCommand("mask_product", metadata=metadata))
 
-    def finish_product(self, metadata: ResourceMetadata, peer: ProductMaskPayload) -> None:
-        self._request(
-            Protocol3EndpointCommand("finish_product", metadata=metadata, product_mask=peer)
-        )
+    def finish_product(self, metadata: ResourceMetadata) -> None:
+        self._request(Protocol3EndpointCommand("finish_product", metadata=metadata))
 
     def complete_product(self, metadata: ResourceMetadata) -> None:
         self._request(Protocol3EndpointCommand("complete_product", metadata=metadata))
@@ -299,38 +292,14 @@ class _SocketProtocol3Endpoint:
     def finish_products(self) -> None:
         self._request(Protocol3EndpointCommand("finish_products"))
 
-    def mask_truncation(self, metadata: ResourceMetadata) -> TruncationMaskPayload:
-        result = self._request(Protocol3EndpointCommand("mask_truncation", metadata=metadata))
-        if not isinstance(result, TruncationMaskPayload):
-            raise LocalhostProtocolError(f"{self._role} 返回了非法截断遮蔽消息。")
-        return result
+    def mask_truncation(self, metadata: ResourceMetadata) -> None:
+        self._request(Protocol3EndpointCommand("mask_truncation", metadata=metadata))
 
-    def p2_truncation_message(
-        self, metadata: ResourceMetadata, peer: TruncationMaskPayload
-    ) -> P2TruncationPayload:
-        result = self._request(
-            Protocol3EndpointCommand(
-                "p2_truncation_message", metadata=metadata, truncation_mask=peer
-            )
-        )
-        if not isinstance(result, P2TruncationPayload):
-            raise LocalhostProtocolError("P2 返回了非法截断消息。")
-        return result
+    def send_truncation(self, metadata: ResourceMetadata) -> None:
+        self._request(Protocol3EndpointCommand("send_truncation", metadata=metadata))
 
-    def finish_truncation_p1(
-        self,
-        metadata: ResourceMetadata,
-        peer: TruncationMaskPayload,
-        message: P2TruncationPayload,
-    ) -> None:
-        self._request(
-            Protocol3EndpointCommand(
-                "finish_truncation_p1",
-                metadata=metadata,
-                truncation_mask=peer,
-                p2_truncation=message,
-            )
-        )
+    def finish_truncation_p1(self, metadata: ResourceMetadata) -> None:
+        self._request(Protocol3EndpointCommand("finish_truncation_p1", metadata=metadata))
 
     def finish_truncation_p2(self, metadata: ResourceMetadata) -> None:
         self._request(Protocol3EndpointCommand("finish_truncation_p2", metadata=metadata))
@@ -533,6 +502,7 @@ class LocalhostSecureStateSpaceRuntime:
         context = mp.get_context("spawn")
         nonce = secrets.token_hex(32)
         data_listeners: dict[Literal["P1", "P2"], socket.socket] = {}
+        peer_listener: socket.socket | None = None
         processes: dict[Role, BaseProcess] = {}
         controls: dict[Role, socket.socket] = {}
         startup_timeout = self._transport.timeouts.startup
@@ -541,6 +511,11 @@ class LocalhostSecureStateSpaceRuntime:
                 "P1": create_listener("127.0.0.1", 0, backlog=1),
                 "P2": create_listener("127.0.0.1", 0, backlog=1),
             }
+            peer_listener = create_listener("127.0.0.1", 0, backlog=1)
+            peer_address = (
+                str(peer_listener.getsockname()[0]),
+                int(peer_listener.getsockname()[1]),
+            )
             party_addresses = tuple(
                 (
                     str(data_listeners[role].getsockname()[0]),
@@ -575,6 +550,8 @@ class LocalhostSecureStateSpaceRuntime:
                         0,
                         self._address,
                         data_listeners["P1"],
+                        peer_listener,
+                        None,
                         nonce,
                         self._fixed_point,
                         self._range_contract,
@@ -593,6 +570,8 @@ class LocalhostSecureStateSpaceRuntime:
                         1,
                         self._address,
                         data_listeners["P2"],
+                        None,
+                        peer_address,
                         nonce,
                         self._fixed_point,
                         self._range_contract,
@@ -609,6 +588,7 @@ class LocalhostSecureStateSpaceRuntime:
                 process.start()
             for listener in data_listeners.values():
                 listener.close()
+            peer_listener.close()
             startup_deadline = deadline_after(startup_timeout)
             while len(controls) < 3:
                 connection = accept_loopback(self._listener, deadline=startup_deadline)
@@ -664,6 +644,11 @@ class LocalhostSecureStateSpaceRuntime:
             for listener in data_listeners.values():
                 try:
                     listener.close()
+                except OSError:
+                    pass
+            if peer_listener is not None:
+                try:
+                    peer_listener.close()
                 except OSError:
                     pass
             for process in processes.values():

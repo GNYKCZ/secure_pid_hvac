@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 
 from secure_control.core import ControllerScaleMetadata, ControllerSpec
-from secure_control.crypto import AdditiveShare, FixedPointContext, TwoPartySharing
+from secure_control.crypto import FixedPointContext, TwoPartySharing
 from secure_control.execution import (
     ControllerRuntime,
     MultiprocessingSecureStateSpaceRuntime,
@@ -32,13 +32,10 @@ from secure_control.experiments.multiprocessing_runner import run_multiprocessin
 from secure_control.protocol import Client, ControllerRangeContract
 from secure_control.protocol.coordinator import Protocol3Orchestrator
 from secure_control.protocol.messages import (
-    P2TruncationPayload,
     PartyOnlineRound,
-    ProductMaskPayload,
     Protocol3StageReceipt,
     ResourceMetadata,
     StepResourcePlan,
-    TruncationMaskPayload,
 )
 
 
@@ -122,11 +119,10 @@ class _RecordingEndpoint:
         suffix = "" if metadata is None else f":{metadata.resource_id}"
         self._events.append(f"P{self.party + 1}.{operation}{suffix}")
 
-    def mask_product(self, metadata: ResourceMetadata) -> ProductMaskPayload:
+    def mask_product(self, metadata: ResourceMetadata) -> None:
         self._record("mask_product", metadata)
-        return ProductMaskPayload(AdditiveShare(0), AdditiveShare(0), self.party)
 
-    def finish_product(self, metadata: ResourceMetadata, peer: ProductMaskPayload) -> None:
+    def finish_product(self, metadata: ResourceMetadata) -> None:
         self._record("finish_product", metadata)
 
     def complete_product(self, metadata: ResourceMetadata) -> None:
@@ -135,22 +131,13 @@ class _RecordingEndpoint:
     def finish_products(self) -> None:
         self._record("finish_products")
 
-    def mask_truncation(self, metadata: ResourceMetadata) -> TruncationMaskPayload:
+    def mask_truncation(self, metadata: ResourceMetadata) -> None:
         self._record("mask_truncation", metadata)
-        return TruncationMaskPayload(AdditiveShare(0), self.party)
 
-    def p2_truncation_message(
-        self, metadata: ResourceMetadata, peer: TruncationMaskPayload
-    ) -> P2TruncationPayload:
-        self._record("p2_truncation_message", metadata)
-        return P2TruncationPayload(AdditiveShare(0))
+    def send_truncation(self, metadata: ResourceMetadata) -> None:
+        self._record("send_truncation", metadata)
 
-    def finish_truncation_p1(
-        self,
-        metadata: ResourceMetadata,
-        peer: TruncationMaskPayload,
-        message: P2TruncationPayload,
-    ) -> None:
+    def finish_truncation_p1(self, metadata: ResourceMetadata) -> None:
         self._record("finish_truncation_p1", metadata)
 
     def finish_truncation_p2(self, metadata: ResourceMetadata) -> None:
@@ -424,7 +411,7 @@ def test_protocol3_orchestrator_has_one_explicit_message_order() -> None:
             [
                 f"P1.mask_truncation:{metadata.resource_id}",
                 f"P2.mask_truncation:{metadata.resource_id}",
-                f"P2.p2_truncation_message:{metadata.resource_id}",
+                    f"P2.send_truncation:{metadata.resource_id}",
                 f"P1.finish_truncation_p1:{metadata.resource_id}",
                 f"P2.finish_truncation_p2:{metadata.resource_id}",
                 f"P1.complete_truncation:{metadata.resource_id}",
