@@ -24,6 +24,7 @@ from secure_control.execution import (
     LocalhostStateError,
     LocalhostTimeoutError,
     MultiprocessingSecureStateSpaceRuntime,
+    localhost_runtime,
 )
 from secure_control.execution._localhost_peer import LocalhostProtocol3PeerPort
 from secure_control.execution.localhost_codec import (
@@ -39,10 +40,12 @@ from secure_control.execution.localhost_codec import (
 from secure_control.execution.localhost_transport import (
     LocalhostTimeouts,
     LocalhostTransportConfig,
+    LocalhostTransportDisconnected,
     LocalhostTransportProtocolError,
     LocalhostTransportTimeout,
     deadline_after,
     receive_frame,
+    send_envelope,
     send_frame,
 )
 from secure_control.experiments.localhost_runner import run_localhost_comparison
@@ -204,6 +207,171 @@ def test_peer_port_exchanges_only_protocol_messages_and_parent_reply_rejects_sha
     finally:
         first.close()
         second.close()
+
+
+@pytest.mark.parametrize(
+    ("kind", "operation", "sender", "recipient", "payload", "accepted"),
+    (
+        ("request", "peer_product", "P1", "P2", ProductMaskPayload(AdditiveShare(1), AdditiveShare(2), 0), True),
+        ("request", "peer_product", "P2", "P1", ProductMaskPayload(AdditiveShare(1), AdditiveShare(2), 1), True),
+        ("request", "peer_product", "P1", "Supervisor", ProductMaskPayload(AdditiveShare(1), AdditiveShare(2), 0), False),
+        ("request", "peer_product", "P1", "Client", ProductMaskPayload(AdditiveShare(1), AdditiveShare(2), 0), False),
+        ("reply", "peer_product", "P1", "P2", ProductMaskPayload(AdditiveShare(1), AdditiveShare(2), 0), False),
+        ("request", "peer_truncation", "P2", "P1", P2TruncationPayload(AdditiveShare(1)), True),
+        ("request", "peer_truncation", "P1", "P2", P2TruncationPayload(AdditiveShare(1)), False),
+        ("request", "peer_truncation", "P2", "Supervisor", P2TruncationPayload(AdditiveShare(1)), False),
+        ("request", "peer_truncation", "P2", "Client", P2TruncationPayload(AdditiveShare(1)), False),
+        ("reply", "peer_truncation", "P2", "P1", P2TruncationPayload(AdditiveShare(1)), False),
+        ("request", "peer_product", "P2", "P1", P2TruncationPayload(AdditiveShare(1)), False),
+        ("request", "peer_truncation", "P2", "P1", ProductMaskPayload(AdditiveShare(1), AdditiveShare(2), 1), False),
+    ),
+)
+def test_codec_enforces_schema_v2_peer_direction_matrix(
+    kind: str, operation: str, sender: str, recipient: str, payload: object, accepted: bool
+) -> None:
+    """schema owner 必须在解码前拒绝进入 Supervisor/Client 的在线 peer payload。"""
+    envelope = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": kind,
+        "sender": sender,
+        "recipient": recipient,
+        "sequence": 1,
+        "operation": operation,
+        "session_id": "session-0",
+        "round_id": "round-0",
+        "step": 0,
+        "resource_id": "resource-0",
+        "payload": json.loads(encode_wire_value(payload)),
+    }
+    encoded = json.dumps(envelope, separators=(",", ":")).encode()
+    if accepted:
+        assert decode_envelope(encoded).payload == payload
+    else:
+        with pytest.raises(LocalhostCodecError):
+            decode_envelope(encoded)
+
+
+@pytest.mark.parametrize(
+    ("sequence", "operation", "round_id", "step", "resource_id", "payload"),
+    (
+        (0, "peer_product", "round-0", 0, "resource-0", ProductMaskPayload(AdditiveShare(3), AdditiveShare(5), 1)),
+        (2, "peer_product", "round-0", 0, "resource-0", ProductMaskPayload(AdditiveShare(3), AdditiveShare(5), 1)),
+        (1, "peer_product", "other-round", 0, "resource-0", ProductMaskPayload(AdditiveShare(3), AdditiveShare(5), 1)),
+        (1, "peer_product", "round-0", 1, "resource-0", ProductMaskPayload(AdditiveShare(3), AdditiveShare(5), 1)),
+        (1, "peer_product", "round-0", 0, "other-resource", ProductMaskPayload(AdditiveShare(3), AdditiveShare(5), 1)),
+        (1, "peer_truncation", "round-0", 0, "resource-0", P2TruncationPayload(AdditiveShare(7))),
+    ),
+)
+def test_peer_port_rejects_bad_sequence_identity_and_operation(
+    sequence: int, operation: str, round_id: str, step: int, resource_id: str, payload: object
+) -> None:
+    """peer port 的接收边界拒绝错序、错资源与错误的 Protocol 2/1 操作替换。"""
+    receiver, sender = socket.socketpair()
+    metadata = _peer_metadata()
+    port = LocalhostProtocol3PeerPort(receiver, "P1", 1024, 1.0)
+    port.bind(metadata.session_id)
+    try:
+        send_envelope(
+            sender,
+            WireEnvelope(
+                SCHEMA_VERSION,
+                "request",
+                "P2",
+                "P1",
+                sequence,
+                operation,
+                metadata.session_id,
+                round_id,
+                step,
+                resource_id,
+                payload,  # type: ignore[arg-type]
+            ),
+            deadline=deadline_after(1.0),
+            limit=1024,
+        )
+        with pytest.raises(ValueError, match="顺序、方向或 identity"):
+            port.receive_product(metadata)
+    finally:
+        port.close()
+        sender.close()
+
+
+def test_peer_port_rejects_duplicate_sequence_after_a_valid_message() -> None:
+    """消费过的 peer sequence 不能因 duplicate payload 被再次接受。"""
+    receiver, sender = socket.socketpair()
+    metadata = _peer_metadata()
+    port = LocalhostProtocol3PeerPort(receiver, "P1", 1024, 1.0)
+    port.bind(metadata.session_id)
+    payload = ProductMaskPayload(AdditiveShare(3), AdditiveShare(5), 1)
+    try:
+        for _ in range(2):
+            send_envelope(
+                sender,
+                WireEnvelope(
+                    SCHEMA_VERSION,
+                    "request",
+                    "P2",
+                    "P1",
+                    1,
+                    "peer_product",
+                    metadata.session_id,
+                    metadata.round_id,
+                    metadata.step,
+                    metadata.resource_id,
+                    payload,
+                ),
+                deadline=deadline_after(1.0),
+                limit=1024,
+            )
+        assert port.receive_product(metadata) == payload
+        with pytest.raises(ValueError, match="顺序、方向或 identity"):
+            port.receive_product(metadata)
+    finally:
+        port.close()
+        sender.close()
+
+
+def test_peer_port_disconnect_and_timeout_are_bounded() -> None:
+    """peer 断开或静默不产生回退；调用方获得 transport 异常以触发 session fail-closed。"""
+    receiver, sender = socket.socketpair()
+    metadata = _peer_metadata()
+    disconnected = LocalhostProtocol3PeerPort(receiver, "P1", 1024, 1.0)
+    disconnected.bind(metadata.session_id)
+    sender.close()
+    try:
+        with pytest.raises(LocalhostTransportDisconnected):
+            disconnected.receive_product(metadata)
+    finally:
+        disconnected.close()
+
+    receiver, sender = socket.socketpair()
+    timed_out = LocalhostProtocol3PeerPort(receiver, "P1", 1024, 0.02)
+    timed_out.bind(metadata.session_id)
+    started = time.monotonic()
+    try:
+        with pytest.raises(LocalhostTransportTimeout):
+            timed_out.receive_product(metadata)
+        assert time.monotonic() - started < 0.5
+    finally:
+        timed_out.close()
+        sender.close()
+
+
+def _peer_metadata() -> ResourceMetadata:
+    """构造不依赖 controller 的最小合法 Protocol 1 resource identity。"""
+    return ResourceMetadata(
+        "resource-0",
+        "session-0",
+        "round-0",
+        0,
+        "multiplication",
+        "D",
+        (0, 0),
+        (1,),
+        8,
+        8,
+        16,
+    )
 
 
 @pytest.mark.parametrize(
@@ -526,6 +694,47 @@ def test_disconnect_and_step_timeout_fail_closed_and_reap_every_role() -> None:
     assert timeout_pids.isdisjoint(
         {process.pid for process in mp.active_children() if process.pid is not None}
     )
+
+
+def test_peer_timeout_fails_closed_without_resource_reuse_and_reset_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P1 在直连 peer 超时后必须废弃整组角色；只有 reset 可创建全新材料 session。"""
+    runtime = _runtime(
+        transport=LocalhostTransportConfig(
+            timeouts=LocalhostTimeouts(startup=10.0, step=0.2, shutdown=5.0)
+        )
+    )
+    original_orchestrator = localhost_runtime.Protocol3Orchestrator
+    original_pids = {item.pid for item in runtime.topology.roles}
+
+    class _PeerTimeoutOrchestrator:
+        def stage(self, p1: object, _: object, plan: object) -> object:
+            metadata = plan.product_resources[0]  # type: ignore[union-attr]
+            p1.mask_product(metadata)  # type: ignore[union-attr]
+            return p1.finish_product(metadata)  # type: ignore[union-attr]
+
+    monkeypatch.setattr(localhost_runtime, "Protocol3Orchestrator", _PeerTimeoutOrchestrator)
+    try:
+        # peer 与父端请求共用同一 step deadline；父端可先观察到 timeout，
+        # 但无论先后都必须使本轮和整组角色 fail closed。
+        with pytest.raises(LocalhostExecutionError):
+            runtime.step(0.0)
+        assert runtime.resource_counts == {"products_consumed": 0, "truncations_consumed": 0}
+        assert all(item.status == "failed" for item in runtime.topology.roles)
+        assert original_pids.isdisjoint(
+            {process.pid for process in mp.active_children() if process.pid is not None}
+        )
+        with pytest.raises(LocalhostStateError, match="已失败"):
+            runtime.step(0.0)
+
+        monkeypatch.setattr(localhost_runtime, "Protocol3Orchestrator", original_orchestrator)
+        runtime.reset()
+        assert original_pids.isdisjoint({item.pid for item in runtime.topology.roles})
+        assert runtime.step(0.0).shape == (1,)
+    finally:
+        monkeypatch.setattr(localhost_runtime, "Protocol3Orchestrator", original_orchestrator)
+        runtime.close()
 
 
 def test_partial_startup_failure_and_import_have_no_resource_side_effects() -> None:
