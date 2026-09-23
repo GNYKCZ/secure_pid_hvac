@@ -18,6 +18,7 @@ wheels/
 .vscode/
 .idea/
 .env
+.tmp/
 
 # Generated experiment outputs
 results/csv/*

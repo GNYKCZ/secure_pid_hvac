@@ -11,7 +11,8 @@ GitHub 仓库和发行包继续使用 `secure_pid_hvac` / `secure-pid-hvac`，Py
 当前已完成架构基础、一阶与 2R2C HVAC 明文基线、安全算术原语与组合验证门、通用
 Client/P1/P2 单进程协议核心、与明文接口兼容的通用安全状态空间运行时，以及领域无关 simulation engine 和
 180 步 HVAC 明文/安全双闭环。现已提供显式选择的本机 multiprocessing 后端与仅绑定 loopback
-的 localhost TCP 后端；默认安全运行时不变。
+的 localhost TCP 后端；默认安全运行时不变。另有独立三角色、双向 TLS 的单步 LAN 命令入口；
+其本机示例、部署和未完成的真实三机验收见 [LAN 单步试验](docs/lan_single_step.md)。
 现已提供显式场景选择的实验入口与通用 CSV/metadata/config 产物。
 
 ## 架构边界

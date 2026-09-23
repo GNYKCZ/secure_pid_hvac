@@ -187,6 +187,20 @@ class HvacComparison:
         return self.legacy_segment_metrics_secure
 
 
+@dataclass(frozen=True, slots=True)
+class HvacLanSingleStep:
+    """冻结 HVAC k=0 的通用协议参数和 raw-control 对照，不创建本机安全进程。"""
+
+    spec: ControllerSpec
+    fixed_point: FixedPointContext
+    range_contract: ControllerRangeContract
+    security_parameter: int
+    modulus_evidence: PrimeModulusEvidence | None
+    controller_input: np.ndarray
+    expected_raw_output: np.ndarray
+    config_sha256: str
+
+
 def _safe_lineage_member(parent: Path, value: object, name: str) -> Path:
     """只接受同目录普通非链接文件，避免 lineage 路径改变 source authority。"""
     if not isinstance(value, str) or not value or Path(value).name != value:
@@ -636,6 +650,32 @@ class HvacScenario:
             sample_times=np.array(contract.timing.sample_times_seconds, dtype=float),
             ideal=ideal,
             secure=secure,
+        )
+
+    def build_lan_single_step(self) -> HvacLanSingleStep:
+        """只装配首个采样的 Client 输入；沿用现有 adapter 和更新前输出约定。"""
+        self._validate_safety_certificate()
+        plain_spec, secure_spec = self._controller_specs()
+        contract = self._contract
+        adapter = HvacSignalAdapter(contract)
+        plant = build_hvac_plant(contract)
+        time = float(contract.timing.sample_times_seconds[0])
+        controller_input = adapter.controller_input(adapter.reference_at(time), plant.output())
+        expected_raw = PlaintextStateSpaceRuntime(plain_spec).step(controller_input)
+        range_contract = ControllerRangeContract(
+            state_payload_bounds=self.safety_certificate.state_payload_bounds,
+            input_payload_bounds=self.safety_certificate.input_payload_bounds,
+            horizon_steps=self._horizon_steps,
+        )
+        return HvacLanSingleStep(
+            secure_spec,
+            self._fixed_point,
+            range_contract,
+            self._security_parameter,
+            self._modulus_evidence,
+            controller_input,
+            expected_raw,
+            self._wrapper_source_hash,
         )
 
     def metrics(self, result: SimulationResult) -> HvacComparison:

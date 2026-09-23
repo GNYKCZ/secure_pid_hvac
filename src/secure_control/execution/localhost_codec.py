@@ -39,6 +39,9 @@ _OPERATIONS = {
     "ready",
     "offline",
     "online",
+    "lan_hello",
+    "lan_ready",
+    "lan_setup",
     "step",
     "endpoint",
     "peer_product",
@@ -91,6 +94,28 @@ class RemoteErrorPayload:
 
     error_type: str
     message: str
+
+
+@dataclass(frozen=True, slots=True)
+class LanHelloPayload:
+    """mTLS 建立后对单步 LAN 模式、拓扑和新鲜 session nonce 再绑定。"""
+
+    profile_sha256: str
+    nonce: str
+    mode: Literal["lan-single-step-v1"] = "lan-single-step-v1"
+
+
+@dataclass(frozen=True, slots=True)
+class LanSetupPayload:
+    """离线分享前传给单方的公开数值上下文，不含 controller 或随机材料。"""
+
+    modulus: int
+    integer_bits: int
+    fractional_bits: int
+    security_parameter: int
+    state_payload_bounds: tuple[int, ...]
+    input_payload_bounds: tuple[int, ...]
+    horizon_steps: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +176,8 @@ WirePayload = (
     | ControlShareMessage
     | ClientStepResult
     | PartyStageResult
+    | LanHelloPayload
+    | LanSetupPayload
     | None
 )
 
@@ -291,6 +318,24 @@ def _encode_value(value: object) -> object:
         }
     if isinstance(value, RemoteErrorPayload):
         return {"type": "remote_error", "error_type": value.error_type, "message": value.message}
+    if isinstance(value, LanHelloPayload):
+        return {
+            "type": "lan_hello",
+            "profile_sha256": value.profile_sha256,
+            "nonce": value.nonce,
+            "mode": value.mode,
+        }
+    if isinstance(value, LanSetupPayload):
+        return {
+            "type": "lan_setup",
+            "modulus": _decimal(value.modulus),
+            "integer_bits": value.integer_bits,
+            "fractional_bits": value.fractional_bits,
+            "security_parameter": value.security_parameter,
+            "state_payload_bounds": list(value.state_payload_bounds),
+            "input_payload_bounds": list(value.input_payload_bounds),
+            "horizon_steps": value.horizon_steps,
+        }
     if isinstance(value, ClientStepResult):
         return {
             "type": "client_step_result",
@@ -514,6 +559,44 @@ def _decode_value(value: object) -> object:
         return RemoteErrorPayload(
             _text(mapping["error_type"], "error_type", maximum=128),
             _text(mapping["message"], "message", maximum=1024),
+        )
+    if kind == "lan_hello":
+        _exact_fields(mapping, {"type", "profile_sha256", "nonce", "mode"}, kind)
+        mode = _text(mapping["mode"], "mode")
+        if mode != "lan-single-step-v1":
+            raise LocalhostCodecError("不支持的 LAN 模式。")
+        return LanHelloPayload(
+            _required_sha256(mapping["profile_sha256"], "profile_sha256"),
+            _required_sha256(mapping["nonce"], "nonce"),
+            mode,
+        )
+    if kind == "lan_setup":
+        _exact_fields(
+            mapping,
+            {
+                "type",
+                "modulus",
+                "integer_bits",
+                "fractional_bits",
+                "security_parameter",
+                "state_payload_bounds",
+                "input_payload_bounds",
+                "horizon_steps",
+            },
+            kind,
+        )
+        return LanSetupPayload(
+            _positive_decimal(mapping["modulus"], "modulus"),
+            _positive(mapping["integer_bits"], "integer_bits"),
+            _nonnegative(mapping["fractional_bits"], "fractional_bits"),
+            _positive(mapping["security_parameter"], "security_parameter"),
+            _integer_tuple(
+                mapping["state_payload_bounds"], "state_payload_bounds", nonnegative=True
+            ),
+            _integer_tuple(
+                mapping["input_payload_bounds"], "input_payload_bounds", nonnegative=True
+            ),
+            _positive(mapping["horizon_steps"], "horizon_steps"),
         )
     if kind == "client_step_result":
         _exact_fields(
@@ -803,10 +886,19 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
         ("hello", "hello"): to_supervisor | to_party | peer,
         ("ready", "ready"): to_supervisor,
         ("error", "ready"): to_supervisor,
+        ("hello", "lan_hello"): to_party | to_client | peer,
+        ("request", "lan_ready"): to_party,
+        ("reply", "lan_ready"): to_client,
+        ("error", "lan_ready"): to_client,
+        ("request", "lan_setup"): to_party,
+        ("reply", "lan_setup"): to_client,
+        ("error", "lan_setup"): to_client,
         ("request", "step"): {("Supervisor", "Client")},
         ("reply", "step"): {("Client", "Supervisor")},
         ("error", "step"): {("Client", "Supervisor")},
         ("request", "offline"): to_party,
+        ("reply", "offline"): to_client,
+        ("error", "offline"): to_client,
         ("request", "online"): to_party,
         ("reply", "online"): to_client,
         ("error", "online"): to_client,
@@ -832,6 +924,8 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
     expected: tuple[type[object], ...] | None
     if key == ("hello", "hello"):
         expected = (HelloPayload,)
+    elif key == ("hello", "lan_hello"):
+        expected = (LanHelloPayload,)
     elif key == ("ready", "ready"):
         expected = (ReadyPayload,)
     elif message.kind == "error":
@@ -850,9 +944,22 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
         expected = (P2TruncationPayload,)
     elif key == ("request", "offline"):
         expected = (PartyOfflineMaterial,)
+    elif key == ("request", "lan_setup"):
+        expected = (LanSetupPayload,)
     elif key == ("request", "online"):
         expected = (PartyOnlineMaterial,)
-    elif key in {("reply", "online"), ("reply", "shutdown")} or message.kind == "shutdown":
+    elif (
+        key
+        in {
+            ("request", "lan_ready"),
+            ("reply", "lan_ready"),
+            ("reply", "lan_setup"),
+            ("reply", "offline"),
+            ("reply", "online"),
+            ("reply", "shutdown"),
+        }
+        or message.kind == "shutdown"
+    ):
         expected = (type(None),)
     else:
         expected = None
@@ -1107,6 +1214,13 @@ def _optional_sha256(value: object, name: str) -> str | None:
     digest = _text(value, name, maximum=64)
     if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
         raise LocalhostCodecError(f"{name} 必须是 64 位小写十六进制字符串。")
+    return digest
+
+
+def _required_sha256(value: object, name: str) -> str:
+    digest = _optional_sha256(value, name)
+    if digest is None:
+        raise LocalhostCodecError(f"{name} 必须是 SHA-256 摘要。")
     return digest
 
 

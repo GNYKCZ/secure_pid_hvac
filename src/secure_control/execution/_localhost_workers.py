@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import random
 import socket
+from collections.abc import Callable
 from typing import Literal
 
 import numpy as np
@@ -65,6 +66,7 @@ class _ClientPartyEndpoint:
         sequence: int,
         limit: int,
         timeout: float,
+        deadline: float | None = None,
     ) -> None:
         self._sock = sock
         self._party = party
@@ -73,6 +75,7 @@ class _ClientPartyEndpoint:
         self.sequence = sequence
         self._limit = limit
         self._timeout = timeout
+        self._deadline = deadline
         self.share: ControlShareMessage | None = None
 
     @property
@@ -140,7 +143,7 @@ class _ClientPartyEndpoint:
             command,
         )
         self.sequence += 1
-        deadline = deadline_after(self._timeout)
+        deadline = self._deadline if self._deadline is not None else deadline_after(self._timeout)
         send_envelope(self._sock, request, deadline=deadline, limit=self._limit)
         response = receive_envelope(self._sock, deadline=deadline, limit=self._limit)
         _validate_party_reply(response, request)
@@ -713,10 +716,13 @@ def _complete_client_round(
     first: _ClientPartyEndpoint,
     second: _ClientPartyEndpoint,
     plan: StepResourcePlan,
+    on_phase: Callable[[str], None] | None = None,
 ) -> ClientStepResult:
     """仅在两方暂存、重构与双提交均完成后签发父进程可见结果。"""
     orchestrator = Protocol3Orchestrator()
     receipts = orchestrator.stage(first, second, plan)
+    if on_phase is not None:
+        on_phase("stage")
     shares = (first.share, second.share)
     if not all(isinstance(share, ControlShareMessage) for share in shares):
         raise ValueError("Client 未收到两份暂存控制份额。")
@@ -724,8 +730,12 @@ def _complete_client_round(
     result = np.asarray(output, dtype=float)
     if result.shape != plan.output_shape or not np.isfinite(result).all():
         raise ValueError("Client 重构输出 shape 或有限性不合法。")
+    if on_phase is not None:
+        on_phase("reconstruct")
     # P2 提交或回执不确定时不能返回结果；调用方必须废弃整组角色。
     orchestrator.commit(first, second)
+    if on_phase is not None:
+        on_phase("commit")
     return ClientStepResult(
         result, plan.round_id, plan.step, receipts[0].products, receipts[0].truncations
     )

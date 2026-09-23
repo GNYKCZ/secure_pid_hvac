@@ -272,6 +272,22 @@ def test_localhost_layers_preserve_transport_only_boundaries() -> None:
     assert "dispatch_direct_protocol3_command" in worker_source
 
 
+def test_lan_entry_keeps_scenario_and_transport_boundaries() -> None:
+    """LAN 仅在实验入口装配 HVAC，不放宽旧 localhost 或协议数学层。"""
+    execution = PACKAGE_ROOT / "execution"
+    for name in ("lan_config.py", "lan_transport.py", "lan_runtime.py"):
+        path = execution / name
+        assert not any(
+            module.startswith("secure_control.scenarios") for module in imported_modules(path)
+        )
+    transport = (execution / "lan_transport.py").read_text(encoding="utf-8")
+    assert "CERT_REQUIRED" in transport and "TLSv1_3" in transport
+    assert "CERT_NONE" not in transport
+    assert "LocalhostTransportConfig" not in transport
+    runner = PACKAGE_ROOT / "experiments" / "lan_runner.py"
+    assert "secure_control.scenarios.hvac.integration" in imported_modules(runner)
+
+
 def test_localhost_and_multiprocessing_share_protocol_authorities() -> None:
     """两种隔离 backend 复用同一 command dispatcher 和唯一 orchestrator。"""
     execution = PACKAGE_ROOT / "execution"
