@@ -12,15 +12,18 @@ controller、state、input 和一次性资源 share，并接收各自的 control
 这两份原始 share。
 
 Issue #66 将在线 P1/P2 消息改为专用全双工 loopback TCP 通道：P1 监听、P2 连接，并在启动时用
-一次性 nonce 确认角色。父进程仍由唯一的 `protocol.coordinator.Protocol3Orchestrator` 调度阶段，
-但 `endpoint` command 与 reply 不携带 share。每个 Protocol 1 资源由 P1/P2 双向交换
+一次性 nonce 确认角色。Issue #67 将唯一的 `protocol.coordinator.Protocol3Orchestrator` 放在
+Client 进程中运行；父进程每轮只发送一次 `step` 请求并接收双角色提交后的公开结果。
+Client 经私有通道发送单方在线材料和不带 share 的 `endpoint` command，接收各方暂存回执与
+各自的 control share。每个 Protocol 1 资源由 P1/P2 双向交换
 `ProductMaskPayload`；Protocol 2 只发送 P2→P1 的 `P2TruncationPayload`，不发送 P1 的截断
-masked share。localhost worker 只做 framing、严格 codec、单条 command 分派和清理，不拥有矩阵
-遍历、Beaver/Trunc 顺序或 lifecycle。nonce 只用于避免启动串线，不能视为密码学认证。
+masked share。localhost worker 只负责 Client 编排、framing、严格 codec、单条 command 分派和清理；
+矩阵遍历、Beaver/Trunc 顺序及资源生命周期仍由 protocol 层拥有。nonce 只用于避免启动串线，
+不能视为密码学认证。
 
 ## Wire 契约
 
-- schema version 固定为 `2`，未知版本直接失败，不协商降级；
+- schema version 固定为 `3`，未知版本直接失败，不协商降级；v2 的父进程逐阶段调度信封不可混用；
 - envelope 明确 kind、sender、recipient、单调 sequence、operation、session、round、step 与
   resource identity，并拒绝未知、重复、缺失字段和非法组合；
 - payload 为 canonical UTF-8 JSON 的固定类型 union，不使用 pickle、`eval` 或动态类型导入；
@@ -33,6 +36,11 @@ masked share。localhost worker 只做 framing、严格 codec、单条 command �
 
 transport-safe offline/online material 只包含单方数值 share 和不可变 identity。接收角色在 protocol
 边界建立本地 owner/lifecycle；wire 和 execution codec 都不能提供或恢复远端声明的消费状态。
+在线状态依次为 `READY(k) → PREPARED(k) → STAGED(k) → RECONSTRUCTED(k) →
+COMMITTING(k) → READY(k+1)`。Client 先确认两方暂存与重构，再按 P1、P2 顺序确认提交；
+只有两份提交回执都通过，才返回公开输出、round/step 和资源计数。父进程看不到资源计划、
+endpoint command、两份原始 share 或任一单方提交回执。任一在线错误、断开、超时或提交回执
+不确定均进入失败状态，不能在旧 session 重试；`reset()` 才建立新的三角色 session。
 
 ## Timeout、失败与生命周期
 
@@ -41,6 +49,7 @@ transport-safe offline/online material 只包含单方数值 share 和不可变 
 截断帧、非法 JSON、错误角色/顺序/identity、disconnect 和远端异常都会 fail closed：整组三角色
 连接和进程被有界关闭，不在提交状态不确定时自动重连或继续旧 session。
 
+正常 `close()` 由父进程请求 Client 关闭，Client 再经私有通道关闭 P1/P2；异常时父进程有界终止整组。
 `reset()` 复用 supervisor listener，先让 replacement trio 完整 ready，再替换旧 session；启动失败
 时旧 session 仍可使用。`close()` 幂等，关闭后释放 listener 端口。`topology` 只公开 loopback
 host/port、角色 PID 和状态；`resource_counts` 只统计成功提交的逻辑资源。

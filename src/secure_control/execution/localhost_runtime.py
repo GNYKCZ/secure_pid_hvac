@@ -20,18 +20,12 @@ from secure_control.protocol import (
     ControllerRangeVerification,
     ControllerScaleLedger,
 )
-from secure_control.protocol.coordinator import Protocol3Orchestrator
-from secure_control.protocol.messages import (
-    Protocol3EndpointCommand,
-    Protocol3StageReceipt,
-    ResourceMetadata,
-    StepResourcePlan,
-)
 
 from ._inputs import normalize_step_input
 from ._localhost_workers import localhost_client_worker, localhost_role_worker
 from .localhost_codec import (
     SCHEMA_VERSION,
+    ClientStepResult,
     HelloPayload,
     ReadyPayload,
     RemoteErrorPayload,
@@ -243,92 +237,6 @@ class _LocalhostSession:
         return response.payload
 
 
-class _SocketProtocol3Endpoint:
-    """把统一 Protocol 3 endpoint 调用映射为一条 localhost typed command。"""
-
-    def __init__(
-        self,
-        session: _LocalhostSession,
-        party: Literal[0, 1],
-        plan: StepResourcePlan,
-        timeout: float,
-    ) -> None:
-        self._session = session
-        self._party = party
-        self._role: Literal["P1", "P2"] = "P1" if party == 0 else "P2"
-        self._plan = plan
-        self._timeout = timeout
-
-    @property
-    def party(self) -> int:
-        return self._party
-
-    @property
-    def session_id(self) -> str:
-        return self._session.session_id
-
-    @property
-    def plan(self) -> StepResourcePlan:
-        return self._plan
-
-    def begin(self) -> None:
-        self._session.request(
-            self._role,
-            "begin",
-            self._timeout,
-            round_id=self._plan.round_id,
-            step=self._plan.step,
-        )
-
-    def mask_product(self, metadata: ResourceMetadata) -> None:
-        self._request(Protocol3EndpointCommand("mask_product", metadata=metadata))
-
-    def finish_product(self, metadata: ResourceMetadata) -> None:
-        self._request(Protocol3EndpointCommand("finish_product", metadata=metadata))
-
-    def complete_product(self, metadata: ResourceMetadata) -> None:
-        self._request(Protocol3EndpointCommand("complete_product", metadata=metadata))
-
-    def finish_products(self) -> None:
-        self._request(Protocol3EndpointCommand("finish_products"))
-
-    def mask_truncation(self, metadata: ResourceMetadata) -> None:
-        self._request(Protocol3EndpointCommand("mask_truncation", metadata=metadata))
-
-    def send_truncation(self, metadata: ResourceMetadata) -> None:
-        self._request(Protocol3EndpointCommand("send_truncation", metadata=metadata))
-
-    def finish_truncation_p1(self, metadata: ResourceMetadata) -> None:
-        self._request(Protocol3EndpointCommand("finish_truncation_p1", metadata=metadata))
-
-    def finish_truncation_p2(self, metadata: ResourceMetadata) -> None:
-        self._request(Protocol3EndpointCommand("finish_truncation_p2", metadata=metadata))
-
-    def complete_truncation(self, metadata: ResourceMetadata) -> None:
-        self._request(Protocol3EndpointCommand("complete_truncation", metadata=metadata))
-
-    def stage_output(self) -> Protocol3StageReceipt:
-        result = self._request(Protocol3EndpointCommand("stage_output"))
-        if not isinstance(result, Protocol3StageReceipt):
-            raise LocalhostProtocolError(f"{self._role} 返回了非法暂存回执。")
-        return result
-
-    def commit(self) -> None:
-        self._request(Protocol3EndpointCommand("commit"))
-
-    def _request(self, command: Protocol3EndpointCommand) -> object:
-        resource_id = command.metadata.resource_id if command.metadata is not None else None
-        return self._session.request(
-            self._role,
-            "endpoint",
-            self._timeout,
-            round_id=self._plan.round_id,
-            step=self._plan.step,
-            resource_id=resource_id,
-            payload=command,
-        )
-
-
 class LocalhostSecureStateSpaceRuntime:
     """经 localhost TCP 运行 Client/P1/P2，保持通用 ``step(v)`` contract。"""
 
@@ -430,34 +338,20 @@ class LocalhostSecureStateSpaceRuntime:
         session = self._session
         timeout = self._transport.timeouts.step
         try:
-            plan = session.request(
+            response = session.request(
                 "Client",
-                "prepare",
+                "step",
                 timeout,
                 step=self._step_index,
                 payload=input_vector,
             )
-            if not isinstance(plan, StepResourcePlan):
-                raise LocalhostProtocolError("Client 返回了非法资源计划。")
-            first = _SocketProtocol3Endpoint(session, 0, plan, timeout)
-            second = _SocketProtocol3Endpoint(session, 1, plan, timeout)
-            first.begin()
-            second.begin()
-            orchestrator = Protocol3Orchestrator()
-            receipts = orchestrator.stage(first, second, plan)
-            output = session.request(
-                "Client",
-                "reconstruct",
-                timeout,
-                round_id=plan.round_id,
-                step=self._step_index,
-            )
-            orchestrator.commit(first, second)
-            result = np.array(output, dtype=float, copy=True)
+            if not isinstance(response, ClientStepResult) or response.step != self._step_index:
+                raise LocalhostProtocolError("Client 返回的单步结果或 step 不合法。")
+            result = np.array(response.output, dtype=float, copy=True)
             if result.shape != (self._spec.output_dimension,) or not np.isfinite(result).all():
                 raise LocalhostProtocolError("Client 返回的控制输出 shape 或有限性不合法。")
-            self._product_count += receipts[0].products
-            self._truncation_count += receipts[0].truncations
+            self._product_count += response.products
+            self._truncation_count += response.truncations
             self._step_index += 1
             return result
         except Exception:
@@ -703,7 +597,7 @@ class LocalhostSecureStateSpaceRuntime:
         timeout = self._transport.timeouts.shutdown
         if not session.failed:
             pending: list[tuple[Role, WireEnvelope]] = []
-            for role in ("Client", "P1", "P2"):
+            for role in ("Client",):
                 try:
                     pending.append((role, session.send(role, "shutdown", timeout)))
                 except LocalhostExecutionError:

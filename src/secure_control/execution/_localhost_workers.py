@@ -7,12 +7,15 @@ import random
 import socket
 from typing import Literal
 
+import numpy as np
+
 from secure_control.core import ControllerSpec
 from secure_control.crypto import FixedPointContext, PrimeModulusEvidence, TwoPartySharing
 from secure_control.protocol import P1, P2, Client, ControllerRangeContract
 from secure_control.protocol.coordinator import (
     DirectProtocol3PartyEndpoint,
     LocalProtocol3PartyEndpoint,
+    Protocol3Orchestrator,
     dispatch_direct_protocol3_command,
     rehydrate_offline_material,
     rehydrate_online_material,
@@ -24,12 +27,17 @@ from secure_control.protocol.messages import (
     PartyOnlineMaterial,
     PartyOnlineRound,
     Protocol3EndpointCommand,
+    Protocol3StageReceipt,
+    ResourceMetadata,
+    StepResourcePlan,
 )
 
 from ._localhost_peer import LocalhostProtocol3PeerPort, accept_p1_peer, connect_p2_peer
 from .localhost_codec import (
     SCHEMA_VERSION,
+    ClientStepResult,
     HelloPayload,
+    PartyStageResult,
     ReadyPayload,
     RemoteErrorPayload,
     WireEnvelope,
@@ -44,6 +52,120 @@ from .localhost_transport import (
 
 Address = tuple[str, int]
 RoleName = Literal["Client", "P1", "P2"]
+
+
+class _ClientPartyEndpoint:
+    """Client 私有通道上的单方 Protocol 3 endpoint；只传调度命令和回执。"""
+
+    def __init__(
+        self,
+        sock: socket.socket,
+        party: Literal[0, 1],
+        plan: StepResourcePlan,
+        sequence: int,
+        limit: int,
+        timeout: float,
+    ) -> None:
+        self._sock = sock
+        self._party = party
+        self._role: Literal["P1", "P2"] = "P1" if party == 0 else "P2"
+        self._plan = plan
+        self.sequence = sequence
+        self._limit = limit
+        self._timeout = timeout
+        self.share: ControlShareMessage | None = None
+
+    @property
+    def party(self) -> int:
+        return self._party
+
+    @property
+    def session_id(self) -> str:
+        return self._plan.session_id
+
+    @property
+    def plan(self) -> StepResourcePlan:
+        return self._plan
+
+    def mask_product(self, metadata: ResourceMetadata) -> None:
+        self._command("mask_product", metadata)
+
+    def finish_product(self, metadata: ResourceMetadata) -> None:
+        self._command("finish_product", metadata)
+
+    def complete_product(self, metadata: ResourceMetadata) -> None:
+        self._command("complete_product", metadata)
+
+    def finish_products(self) -> None:
+        self._command("finish_products")
+
+    def mask_truncation(self, metadata: ResourceMetadata) -> None:
+        self._command("mask_truncation", metadata)
+
+    def send_truncation(self, metadata: ResourceMetadata) -> None:
+        self._command("send_truncation", metadata)
+
+    def finish_truncation_p1(self, metadata: ResourceMetadata) -> None:
+        self._command("finish_truncation_p1", metadata)
+
+    def finish_truncation_p2(self, metadata: ResourceMetadata) -> None:
+        self._command("finish_truncation_p2", metadata)
+
+    def complete_truncation(self, metadata: ResourceMetadata) -> None:
+        self._command("complete_truncation", metadata)
+
+    def stage_output(self) -> Protocol3StageReceipt:
+        result = self._command("stage_output")
+        if not isinstance(result, PartyStageResult):
+            raise TypeError("角色未返回暂存回执和单方输出份额。")
+        self.share = result.share
+        return result.receipt
+
+    def commit(self) -> None:
+        self._command("commit")
+
+    def _command(self, operation: str, metadata: ResourceMetadata | None = None) -> object:
+        command = Protocol3EndpointCommand(operation, metadata=metadata)
+        request = WireEnvelope(
+            SCHEMA_VERSION,
+            "request",
+            "Client",
+            self._role,
+            self.sequence,
+            "endpoint",
+            self._plan.session_id,
+            self._plan.round_id,
+            self._plan.step,
+            metadata.resource_id if metadata is not None else None,
+            command,
+        )
+        self.sequence += 1
+        deadline = deadline_after(self._timeout)
+        send_envelope(self._sock, request, deadline=deadline, limit=self._limit)
+        response = receive_envelope(self._sock, deadline=deadline, limit=self._limit)
+        _validate_party_reply(response, request)
+        if operation != "stage_output" and response.payload is not None:
+            raise ValueError("非暂存操作不得返回输出份额或其他 payload。")
+        return response.payload
+
+
+def _validate_party_reply(response: WireEnvelope, request: WireEnvelope) -> None:
+    if (
+        response.sender != request.recipient
+        or response.recipient != "Client"
+        or response.sequence != request.sequence
+        or response.operation != request.operation
+        or (response.session_id, response.round_id, response.step, response.resource_id)
+        != (request.session_id, request.round_id, request.step, request.resource_id)
+    ):
+        raise ValueError("单方回执的方向、顺序或 round identity 不匹配。")
+    if response.kind == "error" and isinstance(response.payload, RemoteErrorPayload):
+        raise RuntimeError(
+            f"{response.sender}.{response.operation} 失败："
+            f"{response.payload.error_type}: {response.payload.message}"
+        )
+    if response.kind != "reply":
+        raise ValueError("单方未返回 reply 或受限 error。")
 
 
 def localhost_client_worker(
@@ -65,7 +187,7 @@ def localhost_client_worker(
     control: socket.socket | None = None
     parties: tuple[socket.socket, socket.socket] | None = None
     distribution_session: str | None = None
-    current: OnlineRound | None = None
+    ready_sent = False
     try:
         startup_deadline = deadline_after(startup_timeout)
         control = connect_loopback(control_address, deadline=startup_deadline)
@@ -130,7 +252,10 @@ def localhost_client_worker(
             startup_deadline,
             max_frame_bytes,
         )
+        ready_sent = True
         expected_sequence = 2
+        party_sequences = [2, 2]
+        expected_step = 0
         while True:
             request = receive_envelope(
                 control,
@@ -141,78 +266,96 @@ def localhost_client_worker(
             expected_sequence += 1
             try:
                 if request.operation == "shutdown":
+                    for party, sock in enumerate(parties):
+                        role_name: Literal["P1", "P2"] = "P1" if party == 0 else "P2"
+                        shutdown = WireEnvelope(
+                            SCHEMA_VERSION,
+                            "shutdown",
+                            "Client",
+                            role_name,
+                            party_sequences[party],
+                            "shutdown",
+                            distribution.session_id,
+                            None,
+                            None,
+                            None,
+                        )
+                        deadline = deadline_after(shutdown_timeout)
+                        send_envelope(sock, shutdown, deadline=deadline, limit=max_frame_bytes)
+                        answer = receive_envelope(sock, deadline=deadline, limit=max_frame_bytes)
+                        _validate_party_reply(answer, shutdown)
                     _send_reply(control, request, None, max_frame_bytes, shutdown_timeout)
                     return
-                if request.operation == "prepare":
-                    if current is not None:
-                        raise RuntimeError("前一 round 尚未结束。")
-                    if request.round_id is not None:
-                        raise ValueError("prepare 请求不得预先指定 round identity。")
-                    current = client.prepare_online(
+                if request.operation == "step":
+                    if request.round_id is not None or request.step != expected_step:
+                        raise ValueError("Client 单步请求的 round 或 step identity 不匹配。")
+                    current: OnlineRound = client.prepare_online(
                         distribution,
                         request.payload,
-                        step=request.step if request.step is not None else -1,
+                        step=expected_step,
                         rng=material_rng,
                     )
-                    _send_reply(
-                        control,
-                        request,
-                        current.p1_resources.plan,
-                        max_frame_bytes,
-                        step_timeout,
-                    )
+                    plan = current.p1_resources.plan
+                    if current.p2_resources.plan != plan:
+                        raise ValueError("两方在线资源计划不一致。")
+                    endpoints: list[_ClientPartyEndpoint] = []
                     for party, online in enumerate(
                         (
                             PartyOnlineRound(current.p1_input, current.p1_resources),
                             PartyOnlineRound(current.p2_input, current.p2_resources),
                         )
                     ):
-                        _send_data(
+                        online_request = WireEnvelope(
+                            SCHEMA_VERSION,
+                            "request",
+                            "Client",
+                            "P1" if party == 0 else "P2",
+                            party_sequences[party],
+                            "online",
+                            current.session_id,
+                            current.round_id,
+                            current.step,
+                            None,
+                            PartyOnlineMaterial.from_round(online),
+                        )
+                        deadline = deadline_after(step_timeout)
+                        send_envelope(
                             parties[party],
-                            WireEnvelope(
-                                SCHEMA_VERSION,
-                                "request",
-                                "Client",
-                                "P1" if party == 0 else "P2",
-                                2 + current.step,
-                                "online",
-                                current.session_id,
-                                current.round_id,
-                                current.step,
-                                None,
-                                PartyOnlineMaterial.from_round(online),
-                            ),
-                            deadline_after(step_timeout),
-                            max_frame_bytes,
+                            online_request,
+                            deadline=deadline,
+                            limit=max_frame_bytes,
                         )
-                    continue
-                if request.operation == "reconstruct":
-                    if current is None:
-                        raise RuntimeError("没有可重构的当前 round。")
-                    identity = (current.session_id, current.round_id, current.step)
-                    if (request.session_id, request.round_id, request.step) != identity:
-                        raise ValueError("reconstruct 请求的 round 或 step identity 不匹配。")
-                    outputs = tuple(
-                        _receive_control_share(
-                            sock,
-                            party,
-                            identity,
-                            current.step + 1,
-                            max_frame_bytes,
-                            step_timeout,
+                        answer = receive_envelope(
+                            parties[party], deadline=deadline, limit=max_frame_bytes
                         )
-                        for party, sock in enumerate(parties)
+                        _validate_party_reply(answer, online_request)
+                        endpoints.append(
+                            _ClientPartyEndpoint(
+                                parties[party],
+                                party,
+                                plan,
+                                party_sequences[party] + 1,
+                                max_frame_bytes,
+                                step_timeout,
+                            )
+                        )
+                    result = _complete_client_round(client, endpoints[0], endpoints[1], plan)
+                    party_sequences = [item.sequence for item in endpoints]
+                    expected_step += 1
+                    _send_reply(
+                        control,
+                        request,
+                        result,
+                        max_frame_bytes,
+                        step_timeout,
                     )
-                    output = client.reconstruct_control(outputs[0], outputs[1])
-                    current = None
-                    _send_reply(control, request, output, max_frame_bytes, step_timeout)
                     continue
                 raise ValueError(f"Client 不支持操作：{request.operation}")
             except Exception as error:  # noqa: BLE001 - wire 边界必须返回受限角色错误
                 _send_error(control, request, error, max_frame_bytes, step_timeout)
                 return
     except Exception as error:  # noqa: BLE001 - 启动失败必须尽力通知 supervisor
-        if control is not None:
+        if control is not None and not ready_sent:
             _send_startup_error(
                 control,
                 "Client",
@@ -248,6 +391,7 @@ def localhost_role_worker(
     control: socket.socket | None = None
     client_channel: socket.socket | None = None
     session_id: str | None = None
+    ready_sent = False
     endpoint: LocalProtocol3PartyEndpoint | None = None
     direct_endpoint: DirectProtocol3PartyEndpoint | None = None
     peer: LocalhostProtocol3PeerPort | None = None
@@ -314,62 +458,61 @@ def localhost_role_worker(
             startup_deadline,
             max_frame_bytes,
         )
+        ready_sent = True
         expected_sequence = 2
+        expected_step = 0
         while True:
             request = receive_envelope(
-                control,
+                client_channel,
                 deadline=deadline_after(24 * 60 * 60),
                 limit=max_frame_bytes,
             )
-            _validate_control_request(request, role_name, expected_sequence, role.session_id)
+            if (
+                request.sender != "Client"
+                or request.recipient != role_name
+                or request.sequence != expected_sequence
+                or request.session_id != role.session_id
+                or request.kind != ("shutdown" if request.operation == "shutdown" else "request")
+            ):
+                raise ValueError("单方私有通道请求的方向、顺序或 session 不匹配。")
             expected_sequence += 1
             try:
                 if request.operation == "shutdown":
-                    _send_reply(control, request, None, max_frame_bytes, shutdown_timeout)
+                    if request.step is not None or request.round_id is not None:
+                        raise ValueError("shutdown 不得携带 round identity。")
+                    _send_reply(client_channel, request, None, max_frame_bytes, shutdown_timeout)
                     return
-                if request.operation == "begin":
+                if request.operation == "online":
                     if endpoint is not None:
                         raise RuntimeError("前一 round 尚未提交。")
-                    online_envelope = receive_envelope(
-                        client_channel,
-                        deadline=deadline_after(step_timeout),
-                        limit=max_frame_bytes,
-                    )
-                    expected_data_sequence = 2 + (request.step if request.step is not None else -1)
                     if (
-                        online_envelope.kind != "request"
-                        or online_envelope.sender != "Client"
-                        or online_envelope.recipient != role_name
-                        or online_envelope.sequence != expected_data_sequence
-                        or online_envelope.operation != "online"
-                        or not isinstance(online_envelope.payload, PartyOnlineMaterial)
-                        or (
-                            online_envelope.session_id,
-                            online_envelope.round_id,
-                            online_envelope.step,
-                        )
-                        != (request.session_id, request.round_id, request.step)
+                        not isinstance(request.payload, PartyOnlineMaterial)
+                        or request.step != expected_step
+                        or request.round_id is None
+                        or request.resource_id is not None
                     ):
                         raise ValueError("Server 在线材料信封顺序或 identity 不匹配。")
                     online = rehydrate_online_material(
-                        online_envelope.payload,
+                        request.payload,
                         modulus=fixed_point.modulus,
                         security_parameter=security_parameter,
                         modulus_evidence=modulus_evidence,
                     )
+                    staged_shares: list[ControlShareMessage] = []
                     endpoint = LocalProtocol3PartyEndpoint(
                         role,
                         online,
-                        lambda message: _send_control_share(
-                            client_channel,
-                            role_name,
-                            message,
-                            max_frame_bytes,
-                            step_timeout,
+                        lambda message, collected=staged_shares: _capture_stage_share(
+                            message, collected
                         ),
                     )
                     direct_endpoint = DirectProtocol3PartyEndpoint(endpoint, peer)
-                    _send_reply(control, request, None, max_frame_bytes, step_timeout)
+                    if (endpoint.plan.round_id, endpoint.plan.step) != (
+                        request.round_id,
+                        request.step,
+                    ):
+                        raise ValueError("在线材料与信封的 round identity 不匹配。")
+                    _send_reply(client_channel, request, None, max_frame_bytes, step_timeout)
                     continue
                 if (
                     request.operation != "endpoint"
@@ -383,15 +526,20 @@ def localhost_role_worker(
                 ):
                     raise ValueError("角色请求的 round 或 step identity 不匹配。")
                 result = dispatch_direct_protocol3_command(direct_endpoint, request.payload)
+                if request.payload.operation == "stage_output":
+                    if not isinstance(result, Protocol3StageReceipt) or len(staged_shares) != 1:
+                        raise ValueError("角色暂存未产生唯一输出份额。")
+                    result = PartyStageResult(result, staged_shares[0])
                 if request.payload.operation == "commit":
                     endpoint = None
                     direct_endpoint = None
-                _send_reply(control, request, result, max_frame_bytes, step_timeout)
+                    expected_step += 1
+                _send_reply(client_channel, request, result, max_frame_bytes, step_timeout)
             except Exception as error:  # noqa: BLE001 - wire 边界必须返回受限角色错误
-                _send_error(control, request, error, max_frame_bytes, step_timeout)
+                _send_error(client_channel, request, error, max_frame_bytes, step_timeout)
                 return
     except Exception as error:  # noqa: BLE001 - 启动失败必须尽力通知 supervisor
-        if control is not None:
+        if control is not None and not ready_sent:
             _send_startup_error(control, role_name, session_id, error, max_frame_bytes)
     finally:
         _close_socket(control)
@@ -552,55 +700,35 @@ def _send_startup_error(
         return
 
 
-def _send_control_share(
-    sock: socket.socket,
-    role: Literal["P1", "P2"],
-    message: ControlShareMessage,
-    limit: int,
-    timeout: float,
+def _capture_stage_share(
+    message: ControlShareMessage, collected: list[ControlShareMessage]
 ) -> None:
-    _send_data(
-        sock,
-        WireEnvelope(
-            SCHEMA_VERSION,
-            "request",
-            role,
-            "Client",
-            message.step + 1,
-            "control_share",
-            message.session_id,
-            message.round_id,
-            message.step,
-            None,
-            message,
-        ),
-        deadline_after(timeout),
-        limit,
+    if collected:
+        raise ValueError("角色不得重复暂存控制份额。")
+    collected.append(message)
+
+
+def _complete_client_round(
+    client: Client,
+    first: _ClientPartyEndpoint,
+    second: _ClientPartyEndpoint,
+    plan: StepResourcePlan,
+) -> ClientStepResult:
+    """仅在两方暂存、重构与双提交均完成后签发父进程可见结果。"""
+    orchestrator = Protocol3Orchestrator()
+    receipts = orchestrator.stage(first, second, plan)
+    shares = (first.share, second.share)
+    if not all(isinstance(share, ControlShareMessage) for share in shares):
+        raise ValueError("Client 未收到两份暂存控制份额。")
+    output = client.reconstruct_control(shares[0], shares[1])
+    result = np.asarray(output, dtype=float)
+    if result.shape != plan.output_shape or not np.isfinite(result).all():
+        raise ValueError("Client 重构输出 shape 或有限性不合法。")
+    # P2 提交或回执不确定时不能返回结果；调用方必须废弃整组角色。
+    orchestrator.commit(first, second)
+    return ClientStepResult(
+        result, plan.round_id, plan.step, receipts[0].products, receipts[0].truncations
     )
-
-
-def _receive_control_share(
-    sock: socket.socket,
-    party: int,
-    identity: tuple[str, str, int],
-    sequence: int,
-    limit: int,
-    timeout: float,
-) -> ControlShareMessage:
-    message = receive_envelope(sock, deadline=deadline_after(timeout), limit=limit)
-    role: Literal["P1", "P2"] = "P1" if party == 0 else "P2"
-    if (
-        message.kind != "request"
-        or message.sender != role
-        or message.recipient != "Client"
-        or message.sequence != sequence
-        or message.operation != "control_share"
-        or (message.session_id, message.round_id, message.step) != identity
-        or not isinstance(message.payload, ControlShareMessage)
-        or message.payload.sender != party
-    ):
-        raise ValueError("control share wire identity 不匹配。")
-    return message.payload
 
 
 def _send_data(
