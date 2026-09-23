@@ -282,7 +282,8 @@ def test_localhost_and_multiprocessing_share_protocol_authorities() -> None:
     assert "dispatch_protocol3_command" in multiprocessing_worker
     assert "dispatch_direct_protocol3_command" in localhost_worker
     assert "Protocol3Orchestrator" in multiprocessing_runtime
-    assert "Protocol3Orchestrator" in localhost_runtime
+    assert "Protocol3Orchestrator" in localhost_worker
+    assert "Protocol3Orchestrator" not in localhost_runtime
 
     for path in python_files("protocol"):
         modules = imported_modules(path)

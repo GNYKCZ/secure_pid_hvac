@@ -31,7 +31,7 @@ from secure_control.protocol.messages import (
     TruncationResourceMaterial,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _ROLES = {"Supervisor", "Client", "P1", "P2"}
 _KINDS = {"hello", "ready", "request", "reply", "error", "shutdown"}
 _OPERATIONS = {
@@ -39,11 +39,8 @@ _OPERATIONS = {
     "ready",
     "offline",
     "online",
-    "prepare",
-    "begin",
+    "step",
     "endpoint",
-    "reconstruct",
-    "control_share",
     "peer_product",
     "peer_truncation",
     "shutdown",
@@ -96,6 +93,48 @@ class RemoteErrorPayload:
     message: str
 
 
+@dataclass(frozen=True, slots=True)
+class ClientStepResult:
+    """双角色均确认提交后返回给父进程的公开单步结果。"""
+
+    output: np.ndarray[Any, Any]
+    round_id: str
+    step: int
+    products: int
+    truncations: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.output, np.ndarray) or self.output.ndim != 1:
+            raise ValueError("Client 输出必须是一维数组。")
+        if self.output.dtype.kind != "f" or not np.isfinite(self.output).all():
+            raise ValueError("Client 输出必须是有限浮点数组。")
+        _text(self.round_id, "round_id")
+        _require_nonnegative_integer(self.step, "step")
+        _require_nonnegative_integer(self.products, "products")
+        _require_nonnegative_integer(self.truncations, "truncations")
+
+
+@dataclass(frozen=True, slots=True)
+class PartyStageResult:
+    """仅在 Client 私有通道返回的单方暂存回执和输出 share。"""
+
+    receipt: Protocol3StageReceipt
+    share: ControlShareMessage
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.receipt, Protocol3StageReceipt) or not isinstance(
+            self.share, ControlShareMessage
+        ):
+            raise TypeError("暂存结果必须包含回执与控制份额。")
+        if (
+            self.receipt.party,
+            self.receipt.session_id,
+            self.receipt.round_id,
+            self.receipt.step,
+        ) != (self.share.sender, self.share.session_id, self.share.round_id, self.share.step):
+            raise ValueError("暂存回执与控制份额 identity 不匹配。")
+
+
 WirePayload = (
     HelloPayload
     | ReadyPayload
@@ -110,6 +149,8 @@ WirePayload = (
     | PartyOfflineMaterial
     | PartyOnlineMaterial
     | ControlShareMessage
+    | ClientStepResult
+    | PartyStageResult
     | None
 )
 
@@ -250,6 +291,21 @@ def _encode_value(value: object) -> object:
         }
     if isinstance(value, RemoteErrorPayload):
         return {"type": "remote_error", "error_type": value.error_type, "message": value.message}
+    if isinstance(value, ClientStepResult):
+        return {
+            "type": "client_step_result",
+            "output": _encode_value(value.output),
+            "round_id": value.round_id,
+            "step": value.step,
+            "products": value.products,
+            "truncations": value.truncations,
+        }
+    if isinstance(value, PartyStageResult):
+        return {
+            "type": "party_stage_result",
+            "receipt": _encode_value(value.receipt),
+            "share": _encode_value(value.share),
+        }
     if isinstance(value, np.ndarray):
         array = np.asarray(value)
         if array.dtype.kind in "iu":
@@ -458,6 +514,23 @@ def _decode_value(value: object) -> object:
         return RemoteErrorPayload(
             _text(mapping["error_type"], "error_type", maximum=128),
             _text(mapping["message"], "message", maximum=1024),
+        )
+    if kind == "client_step_result":
+        _exact_fields(
+            mapping, {"type", "output", "round_id", "step", "products", "truncations"}, kind
+        )
+        return ClientStepResult(
+            _typed(mapping["output"], np.ndarray),
+            _text(mapping["round_id"], "round_id"),
+            _nonnegative(mapping["step"], "step"),
+            _nonnegative(mapping["products"], "products"),
+            _nonnegative(mapping["truncations"], "truncations"),
+        )
+    if kind == "party_stage_result":
+        _exact_fields(mapping, {"type", "receipt", "share"}, kind)
+        return PartyStageResult(
+            _typed(mapping["receipt"], Protocol3StageReceipt),
+            _typed(mapping["share"], ControlShareMessage),
         )
     if kind == "float_array":
         _exact_fields(mapping, {"type", "shape", "values"}, kind)
@@ -721,6 +794,33 @@ def _decode_value(value: object) -> object:
 def _validate_payload_contract(message: WireEnvelope) -> None:
     key = (message.kind, message.operation)
     payload = message.payload
+    direction = (message.sender, message.recipient)
+    to_supervisor = {("Client", "Supervisor"), ("P1", "Supervisor"), ("P2", "Supervisor")}
+    to_party = {("Client", "P1"), ("Client", "P2")}
+    to_client = {("P1", "Client"), ("P2", "Client")}
+    peer = {("P1", "P2"), ("P2", "P1")}
+    allowed: dict[tuple[str, str], set[tuple[str, str]]] = {
+        ("hello", "hello"): to_supervisor | to_party | peer,
+        ("ready", "ready"): to_supervisor,
+        ("error", "ready"): to_supervisor,
+        ("request", "step"): {("Supervisor", "Client")},
+        ("reply", "step"): {("Client", "Supervisor")},
+        ("error", "step"): {("Client", "Supervisor")},
+        ("request", "offline"): to_party,
+        ("request", "online"): to_party,
+        ("reply", "online"): to_client,
+        ("error", "online"): to_client,
+        ("request", "endpoint"): to_party,
+        ("reply", "endpoint"): to_client,
+        ("error", "endpoint"): to_client,
+        ("request", "peer_product"): peer,
+        ("request", "peer_truncation"): {("P2", "P1")},
+        ("shutdown", "shutdown"): {("Supervisor", "Client")} | to_party,
+        ("reply", "shutdown"): {("Client", "Supervisor")} | to_client,
+        ("error", "shutdown"): {("Client", "Supervisor")} | to_client,
+    }
+    if direction not in allowed.get(key, set()):
+        raise LocalhostCodecError("wire kind/operation 与角色方向组合非法。")
     if message.operation == "peer_product" and (
         message.kind != "request" or {message.sender, message.recipient} != {"P1", "P2"}
     ):
@@ -736,27 +836,23 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
         expected = (ReadyPayload,)
     elif message.kind == "error":
         expected = (RemoteErrorPayload,)
-    elif key == ("request", "prepare"):
+    elif key == ("request", "step"):
         expected = (np.ndarray,)
-    elif key == ("reply", "prepare"):
-        expected = (StepResourcePlan,)
+    elif key == ("reply", "step"):
+        expected = (ClientStepResult,)
     elif key == ("request", "endpoint"):
         expected = (Protocol3EndpointCommand,)
     elif key == ("reply", "endpoint"):
-        expected = (Protocol3StageReceipt, type(None))
+        expected = (PartyStageResult, type(None))
     elif key == ("request", "peer_product"):
         expected = (ProductMaskPayload,)
     elif key == ("request", "peer_truncation"):
         expected = (P2TruncationPayload,)
-    elif key == ("reply", "reconstruct"):
-        expected = (np.ndarray,)
     elif key == ("request", "offline"):
         expected = (PartyOfflineMaterial,)
     elif key == ("request", "online"):
         expected = (PartyOnlineMaterial,)
-    elif key == ("request", "control_share"):
-        expected = (ControlShareMessage,)
-    elif message.operation in {"begin", "reconstruct", "shutdown"}:
+    elif key in {("reply", "online"), ("reply", "shutdown")} or message.kind == "shutdown":
         expected = (type(None),)
     else:
         expected = None
@@ -766,6 +862,31 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
         expected_resource = payload.metadata.resource_id if payload.metadata is not None else None
         if message.resource_id != expected_resource:
             raise LocalhostCodecError("endpoint envelope 与 command resource identity 不匹配。")
+    if (
+        message.operation == "step"
+        and isinstance(payload, ClientStepResult)
+        and (payload.step != message.step or message.round_id is not None)
+    ):
+        raise LocalhostCodecError("Client 单步结果与信封 step 不匹配。")
+    if (
+        message.operation == "endpoint"
+        and isinstance(payload, PartyStageResult)
+        and (
+            direction[0] not in {"P1", "P2"}
+            or payload.receipt.party != (0 if direction[0] == "P1" else 1)
+        )
+    ):
+        raise LocalhostCodecError("暂存结果的角色不匹配。")
+    if (
+        message.operation == "endpoint"
+        and isinstance(payload, PartyStageResult)
+        and (
+            (payload.receipt.session_id, payload.receipt.round_id, payload.receipt.step)
+            != (message.session_id, message.round_id, message.step)
+            or message.resource_id is not None
+        )
+    ):
+        raise LocalhostCodecError("暂存结果与信封 round identity 不匹配。")
 
 
 def _load_json(payload: bytes) -> object:

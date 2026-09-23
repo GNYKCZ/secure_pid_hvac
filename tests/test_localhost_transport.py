@@ -10,6 +10,7 @@ import struct
 import subprocess
 import sys
 import time
+from dataclasses import fields
 from pathlib import Path
 
 import numpy as np
@@ -24,13 +25,15 @@ from secure_control.execution import (
     LocalhostStateError,
     LocalhostTimeoutError,
     MultiprocessingSecureStateSpaceRuntime,
-    localhost_runtime,
+    _localhost_workers,
 )
 from secure_control.execution._localhost_peer import LocalhostProtocol3PeerPort
 from secure_control.execution.localhost_codec import (
     SCHEMA_VERSION,
+    ClientStepResult,
     HelloPayload,
     LocalhostCodecError,
+    PartyStageResult,
     WireEnvelope,
     decode_envelope,
     decode_wire_value,
@@ -49,12 +52,17 @@ from secure_control.execution.localhost_transport import (
     send_frame,
 )
 from secure_control.experiments.localhost_runner import run_localhost_comparison
-from secure_control.protocol import ControllerRangeContract
+from secure_control.protocol import ControllerRangeContract, ControllerScaleLedger
 from secure_control.protocol.messages import (
+    ControlShareMessage,
     P2TruncationPayload,
     ProductMaskPayload,
+    Protocol3StageReceipt,
     ResourceMetadata,
+    StepResourcePlan,
 )
+from secure_control.scenarios.hvac.integration import HvacScenario
+from secure_control.simulation.engine import compare_closed_loops
 
 _DEFAULT_TRANSPORT = LocalhostTransportConfig()
 
@@ -156,6 +164,76 @@ def test_wire_envelope_round_trip_preserves_version_direction_and_identity() -> 
     )
 
     assert decode_envelope(encode_envelope(message)) == message
+
+
+def test_schema_v3_restricts_step_result_and_stage_share_to_their_owner_channels() -> None:
+    """父进程只能收到已提交的公开结果，原始输出份额只可留在 Client 私有通道。"""
+    result = ClientStepResult(np.array([0.25]), "round-0", 0, 4, 1)
+    public = WireEnvelope(
+        SCHEMA_VERSION,
+        "reply",
+        "Client",
+        "Supervisor",
+        2,
+        "step",
+        "session-0",
+        None,
+        0,
+        None,
+        result,
+    )
+    assert isinstance(decode_envelope(encode_envelope(public)).payload, ClientStepResult)
+    stage = PartyStageResult(
+        Protocol3StageReceipt(0, "session-0", "round-0", 0, 4, 1),
+        ControlShareMessage(0, "session-0", "round-0", 0, 16, AdditiveShare(5)),
+    )
+    private = WireEnvelope(
+        SCHEMA_VERSION,
+        "reply",
+        "P1",
+        "Client",
+        4,
+        "endpoint",
+        "session-0",
+        "round-0",
+        0,
+        None,
+        stage,
+    )
+    assert isinstance(decode_envelope(encode_envelope(private)).payload, PartyStageResult)
+    with pytest.raises(LocalhostCodecError):
+        WireEnvelope(
+            SCHEMA_VERSION,
+            "reply",
+            "P1",
+            "Supervisor",
+            4,
+            "endpoint",
+            "session-0",
+            "round-0",
+            0,
+            None,
+            stage,
+        )
+    with pytest.raises(LocalhostCodecError):
+        WireEnvelope(
+            SCHEMA_VERSION,
+            "reply",
+            "Client",
+            "Supervisor",
+            2,
+            "step",
+            "session-0",
+            None,
+            1,
+            None,
+            result,
+        )
+    with pytest.raises(ValueError):
+        PartyStageResult(
+            stage.receipt,
+            ControlShareMessage(0, "session-0", "other-round", 0, 16, AdditiveShare(5)),
+        )
 
 
 def test_peer_port_exchanges_only_protocol_messages_and_parent_reply_rejects_shares() -> None:
@@ -282,7 +360,7 @@ def test_peer_port_exchanges_only_protocol_messages_and_parent_reply_rejects_sha
         ),
     ),
 )
-def test_codec_enforces_schema_v2_peer_direction_matrix(
+def test_codec_enforces_schema_v3_peer_direction_matrix(
     kind: str, operation: str, sender: str, recipient: str, payload: object, accepted: bool
 ) -> None:
     """schema owner 必须在解码前拒绝进入 Supervisor/Client 的在线 peer payload。"""
@@ -579,6 +657,7 @@ def test_unknown_envelope_fields_are_rejected() -> None:
     ("field", "value"),
     (
         ("schema_version", 1),
+        ("schema_version", 2),
         ("schema_version", True),
         ("schema_version", 1.0),
         ("kind", "unknown"),
@@ -637,6 +716,181 @@ def test_localhost_runtime_uses_distinct_loopback_roles_and_matches_issue16_back
         assert len({item.pid for item in topology.roles}) == 3
         assert os.getpid() not in {item.pid for item in topology.roles}
         assert localhost.resource_counts == process.resource_counts
+
+
+def test_parent_sends_only_one_client_step_request_per_round(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """父进程不得重新持有资源计划或向任一 Server 发送在线调度命令。"""
+    with _runtime(horizon=3) as runtime:
+        session_type = type(runtime._session)
+        original = session_type.request
+        calls: list[tuple[str, str]] = []
+
+        def record_request(
+            self: object, role: str, operation: str, *args: object, **kwargs: object
+        ) -> object:
+            calls.append((role, operation))
+            return original(self, role, operation, *args, **kwargs)
+
+        monkeypatch.setattr(session_type, "request", record_request)
+        assert runtime.step(0.0).shape == (1,)
+        assert runtime.step(0.25).shape == (1,)
+        assert calls == [("Client", "step"), ("Client", "step")]
+        assert runtime.resource_counts == {"products_consumed": 8, "truncations_consumed": 2}
+
+
+def test_client_rejects_duplicate_step_and_discards_the_session() -> None:
+    """同一 Client 会话不能重放上一轮输入或续用其已消耗资源。"""
+    runtime = _runtime(horizon=3)
+    try:
+        runtime.step(0.0)
+        with pytest.raises(LocalhostPeerError, match="step identity"):
+            runtime._session.request(
+                "Client",
+                "step",
+                2.0,
+                step=0,
+                payload=np.array([0.0]),
+            )
+        with pytest.raises(LocalhostStateError, match="已失败"):
+            runtime.step(0.0)
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("failure", ("reconstruct", "p2_commit"))
+def test_client_never_reports_success_for_reconstruction_or_second_commit_failure(
+    failure: str,
+) -> None:
+    """P1 已提交但 P2 回执不确定时仍不得向父进程发布成功结果。"""
+    plan = StepResourcePlan(
+        "session-0",
+        "round-0",
+        0,
+        (0,),
+        (1,),
+        (1,),
+        ControllerScaleLedger(0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+        (),
+        (),
+    )
+    events: list[str] = []
+
+    class _Endpoint:
+        def __init__(self, party: int) -> None:
+            self.party = party
+            self.session_id = plan.session_id
+            self.plan = plan
+            self.share: ControlShareMessage | None = None
+
+        def finish_products(self) -> None:
+            events.append(f"p{self.party + 1}_stage")
+
+        def stage_output(self) -> Protocol3StageReceipt:
+            self.share = ControlShareMessage(
+                self.party,
+                plan.session_id,
+                plan.round_id,
+                plan.step,
+                0,
+                AdditiveShare(self.party + 1),
+            )
+            return Protocol3StageReceipt(
+                self.party,
+                plan.session_id,
+                plan.round_id,
+                plan.step,
+                0,
+                0,
+            )
+
+        def commit(self) -> None:
+            events.append(f"p{self.party + 1}_commit")
+            if failure == "p2_commit" and self.party == 1:
+                raise TimeoutError("P2 提交回执丢失")
+
+    class _Client:
+        def reconstruct_control(self, first: object, second: object) -> np.ndarray:
+            events.append("reconstruct")
+            if failure == "reconstruct":
+                raise ValueError("重构失败")
+            return np.array([0.25])
+
+    with pytest.raises((ValueError, TimeoutError)):
+        _localhost_workers._complete_client_round(
+            _Client(),
+            _Endpoint(0),
+            _Endpoint(1),
+            plan,  # type: ignore[arg-type]
+        )
+    if failure == "reconstruct":
+        assert events == ["p1_stage", "p2_stage", "reconstruct"]
+    else:
+        assert events == [
+            "p1_stage",
+            "p2_stage",
+            "reconstruct",
+            "p1_commit",
+            "p2_commit",
+        ]
+
+
+@pytest.mark.parametrize("response_kind", ("wrong_payload", "timeout"))
+def test_client_rejects_uncertain_party_commit_ack(response_kind: str) -> None:
+    """提交回执缺失或错配时不能把本地调用视为已确认提交。"""
+    plan = StepResourcePlan(
+        "session-0",
+        "round-0",
+        0,
+        (0,),
+        (1,),
+        (1,),
+        ControllerScaleLedger(0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+        (),
+        (),
+    )
+    client_sock, party_sock = socket.socketpair()
+    try:
+        endpoint = _localhost_workers._ClientPartyEndpoint(
+            client_sock,
+            1,
+            plan,
+            3,
+            4096,
+            0.02,
+        )
+        if response_kind == "wrong_payload":
+            staged = PartyStageResult(
+                Protocol3StageReceipt(1, plan.session_id, plan.round_id, 0, 0, 0),
+                ControlShareMessage(1, plan.session_id, plan.round_id, 0, 0, AdditiveShare(1)),
+            )
+            send_envelope(
+                party_sock,
+                WireEnvelope(
+                    SCHEMA_VERSION,
+                    "reply",
+                    "P2",
+                    "Client",
+                    3,
+                    "endpoint",
+                    plan.session_id,
+                    plan.round_id,
+                    0,
+                    None,
+                    staged,
+                ),
+                deadline=deadline_after(1.0),
+                limit=4096,
+            )
+            with pytest.raises(ValueError, match="非暂存操作"):
+                endpoint.commit()
+        else:
+            with pytest.raises(LocalhostTransportTimeout):
+                endpoint.commit()
+    finally:
+        client_sock.close()
+        party_sock.close()
 
 
 def test_vector_zero_state_and_no_truncation_match_issue16_backend() -> None:
@@ -716,6 +970,40 @@ def test_hvac_180_step_runner_matches_issue16_backend_and_cleans_up() -> None:
     assert summary["cleanup"] == "closed"
 
 
+def test_hvac_180_step_result_fields_match_issue16_without_semantic_drift() -> None:
+    """八个仿真结果字段逐采样一致，且不改变 HVAC 的时间索引和结果契约。"""
+    config = Path(__file__).parents[1] / "configs" / "hvac_dual_loop.yaml"
+    baseline = HvacScenario(
+        config,
+        test_seed=905,
+        secure_runtime_builder=MultiprocessingSecureStateSpaceRuntime,
+    ).build_plan()
+    localhost = HvacScenario(
+        config,
+        test_seed=905,
+        secure_runtime_builder=LocalhostSecureStateSpaceRuntime,
+    ).build_plan()
+    try:
+        expected = compare_closed_loops(
+            baseline.ideal,
+            baseline.secure,
+            baseline.sample_times,
+        )
+        actual = compare_closed_loops(
+            localhost.ideal,
+            localhost.secure,
+            localhost.sample_times,
+        )
+        assert len(fields(actual)) == 8
+        for field in fields(actual):
+            np.testing.assert_array_equal(
+                getattr(actual, field.name), getattr(expected, field.name)
+            )
+    finally:
+        baseline.secure.runtime.close()
+        localhost.secure.runtime.close()
+
+
 def test_port_collision_is_reported_without_starting_children() -> None:
     blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     blocker.bind(("127.0.0.1", 0))
@@ -770,7 +1058,9 @@ def test_failed_replacement_reset_keeps_old_ready_session(monkeypatch: pytest.Mo
 def test_disconnect_and_step_timeout_fail_closed_and_reap_every_role() -> None:
     runtime = _runtime()
     role_pids = {item.pid for item in runtime.topology.roles}
-    runtime._session.controls["P1"].close()
+    role = runtime._session.processes["P1"]
+    role.terminate()
+    role.join(1.0)
     with pytest.raises(LocalhostPeerError):
         runtime.step(0.0)
     assert all(item.status == "failed" for item in runtime.topology.roles)
@@ -798,40 +1088,23 @@ def test_disconnect_and_step_timeout_fail_closed_and_reap_every_role() -> None:
     )
 
 
-@pytest.mark.parametrize(
-    ("failure", "worker_error"),
-    (("timeout", "LocalhostTransportTimeout"), ("disconnect", "LocalhostTransportDisconnected")),
-)
-def test_peer_failure_fails_closed_without_resource_reuse_and_reset_recovers(
-    monkeypatch: pytest.MonkeyPatch, failure: str, worker_error: str
+@pytest.mark.parametrize("party", ("P1", "P2"))
+def test_party_disconnect_fails_closed_without_resource_reuse_and_reset_recovers(
+    party: str,
 ) -> None:
-    """真实 peer timeout/disconnect 由 worker 报告，随后整组角色废弃且仅 reset 可恢复。"""
+    """单方中断由 Client 发现；父进程不能继续旧会话，只有新会话可恢复。"""
     runtime = _runtime(
         transport=LocalhostTransportConfig(
             timeouts=LocalhostTimeouts(startup=10.0, step=0.2, shutdown=5.0)
         )
     )
-    original_orchestrator = localhost_runtime.Protocol3Orchestrator
     original_pids = {item.pid for item in runtime.topology.roles}
     original_session_id = runtime._session.session_id
-
-    class _PeerFailureOrchestrator:
-        def stage(self, p1: object, _: object, plan: object) -> object:
-            metadata = plan.product_resources[0]  # type: ignore[union-attr]
-            p1.mask_product(metadata)  # type: ignore[union-attr]
-            if failure == "disconnect":
-                p2_process = runtime._session.processes["P2"]
-                p2_process.terminate()
-                p2_process.join(1.0)
-                assert not p2_process.is_alive()
-            # worker 的 peer deadline 仍为 0.2s；仅将父端等待延长，
-            # 使测试必须收到 worker 报告的 peer 错误，不能靠父端自身超时通过。
-            p1._timeout = 2.0  # type: ignore[union-attr]
-            return p1.finish_product(metadata)  # type: ignore[union-attr]
-
-    monkeypatch.setattr(localhost_runtime, "Protocol3Orchestrator", _PeerFailureOrchestrator)
+    lost = runtime._session.processes[party]
+    lost.terminate()
+    lost.join(1.0)
     try:
-        with pytest.raises(LocalhostPeerError, match=worker_error):
+        with pytest.raises(LocalhostPeerError):
             runtime.step(0.0)
         assert runtime.resource_counts == {"products_consumed": 0, "truncations_consumed": 0}
         assert runtime._step_index == 0
@@ -842,14 +1115,12 @@ def test_peer_failure_fails_closed_without_resource_reuse_and_reset_recovers(
         with pytest.raises(LocalhostStateError, match="已失败"):
             runtime.step(0.0)
 
-        monkeypatch.setattr(localhost_runtime, "Protocol3Orchestrator", original_orchestrator)
         runtime.reset()
         assert original_pids.isdisjoint({item.pid for item in runtime.topology.roles})
         assert runtime._session.session_id != original_session_id
         np.testing.assert_array_equal(runtime.step(0.0), np.array([0.5]))
         assert runtime.resource_counts == {"products_consumed": 4, "truncations_consumed": 1}
     finally:
-        monkeypatch.setattr(localhost_runtime, "Protocol3Orchestrator", original_orchestrator)
         runtime.close()
 
 

@@ -230,7 +230,8 @@ Windows 兼容的 `spawn` 建立独立 Client/P1/P2 PID，保持同一 runtime �
 
 需要验证本机 TCP wire schema、framing 与故障清理时，可显式使用
 `LocalhostSecureStateSpaceRuntime`。它保持同一 runtime/simulation 接口，并与 multiprocessing
-后端复用唯一 Protocol 3 orchestrator；不提供 TLS、认证或生产安全声明。运行和对照命令见
+后端复用唯一 Protocol 3 orchestrator；Client 驱动在线轮次，父进程仅交换公开输入与提交后的
+结果。不提供 TLS、认证或生产安全声明。运行和对照命令见
 [localhost 通信传输](docs/localhost_transport.md)。
 
 仿真产生的大量 CSV、图片、扫描与诊断工件应分别写入 `results/csv/`、`results/figures/`、
