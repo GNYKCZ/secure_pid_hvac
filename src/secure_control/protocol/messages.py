@@ -629,6 +629,7 @@ Protocol3Operation = Literal[
     "complete_product",
     "finish_products",
     "mask_truncation",
+    "send_truncation",
     "p2_truncation_message",
     "finish_truncation_p1",
     "finish_truncation_p2",

@@ -250,6 +250,7 @@ def test_localhost_layers_preserve_transport_only_boundaries() -> None:
         for name in (
             "localhost_codec.py",
             "localhost_transport.py",
+            "_localhost_peer.py",
             "_localhost_workers.py",
             "localhost_runtime.py",
         )
@@ -268,7 +269,7 @@ def test_localhost_layers_preserve_transport_only_boundaries() -> None:
         "SecureTruncation",
     ):
         assert forbidden not in worker_source
-    assert "dispatch_protocol3_command" in worker_source
+    assert "dispatch_direct_protocol3_command" in worker_source
 
 
 def test_localhost_and_multiprocessing_share_protocol_authorities() -> None:
@@ -279,7 +280,7 @@ def test_localhost_and_multiprocessing_share_protocol_authorities() -> None:
     multiprocessing_runtime = (execution / "multiprocessing_runtime.py").read_text(encoding="utf-8")
     localhost_runtime = (execution / "localhost_runtime.py").read_text(encoding="utf-8")
     assert "dispatch_protocol3_command" in multiprocessing_worker
-    assert "dispatch_protocol3_command" in localhost_worker
+    assert "dispatch_direct_protocol3_command" in localhost_worker
     assert "Protocol3Orchestrator" in multiprocessing_runtime
     assert "Protocol3Orchestrator" in localhost_runtime
 

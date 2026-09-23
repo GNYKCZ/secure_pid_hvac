@@ -11,8 +11,9 @@ from secure_control.core import ControllerSpec
 from secure_control.crypto import FixedPointContext, PrimeModulusEvidence, TwoPartySharing
 from secure_control.protocol import P1, P2, Client, ControllerRangeContract
 from secure_control.protocol.coordinator import (
+    DirectProtocol3PartyEndpoint,
     LocalProtocol3PartyEndpoint,
-    dispatch_protocol3_command,
+    dispatch_direct_protocol3_command,
     rehydrate_offline_material,
     rehydrate_online_material,
 )
@@ -25,7 +26,9 @@ from secure_control.protocol.messages import (
     Protocol3EndpointCommand,
 )
 
+from ._localhost_peer import LocalhostProtocol3PeerPort, accept_p1_peer, connect_p2_peer
 from .localhost_codec import (
+    SCHEMA_VERSION,
     HelloPayload,
     ReadyPayload,
     RemoteErrorPayload,
@@ -89,7 +92,7 @@ def localhost_client_worker(
             _send_data(
                 parties[party],
                 WireEnvelope(
-                    1,
+                    SCHEMA_VERSION,
                     "request",
                     "Client",
                     "P1" if party == 0 else "P2",
@@ -107,7 +110,7 @@ def localhost_client_worker(
         _send_data(
             control,
             WireEnvelope(
-                1,
+                SCHEMA_VERSION,
                 "ready",
                 "Client",
                 "Supervisor",
@@ -167,7 +170,7 @@ def localhost_client_worker(
                         _send_data(
                             parties[party],
                             WireEnvelope(
-                                1,
+                                SCHEMA_VERSION,
                                 "request",
                                 "Client",
                                 "P1" if party == 0 else "P2",
@@ -228,6 +231,8 @@ def localhost_role_worker(
     party: Literal[0, 1],
     control_address: Address,
     data_listener: socket.socket,
+    peer_listener: socket.socket | None,
+    peer_address: Address | None,
     bootstrap_nonce: str,
     fixed_point: FixedPointContext,
     range_contract: ControllerRangeContract,
@@ -244,12 +249,27 @@ def localhost_role_worker(
     client_channel: socket.socket | None = None
     session_id: str | None = None
     endpoint: LocalProtocol3PartyEndpoint | None = None
+    direct_endpoint: DirectProtocol3PartyEndpoint | None = None
+    peer: LocalhostProtocol3PeerPort | None = None
     try:
         startup_deadline = deadline_after(startup_timeout)
         control = connect_loopback(control_address, deadline=startup_deadline)
         _send_hello(
             control, role_name, "Supervisor", bootstrap_nonce, startup_deadline, max_frame_bytes
         )
+        if party == 0:
+            if peer_listener is None or peer_address is not None:
+                raise ValueError("P1 peer listener 配置错误。")
+            peer = accept_p1_peer(
+                peer_listener, bootstrap_nonce, startup_deadline, max_frame_bytes, step_timeout
+            )
+            peer_listener.close()
+        else:
+            if peer_listener is not None or peer_address is None:
+                raise ValueError("P2 peer address 配置错误。")
+            peer = connect_p2_peer(
+                peer_address, bootstrap_nonce, startup_deadline, max_frame_bytes, step_timeout
+            )
         client_channel = accept_loopback(data_listener, deadline=startup_deadline)
         data_listener.close()
         hello = receive_envelope(client_channel, deadline=startup_deadline, limit=max_frame_bytes)
@@ -275,10 +295,11 @@ def localhost_role_worker(
         else:
             role = P2(offline)
         session_id = role.session_id
+        peer.bind(session_id)
         _send_data(
             control,
             WireEnvelope(
-                1,
+                SCHEMA_VERSION,
                 "ready",
                 role_name,
                 "Supervisor",
@@ -347,11 +368,12 @@ def localhost_role_worker(
                             step_timeout,
                         ),
                     )
+                    direct_endpoint = DirectProtocol3PartyEndpoint(endpoint, peer)
                     _send_reply(control, request, None, max_frame_bytes, step_timeout)
                     continue
                 if (
                     request.operation != "endpoint"
-                    or endpoint is None
+                    or direct_endpoint is None
                     or not isinstance(request.payload, Protocol3EndpointCommand)
                 ):
                     raise RuntimeError("当前没有可执行的 Protocol 3 endpoint command。")
@@ -360,9 +382,10 @@ def localhost_role_worker(
                     endpoint.plan.step,
                 ):
                     raise ValueError("角色请求的 round 或 step identity 不匹配。")
-                result = dispatch_protocol3_command(endpoint, request.payload)
+                result = dispatch_direct_protocol3_command(direct_endpoint, request.payload)
                 if request.payload.operation == "commit":
                     endpoint = None
+                    direct_endpoint = None
                 _send_reply(control, request, result, max_frame_bytes, step_timeout)
             except Exception as error:  # noqa: BLE001 - wire 边界必须返回受限角色错误
                 _send_error(control, request, error, max_frame_bytes, step_timeout)
@@ -374,6 +397,9 @@ def localhost_role_worker(
         _close_socket(control)
         _close_socket(client_channel)
         _close_socket(data_listener)
+        _close_socket(peer_listener)
+        if peer is not None:
+            peer.close()
 
 
 def _send_hello(
@@ -387,7 +413,7 @@ def _send_hello(
     _send_data(
         sock,
         WireEnvelope(
-            1,
+            SCHEMA_VERSION,
             "hello",
             sender,
             recipient,
@@ -449,7 +475,7 @@ def _send_reply(
     _send_data(
         sock,
         WireEnvelope(
-            1,
+            SCHEMA_VERSION,
             "reply",
             request.recipient,
             request.sender,
@@ -477,7 +503,7 @@ def _send_error(
     _send_data(
         sock,
         WireEnvelope(
-            1,
+            SCHEMA_VERSION,
             "error",
             request.recipient,
             request.sender,
@@ -505,7 +531,7 @@ def _send_startup_error(
         _send_data(
             sock,
             WireEnvelope(
-                1,
+                SCHEMA_VERSION,
                 "error",
                 role,
                 "Supervisor",
@@ -536,7 +562,7 @@ def _send_control_share(
     _send_data(
         sock,
         WireEnvelope(
-            1,
+            SCHEMA_VERSION,
             "request",
             role,
             "Client",

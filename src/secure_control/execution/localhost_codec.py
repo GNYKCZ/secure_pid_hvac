@@ -31,7 +31,7 @@ from secure_control.protocol.messages import (
     TruncationResourceMaterial,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _ROLES = {"Supervisor", "Client", "P1", "P2"}
 _KINDS = {"hello", "ready", "request", "reply", "error", "shutdown"}
 _OPERATIONS = {
@@ -44,6 +44,8 @@ _OPERATIONS = {
     "endpoint",
     "reconstruct",
     "control_share",
+    "peer_product",
+    "peer_truncation",
     "shutdown",
 }
 _CANONICAL_INTEGER = re.compile(r"(?:0|-[1-9][0-9]*|[1-9][0-9]*)\Z")
@@ -719,6 +721,14 @@ def _decode_value(value: object) -> object:
 def _validate_payload_contract(message: WireEnvelope) -> None:
     key = (message.kind, message.operation)
     payload = message.payload
+    if message.operation == "peer_product" and (
+        message.kind != "request" or {message.sender, message.recipient} != {"P1", "P2"}
+    ):
+        raise LocalhostCodecError("Protocol 1 peer 消息必须在 P1 与 P2 之间请求发送。")
+    if message.operation == "peer_truncation" and (
+        message.kind != "request" or (message.sender, message.recipient) != ("P2", "P1")
+    ):
+        raise LocalhostCodecError("Protocol 2 peer 消息必须由 P2 发送给 P1。")
     expected: tuple[type[object], ...] | None
     if key == ("hello", "hello"):
         expected = (HelloPayload,)
@@ -733,13 +743,11 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
     elif key == ("request", "endpoint"):
         expected = (Protocol3EndpointCommand,)
     elif key == ("reply", "endpoint"):
-        expected = (
-            ProductMaskPayload,
-            TruncationMaskPayload,
-            P2TruncationPayload,
-            Protocol3StageReceipt,
-            type(None),
-        )
+        expected = (Protocol3StageReceipt, type(None))
+    elif key == ("request", "peer_product"):
+        expected = (ProductMaskPayload,)
+    elif key == ("request", "peer_truncation"):
+        expected = (P2TruncationPayload,)
     elif key == ("reply", "reconstruct"):
         expected = (np.ndarray,)
     elif key == ("request", "offline"):

@@ -35,9 +35,10 @@ scale ledger、范围验证、step 和 reset 语义，并增加 `close()`、上�
 超时或工作进程错误采用 fail-closed 清理，不尝试在提交状态不确定时继续。完整进程边界见
 [多进程安全执行](multiprocessing_execution.md)。
 
-Issue #17 另提供显式选择的 `LocalhostSecureStateSpaceRuntime`。它在三个 `spawn` 角色和父进程间
-使用仅限 `127.0.0.1` 的固定 schema TCP 传输，仍复用同一 Protocol 3 orchestrator，并保持本节
-的 spec、shape、scale、step/reset 和数值语义。网络或协议 identity 失败会关闭当前 session；
+Issue #17/#66 另提供显式选择的 `LocalhostSecureStateSpaceRuntime`。它在三个 `spawn` 角色和父
+进程间使用仅限 `127.0.0.1` 的固定 schema TCP，并让 P1/P2 直接交换在线 Protocol 1/2 消息；
+父进程只发送无 share 的调度 command 并接收回执。它仍复用同一 Protocol 3 orchestrator，并保持
+本节的 spec、shape、scale、step/reset 和数值语义。网络或协议 identity 失败会关闭当前 session；
 该后端不改变默认 runtime，也不声明 TLS、认证或生产安全。完整 wire 与生命周期边界见
 [localhost 通信传输](localhost_transport.md)。
 
