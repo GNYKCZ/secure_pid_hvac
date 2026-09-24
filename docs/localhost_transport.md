@@ -1,5 +1,8 @@
 # localhost 通信传输
 
+Client 公开运行状态与采样遥测在仿真装配层产生，不改变本 wire 契约；角色 `topology`
+仅是 session 状态投影。见 [公开遥测事件 v1](public_telemetry.md)。
+
 Issue #17 增加显式选择的 `LocalhostSecureStateSpaceRuntime`。它仍向 simulation 提供
 `step(v) -> ndarray(p,)` 与 `reset()`，默认 `SecureStateSpaceRuntime` 不变。此后端只模拟本机
 TCP 消息传输，不提供 TLS、身份认证、多机部署或生产安全保证。

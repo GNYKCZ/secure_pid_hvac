@@ -61,6 +61,9 @@ class LocalhostTimeoutError(LocalhostExecutionError, TimeoutError):
 class LocalhostProtocolError(LocalhostExecutionError):
     """framing、schema、方向、顺序或协议 identity 不匹配。"""
 
+    # 仅暴露固定故障类别；公开遥测不读取异常文本或 wire payload。
+    _public_fault_category = "protocol"
+
 
 class LocalhostPeerError(LocalhostExecutionError):
     """远端角色报告受限错误或提前断开。"""
@@ -655,7 +658,12 @@ def _execution_error(error: BaseException, context: str) -> LocalhostExecutionEr
         return LocalhostTimeoutError(f"{context}：超时。")
     if isinstance(error, (LocalhostTransportProtocolError, ValueError, TypeError)):
         return LocalhostProtocolError(f"{context}：wire 协议错误。")
-    if isinstance(error, (LocalhostTransportDisconnected, LocalhostTransportError, OSError)):
+    if isinstance(error, LocalhostTransportDisconnected):
+        # 仅在 transport 已确认断线时标记；远端受限 error 也使用 PeerError。
+        failure = LocalhostPeerError(f"{context}：连接断开或不可用。")
+        failure._public_fault_category = "disconnected"
+        return failure
+    if isinstance(error, (LocalhostTransportError, OSError)):
         return LocalhostPeerError(f"{context}：连接断开或不可用。")
     return LocalhostExecutionError(f"{context}。")
 

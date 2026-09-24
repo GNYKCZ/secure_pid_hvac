@@ -151,6 +151,7 @@ scenario:
 
 HVAC 的装配与 180 步物理/编码范围条件见 [仿真与双闭环集成](simulation_hvac_integration.md)。
 正式场景选择、schema v1 与无覆盖发布见 [实验产物约定](experiment_schema.md)。
+Client 公开采样事件、有损直播与 verified artifact 回放见 [公开遥测事件 v1](public_telemetry.md)。
 从已发布结果生成四类图、显式向量通道选择与 log 零值规则见
 [已保存结果绘图契约](figure_contract.md)。
 冻结 2R2C 配置上的定点精度扫描、逐点预检和部分失败发布语义见
