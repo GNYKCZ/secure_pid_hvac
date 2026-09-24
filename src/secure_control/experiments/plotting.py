@@ -22,7 +22,7 @@ from matplotlib.ticker import LogFormatterMathtext, ScalarFormatter
 
 from secure_control.simulation import ChannelMetadata, ScenarioMetadata, SimulationResult
 
-from .artifacts import SCHEMA_VERSION, ExperimentRecord, load_artifacts
+from .artifacts import SCHEMA_VERSION, ExperimentRecord, _json_bytes, load_artifacts
 
 ErrorScale = Literal["linear", "log"]
 TimeUnit = Literal["s", "min", "h"]
@@ -263,6 +263,105 @@ def plot_control(record: ExperimentRecord, control_index: int, display: PlotDisp
     axes.plot(time, secure, color="tab:orange", linestyle=":", label=f"Secure · {name}")
     axes.legend()
     return figure
+
+
+def plot_control_triptych(record: ExperimentRecord, control_index: int) -> Figure:
+    """由同一已验证 run 绘 u、û、有符号 u−û；前两轴共用真实纵轴尺度。"""
+    ideal = _series(record, "control_ideal", record.metadata.control, control_index)
+    secure = _series(record, "control_secure", record.metadata.control, control_index)
+    error = _series(record, "control_error", record.metadata.control, control_index)
+    name, unit = _channel(record.metadata.control, control_index, "control")
+    figure = Figure(figsize=(9, 9), layout="constrained")
+    FigureCanvasAgg(figure)
+    axes = figure.subplots(3, 1, sharex=True)
+    axes[1].sharey(axes[0])
+    config = record.effective_config
+    provenance = record.provenance
+    relation = "raw=applied" if config.get("raw_equals_applied") is True else "applied control"
+    figure.suptitle(
+        f"{record.run_id} · {provenance.get('backend', 'unknown')} · "
+        f"ell={config.get('fractional_bits', 'unknown')}\n{relation}"
+    )
+    for axis, values, label, color in (
+        (axes[0], ideal, "u(t) · ideal", "tab:blue"),
+        (axes[1], secure, "û(t) · secure", "tab:orange"),
+        (axes[2], error, "u−û · signed", "tab:red"),
+    ):
+        axis.plot(record.result.time, values, marker=".", markersize=3,
+                  linewidth=1.0, color=color, label=label)
+        axis.set_ylabel(f"{name} ({unit})")
+        axis.grid(True, alpha=0.3)
+        axis.legend(loc="best")
+    axes[2].axhline(0, color="gray", linewidth=0.7)
+    axes[2].set_xlabel("Time (s) · sampled points")
+    return figure
+
+
+def write_control_triptych(record: ExperimentRecord, stage: Path,
+                           control_index: int) -> tuple[str, ...]:
+    """在正式 staging 写图与源摘要清单；由 writer 复验并一次 rename。"""
+    figure = plot_control_triptych(record, control_index)
+    target = stage / "control.png"
+    try:
+        figure.savefig(target, dpi=180, format="png")
+    finally:
+        figure.clear()
+    manifest = {
+        "source_run_id": record.run_id,
+        "source_metadata_sha256": _digest(stage / "metadata.json"),
+        "source_trajectory_sha256": _digest(stage / "trajectory.csv"),
+        "source_config_sha256": _digest(stage / "config.json"),
+        "figure_sha256": _digest(target),
+        "control_channel": control_index,
+        "control_name": record.metadata.control.names[control_index],
+        "control_unit": record.metadata.control.units[control_index],
+        "sample_count": int(record.result.time.size),
+        "signed_error": "control_ideal - control_secure",
+        "shared_control_y_scale": True,
+    }
+    (stage / "control_plot.json").write_text(
+        json.dumps(manifest, sort_keys=True, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    verify_control_triptych(record, stage)
+    return ("control.png", "control_plot.json")
+
+
+def verify_control_triptych(record: ExperimentRecord, run_dir: Path) -> None:
+    """发布前核对图清单与已验证八字段 run 的源身份和文件摘要。"""
+    plot = json.loads((run_dir / "control_plot.json").read_text(encoding="utf-8"))
+    metadata = json.loads((run_dir / "metadata.json").read_text(encoding="utf-8"))
+    metadata.pop("derived_files_sha256", None)
+    source_metadata_sha256 = sha256(_json_bytes(metadata)).hexdigest()
+    channel = plot.get("control_channel")
+    if (type(channel) is not int or not 0 <= channel < len(record.metadata.control.names)
+            or plot.get("source_run_id") != record.run_id
+            or plot.get("source_metadata_sha256") != source_metadata_sha256
+            or plot.get("source_trajectory_sha256") != _digest(run_dir / "trajectory.csv")
+            or plot.get("source_config_sha256") != _digest(run_dir / "config.json")
+            or plot.get("figure_sha256") != _digest(run_dir / "control.png")
+            or plot.get("sample_count") != record.result.time.size
+            or plot.get("control_name") != record.metadata.control.names[channel]
+            or plot.get("control_unit") != record.metadata.control.units[channel]
+            or plot.get("signed_error") != "control_ideal - control_secure"
+            or plot.get("shared_control_y_scale") is not True):
+        raise ValueError("衍生控制图与正式 run 的来源绑定不一致。")
+
+
+def redraw_control_triptych(run_dir: str | Path, output_path: str | Path,
+                            control_index: int = 0) -> Path:
+    """只通过 canonical reader 重绘，不创建或恢复任何安全会话。"""
+    record = load_artifacts(run_dir)
+    target = Path(output_path)
+    if target.exists():
+        raise FileExistsError("重绘目标已存在。")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    figure = plot_control_triptych(record, control_index)
+    try:
+        figure.savefig(target, dpi=180, format="png")
+    finally:
+        figure.clear()
+    return target
 
 
 def plot_control_error(

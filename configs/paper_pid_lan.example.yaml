@@ -1,0 +1,17 @@
+# k 是带符号参数/初态 payload 总位宽，不是整数位数。
+# runtime_payload_bits 给动态 state/input 留更宽的 payload 空间。
+schema_version: 1
+scenario: paper_pid_fig3
+sample_count: 51
+numeric:
+  ell: 32
+  k: 40
+  runtime_payload_bits: 46
+  lambda: 80
+  prime_source: hvac_2r2c_sweep_prime.yaml
+range:
+  measurement_absolute_bound: 128
+plot:
+  control_channel: 0
+frozen_definition: paper_pid_fig3_sweep.yaml
+output_root: ../results/lan_continuous

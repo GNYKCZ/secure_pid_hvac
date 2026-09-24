@@ -69,6 +69,8 @@ class LanConfig:
     step_timeout: float
     shutdown_timeout: float
     controller_config: Path | None
+    experiment_config: Path | None = None
+    idle_timeout: float = 30.0
 
 
 def load_lan_config(path: str | Path, role: Role) -> LanConfig:
@@ -77,7 +79,9 @@ def load_lan_config(path: str | Path, role: Role) -> LanConfig:
     data = _load_yaml(source)
     _fields(
         data,
-        {"role", "topology", "tls", "timeouts"} | ({"controller"} if role == "Client" else set()),
+        {"role", "topology", "tls", "timeouts"}
+        | ({"controller"} if role == "Client" and "controller" in data else set())
+        | ({"experiment"} if role == "Client" and "experiment" in data else set()),
     )
     if data["role"] != role:
         raise ValueError("角色配置与命令角色不匹配。")
@@ -110,12 +114,19 @@ def load_lan_config(path: str | Path, role: Role) -> LanConfig:
         if not file.is_file():
             raise ValueError(f"{name} 路径不是存在的普通文件。")
     timeouts = data["timeouts"]
-    _fields(timeouts, {"startup", "step", "shutdown"})
+    _fields(timeouts, {"startup", "step", "shutdown"} | ({"idle"} if "idle" in timeouts else set()))
     seconds = tuple(_timeout(timeouts[name], name) for name in ("startup", "step", "shutdown"))
-    controller = _relative(source, data["controller"]) if role == "Client" else None
+    if role == "Client" and ("controller" in data) == ("experiment" in data):
+        raise ValueError("Client 必须且只能选择 controller 或 experiment。")
+    controller = _relative(source, data["controller"]) if "controller" in data else None
+    experiment = _relative(source, data["experiment"]) if "experiment" in data else None
     if controller is not None and not controller.is_file():
         raise ValueError("Client controller 配置不存在。")
-    return LanConfig(role, topology, ca, certificate, private_key, *seconds, controller)
+    if experiment is not None and not experiment.is_file():
+        raise ValueError("Client experiment 配置不存在。")
+    idle = _timeout(timeouts.get("idle", timeouts["step"]), "idle")
+    return LanConfig(role, topology, ca, certificate, private_key, *seconds, controller,
+                     experiment, idle)
 
 
 def _load_yaml(path: Path) -> dict[str, object]:
