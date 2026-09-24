@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Client 控制 Dashboard</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header>
+    <h1>Client 控制 Dashboard</h1>
+    <p>本机只读 · 直播可能缺帧 · 正式回放来自已验证结果</p>
+  </header>
+  <main>
+    <section class="panel">
+      <h2>会话与来源</h2>
+      <div class="toolbar">
+        <button id="live-button" type="button">查看直播</button>
+        <label for="run-select">已验证回放</label><select id="run-select"><option value="">选择 run</option></select>
+        <button id="replay-button" type="button">回放所选 run</button>
+      </div>
+      <div class="facts">
+        <p>来源：<span id="source">直播</span></p>
+        <p>状态：<strong id="status">等待公开事件</strong></p>
+        <p>公开 ID：<span id="session-id">未提供</span></p>
+        <p>正式发布：<span id="publication">未开始</span></p>
+        <p>步数：<span id="step">未提供</span></p>
+        <p>样本：<span id="sample-count">0</span></p>
+        <p>时间：<span id="time-range">未提供</span></p>
+        <p>后端：<span id="backend">未提供</span></p>
+        <p>缺帧：<span id="gaps">0</span></p>
+        <p>迟到事件：<span id="late-count">0</span></p>
+      </div>
+      <p id="scenario-note" class="note"></p>
+      <p id="delivery-note" class="note"></p>
+    </section>
+    <section class="panel">
+      <h2>通道与角色</h2>
+      <div class="toolbar">
+        <label for="reference-channel">Reference</label><select id="reference-channel"></select>
+        <label for="output-channel">Output</label><select id="output-channel"></select>
+        <label for="control-channel">Applied control</label><select id="control-channel"></select>
+      </div>
+      <p id="channel-note" class="note">向量信号须逐通道选择。</p>
+      <div id="roles" class="roles"></div>
+      <p class="note">角色状态是最近一次 session topology 观测，不是 P1/P2 独立心跳。旧回放为 unknown。</p>
+      <p>controller_round：<span id="latency-round">未采集</span>；actuator_plant：<span id="latency-plant">未采集</span>；prepare / stage / commit：未采集</p>
+    </section>
+    <section class="panel">
+      <h2>输出与参考</h2><p id="output-legend" class="legend"></p><svg id="output-chart" role="img" aria-label="输出与参考曲线"></svg>
+    </section>
+    <section class="panel">
+      <h2>实际施加控制量 u(t) / û(t)</h2><p id="control-legend" class="legend"></p><svg id="control-chart" role="img" aria-label="理想与安全控制量原始曲线"></svg>
+    </section>
+    <section class="panel">
+      <h2>控制误差 u−û</h2><p id="control-error-legend" class="legend"></p><svg id="control-error-chart" role="img" aria-label="有符号控制误差曲线"></svg>
+    </section>
+    <section class="panel">
+      <h2>输出误差 ideal−secure</h2><p id="output-error-legend" class="legend"></p><svg id="output-error-chart" role="img" aria-label="有符号输出误差曲线"></svg>
+    </section>
+  </main>
+  <footer>paper-inspired PID 的 51 点属于仓库选择的 ZOH 对象；不代表作者原 Fig. 3 逐点数据。页面不发送控制命令。</footer>
+</body>
+</html>

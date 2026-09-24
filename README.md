@@ -14,6 +14,14 @@ Client/P1/P2 单进程协议核心、与明文接口兼容的通用安全状态�
 的 localhost TCP 后端；默认安全运行时不变。另有独立三角色、双向 TLS 的单步 LAN 命令入口；
 其本机示例、部署和未完成的真实三机验收见 [LAN 单步试验](docs/lan_single_step.md)。
 现已提供显式场景选择的实验入口与通用 CSV/metadata/config 产物。
+Client 本机只读的实时控制 Dashboard 与 verified 结果回放见
+[Dashboard 启动及数据边界](docs/dashboard.md)。
+快速查看已保存的 #70 四点或启动一次本机 HVAC 直播：
+
+```powershell
+uv run python -m secure_control.experiments.dashboard replay-paper-sweep
+uv run python -m secure_control.experiments.dashboard live-hvac --seed 42
+```
 
 ## 架构边界
 
