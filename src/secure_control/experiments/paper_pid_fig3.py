@@ -180,7 +180,8 @@ def render_saved_sweep(sweep_dir: str | Path) -> dict[str, Any]:
         raise ValueError("Fig.3 必须包含四个精度")
     records = []
     for ell, entry in zip(PRECISIONS, manifest["runs"]):
-        if entry.get("ell") != ell or not isinstance(entry.get("run_id"), str):
+        if (entry.get("ell") != ell or entry.get("status") != "success" or
+                not isinstance(entry.get("run_id"), str)):
             raise ValueError("Fig.3 run 顺序或精度不符")
         record = load_artifacts(root / entry["run_id"])
         if (_digest(root / entry["run_id"] / "metadata.json") != entry.get("metadata_sha256") or
@@ -276,7 +277,7 @@ def run_sweep(config_path: str | Path, *, output_root: str | Path,
                                        output_root=root)
             record = load_artifacts(artifact.run_dir)
             records.append(record)
-            entries.append({"ell": ell, "run_id": artifact.run_id,
+            entries.append({"ell": ell, "status": "success", "run_id": artifact.run_id,
                             "metadata_sha256": _digest(artifact.metadata_path)})
         finally:
             if isinstance(runtime, LocalhostSecureStateSpaceRuntime):

@@ -1,0 +1,5 @@
+# Formal #70 v1 artifacts contain byte-level SHA-256 links. Restore writer line endings.
+paper_pid_fig3/manifest.json text eol=crlf
+paper_pid_fig3/*/trajectory.csv text eol=crlf
+paper_pid_fig3/*/config.json text eol=lf
+paper_pid_fig3/*/metadata.json text eol=lf

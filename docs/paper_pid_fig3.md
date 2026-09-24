@@ -31,9 +31,9 @@
 运行与复验：
 
 ```powershell
-uv run python -m secure_control.experiments.paper_pid_fig3 --config configs/paper_pid_fig3_sweep.yaml --output-root results/paper_pid_fig3 --seed 70
+uv run python -m secure_control.experiments.paper_pid_fig3 --config configs/paper_pid_fig3_sweep.yaml --output-root results/diagnostics/paper_pid_fig3_formal_staging --seed 70
 uv run python -m secure_control.experiments.paper_pid_fig3 --verify-dir results/paper_pid_fig3
-uv run python -m secure_control.experiments.paper_pid_fig3 --config configs/paper_pid_fig3_sweep.yaml --output-root results/paper_pid_fig3_localhost --seed 70 --backend localhost
+uv run python -m secure_control.experiments.paper_pid_fig3 --config configs/paper_pid_fig3_sweep.yaml --output-root results/diagnostics/paper_pid_fig3_localhost --seed 70 --backend localhost
 ```
 
 每个点是 v1 成功目录，含 `trajectory.csv`、`config.json`、`metadata.json`，
@@ -42,6 +42,9 @@ uv run python -m secure_control.experiments.paper_pid_fig3 --config configs/pape
 [`fig3.png`](../results/paper_pid_fig3/fig3.png)。绘图入口仅读取这些已验证数据；
 纵轴为 symlog，使真正的零值保持为零。正式四点原始数据随本 Issue 的 PR 版本管理，
 因为它们正是本 Issue 要求审查和重建的证据；其余临时实验结果不提交。
+仓库中的正式目录是在干净代码提交下先于已忽略的诊断路径完成四点验证、
+再整体移入 `results/paper_pid_fig3`；准确源码 SHA 由各点 `metadata.json` 记录，
+四点 sidecar 的 Git `dirty` 均为 `false`。
 
 ## 实测结果
 
