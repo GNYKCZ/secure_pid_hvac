@@ -1,0 +1,188 @@
+{
+  "channel_counts": {
+    "control": 1,
+    "output": 1,
+    "reference": 1
+  },
+  "channels": {
+    "control": {
+      "names": [
+        "raw_u"
+      ],
+      "units": [
+        "paper_unit_unspecified"
+      ]
+    },
+    "output": {
+      "names": [
+        "y"
+      ],
+      "units": [
+        "paper_unit_unspecified"
+      ]
+    },
+    "reference": {
+      "names": [
+        "unused_zero"
+      ],
+      "units": [
+        "dimensionless"
+      ]
+    }
+  },
+  "columns": [
+    {
+      "channel_index": null,
+      "channel_name": null,
+      "column_name": "time",
+      "field": "time",
+      "unit": "seconds"
+    },
+    {
+      "channel_index": 0,
+      "channel_name": "unused_zero",
+      "column_name": "reference[0]",
+      "field": "reference",
+      "unit": "dimensionless"
+    },
+    {
+      "channel_index": 0,
+      "channel_name": "y",
+      "column_name": "output_ideal[0]",
+      "field": "output_ideal",
+      "unit": "paper_unit_unspecified"
+    },
+    {
+      "channel_index": 0,
+      "channel_name": "y",
+      "column_name": "output_secure[0]",
+      "field": "output_secure",
+      "unit": "paper_unit_unspecified"
+    },
+    {
+      "channel_index": 0,
+      "channel_name": "raw_u",
+      "column_name": "control_ideal[0]",
+      "field": "control_ideal",
+      "unit": "paper_unit_unspecified"
+    },
+    {
+      "channel_index": 0,
+      "channel_name": "raw_u",
+      "column_name": "control_secure[0]",
+      "field": "control_secure",
+      "unit": "paper_unit_unspecified"
+    },
+    {
+      "channel_index": 0,
+      "channel_name": "raw_u",
+      "column_name": "control_error[0]",
+      "field": "control_error",
+      "unit": "paper_unit_unspecified"
+    },
+    {
+      "channel_index": 0,
+      "channel_name": "y",
+      "column_name": "output_error[0]",
+      "field": "output_error",
+      "unit": "paper_unit_unspecified"
+    }
+  ],
+  "created_at_utc": "2026-09-24T02:18:33.601592+00:00",
+  "files_sha256": {
+    "config.json": "109260003bb6fbcf13f910a0bfa9de506e09c36863f5f7a570003e82db5fe8ed",
+    "trajectory.csv": "4c07eb1bc8eb706dffbf58672a0f472cf8bbff2c4df3ed776aea9e1b6ceb90c3"
+  },
+  "provenance": {
+    "backend": "single_process",
+    "claim_level": "paper-inspired",
+    "collected_at_utc": "2026-09-24T02:18:33.534902+00:00",
+    "configured_seeds": {
+      "secure_material_test_seed": 70
+    },
+    "dependency_versions": {
+      "matplotlib": "3.11.2",
+      "numpy": "2.4.6",
+      "pyyaml": "6.0.3",
+      "scipy": "1.17.1"
+    },
+    "git": {
+      "available": true,
+      "commit": "3574977cc5c05d44f3462bbfed2deb23ba4a5622",
+      "dirty": false
+    },
+    "kappa": 174,
+    "platform": {
+      "machine": "AMD64",
+      "release": "10",
+      "system": "Windows"
+    },
+    "prime_certificate_sha256": "aa15ad45266d1c1bffee97cb2626ba4940ffbc8c3472045e92696c196a06dc3b",
+    "prime_verification": {
+      "bit_length": 256,
+      "certificate_id": "issue15-256bit-pocklington-v1",
+      "certificate_sha256": "aa15ad45266d1c1bffee97cb2626ba4940ffbc8c3472045e92696c196a06dc3b",
+      "method": "pocklington_v1",
+      "modulus": 57919013630500220500943667918768663966531314514739586011956233569313332958947,
+      "source": "secure_pid_hvac Issue",
+      "source_version": "1",
+      "status": "verified"
+    },
+    "project_version": "0.1.0",
+    "pyproject": {
+      "available": true,
+      "sha256": "9a0afa86ff43945ec7d7636f861d222236229d56fe0e85641cf7877cde599415"
+    },
+    "python": {
+      "implementation": "CPython",
+      "version": "3.11.16"
+    },
+    "range_verification": {
+      "centered_modulus_limit": 28959506815250110250471833959384331983265657257369793005978116784656666479473,
+      "certificate_sha256": null,
+      "maximum_truncation_message": 11972621413014756705924586149611790497021399392059391,
+      "output_accumulator_bounds": [
+        678038217459101882123240
+      ],
+      "proof_mode": "finite_horizon",
+      "state_accumulator_bounds": [
+        120420345313390701314048,
+        118059162071955878707200
+      ]
+    },
+    "resource_counts": {
+      "products_consumed": 459,
+      "truncations_consumed": 102
+    },
+    "role_pids": null,
+    "scale_ledger": {
+      "A": 32,
+      "B": 32,
+      "C": 32,
+      "D": 32,
+      "input": 32,
+      "output": 64,
+      "output_accumulator": 64,
+      "state": 32,
+      "state_accumulator": 64,
+      "state_truncation_bits": 32
+    },
+    "scenario_name": "paper_pid_fig3",
+    "scenario_version": "1",
+    "schema_version": 1,
+    "secure_material_randomness": "deterministic_test",
+    "security_boundary": "diagnostic seed; no deployment security claim",
+    "uv_lock": {
+      "available": true,
+      "sha256": "810af24ad18b128117a1a45ce4fbc11c038f3a511e2daf65a06f47b2e1a63a5a"
+    }
+  },
+  "run_id": "20260924T021833595425Z-4bd24ce042f7",
+  "sample_count": 51,
+  "scenario": {
+    "name": "paper_pid_fig3",
+    "version": "1"
+  },
+  "schema_version": 1,
+  "success": true
+}

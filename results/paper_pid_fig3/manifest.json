@@ -1,0 +1,84 @@
+{
+  "definition": {
+    "baseline_config": "paper_pid_cascade_zoh.yaml",
+    "baseline_sha256": "2431449fad27a07863ec8b390c1ee7769b9bc6b8ddc4a0bd9d9aab6a622bda78",
+    "claim_level": "paper-inspired",
+    "epsilon": 0.0009765625,
+    "fractional_bits": [
+      32,
+      40,
+      48,
+      56
+    ],
+    "measurement_absolute_bound": 128,
+    "paper_parameter_headroom_bits": 8,
+    "prime_config": "hvac_2r2c_sweep_prime.yaml",
+    "prime_sha256": "b8c5e9e779d945cfc19d0662b641cd1084acadd0907cc6b4e64ee4076455111b",
+    "reference_channel": "unused_zero",
+    "runtime_payload_headroom_bits": 14,
+    "sample_count": 51,
+    "schema_version": 1,
+    "security_parameter": 80
+  },
+  "figure_sha256": "739297ec0a7beb6dadd8d4d616579ae5cfd3a6780a1e25918e5eb8d51adf410b",
+  "runs": [
+    {
+      "ell": 32,
+      "metadata_sha256": "273725eb994af03f971a1c16a5b5291c30434ce624094ed31e86cc2807dd586c",
+      "run_id": "20260924T021833595425Z-4bd24ce042f7",
+      "status": "success"
+    },
+    {
+      "ell": 40,
+      "metadata_sha256": "96bf8c07c8953c67d592d33a36375b21b18996d044605fd044dc2ace75a00caa",
+      "run_id": "20260924T021833736875Z-617d5b84b2ee",
+      "status": "success"
+    },
+    {
+      "ell": 48,
+      "metadata_sha256": "71ea14d40e9650d3318753a4d5a9533caf3a766b49e9a91a42a16da5a3140b4a",
+      "run_id": "20260924T021833877447Z-83a71bdb9d94",
+      "status": "success"
+    },
+    {
+      "ell": 56,
+      "metadata_sha256": "154a9a8fbdbf2279d0342b1c67884915f3425044bb04b212c6683d0fde7d65b2",
+      "run_id": "20260924T021834020502Z-a3560e74f37a",
+      "status": "success"
+    }
+  ],
+  "summaries": [
+    {
+      "below_epsilon": true,
+      "below_numeric_resolution": false,
+      "binary64_ulp_upper": 5.684341886080802e-14,
+      "ell": 32,
+      "max_error": 3.37553984763872e-08,
+      "run_id": "20260924T021833595425Z-4bd24ce042f7"
+    },
+    {
+      "below_epsilon": true,
+      "below_numeric_resolution": false,
+      "binary64_ulp_upper": 5.684341886080802e-14,
+      "ell": 40,
+      "max_error": 1.0243184078717604e-10,
+      "run_id": "20260924T021833736875Z-617d5b84b2ee"
+    },
+    {
+      "below_epsilon": true,
+      "below_numeric_resolution": true,
+      "binary64_ulp_upper": 5.684341886080802e-14,
+      "ell": 48,
+      "max_error": 2.2737367544323206e-13,
+      "run_id": "20260924T021833877447Z-83a71bdb9d94"
+    },
+    {
+      "below_epsilon": true,
+      "below_numeric_resolution": true,
+      "binary64_ulp_upper": 5.684341886080802e-14,
+      "ell": 56,
+      "max_error": 1.1368683772161603e-13,
+      "run_id": "20260924T021834020502Z-a3560e74f37a"
+    }
+  ]
+}
