@@ -269,7 +269,7 @@ def test_parent_rejects_invalid_input_without_losing_session() -> None:
 
 def test_hvac_180_step_runner_matches_existing_secure_backend_and_cleans_up() -> None:
     summary = run_multiprocessing_comparison(
-        Path(__file__).parents[1] / "configs" / "hvac_dual_loop.yaml",
+        Path(__file__).parents[1] / "tests" / "fixtures" / "legacy_hvac" / "hvac_dual_loop.yaml",
         test_seed=901,
     )
 

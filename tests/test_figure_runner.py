@@ -17,8 +17,8 @@ from secure_control.experiments.runner import run_experiment
 from secure_control.simulation import ChannelMetadata, ScenarioMetadata, SimulationResult
 
 PROJECT_ROOT = Path(__file__).parents[1]
-HVAC_CONFIG = PROJECT_ROOT / "configs" / "hvac_dual_loop.yaml"
-HVAC_2R2C_CONFIG = PROJECT_ROOT / "configs" / "hvac_2r2c_dual_loop.yaml"
+HVAC_CONFIG = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_dual_loop.yaml"
+HVAC_2R2C_CONFIG = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_dual_loop.yaml"
 
 
 def _vector_run(tmp_path: Path) -> RunArtifacts:

@@ -16,46 +16,29 @@ import numpy as np
 import yaml
 
 from secure_control.crypto import (
-    PocklingtonCertificate,
-    PocklingtonFactorEvidence,
     PrimeModulusEvidence,
     verify_prime_modulus,
 )
 from secure_control.execution import LocalhostSecureStateSpaceRuntime
 from secure_control.scenarios.paper_pid.baseline import run_paper_pid_baseline
-from secure_control.scenarios.paper_pid.secure_experiment import build_paper_pid_plan
+from secure_control.scenarios.paper_pid.secure_experiment import (
+    SCENARIO_VERSION,
+    build_paper_pid_plan,
+)
 from secure_control.simulation import compare_closed_loops
 
 from .artifacts import SCHEMA_VERSION, ExperimentRecord, load_artifacts, write_artifacts
-from .paper_pid_runner import _load_config as load_baseline_config
+from .paper_pid_sources import load_baseline_config, parse_prime_certificate
 from .provenance import collect_provenance
 
 matplotlib.use("Agg")
 from matplotlib import pyplot as plt
 
 PRECISIONS = (32, 40, 48, 56)
-SCENARIO_VERSION = "1"
 
 
 def _digest(path: Path) -> str:
     return sha256(path.read_bytes()).hexdigest()
-
-
-def _certificate(raw: dict[str, Any]) -> PocklingtonCertificate:
-    """仅解析已由配置 SHA 锁定的仓库证书，数论验证仍交给 crypto。"""
-    if not isinstance(raw, dict) or set(raw) != {"candidate", "factors"}:
-        raise ValueError("prime certificate 字段无效")
-    factors = []
-    for item in raw["factors"]:
-        if not isinstance(item, dict) or set(item) - {"prime", "exponent", "witness", "certificate"}:
-            raise ValueError("prime factor 字段无效")
-        if not {"prime", "exponent", "witness"} <= set(item):
-            raise ValueError("prime factor 缺失字段")
-        factors.append(PocklingtonFactorEvidence(
-            item["prime"], item["exponent"], item["witness"],
-            _certificate(item["certificate"]) if "certificate" in item else None,
-        ))
-    return PocklingtonCertificate(raw["candidate"], tuple(factors))
 
 
 def load_definition(path: str | Path) -> tuple[dict[str, Any], dict[str, Any], int, PrimeModulusEvidence]:
@@ -99,7 +82,7 @@ def load_definition(path: str | Path) -> tuple[dict[str, Any], dict[str, Any], i
     evidence = PrimeModulusEvidence(
         source["method"], source["source"], source["source_version"],
         source["certificate_id"], source["certificate_sha256"],
-        _certificate(source["certificate"]),
+        parse_prime_certificate(source["certificate"]),
     )
     verify_prime_modulus(q, evidence)
     return definition, baseline, q, evidence

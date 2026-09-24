@@ -27,14 +27,14 @@ from secure_control.scenarios.hvac import (
 from secure_control.scenarios.hvac.integration import HvacScenario, run_hvac_dual_loop
 from secure_control.simulation import SimulationPlan, run
 
-CONFIG_PATH = Path(__file__).parents[1] / "configs" / "hvac_dual_loop.yaml"
-BASELINE_PATH = Path(__file__).parents[1] / "configs" / "hvac_pid_baseline.yaml"
-CONFIG_2R2C_PATH = Path(__file__).parents[1] / "configs" / "hvac_2r2c_dual_loop.yaml"
+CONFIG_PATH = Path(__file__).parents[1] / "tests" / "fixtures" / "legacy_hvac" / "hvac_dual_loop.yaml"
+BASELINE_PATH = Path(__file__).parents[1] / "tests" / "fixtures" / "legacy_hvac" / "hvac_pid_baseline.yaml"
+CONFIG_2R2C_PATH = Path(__file__).parents[1] / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_dual_loop.yaml"
 CONFIG_2R2C_MIGRATED_PATH = (
-    Path(__file__).parents[1] / "configs" / "hvac_2r2c_dual_loop_25_20_15.yaml"
+    Path(__file__).parents[1] / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_dual_loop_25_20_15.yaml"
 )
-BASELINE_2R2C_PATH = Path(__file__).parents[1] / "configs" / "hvac_2r2c_pid_baseline.yaml"
-PLANT_2R2C_PATH = Path(__file__).parents[1] / "configs" / "hvac_2r2c_plant.yaml"
+BASELINE_2R2C_PATH = Path(__file__).parents[1] / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_pid_baseline.yaml"
+PLANT_2R2C_PATH = Path(__file__).parents[1] / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_plant.yaml"
 
 
 def _large_prime_evidence() -> PrimeModulusEvidence:

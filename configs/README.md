@@ -10,11 +10,12 @@
 ## 三角色连续实验
 
 - `lab-p1.example.yaml`、`lab-p2.example.yaml`、`lab-client-continuous.example.yaml`：三个脚本各自默认读取的角色配置；`transport: insecure_tcp` 明确表示网络连接不加密、不验证对端。P1/P2 不配置实验精度。
-- `paper_pid_lan.example.yaml`：**Client 的日常参数入口**，包含场景、`ell`、`k`、`runtime_payload_bits`、`lambda`、步数和结果目录。改 `ell` 时不能只改一个数字；当前 51 步配置建议同时保持 `k=ell+8`、`runtime_payload_bits=ell+14`，并让程序完成数值预检。`ell=32/40/48/56` 的冻结组合分别对应 `k=40/48/56/64`、运行位宽 `46/54/62/70`。其他合法组合会标记为 `user-exploration`。
+- `paper_pid_lan.example.yaml`：**Client 的日常参数入口**，包含场景、`ell`、`k`、`runtime_payload_bits`、`lambda`、步数和结果目录。改 `ell` 时不能只改一个数字；当前 51 步配置建议同时保持 `k=ell+8`、`runtime_payload_bits=ell+14`，并让程序完成数值预检。该入口的合法组合均标记为 `user-exploration`；Fig3 的四个冻结精度只由它自己的定义管理。
+- `scenario: paper_pid_fig3` 是已有 paper PID 数学场景的标识；在三角色配置里出现这个名字不会启动 Fig3 四点扫描。
 - `local-deployment.example.yaml`：三条固定连接的地址和端口；本机的 `127.0.0.1` 不用改。跨电脑时三份文件内容须相同，填实际 LAN IP，并确认端口可访问。它只描述拓扑；连接模式由角色配置决定。
 - `shared_prime_256_pocklington.yaml`：Client profile 使用的跨场景公开素数证明，日常不要手动修改。
 
-原有 `local-{p1,p2,client-continuous}.example.yaml` 是需证书的连续 TLS 入口；`local-client.example.yaml` 和 `lan-{p1,p2,client,deployment}.yaml` 属于较早的单步 LAN 入口。它们仍有文档与测试引用，不能当成未使用文件删除。
+旧 TLS 和单步 LAN 示例配置已从当前目录移除；安全协议的回归测试仍保留。
 
 ## Fig3 四精度批量图
 
@@ -32,6 +33,6 @@ uv run python -m secure_control.experiments.paper_pid_fig3 --config configs/pape
 
 这个命令默认在一个进程里顺序跑四个精度；它不是三个手动启动的 LAN 角色。`--backend localhost` 是另一个自动启动本机三个进程的诊断方式，也不是三台物理电脑。当前三角色 LAN 入口一次只运行一个精度，生成的是单次 `control.png`；现有 Fig3 reader 不接受把四个 LAN run 直接拼成一张图。要让三台电脑的一组角色连续跑四个精度并合成同款 Fig3 图，还需要另行设计批量会话与结果清单。
 
-`paper_pid_fig3_sweep.yaml` 引用 `paper_pid_cascade_zoh.yaml` 和 `hvac_2r2c_sweep_prime.yaml`，并锁定来源 SHA；这些文件与已发布的 `results/paper_pid_fig3` 证据绑定，不要为了改日常 LAN 参数而编辑或删除。更多背景见[Fig3 方法与阈值对照](../docs/paper_pid_fig3.md)。
+三角色 Client 的 `paper_pid_lan.example.yaml` 直接引用 `paper_pid_cascade_zoh.yaml`，不读取 Fig3 四点定义；即使选 `ell=32`，此日常入口也标为 `user-exploration`。`paper_pid_fig3_sweep.yaml` 独立引用同一个基线文件和历史名素数证据 `hvac_2r2c_sweep_prime.yaml`，并锁定来源 SHA；已发布的 `results/paper_pid_fig3` 仍需这些原始字节。更多背景见[Fig3 方法与阈值对照](../docs/paper_pid_fig3.md)。
 
-其余 `hvac_*` 配置支撑已有 HVAC 基线、扫描、报告和历史结果；当前三角色脚本不直接读取它们。它们被测试、文档或已发布来源引用，保留以便复验。
+旧 HVAC 示例配置已退出日常入口，测试所需的原始输入位于 `tests/fixtures/legacy_hvac/`。唯一保留在 `configs/` 的旧名 `hvac_2r2c_sweep_prime.yaml` 是 Fig3 已发布清单的哈希兼容来源，不能独立编辑。

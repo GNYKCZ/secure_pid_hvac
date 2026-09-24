@@ -1,3 +1,5 @@
+> **历史资料（#84）** 本页记录旧 HVAC 实验和当时的命令；文中的 `configs/hvac*` 路径已从当前用户配置目录退出，原始输入只留在 `tests/fixtures/legacy_hvac/` 供回归测试。当前实验请按 [配置索引](../configs/README.md) 运行三角色或 Fig3。
+
 # HVAC 场景与实验配置契约
 
 本文冻结第一个场景的配置语义，并说明其 HVAC plant、reference 与 SignalAdapter 实现。PID 设计和

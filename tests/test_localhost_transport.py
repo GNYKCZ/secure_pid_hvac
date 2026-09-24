@@ -965,7 +965,7 @@ def test_vector_zero_state_and_no_truncation_match_issue16_backend() -> None:
 
 def test_hvac_180_step_runner_matches_issue16_backend_and_cleans_up() -> None:
     summary = run_localhost_comparison(
-        Path(__file__).parents[1] / "configs" / "hvac_dual_loop.yaml",
+        Path(__file__).parents[1] / "tests" / "fixtures" / "legacy_hvac" / "hvac_dual_loop.yaml",
         test_seed=905,
     )
 
@@ -985,7 +985,7 @@ def test_hvac_180_step_runner_matches_issue16_backend_and_cleans_up() -> None:
 
 def test_hvac_180_step_result_fields_match_issue16_without_semantic_drift() -> None:
     """八个仿真结果字段逐采样一致，且不改变 HVAC 的时间索引和结果契约。"""
-    config = Path(__file__).parents[1] / "configs" / "hvac_dual_loop.yaml"
+    config = Path(__file__).parents[1] / "tests" / "fixtures" / "legacy_hvac" / "hvac_dual_loop.yaml"
     baseline = HvacScenario(
         config,
         test_seed=905,
@@ -1021,7 +1021,7 @@ def test_localhost_step_identity_mismatch_publishes_protocol_fault(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """真实 Client 首步成功后伪造第二步回执 identity，验证运行时和公开故障边界。"""
-    config = Path(__file__).parents[1] / "configs" / "hvac_dual_loop.yaml"
+    config = Path(__file__).parents[1] / "tests" / "fixtures" / "legacy_hvac" / "hvac_dual_loop.yaml"
     plan = HvacScenario(
         config, test_seed=905, secure_runtime_builder=LocalhostSecureStateSpaceRuntime
     ).build_plan()
@@ -1078,7 +1078,7 @@ def test_localhost_socket_disconnect_publishes_disconnected_without_relabeling_p
     assert getattr(disconnected, "_public_fault_category", None) == "disconnected"
     assert getattr(remote_error, "_public_fault_category", None) is None
 
-    config = Path(__file__).parents[1] / "configs" / "hvac_dual_loop.yaml"
+    config = Path(__file__).parents[1] / "tests" / "fixtures" / "legacy_hvac" / "hvac_dual_loop.yaml"
     plan = HvacScenario(
         config, test_seed=905, secure_runtime_builder=LocalhostSecureStateSpaceRuntime
     ).build_plan()

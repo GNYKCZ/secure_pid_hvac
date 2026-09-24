@@ -19,11 +19,11 @@ from secure_control.scenarios.hvac import (
 )
 
 PROJECT_ROOT = Path(__file__).parents[1]
-PLANT_CONFIG = PROJECT_ROOT / "configs" / "hvac_2r2c_plant.yaml"
-PID_CONFIG = PROJECT_ROOT / "configs" / "hvac_2r2c_pid_baseline.yaml"
-REDESIGN_PLANT_CONFIG = PROJECT_ROOT / "configs" / "hvac_2r2c_scenario_25_20_15.yaml"
+PLANT_CONFIG = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_plant.yaml"
+PID_CONFIG = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_pid_baseline.yaml"
+REDESIGN_PLANT_CONFIG = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_scenario_25_20_15.yaml"
 REDESIGN_PID_CONFIG = (
-    PROJECT_ROOT / "configs" / "hvac_2r2c_pid_baseline_25_20_15_fast_response.yaml"
+    PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_pid_baseline_25_20_15_fast_response.yaml"
 )
 
 

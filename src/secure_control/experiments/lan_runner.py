@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 from dataclasses import asdict
+from hashlib import sha256
 from pathlib import Path
 
 import numpy as np
@@ -31,6 +32,7 @@ from secure_control.execution.localhost_transport import (
 from secure_control.scenarios.hvac.integration import HvacScenario
 from secure_control.scenarios.paper_pid.baseline import run_paper_pid_baseline
 from secure_control.scenarios.paper_pid.secure_experiment import (
+    SCENARIO_VERSION,
     assemble_paper_pid_plan,
     paper_pid_numeric_contract,
 )
@@ -38,7 +40,6 @@ from secure_control.simulation import compare_closed_loops
 
 from .artifacts import SCHEMA_VERSION, load_artifacts, write_artifacts
 from .lan_profile import load_paper_pid_lan_profile
-from .paper_pid_fig3 import SCENARIO_VERSION, load_definition
 from .plotting import redraw_control_triptych, verify_control_triptych, write_control_triptych
 from .provenance import collect_provenance
 
@@ -97,7 +98,7 @@ def run_client_continuous(config: LanConfig) -> dict[str, object]:
         if max(np.max(np.abs(result.output_ideal)),
                np.max(np.abs(result.output_secure))) > profile.measurement_absolute_bound:
             raise ValueError("plant y 超出声明的有限时域输入界。")
-        definition, baseline_config, _, _ = load_definition(profile.definition_path)
+        definition, baseline_config = profile.definition, profile.baseline_config
         baseline = run_paper_pid_baseline(
             alpha=baseline_config["plant"]["alpha"],
             sample_period_seconds=baseline_config["plant"]["sample_period_seconds"],
@@ -117,11 +118,17 @@ def run_client_continuous(config: LanConfig) -> dict[str, object]:
             for index, item in enumerate(confirmed)
         ):
             raise ValueError("LAN 逐步双提交确认不完整。")
-        if profile.sample_count == definition["sample_count"] and counts != {
+        if counts != {
             "products_consumed": 9 * profile.sample_count,
             "truncations_consumed": 2 * profile.sample_count,
         }:
             raise ValueError("实际资源消费与逐步 Protocol 3 计划不符。")
+        if sha256(profile.baseline_path.read_bytes()).hexdigest() != profile.baseline_digest:
+            raise ValueError("paper PID 基线在运行期间变化。")
+        if (profile.definition_path is not None
+                and sha256(profile.definition_path.read_bytes()).hexdigest()
+                != profile.definition_digest):
+            raise ValueError("Fig3 冻结定义在运行期间变化。")
         runtime.finish()
     finally:
         runtime.close()
@@ -139,6 +146,7 @@ def run_client_continuous(config: LanConfig) -> dict[str, object]:
         "prime_source_sha256": profile.prime_digest,
         "frozen_definition_sha256": profile.definition_digest,
         "definition": definition,
+        "baseline_source_sha256": profile.baseline_digest,
         "baseline_plant": baseline_config["plant"],
         "controller_spec": {
             name: getattr(spec, name).tolist() for name in ("A", "B", "C", "D", "x0")

@@ -29,12 +29,12 @@ from secure_control.scenarios.hvac import (
 )
 from secure_control.simulation import SimulationResult
 
-PID_CONFIG_PATH = Path(__file__).parents[1] / "configs" / "hvac_pid_baseline.yaml"
-PLANT_2R2C_PATH = Path(__file__).parents[1] / "configs" / "hvac_2r2c_plant.yaml"
-PID_2R2C_PATH = Path(__file__).parents[1] / "configs" / "hvac_2r2c_pid_baseline.yaml"
-REDESIGN_SCENARIO_PATH = Path(__file__).parents[1] / "configs" / "hvac_2r2c_scenario_25_20_15.yaml"
+PID_CONFIG_PATH = Path(__file__).parents[1] / "tests" / "fixtures" / "legacy_hvac" / "hvac_pid_baseline.yaml"
+PLANT_2R2C_PATH = Path(__file__).parents[1] / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_plant.yaml"
+PID_2R2C_PATH = Path(__file__).parents[1] / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_pid_baseline.yaml"
+REDESIGN_SCENARIO_PATH = Path(__file__).parents[1] / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_scenario_25_20_15.yaml"
 REDESIGN_PID_PATH = (
-    Path(__file__).parents[1] / "configs" / "hvac_2r2c_pid_baseline_25_20_15_fast_response.yaml"
+    Path(__file__).parents[1] / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_pid_baseline_25_20_15_fast_response.yaml"
 )
 
 

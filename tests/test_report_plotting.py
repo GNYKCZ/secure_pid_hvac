@@ -48,8 +48,8 @@ from secure_control.experiments.sweep_metrics import compute_error_metrics
 from secure_control.simulation import ChannelMetadata, ScenarioMetadata, SimulationResult
 
 PROJECT_ROOT = Path(__file__).parents[1]
-PROFILE = PROJECT_ROOT / "configs" / "hvac_2r2c_report_zh.yaml"
-DEFINITION = PROJECT_ROOT / "configs" / "hvac_2r2c_precision_sweep.yaml"
+PROFILE = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_report_zh.yaml"
+DEFINITION = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_precision_sweep.yaml"
 
 
 def _verified_sweep(root: Path) -> Path:

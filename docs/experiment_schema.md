@@ -1,3 +1,5 @@
+> **历史资料（#84）** 本页记录旧 HVAC 实验和当时的命令；文中的 `configs/hvac*` 路径已从当前用户配置目录退出，原始输入只留在 `tests/fixtures/legacy_hvac/` 供回归测试。当前实验请按 [配置索引](../configs/README.md) 运行三角色或 Fig3。
+
 # Issue #13 可复现实验产物 schema v1
 
 Issue #71 的公开直播/回放事件使用独立版本和有损展示队列；正式八字段产物仍是无损真值。

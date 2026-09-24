@@ -14,8 +14,8 @@ from secure_control.experiments.sweep import SweepRunStatus
 from secure_control.scenarios.hvac.infinite_safety import load_hvac_infinite_safety_bundle
 
 PROJECT_ROOT = Path(__file__).parents[1]
-CONFIG = PROJECT_ROOT / "configs" / "hvac_2r2c_infinite_safety.yaml"
-FINAL_CONFIG = PROJECT_ROOT / "configs" / "hvac_2r2c_infinite_safety_25_20_15_fast_response.yaml"
+CONFIG = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_infinite_safety.yaml"
+FINAL_CONFIG = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_infinite_safety_25_20_15_fast_response.yaml"
 
 
 def test_runner_consumes_verified_reader_without_rerunning_experiment(

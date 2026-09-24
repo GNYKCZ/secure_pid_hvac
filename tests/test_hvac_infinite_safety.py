@@ -25,8 +25,8 @@ from secure_control.scenarios.hvac.infinite_safety import load_hvac_infinite_saf
 from secure_control.scenarios.hvac.tuning import load_hvac_pid_tuning_contract
 
 PROJECT_ROOT = Path(__file__).parents[1]
-CONFIG = PROJECT_ROOT / "configs" / "hvac_2r2c_infinite_safety.yaml"
-FINAL_CONFIG = PROJECT_ROOT / "configs" / "hvac_2r2c_infinite_safety_25_20_15_fast_response.yaml"
+CONFIG = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_infinite_safety.yaml"
+FINAL_CONFIG = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_infinite_safety_25_20_15_fast_response.yaml"
 
 
 @pytest.fixture(scope="module")
@@ -134,9 +134,9 @@ def test_protocol_reverifies_evidence_before_any_share(bundle, monkeypatch) -> N
 
 def test_default_segmented_baseline_is_explicitly_outside_claim(bundle) -> None:
     """默认 15°C 首步 raw u=12.875 kW，会饱和且不能引用局部证书。"""
-    plant = load_hvac_scenario_contract(PROJECT_ROOT / "configs" / "hvac_2r2c_plant.yaml")
+    plant = load_hvac_scenario_contract(PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_plant.yaml")
     design, _, _ = load_hvac_pid_tuning_contract(
-        PROJECT_ROOT / "configs" / "hvac_2r2c_pid_baseline.yaml", plant
+        PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_pid_baseline.yaml", plant
     )
     spec = design.to_controller_spec()
     first_error = 15.0 - 30.0
@@ -158,7 +158,7 @@ def test_configuration_rejects_missing_infinite_reference_tail(tmp_path: Path) -
         "hvac_2r2c_precision_sweep.yaml",
         "hvac_2r2c_sweep_prime.yaml",
     ):
-        (config_dir / name).write_bytes((PROJECT_ROOT / "configs" / name).read_bytes())
+        (config_dir / name).write_bytes((PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / name).read_bytes())
     path = config_dir / CONFIG.name
     path.write_text(yaml.safe_dump(source, allow_unicode=True, sort_keys=False), encoding="utf-8")
 
@@ -178,7 +178,7 @@ def test_configuration_rejects_mismatched_upstream_stability_report(tmp_path: Pa
         "hvac_2r2c_precision_sweep.yaml",
         "hvac_2r2c_sweep_prime.yaml",
     ):
-        (config_dir / name).write_bytes((PROJECT_ROOT / "configs" / name).read_bytes())
+        (config_dir / name).write_bytes((PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / name).read_bytes())
     path = config_dir / CONFIG.name
     path.write_text(yaml.safe_dump(source, allow_unicode=True, sort_keys=False), encoding="utf-8")
 
@@ -195,7 +195,7 @@ def test_final_certificate_rejects_pid_aba_switch(
     assumptions = yaml.safe_load(FINAL_CONFIG.read_text(encoding="utf-8"))
     for item in assumptions["sources"].values():
         name = item["path"]
-        (config_dir / name).write_bytes((PROJECT_ROOT / "configs" / name).read_bytes())
+        (config_dir / name).write_bytes((PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / name).read_bytes())
     path = config_dir / FINAL_CONFIG.name
     path.write_bytes(FINAL_CONFIG.read_bytes())
 

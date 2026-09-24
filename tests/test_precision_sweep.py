@@ -35,11 +35,11 @@ from secure_control.experiments.sweep_runner import (
 from secure_control.scenarios.hvac.integration import HvacSafetyCertificate, HvacScenario
 
 PROJECT_ROOT = Path(__file__).parents[1]
-DEFINITION_PATH = PROJECT_ROOT / "configs" / "hvac_2r2c_precision_sweep.yaml"
-V2_DEFINITION_PATH = PROJECT_ROOT / "configs" / "hvac_2r2c_precision_sweep_definition.yaml"
-HISTORICAL_BASELINE = PROJECT_ROOT / "configs" / "hvac_2r2c_dual_loop.yaml"
-CURRENT_BASELINE = PROJECT_ROOT / "configs" / "hvac_2r2c_dual_loop_25_20_15.yaml"
-REDESIGN_BASELINE = PROJECT_ROOT / "configs" / "hvac_2r2c_dual_loop_25_20_15_fast_response.yaml"
+DEFINITION_PATH = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_precision_sweep.yaml"
+V2_DEFINITION_PATH = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_precision_sweep_definition.yaml"
+HISTORICAL_BASELINE = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_dual_loop.yaml"
+CURRENT_BASELINE = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_dual_loop_25_20_15.yaml"
+REDESIGN_BASELINE = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_dual_loop_25_20_15_fast_response.yaml"
 HISTORICAL_BASELINE_ID = "2489e5476ad316ea2d9599783e29f2d849ffcf485ca860e0db76c80312c532f9"
 CURRENT_BASELINE_ID = "f5d1bee247279ff85ba33db12778621724e46b76b880c48d8ee5637838e5aeab"
 REDESIGN_BASELINE_ID = "e0d0100f0ccf9fac15910c010090113574d9b53b61118fa6ad8a7035116138b7"
@@ -67,7 +67,7 @@ def test_v2_definition_is_source_independent_and_preserves_historical_files() ->
         sha256(DEFINITION_PATH.read_bytes()).hexdigest()
         == "87e20bf25c445849acf3ca15c8a7b6f9848f1fbd1b739aaab3cfd51a35a10e83"
     )
-    legacy_profile = PROJECT_ROOT / "configs" / "hvac_2r2c_evidence_report_zh.yaml"
+    legacy_profile = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_evidence_report_zh.yaml"
     assert (
         sha256(legacy_profile.read_bytes()).hexdigest()
         == "bf3166c51ad3f87373618d2379730dbdfe0e6c7fa8178c9cb55fa0b1032cb20e"
@@ -148,7 +148,7 @@ def test_v2_definition_rejects_instance_identity_fields(tmp_path: Path) -> None:
     target = tmp_path / "definition.yaml"
     target.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
     (tmp_path / "hvac_2r2c_sweep_prime.yaml").write_bytes(
-        (PROJECT_ROOT / "configs" / "hvac_2r2c_sweep_prime.yaml").read_bytes()
+        (PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_sweep_prime.yaml").read_bytes()
     )
     with pytest.raises(ValueError, match="字段"):
         load_precision_sweep_definition(target)
@@ -210,7 +210,7 @@ def test_source_resolution_rejects_tampered_current_config_chain(tmp_path: Path)
         "hvac_2r2c_scenario_25_20_15.yaml",
     )
     for name in names:
-        (tmp_path / name).write_bytes((PROJECT_ROOT / "configs" / name).read_bytes())
+        (tmp_path / name).write_bytes((PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / name).read_bytes())
     scenario = tmp_path / names[-1]
     scenario.write_text(
         scenario.read_text(encoding="utf-8") + "\n# tampered\n",

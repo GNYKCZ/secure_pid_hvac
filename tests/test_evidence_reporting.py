@@ -32,9 +32,9 @@ from secure_control.experiments.sweep_artifacts import VerifiedSweepData
 from secure_control.experiments.sweep_metrics import ErrorMetrics
 
 PROJECT_ROOT = Path(__file__).parents[1]
-PROFILE = PROJECT_ROOT / "configs" / "hvac_2r2c_evidence_report_zh.yaml"
-PROFILE_V2 = PROJECT_ROOT / "configs" / "hvac_2r2c_evidence_report_profile_zh.yaml"
-BASE_PROFILE = PROJECT_ROOT / "configs" / "hvac_2r2c_report_zh.yaml"
+PROFILE = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_evidence_report_zh.yaml"
+PROFILE_V2 = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_evidence_report_profile_zh.yaml"
+BASE_PROFILE = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_report_zh.yaml"
 
 
 def _record(ell: int, seed: int, *, triples: int = 1620) -> SweepRunRecord:

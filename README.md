@@ -13,7 +13,7 @@ P1/P2 在等待 Client 时不持续输出。新终端默认使用命令提示符
 Client 完成后输出 run ID、结果目录与 `figure_path`（正式三栏 `control.png`）。
 失败时停止三方，再从 P1 重新开始。
 场景、精度、步数和输出目录只改 `configs/paper_pid_lan.example.yaml`；
-三机 IP、配置归属、原有 TLS 入口及验证结果重绘见
+三机 IP、配置归属及验证结果重绘见
 [连续 LAN 实验指南](docs/lan_continuous.md)。
 配置文件的日常用途和 Fig3 四精度批量入口见[配置索引](configs/README.md)。
 当前只支持 `paper_pid_fig3`；网页 Dashboard 属 [#72](https://github.com/GNYKCZ/secure_pid_hvac/issues/72)，
@@ -30,8 +30,7 @@ GitHub 仓库和发行包继续使用 `secure_pid_hvac` / `secure-pid-hvac`，Py
 当前已完成架构基础、一阶与 2R2C HVAC 明文基线、安全算术原语与组合验证门、通用
 Client/P1/P2 单进程协议核心、与明文接口兼容的通用安全状态空间运行时，以及领域无关 simulation engine 和
 180 步 HVAC 明文/安全双闭环。现已提供显式选择的本机 multiprocessing 后端与仅绑定 loopback
-的 localhost TCP 后端；默认安全运行时不变。另有独立三角色、双向 TLS 的单步 LAN 命令入口；
-其本机示例、部署和未完成的真实三机验收见 [LAN 单步试验](docs/lan_single_step.md)。
+的 localhost TCP 后端；默认安全运行时不变。旧单步 LAN 示例配置已退出日常入口。
 独立三终端连续 paper-inspired PID、本机 Client profile 与同次正式三栏控制图见
 [连续 LAN 实验](docs/lan_continuous.md)。
 现已提供显式场景选择的实验入口与通用 CSV/metadata/config 产物。
@@ -87,122 +86,7 @@ uv run python path\to\script.py
 uv run python -c "import secure_control; print(secure_control.__version__)"
 ```
 
-实验配置使用场景选择外壳：
-
-```yaml
-scenario:
-  name: hvac
-```
-
-通用 `simulation.runner.run(scenario)` 不根据 YAML 选择场景；具体 HVAC 装配位于场景层。
-实验入口只显式支持 `hvac`；未实现的场景名会明确失败。
-
-## HVAC 场景基线
-
-[`configs/hvac_baseline.yaml`](configs/hvac_baseline.yaml) 冻结了 HVAC 的一阶 RC 冷却模型、60 s
-采样、3 小时 horizon、15 → 20 → 25 °C reference、控制量方向、结果通道及 `v = r - T` 的场景
-信号适配语义。项目已提供确定性的 HVAC plant、reference、signal adapter、PID 到通用状态空间
-矩阵的转换、场景级明文闭环基线，以及复用通用 engine 的 180 步安全双闭环。运行双闭环：
-
-```powershell
-uv run python -m secure_control.scenarios.hvac.runner --config configs/hvac_dual_loop.yaml --seed 12
-uv run python -m secure_control.scenarios.hvac.runner --config configs/hvac_2r2c_dual_loop.yaml --seed 42
-uv run python -m secure_control.scenarios.hvac.runner --config configs/hvac_2r2c_dual_loop_25_20_15.yaml --seed 42
-```
-
-`--seed` 仅用于隔离测试复现；省略时使用安全随机材料源。CLI 只输出摘要，不保存 #13 的
-正式结果文件。配置、时间索引、范围证书与公平比较见
-[HVAC 双闭环集成](docs/simulation_hvac_integration.md)。详细 PID 设计见
-[HVAC PID 设计](docs/hvac_pid_design.md)；完整场景约定见
-[HVAC 场景契约](docs/hvac_scenario_contract.md)。
-
-2R2C 配置使用确定性 10,179 候选 plaintext exhaustive grid，冻结 gains 为
-`Kp=-0.85, Ki=-0.0007, Kd=-0.5`。调参规则、完整指标、二维有限时域范围和论文适配边界见
-[2R2C HVAC PID 设计](docs/hvac_2r2c_pid_design.md)。该结果是 adapted application，不能称为
-论文原数值实验复刻，也不声明无限时域稳定性。
-
-Issue #53 将正式参考迁移为 25→20→15 °C；当前 PID 先经独立 plaintext 门禁并直接复用，
-没有重新执行网格搜索。新配置链、稳定 baseline identity、180 步证书和历史证据边界见
-[2R2C HVAC 参考迁移](docs/hvac_reference_migration.md)。旧 15→20→25 配置及其下游报告继续作为
-历史证据保留，不自动代表新正式基线。
-
-Issue #57 在同一 plant/reference/actuator/PID realization 上增加显式 plaintext redesign，
-用冻结的 10,179 点 Stage 1 网格选择更快响应 PID，并形成独立 lineage、有限时域证书和
-baseline identity。运行入口为：
-
-```powershell
-uv run python -m secure_control.scenarios.hvac.runner --config configs/hvac_2r2c_dual_loop_25_20_15_fast_response.yaml --seed 42
-```
-
-设计契约、old/new 指标、哈希与声明边界见
-[2R2C HVAC 主动 PID redesign](docs/hvac_pid_redesign.md)。
-
-保存正式八字段实验产物使用独立入口，不改变上面的场景级摘要 CLI：
-
-```powershell
-uv run python -m secure_control.experiments.runner --config configs/hvac_dual_loop.yaml --seed 12
-uv run python -m secure_control.experiments.runner --config configs/hvac_2r2c_dual_loop.yaml --seed 42
-uv run python -m secure_control.experiments.runner --config configs/hvac_2r2c_dual_loop_25_20_15.yaml --seed 42
-```
-
-每次运行创建独立的 `results/csv/<run_id>/trajectory.csv`、`metadata.json` 和
-`config.json`；固定测试 seed 可重跑相同数值内容，已存在 run 不覆盖。schema、
-通道单位、有效配置快照、公开 provenance、失败与读取语义见
-[实验产物约定](docs/experiment_schema.md)。普通生成产物默认不提交 Git。
-
-从上述完整成功 run 读取数据生成 HVAC 四类对比图（tracking、applied control、
-control error、output error），不重新运行双闭环：
-
-```powershell
-uv run python -m secure_control.experiments.figure_runner --run-dir results/csv/<run_id> --control-error-scale log
-```
-
-把 `<run_id>` 换成实际已发布目录名。默认单通道 HVAC 使用小时轴并输出四张 PNG
-到 `results/figures/<run_id>/<render_id>/`；向量通道必须显式提供可重复的
-`--tracking output:reference` 与 `--control-channel index`，也可选择 linear/log 和
-PNG/PDF。无同单位 reference 的输出误差可用可重复的 `--output-error-channel index`
-独立选择；省略时沿用 tracking 的输出通道。图只修改渲染副本，不反写原始数据；
-路径、单位、log 零值与追溯清单见
-[已保存结果绘图契约](docs/figure_contract.md)。普通生成图片默认不提交 Git。
-
-使用最终快速响应 baseline 运行 source-independent 2R2C 定点精度扫描：
-
-```powershell
-uv run python -m secure_control.experiments.sweep_runner --definition configs/hvac_2r2c_precision_sweep_definition.yaml --baseline-config configs/hvac_2r2c_dual_loop_25_20_15_fast_response.yaml --expected-baseline-id e0d0100f0ccf9fac15910c010090113574d9b53b61118fa6ad8a7035116138b7
-```
-
-source-independent schema v2 通过显式 baseline path/expected ID 解析运行来源；使用方式和
-兼容边界见[实验证据输入边界与 schema v2 迁移](docs/evidence_input_boundaries.md)。
-
-扫描固定 plant、PID、reference、horizon、执行器、256-bit 素数与 `lambda=80`，只比较
-`ell={32,40,48,56}`（对应 `k=ell+28`）和三个测试材料 seed。每点先验证来源摘要、
-Pocklington 证据、局部稳定性报告与有限时域整数范围，再发布原始八字段结果、标准图、跨精度图、
-指标和精确推导的协议资源数。完整定义、状态语义和结论边界见
-[2R2C 定点精度扫描](docs/precision_sweep.md)。这些结果是 adapted application，不是论文原数值
-实验的逐项复刻。
-
-从冻结 sweep 只读生成 01–12 中文阶段汇报图：
-
-```powershell
-uv run python -m secure_control.experiments.sweep_figure_runner --sweep-dir results/sweeps/<sweep_id> --display-config configs/hvac_2r2c_report_zh.yaml --output-root results/figures/reports
-```
-
-报告不会重跑实验或写回 sweep；中文 profile、字体 glyph 预检、科学计数法、固定图目录、
-原子发布与追溯边界见 [2R2C HVAC 中文汇报图](docs/chinese_report_figures.md)。
-
-为冻结代表点生成默认关闭的真实安全执行证据，并从 verified sweep/evidence 只读生成增强报告：
-
-```powershell
-uv run python -m secure_control.experiments.evidence_runner --source-sweep-id <verified-sweep-id> --ell 48 --seed 42 --trace-step 60 --baseline-config configs/hvac_2r2c_dual_loop_25_20_15_fast_response.yaml --expected-baseline-id e0d0100f0ccf9fac15910c010090113574d9b53b61118fa6ad8a7035116138b7 --allow-combined-share-diagnostic
-uv run python -m secure_control.experiments.evidence_report_runner --source-sweep-id <verified-sweep-id> --trace-id <trace_id> --display-config configs/hvac_2r2c_evidence_report_profile_zh.yaml
-```
-
-该路径严格复验正式八字段，不修改已有 sweep。公开 evidence 与短时 combined-share 诊断物理隔离；
-增强报告使用分钟轴、applied-control Fig. 3 adapted、三 seed timing 与 exact 协议资源。完整命令、
-文件闭包、安全声明和 Protocol 2 计数为零的含义见
-[安全执行证据与增强中文报告](docs/secure_execution_evidence.md)。
-Issue #59 的最终 artifact ID、哈希、四精度定量结果、复现命令和声明边界集中记录在
-[最终 HVAC 安全证据链索引](docs/final_hvac_evidence_chain.md)。
+当前日常实验只需选择三角色连续运行或 Fig3 四点图，入口与配置见上方快速开始。旧 HVAC 命令不再作为用户入口展示，示例输入移入测试夹具；底层实现和相应回归仍供内部验证。
 
 ## 安全算术基线
 

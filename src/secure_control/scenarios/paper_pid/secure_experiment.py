@@ -24,6 +24,8 @@ from secure_control.simulation import (
 from .pid import paper_sec_vii_controller_spec
 from .plant import PaperPidCascadePlant
 
+SCENARIO_VERSION = "1"
+
 
 class PaperPidOutputAdapter:
     """v=y；schema v1 所需的恒零 reference 不参与控制计算。"""

@@ -26,7 +26,7 @@ from secure_control.scenarios.hvac import (
 from secure_control.scenarios.hvac.integration import HvacScenario, run_hvac_dual_loop
 
 PROJECT_ROOT = Path(__file__).parents[1]
-CONFIGS = PROJECT_ROOT / "configs"
+CONFIGS = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac"
 WRAPPER = CONFIGS / "hvac_2r2c_dual_loop_25_20_15.yaml"
 BASELINE = CONFIGS / "hvac_2r2c_pid_baseline_25_20_15.yaml"
 REDESIGN_WRAPPER = CONFIGS / "hvac_2r2c_dual_loop_25_20_15_fast_response.yaml"

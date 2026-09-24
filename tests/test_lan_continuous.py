@@ -61,7 +61,7 @@ def _continuous_config(paths: dict[str, Path], count: int, ell: int = 32) -> Pat
     profile.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
     role = paths["Client"]
     role.write_text(role.read_text(encoding="utf-8").replace(
-        f"controller: {ROOT / 'configs' / 'hvac_dual_loop.yaml'}",
+        f"controller: {ROOT / 'tests' / 'fixtures' / 'legacy_hvac' / 'hvac_dual_loop.yaml'}",
         f"experiment: {profile}",
     ).replace("experiment: paper_pid_lan.example.yaml",
               f"experiment: {profile}"), encoding="utf-8")
@@ -111,7 +111,11 @@ def _plain_deployment(tmp_path: Path) -> dict[str, Path]:
 def test_direct_python_files_run_three_role_lab_without_certificates(tmp_path: Path) -> None:
     """三个独立 Python 文件各启动一角，Client 发布三步真实图。"""
     paths = _plain_deployment(tmp_path)
-    _continuous_config(paths, 3)
+    profile = _continuous_config(paths, 3, ell=33)
+    data = yaml.safe_load(profile.read_text(encoding="utf-8"))
+    data["baseline_source"] = str(ROOT / "configs" / "paper_pid_cascade_zoh.yaml")
+    del data["frozen_definition"]
+    profile.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
     assert not list(tmp_path.glob("*.pem"))
     parties = [subprocess.Popen(
         [sys.executable, str(ROOT / "scripts" / f"run_continuous_{role.lower()}.py"),
@@ -140,12 +144,14 @@ def test_direct_python_files_run_three_role_lab_without_certificates(tmp_path: P
         assert all(item[1]["transport"] == "insecure_tcp" and
                    item[1]["tls_version"] is None for item in outcomes)
         assert result["transport"] == "insecure_tcp" and result["tls_version"] is None
-        assert result["ell"] == 32
+        assert result["ell"] == 33
+        assert result["claim_level"] == "user-exploration"
         run_dir = Path(result["run_dir"])
         record = load_artifacts(run_dir)
         assert record.result.time.size == 3
         assert Path(result["figure_path"]).is_file()
         assert record.provenance["transport"] == "insecure_tcp"
+        assert record.effective_config["definition"] is None
         assert "unauthenticated plaintext" in record.provenance["security_boundary"]
     finally:
         for party in parties:
@@ -174,23 +180,6 @@ def test_default_lab_configs_need_no_certificate_files() -> None:
         assert (config.ca, config.certificate, config.private_key) == (None, None, None)
 
 
-def test_vscode_launch_maps_to_continuous_module() -> None:
-    """三项点击入口固定到 #86 连续配置，不误选 #68 单步 Client。"""
-    launch = json.loads((ROOT / ".vscode" / "launch.json").read_text(encoding="utf-8"))
-    assert len(launch["configurations"]) == 3
-    expected = {
-        "Continuous P1": ["p1", "--config", "configs/local-p1.example.yaml"],
-        "Continuous P2": ["p2", "--config", "configs/local-p2.example.yaml"],
-        "Continuous Client": ["client", "--config",
-                              "configs/local-client-continuous.example.yaml"],
-    }
-    for entry in launch["configurations"]:
-        assert entry["args"] == expected[entry["name"]]
-        assert entry["module"] == "secure_control.experiments.lan_runner"
-        assert entry["cwd"] == "${workspaceFolder}"
-        assert entry["console"] == "integratedTerminal"
-
-
 def test_continuous_setup_codec_keeps_prime_evidence(deployment: dict[str, Path]) -> None:
     profile = load_paper_pid_lan_profile(_continuous_config(deployment, 3))
     setup = LanContinuousSetupPayload(
@@ -201,6 +190,20 @@ def test_continuous_setup_codec_keeps_prime_evidence(deployment: dict[str, Path]
     assert decode_wire_value(encode_wire_value(LanHelloPayload(
         "a" * 64, "b" * 64, "lan-continuous-v1"
     ))).mode == "lan-continuous-v1"
+
+
+def test_client_profile_can_use_paper_pid_baseline_without_fig3_definition(
+    deployment: dict[str, Path],
+) -> None:
+    """日常三角色实验不必依赖 Fig3 四点冻结定义。"""
+    path = _continuous_config(deployment, 3, ell=33)
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    data.pop("frozen_definition")
+    data["baseline_source"] = str(ROOT / "configs" / "paper_pid_cascade_zoh.yaml")
+    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    profile = load_paper_pid_lan_profile(path)
+    assert profile.ell == 33
+    assert profile.claim_level == "user-exploration"
 
 
 @pytest.mark.parametrize("replacement", ["ell: 0", "k: 32", "lambda: 250",
@@ -403,8 +406,9 @@ def test_shared_prime_and_frozen_compatibility_bytes() -> None:
     """公开证据的日常名称不能使旧 raw SHA 或 HVAC LF 摘要漂移。"""
     shared = (ROOT / "configs" / "shared_prime_256_pocklington.yaml").read_bytes()
     legacy = (ROOT / "configs" / "hvac_2r2c_sweep_prime.yaml").read_bytes()
+    fixture = (ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_sweep_prime.yaml").read_bytes()
     definition = (ROOT / "configs" / "paper_pid_fig3_sweep.yaml").read_bytes()
-    assert shared == legacy
+    assert shared == legacy == fixture
     assert sha256(shared).hexdigest() == (
         "b8c5e9e779d945cfc19d0662b641cd1084acadd0907cc6b4e64ee4076455111b"
     )

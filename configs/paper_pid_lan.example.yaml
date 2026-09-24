@@ -13,5 +13,5 @@ range:
   measurement_absolute_bound: 128
 plot:
   control_channel: 0
-frozen_definition: paper_pid_fig3_sweep.yaml
+baseline_source: paper_pid_cascade_zoh.yaml
 output_root: ../results/lan_continuous
