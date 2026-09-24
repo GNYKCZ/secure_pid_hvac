@@ -15,8 +15,8 @@ from secure_control.scenarios.hvac import (
     load_hvac_scenario_contract,
 )
 
-BASELINE_CONFIG_PATH = Path(__file__).parents[1] / "configs" / "hvac_baseline.yaml"
-TWO_R_TWO_C_CONFIG_PATH = Path(__file__).parents[1] / "configs" / "hvac_2r2c_plant.yaml"
+BASELINE_CONFIG_PATH = Path(__file__).parents[1] / "tests" / "fixtures" / "legacy_hvac" / "hvac_baseline.yaml"
+TWO_R_TWO_C_CONFIG_PATH = Path(__file__).parents[1] / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_plant.yaml"
 
 
 def _baseline_mapping() -> dict[str, Any]:

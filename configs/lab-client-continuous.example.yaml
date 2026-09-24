@@ -1,12 +1,9 @@
 role: Client
+transport: insecure_tcp
 topology: local-deployment.example.yaml
 experiment: paper_pid_lan.example.yaml
-tls:
-  ca: ../.tmp/lan-certs/ca.pem
-  certificate: ../.tmp/lan-certs/client.pem
-  private_key: ../.tmp/lan-certs/client.key
 timeouts:
-  startup: 30
+  startup: 180
   step: 30
   idle: 30
   shutdown: 5

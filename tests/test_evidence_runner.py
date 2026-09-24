@@ -30,8 +30,8 @@ from secure_control.protocol import ControllerScaleLedger
 from secure_control.simulation import SimulationResult
 
 PROJECT_ROOT = Path(__file__).parents[1]
-V2_DEFINITION = PROJECT_ROOT / "configs" / "hvac_2r2c_precision_sweep_definition.yaml"
-CURRENT_BASELINE = PROJECT_ROOT / "configs" / "hvac_2r2c_dual_loop_25_20_15.yaml"
+V2_DEFINITION = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_precision_sweep_definition.yaml"
+CURRENT_BASELINE = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_dual_loop_25_20_15.yaml"
 CURRENT_BASELINE_ID = "f5d1bee247279ff85ba33db12778621724e46b76b880c48d8ee5637838e5aeab"
 HISTORICAL_BASELINE_ID = "2489e5476ad316ea2d9599783e29f2d849ffcf485ca860e0db76c80312c532f9"
 

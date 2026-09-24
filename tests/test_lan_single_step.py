@@ -38,7 +38,7 @@ NAMES = {
 }
 
 # 故障进程仍使用仓库原有 LAN 入口、真实 TLS socket 与独立 PID；只在该进程内
-# 替换一个发送/回执边界。生产代码不提供故障开关或明文回退。
+# 替换一个发送/回执边界。生产代码不提供故障开关或 TLS 隐式明文回退。
 _FAULT_BOOTSTRAP = r"""
 import struct
 import sys
@@ -156,7 +156,7 @@ def deployment(tmp_path: Path) -> dict[str, Path]:
     subprocess.run(
         [
             sys.executable,
-            str(ROOT / "scripts" / "prepare_local_lan_certs.py"),
+            str(ROOT / "tests" / "fixtures" / "prepare_local_lan_certs.py"),
             "--output",
             str(tmp_path),
         ],
@@ -182,7 +182,7 @@ def deployment(tmp_path: Path) -> dict[str, Path]:
         config.write_text(
             f"role: {role}\ntopology: topology.yaml\n"
             + (
-                f"controller: {ROOT / 'configs' / 'hvac_dual_loop.yaml'}\n"
+                f"controller: {ROOT / 'tests' / 'fixtures' / 'legacy_hvac' / 'hvac_dual_loop.yaml'}\n"
                 if role == "Client"
                 else ""
             )
@@ -409,7 +409,7 @@ def test_untrusted_ca_rejected(deployment: dict[str, Path]) -> None:
     subprocess.run(
         [
             sys.executable,
-            str(ROOT / "scripts" / "prepare_local_lan_certs.py"),
+            str(ROOT / "tests" / "fixtures" / "prepare_local_lan_certs.py"),
             "--output",
             str(other),
         ],

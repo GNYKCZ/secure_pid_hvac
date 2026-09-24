@@ -263,7 +263,7 @@ def test_real_localhost_client_trajectory_and_resources_ignore_consumer(
     consumer_mode: str,
 ) -> None:
     """真实 Client/P1/P2 固定输入多步，对照慢/断开消费者的完整八字段与资源。"""
-    config = Path(__file__).parents[1] / "configs" / "hvac_dual_loop.yaml"
+    config = Path(__file__).parents[1] / "tests" / "fixtures" / "legacy_hvac" / "hvac_dual_loop.yaml"
     baseline = HvacScenario(
         config, test_seed=905, secure_runtime_builder=LocalhostSecureStateSpaceRuntime
     ).build_plan()

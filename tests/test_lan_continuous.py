@@ -6,11 +6,13 @@ import json
 import subprocess
 import sys
 import time
+from hashlib import sha256
 from pathlib import Path
 
 import numpy as np
 import pytest
-from test_lan_single_step import ROOT, _finish, _run
+import yaml
+from test_lan_single_step import ROOT, _finish, _free_ports, _run
 from test_lan_single_step import deployment as _base_deployment
 
 from secure_control.execution.lan_config import load_lan_config
@@ -39,25 +41,30 @@ def deployment(tmp_path: Path) -> dict[str, Path]:
 
 
 def _continuous_config(paths: dict[str, Path], count: int, ell: int = 32) -> Path:
-    source = ROOT / "configs" / "paper_pid_lan.example.yaml"
+    definition = yaml.safe_load((ROOT / "configs" / "paper_pid_fig3_sweep.yaml").read_text(
+        encoding="utf-8"
+    ))
     profile = paths["Client"].parent / "experiment.yaml"
-    content = source.read_text(encoding="utf-8")
-    content = content.replace("sample_count: 51", f"sample_count: {count}")
-    content = content.replace("ell: 32", f"ell: {ell}")
-    content = content.replace("k: 40", f"k: {ell + 8}")
-    content = content.replace("runtime_payload_bits: 46", f"runtime_payload_bits: {ell + 14}")
-    content = content.replace("prime_source: hvac_2r2c_sweep_prime.yaml",
-                              f"prime_source: {ROOT / 'configs' / 'hvac_2r2c_sweep_prime.yaml'}")
-    content = content.replace("frozen_definition: paper_pid_fig3_sweep.yaml",
-                              f"frozen_definition: {ROOT / 'configs' / 'paper_pid_fig3_sweep.yaml'}")
-    content = content.replace("output_root: ../results/lan_continuous",
-                              f"output_root: {profile.parent / 'runs'}")
-    profile.write_text(content, encoding="utf-8")
+    data = {
+        "schema_version": 1, "scenario": "paper_pid_fig3", "sample_count": count,
+        "numeric": {
+            "ell": ell, "k": ell + definition["paper_parameter_headroom_bits"],
+            "runtime_payload_bits": ell + definition["runtime_payload_headroom_bits"],
+            "lambda": definition["security_parameter"],
+            "prime_source": str(ROOT / "configs" / "shared_prime_256_pocklington.yaml"),
+        },
+        "range": {"measurement_absolute_bound": definition["measurement_absolute_bound"]},
+        "plot": {"control_channel": 0},
+        "frozen_definition": str(ROOT / "configs" / "paper_pid_fig3_sweep.yaml"),
+        "output_root": str(profile.parent / "runs"),
+    }
+    profile.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
     role = paths["Client"]
     role.write_text(role.read_text(encoding="utf-8").replace(
-        f"controller: {ROOT / 'configs' / 'hvac_dual_loop.yaml'}",
+        f"controller: {ROOT / 'tests' / 'fixtures' / 'legacy_hvac' / 'hvac_dual_loop.yaml'}",
         f"experiment: {profile}",
-    ), encoding="utf-8")
+    ).replace("experiment: paper_pid_lan.example.yaml",
+              f"experiment: {profile}"), encoding="utf-8")
     return profile
 
 
@@ -71,6 +78,108 @@ def _nested_keys(value: object) -> list[str]:
     return []
 
 
+def _run_module(role: str, config: Path) -> subprocess.Popen[str]:
+    """以 VS Code launch.json 所用模块入口启动真实独立进程。"""
+    return subprocess.Popen(
+        [sys.executable, "-m", "secure_control.experiments.lan_runner",
+         role.lower(), "--config", str(config)],
+        cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+
+
+def _plain_deployment(tmp_path: Path) -> dict[str, Path]:
+    """无证书文件的随机端口实验配置，验证三份直接运行脚本。"""
+    ports = _free_ports()
+    topology = ROOT / "configs" / "local-deployment.example.yaml"
+    content = topology.read_text(encoding="utf-8")
+    for old, new in zip((34401, 34402, 34403), ports, strict=True):
+        content = content.replace(f"port: {old}", f"port: {new}")
+    topology_path = tmp_path / "topology.yaml"
+    topology_path.write_text(content, encoding="utf-8")
+    paths = {}
+    for role, name in (("P1", "lab-p1.example.yaml"), ("P2", "lab-p2.example.yaml"),
+                       ("Client", "lab-client-continuous.example.yaml")):
+        role_content = (ROOT / "configs" / name).read_text(encoding="utf-8")
+        role_content = role_content.replace("topology: local-deployment.example.yaml",
+                                            f"topology: {topology_path}")
+        path = tmp_path / name
+        path.write_text(role_content, encoding="utf-8")
+        paths[role] = path
+    return paths
+
+
+def test_direct_python_files_run_three_role_lab_without_certificates(tmp_path: Path) -> None:
+    """三个独立 Python 文件各启动一角，Client 发布三步真实图。"""
+    paths = _plain_deployment(tmp_path)
+    profile = _continuous_config(paths, 3, ell=33)
+    data = yaml.safe_load(profile.read_text(encoding="utf-8"))
+    data["baseline_source"] = str(ROOT / "configs" / "paper_pid_cascade_zoh.yaml")
+    del data["frozen_definition"]
+    profile.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    assert not list(tmp_path.glob("*.pem"))
+    parties = [subprocess.Popen(
+        [sys.executable, str(ROOT / "scripts" / f"run_continuous_{role.lower()}.py"),
+         str(paths[role])], cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True,
+    ) for role in ("P1", "P2")]
+    try:
+        time.sleep(0.5)
+        client = subprocess.Popen(
+            [sys.executable, str(ROOT / "scripts" / "run_continuous_client.py"),
+             str(paths["Client"])], cwd=ROOT, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True,
+        )
+        code, result, errors = _finish(client, 100)
+        assert code == 0, (result, errors)
+        outcomes = [_finish(party, 100) for party in parties]
+        assert all(item[0] == 0 for item in outcomes), outcomes
+        assert "Client 配置检查通过" in errors
+        assert "Client 与 P1 的协议连接已建立" in errors
+        assert "Client 与 P2 的协议连接已建立" in errors
+        assert "三方已就绪" in errors and "Client 运行完成" in errors
+        assert "P1 已启动" in outcomes[0][2] and "P1 运行完成" in outcomes[0][2]
+        assert "P2 已启动" in outcomes[1][2] and "P2 运行完成" in outcomes[1][2]
+        assert len({result["pid"], *(item[1]["pid"] for item in outcomes)}) == 3
+        assert all(item[1]["steps_committed"] == 3 for item in outcomes)
+        assert all(item[1]["transport"] == "insecure_tcp" and
+                   item[1]["tls_version"] is None for item in outcomes)
+        assert result["transport"] == "insecure_tcp" and result["tls_version"] is None
+        assert result["ell"] == 33
+        assert result["claim_level"] == "user-exploration"
+        run_dir = Path(result["run_dir"])
+        record = load_artifacts(run_dir)
+        assert record.result.time.size == 3
+        assert Path(result["figure_path"]).is_file()
+        assert record.provenance["transport"] == "insecure_tcp"
+        assert record.effective_config["definition"] is None
+        assert "unauthenticated plaintext" in record.provenance["security_boundary"]
+    finally:
+        for party in parties:
+            if party.poll() is None:
+                party.kill()
+            party.communicate()
+
+
+def test_plain_transport_must_be_explicit_and_must_not_ignore_tls(tmp_path: Path) -> None:
+    paths = _plain_deployment(tmp_path)
+    role = paths["P1"]
+    content = role.read_text(encoding="utf-8")
+    role.write_text(content.replace("transport: insecure_tcp\n", ""), encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_lan_config(role, "P1")
+    role.write_text(content + "tls:\n  ca: ignored.pem\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_lan_config(role, "P1")
+
+
+def test_default_lab_configs_need_no_certificate_files() -> None:
+    for role, name in (("P1", "lab-p1.example.yaml"), ("P2", "lab-p2.example.yaml"),
+                       ("Client", "lab-client-continuous.example.yaml")):
+        config = load_lan_config(ROOT / "configs" / name, role)
+        assert config.transport == "insecure_tcp"
+        assert (config.ca, config.certificate, config.private_key) == (None, None, None)
+
+
 def test_continuous_setup_codec_keeps_prime_evidence(deployment: dict[str, Path]) -> None:
     profile = load_paper_pid_lan_profile(_continuous_config(deployment, 3))
     setup = LanContinuousSetupPayload(
@@ -81,6 +190,20 @@ def test_continuous_setup_codec_keeps_prime_evidence(deployment: dict[str, Path]
     assert decode_wire_value(encode_wire_value(LanHelloPayload(
         "a" * 64, "b" * 64, "lan-continuous-v1"
     ))).mode == "lan-continuous-v1"
+
+
+def test_client_profile_can_use_paper_pid_baseline_without_fig3_definition(
+    deployment: dict[str, Path],
+) -> None:
+    """日常三角色实验不必依赖 Fig3 四点冻结定义。"""
+    path = _continuous_config(deployment, 3, ell=33)
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    data.pop("frozen_definition")
+    data["baseline_source"] = str(ROOT / "configs" / "paper_pid_cascade_zoh.yaml")
+    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    profile = load_paper_pid_lan_profile(path)
+    assert profile.ell == 33
+    assert profile.claim_level == "user-exploration"
 
 
 @pytest.mark.parametrize("replacement", ["ell: 0", "k: 32", "lambda: 250",
@@ -112,7 +235,7 @@ def test_profile_duplicate_and_wrong_prime_rejected(deployment: dict[str, Path])
     with pytest.raises(ValueError, match="重复"):
         load_paper_pid_lan_profile(profile)
     profile = _continuous_config(deployment, 3)
-    prime = ROOT / "configs" / "hvac_2r2c_sweep_prime.yaml"
+    prime = ROOT / "configs" / "shared_prime_256_pocklington.yaml"
     bad_prime = profile.parent / "bad_prime.yaml"
     content = prime.read_text(encoding="utf-8")
     source = load_paper_pid_lan_profile(profile)
@@ -124,15 +247,32 @@ def test_profile_duplicate_and_wrong_prime_rejected(deployment: dict[str, Path])
         load_paper_pid_lan_profile(profile)
 
 
+def test_bad_shared_prime_certificate_rejected_before_network(deployment: dict[str, Path]) -> None:
+    """证书损坏必须在 Client 配置预检阶段失败。"""
+    profile = _continuous_config(deployment, 3)
+    prime = ROOT / "configs" / "shared_prime_256_pocklington.yaml"
+    damaged = profile.parent / "damaged_prime.yaml"
+    damaged.write_text(prime.read_text(encoding="utf-8").replace(
+        "aa15ad45266d1c1bffee97cb2626ba4940ffbc8c3472045e92696c196a06dc3b",
+        "ba15ad45266d1c1bffee97cb2626ba4940ffbc8c3472045e92696c196a06dc3b", 1
+    ), encoding="utf-8")
+    profile.write_text(profile.read_text(encoding="utf-8").replace(
+        str(prime), str(damaged)
+    ), encoding="utf-8")
+    with pytest.raises((ValueError, TypeError)):
+        load_paper_pid_lan_profile(profile)
+    assert not (profile.parent / "runs").exists()
+
+
 @pytest.mark.parametrize(("count", "ell"), [(3, 32), (51, 32), (51, 40)])
 def test_three_independent_continuous_roles_publish_one_verified_run(
     deployment: dict[str, Path], count: int, ell: int
 ) -> None:
     profile = _continuous_config(deployment, count, ell)
-    parties = [_run(role, deployment[role]) for role in ("P1", "P2")]
+    parties = [_run_module(role, deployment[role]) for role in ("P1", "P2")]
     try:
         time.sleep(0.5)
-        client = _run("Client", deployment["Client"])
+        client = _run_module("Client", deployment["Client"])
         code, result, errors = _finish(client, 100)
         assert code == 0, (result, errors)
         outcomes = [_finish(party, 100) for party in parties]
@@ -147,6 +287,12 @@ def test_three_independent_continuous_roles_publish_one_verified_run(
         }
         run_dir = Path(result["run_dir"])
         record = load_artifacts(run_dir)
+        assert Path(result["figure_path"]) == (run_dir / "control.png").resolve()
+        assert result["scenario"] == "paper_pid_fig3"
+        assert result["ell"] == ell
+        assert result["claim_level"] == record.effective_config["claim_level"]
+        if count == 51:
+            assert result["claim_level"] == "paper-inspired-frozen-parameter-point"
         assert record.result.time.size == count
         assert record.effective_config["fractional_bits"] == ell
         assert record.provenance["session_id"] == result["session_id"]
@@ -217,7 +363,9 @@ def test_three_independent_continuous_roles_publish_one_verified_run(
         np.testing.assert_array_equal(figure.axes[1].lines[0].get_xdata(), record.result.time)
         figure.clear()
         if count == 3:
-            assert redraw_control_triptych(run_dir, profile.parent / "redrawn.png").is_file()
+            redrawn = redraw_control_triptych(run_dir, profile.parent / "redrawn.png")
+            assert redrawn.is_file()
+            assert redrawn.read_bytes() == (run_dir / "control.png").read_bytes()
 
             # 重启全部角色后，不能续用上一组 share/session 或已发布 run ID。
             again = [_run(role, deployment[role]) for role in ("P1", "P2")]
@@ -252,6 +400,24 @@ def test_three_independent_continuous_roles_publish_one_verified_run(
             if party.poll() is None:
                 party.kill()
             party.communicate()
+
+
+def test_shared_prime_and_frozen_compatibility_bytes() -> None:
+    """公开证据的日常名称不能使旧 raw SHA 或 HVAC LF 摘要漂移。"""
+    shared = (ROOT / "configs" / "shared_prime_256_pocklington.yaml").read_bytes()
+    legacy = (ROOT / "configs" / "hvac_2r2c_sweep_prime.yaml").read_bytes()
+    fixture = (ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_sweep_prime.yaml").read_bytes()
+    definition = (ROOT / "configs" / "paper_pid_fig3_sweep.yaml").read_bytes()
+    assert shared == legacy == fixture
+    assert sha256(shared).hexdigest() == (
+        "b8c5e9e779d945cfc19d0662b641cd1084acadd0907cc6b4e64ee4076455111b"
+    )
+    assert sha256(shared.replace(b"\r\n", b"\n")).hexdigest() == (
+        "b317a7db4f14fbf77258102d6b09766dc3b5f495252c1e29ed3ae315cb98340c"
+    )
+    assert sha256(definition).hexdigest() == (
+        "16b635276927e4a14977ff7ac2d7baa67885fc3244017589fb2a638b5c6de39a"
+    )
 
 
 _LOST_SECOND_COMMIT = r"""

@@ -16,7 +16,6 @@ from typing import Any
 from uuid import uuid4
 
 import numpy as np
-import yaml
 
 from secure_control.scenarios.paper_pid.baseline import (
     BASELINE_COLUMNS,
@@ -25,62 +24,7 @@ from secure_control.scenarios.paper_pid.baseline import (
 )
 from secure_control.scenarios.paper_pid.pid import paper_sec_vii_controller_spec
 
-
-def _require_keys(name: str, value: Any, expected: set[str]) -> dict[str, Any]:
-    """严格限定固定实验配置字段，避免拼写错误被静默忽略。"""
-    if not isinstance(value, dict) or set(value) != expected:
-        raise ValueError(f"{name} 字段必须恰好是 {sorted(expected)}")
-    return value
-
-
-def _load_config(path: Path) -> tuple[dict[str, Any], str]:
-    """锁定论文参数和 paper-inspired 身份；变体需另作显式设计。"""
-    raw_bytes = path.read_bytes()
-    loaded = yaml.safe_load(raw_bytes.decode("utf-8"))
-    config = _require_keys(
-        "config",
-        loaded,
-        {"schema_version", "claim_level", "sources", "controller", "plant", "sample_count"},
-    )
-    sources = _require_keys("sources", config["sources"], {"controller", "plant", "plant_equation"})
-    plant = _require_keys(
-        "plant",
-        config["plant"],
-        {"alpha", "sample_period_seconds", "initial_state", "realization", "discretization"},
-    )
-    if type(config["schema_version"]) is not int or config["schema_version"] != 1:
-        raise ValueError("schema_version 必须是 1")
-    if config["claim_level"] != "paper-inspired":
-        raise ValueError("仅允许 paper-inspired 声明等级")
-    if config["controller"] != "printed_section_vii":
-        raise ValueError("仅允许论文 §VII 印刷控制器")
-    if (
-        sources["controller"] != "https://arxiv.org/html/2503.02176v3#S7"
-        or sources["plant"] != "https://doi.org/10.1016/S1474-6670(17)38238-1"
-        or sources["plant_equation"] != "Eq. (2)"
-    ):
-        raise ValueError("来源必须对应论文 v3 §VII 与 [38] Eq. (2)")
-    if (
-        plant["realization"] != "four_stage_cascade_outputs"
-        or plant["discretization"] != "zoh"
-    ):
-        raise ValueError("只支持已审查的四级串联坐标和 ZOH")
-    for name, expected in (("alpha", 0.2), ("sample_period_seconds", 0.1)):
-        value = plant[name]
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or value != expected:
-            raise ValueError(f"{name} 必须保持论文实例值 {expected}")
-    if (
-        not isinstance(plant["initial_state"], list)
-        or len(plant["initial_state"]) != 4
-        or any(
-            isinstance(value, bool) or not isinstance(value, (int, float)) or value != 100.0
-            for value in plant["initial_state"]
-        )
-    ):
-        raise ValueError("initial_state 必须是论文四个 100 的数值向量")
-    if type(config["sample_count"]) is not int or config["sample_count"] != 51:
-        raise ValueError("sample_count 必须是 k=0..50 对应的 51")
-    return config, sha256(raw_bytes).hexdigest()
+from .paper_pid_sources import load_baseline_config as _load_config
 
 
 def _git_revision() -> dict[str, Any]:

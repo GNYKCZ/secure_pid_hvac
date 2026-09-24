@@ -15,7 +15,9 @@ wheels/
 .ruff_cache/
 
 # Editors and local configuration
-.vscode/
+.vscode/*
+!.vscode/launch.json
+!.vscode/settings.json
 .idea/
 .env
 .tmp/
@@ -31,3 +33,4 @@ results/safety/*
 !results/safety/.gitkeep
 results/diagnostics/*
 results/exact_grid/*
+results/lan_continuous/

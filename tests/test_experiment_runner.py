@@ -35,14 +35,14 @@ from secure_control.simulation import (
 )
 
 PROJECT_ROOT = Path(__file__).parents[1]
-CONFIG_PATH = PROJECT_ROOT / "configs" / "hvac_dual_loop.yaml"
-BASELINE_PATH = PROJECT_ROOT / "configs" / "hvac_pid_baseline.yaml"
-CONFIG_2R2C_PATH = PROJECT_ROOT / "configs" / "hvac_2r2c_dual_loop.yaml"
-CONFIG_2R2C_MIGRATED_PATH = PROJECT_ROOT / "configs" / "hvac_2r2c_dual_loop_25_20_15.yaml"
-BASELINE_2R2C_PATH = PROJECT_ROOT / "configs" / "hvac_2r2c_pid_baseline.yaml"
-BASELINE_2R2C_MIGRATED_PATH = PROJECT_ROOT / "configs" / "hvac_2r2c_pid_baseline_25_20_15.yaml"
-PLANT_2R2C_PATH = PROJECT_ROOT / "configs" / "hvac_2r2c_plant.yaml"
-SCENARIO_2R2C_MIGRATED_PATH = PROJECT_ROOT / "configs" / "hvac_2r2c_scenario_25_20_15.yaml"
+CONFIG_PATH = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_dual_loop.yaml"
+BASELINE_PATH = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_pid_baseline.yaml"
+CONFIG_2R2C_PATH = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_dual_loop.yaml"
+CONFIG_2R2C_MIGRATED_PATH = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_dual_loop_25_20_15.yaml"
+BASELINE_2R2C_PATH = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_pid_baseline.yaml"
+BASELINE_2R2C_MIGRATED_PATH = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_pid_baseline_25_20_15.yaml"
+PLANT_2R2C_PATH = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_plant.yaml"
+SCENARIO_2R2C_MIGRATED_PATH = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_scenario_25_20_15.yaml"
 
 
 def test_selector_accepts_only_explicit_hvac_and_rejects_unimplemented_names(

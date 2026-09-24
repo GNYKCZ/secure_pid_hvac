@@ -1,3 +1,5 @@
+> **历史资料（#84）** 本页记录旧 HVAC 实验和当时的命令；文中的 `configs/hvac*` 路径已从当前用户配置目录退出，原始输入只留在 `tests/fixtures/legacy_hvac/` 供回归测试。当前实验请按 [配置索引](../configs/README.md) 运行三角色或 Fig3。
+
 # 最终 HVAC 安全证据链索引
 
 本页记录 Issue #59 使用最终快速响应 PID 生成的完整证据链。普通 `results/` 产物按仓库策略不提交

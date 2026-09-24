@@ -1,4 +1,4 @@
-"""独立主机单步试验的固定端口 TLS 1.3 双向认证建连。"""
+"""独立角色的固定端口建连：显式实验明文或 TLS 1.3 双向认证。"""
 
 from __future__ import annotations
 
@@ -35,6 +35,36 @@ def listener(endpoint: LanEndpoint) -> socket.socket:
     except OSError as error:
         sock.close()
         raise LanConnectionError("固定监听端口不可用或 bind 地址不存在。") from error
+
+
+def connect_role(endpoint: LanEndpoint, config: LanConfig, peer: Role, deadline: float) -> socket.socket:
+    """按显式配置建连；实验明文模式不验证网络对端身份。"""
+    if config.transport == "mutual_tls":
+        return connect_tls(endpoint, config, peer, deadline)
+    if config.transport == "insecure_tcp":
+        return _dial(_resolve(endpoint, deadline), deadline)
+    raise ValueError("未知 LAN transport。")
+
+
+def accept_role(sock: socket.socket, config: LanConfig, peer: Role, deadline: float) -> socket.socket:
+    """按显式配置接受连接；实验明文模式只接受 TCP 连接。"""
+    if config.transport == "mutual_tls":
+        return accept_tls(sock, config, peer, deadline)
+    if config.transport != "insecure_tcp":
+        raise ValueError("未知 LAN transport。")
+    try:
+        sock.settimeout(_remaining(deadline))
+        raw, _ = sock.accept()
+    except TimeoutError as error:
+        raise LanTimeoutError("等待对端 TCP 连接超时。") from error
+    except OSError as error:
+        raise LanConnectionError("接受 TCP 连接失败。") from error
+    try:
+        raw.settimeout(_remaining(deadline))
+        return raw
+    except Exception:
+        raw.close()
+        raise
 
 
 def connect_tls(
@@ -82,6 +112,8 @@ def accept_tls(
 
 
 def _context(config: LanConfig, *, server: bool) -> ssl.SSLContext:
+    if config.ca is None or config.certificate is None or config.private_key is None:
+        raise LanIdentityError("TLS 配置缺少 CA、证书或私钥。")
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER if server else ssl.PROTOCOL_TLS_CLIENT)
     context.minimum_version = ssl.TLSVersion.TLSv1_3
     context.verify_mode = ssl.CERT_REQUIRED

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import secrets
-import ssl
+import socket
 import time
 from typing import Any, Literal
 
@@ -43,7 +44,7 @@ from ._localhost_workers import (
     _validate_party_reply,
 )
 from .lan_config import LanConfig, Role
-from .lan_transport import accept_tls, connect_tls, listener
+from .lan_transport import accept_role, connect_role, listener
 from .localhost_codec import (
     SCHEMA_VERSION,
     LanContinuousSetupPayload,
@@ -57,10 +58,11 @@ from .localhost_transport import deadline_after, receive_envelope, send_envelope
 
 _FRAME_LIMIT = 8 * 1024 * 1024
 _MAX_CONTINUOUS_STEPS = 1000
+_LAN_LOG = logging.getLogger("secure_control.lan")
 
 
 def run_client_single_step(config: LanConfig, trial: Any) -> dict[str, object]:
-    """Client 独立拨号、分发、驱动一次协议、双提交并有界关闭三条 mTLS 连接。"""
+    """Client 独立拨号、分发、驱动一次协议、双提交并有界关闭三条连接。"""
     if config.role != "Client":
         raise ValueError("只有 Client 配置可启动 LAN 单步。")
     if trial.modulus_evidence is not None or trial.range_contract.closed_loop_evidence is not None:
@@ -75,18 +77,21 @@ def run_client_single_step(config: LanConfig, trial: Any) -> dict[str, object]:
     session = distribution.session_id
     hello = LanHelloPayload(config.topology.digest, secrets.token_hex(32))
     stamps: dict[str, int] = {"trial_start": time.perf_counter_ns()}
-    sockets: list[ssl.SSLSocket] = []
+    sockets: list[socket.socket] = []
     committed = False
     try:
         for role, address in (("P1", config.topology.p1_client), ("P2", config.topology.p2_client)):
-            sock = connect_tls(address, config, role, deadline_after(config.startup_timeout))
+            _LAN_LOG.info("Client 正在连接 %s…", role)
+            sock = connect_role(address, config, role, deadline_after(config.startup_timeout))
             sockets.append(sock)
             _hello(sock, "Client", role, session, hello, config.startup_timeout)
+            _LAN_LOG.info("Client 与 %s 的协议连接已建立。", role)
         stamps["tls_hello"] = time.perf_counter_ns()
         for party, sock in enumerate(sockets):
             _request(
                 sock, "P1" if party == 0 else "P2", 1, "lan_ready", session, config.startup_timeout
             )
+        _LAN_LOG.info("三方已就绪，开始计算。")
         stamps["peer_ready"] = time.perf_counter_ns()
         setup = LanSetupPayload(
             trial.fixed_point.modulus,
@@ -177,7 +182,8 @@ def run_client_single_step(config: LanConfig, trial: Any) -> dict[str, object]:
                 "truncations_consumed": result.truncations,
             },
             "timings_ms": _timings(stamps),
-            "tls_version": "TLSv1.3",
+            "transport": config.transport,
+            "tls_version": "TLSv1.3" if config.transport == "mutual_tls" else None,
         }
     except Exception:
         # 双提交完成但关闭回执不确定时也不输出完整成功结果；不重新拨号或重放材料。
@@ -190,7 +196,7 @@ def run_client_single_step(config: LanConfig, trial: Any) -> dict[str, object]:
 
 
 class LanContinuousRuntime:
-    """Client 独占一组 mTLS socket 与单方资源；每个 step 只在双提交后返回。"""
+    """Client 独占一组 socket 与单方资源；每个 step 只在双提交后返回。"""
 
     def __init__(
         self, config: LanConfig, spec: ControllerSpec, fixed_point: FixedPointContext,
@@ -216,7 +222,7 @@ class LanContinuousRuntime:
         self.range_verification = self.client.range_verification
         self.modulus_verification = self.client.truncation.modulus_verification
         self.config = config
-        self._sockets: list[ssl.SSLSocket] = []
+        self._sockets: list[socket.socket] = []
         self._sequences = [4, 4]
         self._step = 0
         self._products = 0
@@ -230,12 +236,15 @@ class LanContinuousRuntime:
         try:
             for role, address in (("P1", config.topology.p1_client),
                                   ("P2", config.topology.p2_client)):
-                sock = connect_tls(address, config, role, deadline_after(config.startup_timeout))
+                _LAN_LOG.info("Client 正在连接 %s…", role)
+                sock = connect_role(address, config, role, deadline_after(config.startup_timeout))
                 self._sockets.append(sock)
                 _hello(sock, "Client", role, self.session_id, hello, config.startup_timeout)
+                _LAN_LOG.info("Client 与 %s 的协议连接已建立。", role)
             for party, sock in enumerate(self._sockets):
                 _request(sock, "P1" if party == 0 else "P2", 1, "lan_ready",
                          self.session_id, config.startup_timeout)
+            _LAN_LOG.info("三方已就绪，开始连续计算。")
             setup = LanContinuousSetupPayload(
                 fixed_point.modulus, fixed_point.integer_bits, fixed_point.fractional_bits,
                 security_parameter, range_contract.state_payload_bounds,
@@ -330,7 +339,7 @@ class LanContinuousRuntime:
 
 
 def run_party_single_step(config: LanConfig) -> dict[str, object]:
-    """P1/P2 只监听固定端口；由认证 hello 选择单步或有界连续模式。"""
+    """P1/P2 只监听固定端口；由 hello 选择单步或有界连续模式。"""
     if config.role not in {"P1", "P2"}:
         raise ValueError("角色命令必须是 P1 或 P2。")
     role: Literal["P1", "P2"] = config.role
@@ -338,14 +347,16 @@ def run_party_single_step(config: LanConfig) -> dict[str, object]:
     address = config.topology.p1_client if party == 0 else config.topology.p2_client
     client_listener = listener(address)
     peer_listener = None
-    client_socket: ssl.SSLSocket | None = None
-    peer_socket: ssl.SSLSocket | None = None
+    client_socket: socket.socket | None = None
+    peer_socket: socket.socket | None = None
     peer_port: LocalhostProtocol3PeerPort | None = None
     try:
         if party == 0:
             peer_listener = listener(config.topology.p1_peer)
         startup_deadline = deadline_after(config.startup_timeout)
-        client_socket = accept_tls(client_listener, config, "Client", startup_deadline)
+        _LAN_LOG.info("%s 已启动，正在等待 Client（最多 %.0f 秒）。", role,
+                      config.startup_timeout)
+        client_socket = accept_role(client_listener, config, "Client", startup_deadline)
         session, hello = _accept_hello(
             client_socket,
             "Client",
@@ -353,15 +364,18 @@ def run_party_single_step(config: LanConfig) -> dict[str, object]:
             config,
             startup_deadline,
         )
+        _LAN_LOG.info("%s 与 Client 的协议连接已建立。", role)
         if party == 0:
             assert peer_listener is not None
-            peer_socket = accept_tls(peer_listener, config, "P2", startup_deadline)
+            peer_socket = accept_role(peer_listener, config, "P2", startup_deadline)
             _accept_hello(
                 peer_socket, "P2", "P1", config, startup_deadline, expected=(session, hello)
             )
+            _LAN_LOG.info("P1 与 P2 的协议连接已建立。")
         else:
-            peer_socket = connect_tls(config.topology.p1_peer, config, "P1", startup_deadline)
+            peer_socket = connect_role(config.topology.p1_peer, config, "P1", startup_deadline)
             _hello(peer_socket, "P2", "P1", session, hello, config.startup_timeout)
+            _LAN_LOG.info("P2 与 P1 的协议连接已建立。")
         _party_reply(
             client_socket,
             _party_receive(client_socket, role, 1, "lan_ready", session, config.startup_timeout),
@@ -475,7 +489,12 @@ def run_party_single_step(config: LanConfig) -> dict[str, object]:
             "profile_sha256": config.topology.digest,
         }
         if hello.mode == "lan-continuous-v1":
-            summary.update({"steps_committed": steps, "tls_version": client_socket.version()})
+            summary.update({
+                "steps_committed": steps,
+                "transport": config.transport,
+                "tls_version": (client_socket.version()
+                                if config.transport == "mutual_tls" else None),
+            })
         return summary
     finally:
         client_listener.close()
@@ -490,7 +509,7 @@ def run_party_single_step(config: LanConfig) -> dict[str, object]:
 
 
 def _hello(
-    sock: ssl.SSLSocket,
+    sock: socket.socket,
     sender: Role,
     recipient: Role,
     session: str,
@@ -534,7 +553,7 @@ def _hello(
 
 
 def _accept_hello(
-    sock: ssl.SSLSocket,
+    sock: socket.socket,
     sender: Role,
     recipient: Role,
     config: LanConfig,
@@ -581,7 +600,7 @@ def _accept_hello(
 
 
 def _request(
-    sock: ssl.SSLSocket,
+    sock: socket.socket,
     role: Literal["P1", "P2"],
     sequence: int,
     operation: str,
@@ -617,7 +636,7 @@ def _request(
 
 
 def _party_receive(
-    sock: ssl.SSLSocket,
+    sock: socket.socket,
     role: Literal["P1", "P2"],
     sequence: int,
     operation: str,
@@ -665,7 +684,7 @@ def _check_request(
 
 
 def _party_reply(
-    sock: ssl.SSLSocket,
+    sock: socket.socket,
     request: WireEnvelope,
     payload: object,
     timeout: float,
@@ -693,7 +712,7 @@ def _party_reply(
 
 
 def _party_error(
-    sock: ssl.SSLSocket, request: WireEnvelope, error: Exception, timeout: float
+    sock: socket.socket, request: WireEnvelope, error: Exception, timeout: float
 ) -> None:
     try:
         send_envelope(

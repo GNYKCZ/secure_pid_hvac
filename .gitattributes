@@ -1,0 +1,3 @@
+configs/hvac_2r2c_sweep_prime.yaml text eol=crlf
+configs/shared_prime_256_pocklington.yaml text eol=crlf
+configs/paper_pid_fig3_sweep.yaml text eol=crlf

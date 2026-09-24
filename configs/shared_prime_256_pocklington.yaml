@@ -1,0 +1,26 @@
+# Issue #15 的单一 256-bit 素数与递归 Pocklington 可审计证据。
+modulus: 57919013630500220500943667918768663966531314514739586011956233569313332958947
+evidence:
+  method: pocklington_v1
+  source: secure_pid_hvac Issue #15 generated and repository-audited certificate
+  source_version: "1"
+  certificate_id: issue15-256bit-pocklington-v1
+  certificate_sha256: aa15ad45266d1c1bffee97cb2626ba4940ffbc8c3472045e92696c196a06dc3b
+  certificate:
+    candidate: 57919013630500220500943667918768663966531314514739586011956233569313332958947
+    factors:
+      - prime: 883423532389192222643355418058763673569008183318684390530432774615071733
+        exponent: 1
+        witness: 2
+        certificate:
+          candidate: 883423532389192222643355418058763673569008183318684390530432774615071733
+          factors:
+            - prime: 1329227995784915959949380658097291227
+              exponent: 1
+              witness: 2
+              certificate:
+                candidate: 1329227995784915959949380658097291227
+                factors:
+                  - prime: 2305843009213693951
+                    exponent: 1
+                    witness: 2

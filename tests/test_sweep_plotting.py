@@ -37,8 +37,8 @@ from secure_control.experiments.sweep_plotting import _time_series_figure, rende
 from secure_control.simulation import ChannelMetadata, ScenarioMetadata, SimulationResult
 
 PROJECT_ROOT = Path(__file__).parents[1]
-DEFINITION_PATH = PROJECT_ROOT / "configs" / "hvac_2r2c_precision_sweep.yaml"
-V2_DEFINITION_PATH = PROJECT_ROOT / "configs" / "hvac_2r2c_precision_sweep_definition.yaml"
+DEFINITION_PATH = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_precision_sweep.yaml"
+V2_DEFINITION_PATH = PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_precision_sweep_definition.yaml"
 
 
 def _verified_sweep(root: Path) -> Path:
@@ -168,7 +168,7 @@ def test_v2_sweep_manifest_closes_definition_resolved_source_and_plan(tmp_path: 
     assert isinstance(v2, ReusablePrecisionSweepDefinition)
     v2 = replace(v2, seeds=(42,), primary_seed=42)
     source = ResolvedBaselineSource(
-        PROJECT_ROOT / "configs" / "hvac_2r2c_dual_loop_25_20_15.yaml",
+        PROJECT_ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_dual_loop_25_20_15.yaml",
         "fixture_identity_v1",
         "1" * 64,
         {"wrapper": "2" * 64, "baseline": "3" * 64, "scenario": "4" * 64},

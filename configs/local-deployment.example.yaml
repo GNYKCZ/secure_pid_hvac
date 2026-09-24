@@ -1,4 +1,5 @@
-# 一台电脑、三条不同固定端口；保持与真实 LAN 完全相同的连接方向和 TLS。
+# 三方共用的固定端口拓扑；本机用 127.0.0.1，跨机器时三份文件的内容须相同并填实际局域网 IP。
+# 连接是否使用 TLS 由各角色配置决定，不由拓扑决定。
 version: 1
 identities:
   Client: client.secure-control.test

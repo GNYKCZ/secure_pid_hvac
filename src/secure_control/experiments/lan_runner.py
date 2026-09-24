@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
+import sys
 from dataclasses import asdict
+from hashlib import sha256
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +32,7 @@ from secure_control.execution.localhost_transport import (
 from secure_control.scenarios.hvac.integration import HvacScenario
 from secure_control.scenarios.paper_pid.baseline import run_paper_pid_baseline
 from secure_control.scenarios.paper_pid.secure_experiment import (
+    SCENARIO_VERSION,
     assemble_paper_pid_plan,
     paper_pid_numeric_contract,
 )
@@ -36,12 +40,24 @@ from secure_control.simulation import compare_closed_loops
 
 from .artifacts import SCHEMA_VERSION, load_artifacts, write_artifacts
 from .lan_profile import load_paper_pid_lan_profile
-from .paper_pid_fig3 import SCENARIO_VERSION, load_definition
 from .plotting import redraw_control_triptych, verify_control_triptych, write_control_triptych
 from .provenance import collect_provenance
 
+_LAN_LOG = logging.getLogger("secure_control.lan")
+
+
+def _enable_terminal_progress() -> None:
+    """只在 CLI 启用可读进度；正式结果仍是 stdout 的单行 JSON。"""
+    if not _LAN_LOG.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        _LAN_LOG.addHandler(handler)
+    _LAN_LOG.setLevel(logging.INFO)
+    _LAN_LOG.propagate = False
+
 
 def _failure(role: str, code: int, category: str, error: Exception) -> int:
+    _LAN_LOG.error("%s 运行失败：%s（%s）。", role, category, type(error).__name__)
     print(
         json.dumps(
             {
@@ -82,7 +98,7 @@ def run_client_continuous(config: LanConfig) -> dict[str, object]:
         if max(np.max(np.abs(result.output_ideal)),
                np.max(np.abs(result.output_secure))) > profile.measurement_absolute_bound:
             raise ValueError("plant y 超出声明的有限时域输入界。")
-        definition, baseline_config, _, _ = load_definition(profile.definition_path)
+        definition, baseline_config = profile.definition, profile.baseline_config
         baseline = run_paper_pid_baseline(
             alpha=baseline_config["plant"]["alpha"],
             sample_period_seconds=baseline_config["plant"]["sample_period_seconds"],
@@ -102,11 +118,17 @@ def run_client_continuous(config: LanConfig) -> dict[str, object]:
             for index, item in enumerate(confirmed)
         ):
             raise ValueError("LAN 逐步双提交确认不完整。")
-        if profile.sample_count == definition["sample_count"] and counts != {
+        if counts != {
             "products_consumed": 9 * profile.sample_count,
             "truncations_consumed": 2 * profile.sample_count,
         }:
             raise ValueError("实际资源消费与逐步 Protocol 3 计划不符。")
+        if sha256(profile.baseline_path.read_bytes()).hexdigest() != profile.baseline_digest:
+            raise ValueError("paper PID 基线在运行期间变化。")
+        if (profile.definition_path is not None
+                and sha256(profile.definition_path.read_bytes()).hexdigest()
+                != profile.definition_digest):
+            raise ValueError("Fig3 冻结定义在运行期间变化。")
         runtime.finish()
     finally:
         runtime.close()
@@ -124,6 +146,7 @@ def run_client_continuous(config: LanConfig) -> dict[str, object]:
         "prime_source_sha256": profile.prime_digest,
         "frozen_definition_sha256": profile.definition_digest,
         "definition": definition,
+        "baseline_source_sha256": profile.baseline_digest,
         "baseline_plant": baseline_config["plant"],
         "controller_spec": {
             name: getattr(spec, name).tolist() for name in ("A", "B", "C", "D", "x0")
@@ -137,13 +160,18 @@ def run_client_continuous(config: LanConfig) -> dict[str, object]:
         "backend": "lan_continuous", "claim_level": profile.claim_level,
         "session_id": runtime.session_id, "client_pid": os.getpid(),
         "topology_sha256": config.topology.digest,
+        "transport": config.transport,
         "resource_counts": counts,
         "confirmed_steps": confirmed,
         "prime_verification": asdict(runtime.modulus_verification),
         "range_verification": asdict(runtime.range_verification),
         "scale_ledger": asdict(runtime.scale_ledger),
         "kappa": profile.q.bit_length() - profile.security_parameter - 2,
-        "security_boundary": "local three-terminal TLS; no real three-machine validation",
+        "security_boundary": (
+            "local three-terminal TLS; no real three-machine validation"
+            if config.transport == "mutual_tls" else
+            "unauthenticated plaintext TCP lab simulation; no authenticated LAN claim"
+        ),
     })
     artifact = write_artifacts(
         result, plan.metadata, effective, provenance, output_root=profile.output_root,
@@ -159,13 +187,17 @@ def run_client_continuous(config: LanConfig) -> dict[str, object]:
         "status": "complete", "role": "Client", "pid": os.getpid(),
         "topology_sha256": config.topology.digest,
         "session_id": runtime.session_id, "run_id": artifact.run_id,
-        "run_dir": str(artifact.run_dir), "sample_count": profile.sample_count,
-        "resource_counts": counts, "tls_version": "TLSv1.3",
+        "run_dir": str(artifact.run_dir),
+        "figure_path": str((artifact.run_dir / "control.png").resolve()),
+        "scenario": "paper_pid_fig3", "ell": profile.ell,
+        "claim_level": profile.claim_level, "sample_count": profile.sample_count,
+        "resource_counts": counts, "transport": config.transport,
+        "tls_version": "TLSv1.3" if config.transport == "mutual_tls" else None,
     }
 
 
 def _run() -> int:
-    parser = argparse.ArgumentParser(prog="secure-control", description="Authenticated LAN experiment")
+    parser = argparse.ArgumentParser(prog="secure-control", description="Three-role LAN experiment")
     commands = parser.add_subparsers(dest="role", required=True)
     for role in ("p1", "p2", "client"):
         command = commands.add_parser(role)
@@ -174,6 +206,7 @@ def _run() -> int:
     redraw.add_argument("--run-dir", required=True, type=Path)
     redraw.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
+    _enable_terminal_progress()
     if args.role == "redraw":
         try:
             target = redraw_control_triptych(args.run_dir, args.output)
@@ -191,6 +224,8 @@ def _run() -> int:
             load_paper_pid_lan_profile(config.experiment_config)
     except (ValueError, TypeError, OSError) as error:
         return _failure(role, 2, "configuration", error)
+    mode = "无证书实验连接" if config.transport == "insecure_tcp" else "TLS 认证连接"
+    _LAN_LOG.info("%s 配置检查通过，开始运行（%s）。", role, mode)
     try:
         result = (
             (run_client_continuous(config) if config.experiment_config is not None
@@ -213,5 +248,13 @@ def _run() -> int:
         return _failure(role, 5, "uncertain_or_disconnected", error)
     except Exception as error:  # noqa: BLE001 - CLI 不把意外异常的 payload/traceback 输出到日志
         return _failure(role, 5, "uncertain_or_disconnected", error)
+    if role == "Client":
+        _LAN_LOG.info("Client 运行完成，图已保存：%s", result.get("figure_path", "单步模式无图"))
+    else:
+        _LAN_LOG.info("%s 运行完成，已提交 %s 步。", role, result.get("steps_committed", 1))
     print(json.dumps(result, ensure_ascii=False, sort_keys=True, allow_nan=False))
     return 0
+
+
+if __name__ == "__main__":
+    cli()

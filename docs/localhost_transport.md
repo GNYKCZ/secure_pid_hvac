@@ -1,3 +1,5 @@
+> **历史资料（#84）** 本页记录旧 HVAC 实验和当时的命令；文中的 `configs/hvac*` 路径已从当前用户配置目录退出，原始输入只留在 `tests/fixtures/legacy_hvac/` 供回归测试。当前实验请按 [配置索引](../configs/README.md) 运行三角色或 Fig3。
+
 # localhost 通信传输
 
 Client 公开运行状态与采样遥测在仿真装配层产生，不改变本 wire 契约；角色 `topology`

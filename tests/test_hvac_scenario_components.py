@@ -21,8 +21,8 @@ from secure_control.scenarios.hvac import (
 from secure_control.scenarios.hvac.integration import HvacScenario
 from secure_control.simulation import Plant, ScenarioAdapter
 
-BASELINE_CONFIG_PATH = Path(__file__).parents[1] / "configs" / "hvac_baseline.yaml"
-TWO_R_TWO_C_CONFIG_PATH = Path(__file__).parents[1] / "configs" / "hvac_2r2c_plant.yaml"
+BASELINE_CONFIG_PATH = Path(__file__).parents[1] / "tests" / "fixtures" / "legacy_hvac" / "hvac_baseline.yaml"
+TWO_R_TWO_C_CONFIG_PATH = Path(__file__).parents[1] / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_plant.yaml"
 
 
 def _contract():
