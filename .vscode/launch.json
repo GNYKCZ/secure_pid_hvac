@@ -1,0 +1,32 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Continuous P1",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "secure_control.experiments.lan_runner",
+      "args": ["p1", "--config", "configs/local-p1.example.yaml"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Continuous P2",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "secure_control.experiments.lan_runner",
+      "args": ["p2", "--config", "configs/local-p2.example.yaml"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Continuous Client",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "secure_control.experiments.lan_runner",
+      "args": ["client", "--config", "configs/local-client-continuous.example.yaml"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    }
+  ]
+}

@@ -159,7 +159,10 @@ def run_client_continuous(config: LanConfig) -> dict[str, object]:
         "status": "complete", "role": "Client", "pid": os.getpid(),
         "topology_sha256": config.topology.digest,
         "session_id": runtime.session_id, "run_id": artifact.run_id,
-        "run_dir": str(artifact.run_dir), "sample_count": profile.sample_count,
+        "run_dir": str(artifact.run_dir),
+        "figure_path": str((artifact.run_dir / "control.png").resolve()),
+        "scenario": "paper_pid_fig3", "ell": profile.ell,
+        "claim_level": profile.claim_level, "sample_count": profile.sample_count,
         "resource_counts": counts, "tls_version": "TLSv1.3",
     }
 
@@ -215,3 +218,7 @@ def _run() -> int:
         return _failure(role, 5, "uncertain_or_disconnected", error)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True, allow_nan=False))
     return 0
+
+
+if __name__ == "__main__":
+    cli()

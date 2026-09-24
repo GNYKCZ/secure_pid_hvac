@@ -8,7 +8,7 @@ numeric:
   k: 40
   runtime_payload_bits: 46
   lambda: 80
-  prime_source: hvac_2r2c_sweep_prime.yaml
+  prime_source: shared_prime_256_pocklington.yaml
 range:
   measurement_absolute_bound: 128
 plot:

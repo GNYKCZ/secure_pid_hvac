@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 import time
+from hashlib import sha256
 from pathlib import Path
 
 import numpy as np
@@ -46,8 +47,8 @@ def _continuous_config(paths: dict[str, Path], count: int, ell: int = 32) -> Pat
     content = content.replace("ell: 32", f"ell: {ell}")
     content = content.replace("k: 40", f"k: {ell + 8}")
     content = content.replace("runtime_payload_bits: 46", f"runtime_payload_bits: {ell + 14}")
-    content = content.replace("prime_source: hvac_2r2c_sweep_prime.yaml",
-                              f"prime_source: {ROOT / 'configs' / 'hvac_2r2c_sweep_prime.yaml'}")
+    content = content.replace("prime_source: shared_prime_256_pocklington.yaml",
+                              f"prime_source: {ROOT / 'configs' / 'shared_prime_256_pocklington.yaml'}")
     content = content.replace("frozen_definition: paper_pid_fig3_sweep.yaml",
                               f"frozen_definition: {ROOT / 'configs' / 'paper_pid_fig3_sweep.yaml'}")
     content = content.replace("output_root: ../results/lan_continuous",
@@ -69,6 +70,32 @@ def _nested_keys(value: object) -> list[str]:
     if isinstance(value, list):
         return [item for child in value for item in _nested_keys(child)]
     return []
+
+
+def _run_module(role: str, config: Path) -> subprocess.Popen[str]:
+    """以 VS Code launch.json 所用模块入口启动真实独立进程。"""
+    return subprocess.Popen(
+        [sys.executable, "-m", "secure_control.experiments.lan_runner",
+         role.lower(), "--config", str(config)],
+        cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+
+
+def test_vscode_launch_maps_to_continuous_module() -> None:
+    """三项点击入口固定到 #86 连续配置，不误选 #68 单步 Client。"""
+    launch = json.loads((ROOT / ".vscode" / "launch.json").read_text(encoding="utf-8"))
+    assert len(launch["configurations"]) == 3
+    expected = {
+        "Continuous P1": ["p1", "--config", "configs/local-p1.example.yaml"],
+        "Continuous P2": ["p2", "--config", "configs/local-p2.example.yaml"],
+        "Continuous Client": ["client", "--config",
+                              "configs/local-client-continuous.example.yaml"],
+    }
+    for entry in launch["configurations"]:
+        assert entry["args"] == expected[entry["name"]]
+        assert entry["module"] == "secure_control.experiments.lan_runner"
+        assert entry["cwd"] == "${workspaceFolder}"
+        assert entry["console"] == "integratedTerminal"
 
 
 def test_continuous_setup_codec_keeps_prime_evidence(deployment: dict[str, Path]) -> None:
@@ -112,7 +139,7 @@ def test_profile_duplicate_and_wrong_prime_rejected(deployment: dict[str, Path])
     with pytest.raises(ValueError, match="重复"):
         load_paper_pid_lan_profile(profile)
     profile = _continuous_config(deployment, 3)
-    prime = ROOT / "configs" / "hvac_2r2c_sweep_prime.yaml"
+    prime = ROOT / "configs" / "shared_prime_256_pocklington.yaml"
     bad_prime = profile.parent / "bad_prime.yaml"
     content = prime.read_text(encoding="utf-8")
     source = load_paper_pid_lan_profile(profile)
@@ -124,15 +151,32 @@ def test_profile_duplicate_and_wrong_prime_rejected(deployment: dict[str, Path])
         load_paper_pid_lan_profile(profile)
 
 
+def test_bad_shared_prime_certificate_rejected_before_network(deployment: dict[str, Path]) -> None:
+    """证书损坏必须在 Client 配置预检阶段失败。"""
+    profile = _continuous_config(deployment, 3)
+    prime = ROOT / "configs" / "shared_prime_256_pocklington.yaml"
+    damaged = profile.parent / "damaged_prime.yaml"
+    damaged.write_text(prime.read_text(encoding="utf-8").replace(
+        "aa15ad45266d1c1bffee97cb2626ba4940ffbc8c3472045e92696c196a06dc3b",
+        "ba15ad45266d1c1bffee97cb2626ba4940ffbc8c3472045e92696c196a06dc3b", 1
+    ), encoding="utf-8")
+    profile.write_text(profile.read_text(encoding="utf-8").replace(
+        str(prime), str(damaged)
+    ), encoding="utf-8")
+    with pytest.raises((ValueError, TypeError)):
+        load_paper_pid_lan_profile(profile)
+    assert not (profile.parent / "runs").exists()
+
+
 @pytest.mark.parametrize(("count", "ell"), [(3, 32), (51, 32), (51, 40)])
 def test_three_independent_continuous_roles_publish_one_verified_run(
     deployment: dict[str, Path], count: int, ell: int
 ) -> None:
     profile = _continuous_config(deployment, count, ell)
-    parties = [_run(role, deployment[role]) for role in ("P1", "P2")]
+    parties = [_run_module(role, deployment[role]) for role in ("P1", "P2")]
     try:
         time.sleep(0.5)
-        client = _run("Client", deployment["Client"])
+        client = _run_module("Client", deployment["Client"])
         code, result, errors = _finish(client, 100)
         assert code == 0, (result, errors)
         outcomes = [_finish(party, 100) for party in parties]
@@ -147,6 +191,10 @@ def test_three_independent_continuous_roles_publish_one_verified_run(
         }
         run_dir = Path(result["run_dir"])
         record = load_artifacts(run_dir)
+        assert Path(result["figure_path"]) == (run_dir / "control.png").resolve()
+        assert result["scenario"] == "paper_pid_fig3"
+        assert result["ell"] == ell
+        assert result["claim_level"] == record.effective_config["claim_level"]
         assert record.result.time.size == count
         assert record.effective_config["fractional_bits"] == ell
         assert record.provenance["session_id"] == result["session_id"]
@@ -217,7 +265,9 @@ def test_three_independent_continuous_roles_publish_one_verified_run(
         np.testing.assert_array_equal(figure.axes[1].lines[0].get_xdata(), record.result.time)
         figure.clear()
         if count == 3:
-            assert redraw_control_triptych(run_dir, profile.parent / "redrawn.png").is_file()
+            redrawn = redraw_control_triptych(run_dir, profile.parent / "redrawn.png")
+            assert redrawn.is_file()
+            assert redrawn.read_bytes() == (run_dir / "control.png").read_bytes()
 
             # 重启全部角色后，不能续用上一组 share/session 或已发布 run ID。
             again = [_run(role, deployment[role]) for role in ("P1", "P2")]
@@ -252,6 +302,26 @@ def test_three_independent_continuous_roles_publish_one_verified_run(
             if party.poll() is None:
                 party.kill()
             party.communicate()
+
+
+def test_shared_prime_and_frozen_compatibility_bytes() -> None:
+    """公开证据的日常名称不能使旧 raw SHA 或 HVAC LF 摘要漂移。"""
+    shared = (ROOT / "configs" / "shared_prime_256_pocklington.yaml").read_bytes()
+    legacy = (ROOT / "configs" / "hvac_2r2c_sweep_prime.yaml").read_bytes()
+    definition = (ROOT / "configs" / "paper_pid_fig3_sweep.yaml").read_bytes()
+    assert shared == legacy
+    assert sha256(shared).hexdigest() == (
+        "b8c5e9e779d945cfc19d0662b641cd1084acadd0907cc6b4e64ee4076455111b"
+    )
+    assert sha256(shared.replace(b"\r\n", b"\n")).hexdigest() == (
+        "b317a7db4f14fbf77258102d6b09766dc3b5f495252c1e29ed3ae315cb98340c"
+    )
+    assert sha256(definition).hexdigest() == (
+        "16b635276927e4a14977ff7ac2d7baa67885fc3244017589fb2a638b5c6de39a"
+    )
+    assert load_paper_pid_lan_profile(ROOT / "configs" / "paper_pid_lan.example.yaml").claim_level == (
+        "paper-inspired-frozen-parameter-point"
+    )
 
 
 _LOST_SECOND_COMMIT = r"""
