@@ -22,9 +22,10 @@ from secure_control.crypto import (
     verify_prime_modulus,
 )
 from secure_control.execution import LocalhostSecureStateSpaceRuntime
-from secure_control.scenarios.paper_pid.baseline import run_paper_pid_baseline
+from secure_control.scenarios.paper_pid.baseline import PaperPidBaseline, run_paper_pid_baseline
 from secure_control.scenarios.paper_pid.secure_experiment import build_paper_pid_plan
 from secure_control.simulation import compare_closed_loops
+from secure_control.simulation.telemetry import TelemetrySession, observe_roles
 
 from .artifacts import SCHEMA_VERSION, ExperimentRecord, load_artifacts, write_artifacts
 from .paper_pid_runner import _load_config as load_baseline_config
@@ -204,6 +205,80 @@ def render_saved_sweep(sweep_dir: str | Path) -> dict[str, Any]:
     return manifest
 
 
+def _run_point(
+    definition: dict[str, Any], baseline: PaperPidBaseline, q: int, evidence: PrimeModulusEvidence,
+    ell: int, *, output_root: str | Path, test_seed: int, backend: str,
+    telemetry: TelemetrySession | None = None,
+) -> ExperimentRecord:
+    """复用四点扫描的单精度计算、资源检查与正式发布；live 只增加公开遥测。"""
+    if ell not in PRECISIONS:
+        raise ValueError("Fig.3 精度必须属于冻结的四点集合")
+    plan, runtime, collector = build_paper_pid_plan(
+        fractional_bits=ell, modulus=q, modulus_evidence=evidence,
+        security_parameter=definition["security_parameter"],
+        sample_count=definition["sample_count"],
+        measurement_absolute_bound=definition["measurement_absolute_bound"],
+        runtime_payload_headroom_bits=definition["runtime_payload_headroom_bits"],
+        test_seed=test_seed, backend=backend,
+    )
+    try:
+        if telemetry is not None and isinstance(runtime, LocalhostSecureStateSpaceRuntime):
+            telemetry.roles = observe_roles(runtime.topology)
+        result = compare_closed_loops(
+            plan.ideal, plan.secure, plan.sample_times, telemetry=telemetry
+        )
+        np.testing.assert_allclose(result.output_ideal[:, 0], baseline.rows[:, 6], rtol=0, atol=1e-12)
+        np.testing.assert_allclose(result.control_ideal[:, 0], baseline.rows[:, 9], rtol=0, atol=1e-12)
+        if max(np.max(np.abs(result.output_ideal)), np.max(np.abs(result.output_secure))) > definition["measurement_absolute_bound"]:
+            raise ValueError("plant y 超出声明的有限时域输入界")
+        if runtime.scale_ledger.state_truncation_bits != ell:
+            raise ValueError("Protocol 2 截断尺度与论文 ell 不符")
+        if isinstance(runtime, LocalhostSecureStateSpaceRuntime):
+            counts = runtime.resource_counts
+            topology = runtime.topology
+            role_pids = {item.role: item.pid for item in topology.roles}
+        else:
+            if collector is None or len(collector.traces()) != 51:
+                raise ValueError("缺少完整真实资源 trace")
+            final = collector.traces()[-1].resources_after
+            counts = {"products_consumed": final.triples_consumed,
+                      "truncations_consumed": final.truncations_consumed}
+            role_pids = None
+        if counts != {"products_consumed": 459, "truncations_consumed": 102}:
+            raise ValueError("实际资源消费与 Protocol 3 计划不符")
+        config = {
+            "scenario": {"name": "paper_pid_fig3", "version": SCENARIO_VERSION},
+            "definition": definition, "fractional_bits": ell,
+            "paper_parameter_bits": ell + 8,
+            "runtime_payload_bits": ell + definition["runtime_payload_headroom_bits"],
+            "q": q, "reference_used": False, "raw_equals_applied": True,
+            "range": {"mode": "finite_horizon", "steps": 51,
+                      "measurement_absolute_bound": 128},
+        }
+        provenance = collect_provenance(
+            scenario_name="paper_pid_fig3", scenario_version=SCENARIO_VERSION,
+            schema_version=SCHEMA_VERSION, test_seed=test_seed,
+        )
+        provenance.update({"claim_level": "paper-inspired", "backend": backend,
+                           "resource_counts": counts, "role_pids": role_pids,
+                           "prime_certificate_sha256": evidence.certificate_sha256,
+                           "prime_verification": asdict(runtime.modulus_verification),
+                           "range_verification": asdict(runtime.range_verification),
+                           "scale_ledger": asdict(runtime.scale_ledger),
+                           "kappa": q.bit_length() - definition["security_parameter"] - 2,
+                           "security_boundary": "diagnostic seed; no deployment security claim"})
+        if telemetry is not None:
+            provenance["public_telemetry_session_id"] = telemetry.session_id
+        artifact = write_artifacts(result, plan.metadata, config, provenance,
+                                   output_root=output_root)
+        record = load_artifacts(artifact.run_dir)
+        _validate_record(record, ell, definition)
+        return record
+    finally:
+        if isinstance(runtime, LocalhostSecureStateSpaceRuntime):
+            runtime.close()
+
+
 def run_sweep(config_path: str | Path, *, output_root: str | Path,
               test_seed: int = 70, backend: str = "single_process") -> Path:
     """逐点正式发布，四点全部成功后才发布完整图与清单。"""
@@ -223,65 +298,11 @@ def run_sweep(config_path: str | Path, *, output_root: str | Path,
     records = []
     entries = []
     for ell in PRECISIONS:
-        plan, runtime, collector = build_paper_pid_plan(
-            fractional_bits=ell, modulus=q, modulus_evidence=evidence,
-            security_parameter=definition["security_parameter"],
-            sample_count=definition["sample_count"],
-            measurement_absolute_bound=definition["measurement_absolute_bound"],
-            runtime_payload_headroom_bits=definition["runtime_payload_headroom_bits"],
-            test_seed=test_seed, backend=backend,
-        )
-        try:
-            result = compare_closed_loops(plan.ideal, plan.secure, plan.sample_times)
-            np.testing.assert_allclose(result.output_ideal[:, 0], baseline.rows[:, 6], rtol=0, atol=1e-12)
-            np.testing.assert_allclose(result.control_ideal[:, 0], baseline.rows[:, 9], rtol=0, atol=1e-12)
-            if max(np.max(np.abs(result.output_ideal)), np.max(np.abs(result.output_secure))) > definition["measurement_absolute_bound"]:
-                raise ValueError("plant y 超出声明的有限时域输入界")
-            if runtime.scale_ledger.state_truncation_bits != ell:
-                raise ValueError("Protocol 2 截断尺度与论文 ell 不符")
-            if isinstance(runtime, LocalhostSecureStateSpaceRuntime):
-                counts = runtime.resource_counts
-                topology = runtime.topology
-                role_pids = {item.role: item.pid for item in topology.roles}
-            else:
-                if collector is None or len(collector.traces()) != 51:
-                    raise ValueError("缺少完整真实资源 trace")
-                final = collector.traces()[-1].resources_after
-                counts = {"products_consumed": final.triples_consumed,
-                          "truncations_consumed": final.truncations_consumed}
-                role_pids = None
-            if counts != {"products_consumed": 459, "truncations_consumed": 102}:
-                raise ValueError("实际资源消费与 Protocol 3 计划不符")
-            config = {
-                "scenario": {"name": "paper_pid_fig3", "version": SCENARIO_VERSION},
-                "definition": definition, "fractional_bits": ell,
-                "paper_parameter_bits": ell + 8,
-                "runtime_payload_bits": ell + definition["runtime_payload_headroom_bits"],
-                "q": q, "reference_used": False, "raw_equals_applied": True,
-                "range": {"mode": "finite_horizon", "steps": 51,
-                          "measurement_absolute_bound": 128},
-            }
-            provenance = collect_provenance(
-                scenario_name="paper_pid_fig3", scenario_version=SCENARIO_VERSION,
-                schema_version=SCHEMA_VERSION, test_seed=test_seed,
-            )
-            provenance.update({"claim_level": "paper-inspired", "backend": backend,
-                               "resource_counts": counts, "role_pids": role_pids,
-                               "prime_certificate_sha256": evidence.certificate_sha256,
-                               "prime_verification": asdict(runtime.modulus_verification),
-                               "range_verification": asdict(runtime.range_verification),
-                               "scale_ledger": asdict(runtime.scale_ledger),
-                               "kappa": q.bit_length() - definition["security_parameter"] - 2,
-                               "security_boundary": "diagnostic seed; no deployment security claim"})
-            artifact = write_artifacts(result, plan.metadata, config, provenance,
-                                       output_root=root)
-            record = load_artifacts(artifact.run_dir)
-            records.append(record)
-            entries.append({"ell": ell, "status": "success", "run_id": artifact.run_id,
-                            "metadata_sha256": _digest(artifact.metadata_path)})
-        finally:
-            if isinstance(runtime, LocalhostSecureStateSpaceRuntime):
-                runtime.close()
+        record = _run_point(definition, baseline, q, evidence, ell,
+                           output_root=root, test_seed=test_seed, backend=backend)
+        records.append(record)
+        entries.append({"ell": ell, "status": "success", "run_id": record.run_id,
+                        "metadata_sha256": _digest(root / record.run_id / "metadata.json")})
     try:
         with TemporaryDirectory(dir=root, prefix=".incomplete-") as temporary:
             figure = Path(temporary) / "fig3.png"
