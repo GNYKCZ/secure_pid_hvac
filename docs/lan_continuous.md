@@ -15,6 +15,28 @@ Client→P1、Client→P2、P2→P1 可使用实验明文 TCP 或已有双向 TL
 3. 打开 `scripts/run_continuous_client.py`，同样点击运行；成功时 JSON 中的
    `status` 为 `complete`，`figure_path` 是图的完整路径，图保存在 Client 电脑。
 
+每个角色成功载入配置后会打印“配置检查通过”。P1/P2 随后打印“已启动，正在等待
+Client”，等待期间终端保持安静是正常的；连接后会打印“协议连接已建立”，
+Client 收到三方就绪回执后打印“开始连续计算”，最后打印“运行完成”。
+这些提示会显示在终端里，不改变供脚本读取的最终单行 JSON。
+最终 JSON 中 Client 的 `status: complete` 与 P1/P2 的 `status: closed` 都表示成功；
+`status: failed` 表示失败。若等待超过角色配置的 `startup: 180` 秒，需重启三方。
+
+如果新电脑上的 PowerShell 出现 `Set-ExecutionPolicy` 激活报错，本仓库的
+`.vscode/settings.json` 已让**新建的** VS Code 终端默认使用 Windows 命令提示符。
+先关闭旧的 PowerShell 终端，再通过菜单 **终端 → 新建终端**开三个终端。
+新建终端只是打开另一个独立命令窗口，原终端里正在等待的 P1/P2 会继续运行；
+新终端不会自动运行任何角色。点“运行 Python 文件”时
+要确认 VS Code 为每个角色保留了独立终端；也可以从仓库根目录在三个终端分别输入：
+
+```text
+uv run python scripts/run_continuous_p1.py
+uv run python scripts/run_continuous_p2.py
+uv run python scripts/run_continuous_client.py
+```
+
+三个命令要分别留在各自终端运行，不能在同一个终端依次等待前一个结束。
+
 这三个文件分别固定角色，默认读取 `configs/lab-p1.example.yaml`、
 `lab-p2.example.yaml`、`lab-client-continuous.example.yaml`。也可在命令行把另一份
 角色配置路径作为脚本的唯一参数。每次启动都用独立终端，重新实验需重启三方。

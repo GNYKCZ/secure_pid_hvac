@@ -124,6 +124,12 @@ def test_direct_python_files_run_three_role_lab_without_certificates(tmp_path: P
         assert code == 0, (result, errors)
         outcomes = [_finish(party, 100) for party in parties]
         assert all(item[0] == 0 for item in outcomes), outcomes
+        assert "Client 配置检查通过" in errors
+        assert "Client 与 P1 的协议连接已建立" in errors
+        assert "Client 与 P2 的协议连接已建立" in errors
+        assert "三方已就绪" in errors and "Client 运行完成" in errors
+        assert "P1 已启动" in outcomes[0][2] and "P1 运行完成" in outcomes[0][2]
+        assert "P2 已启动" in outcomes[1][2] and "P2 运行完成" in outcomes[1][2]
         assert len({result["pid"], *(item[1]["pid"] for item in outcomes)}) == 3
         assert all(item[1]["steps_committed"] == 3 for item in outcomes)
         assert all(item[1]["transport"] == "insecure_tcp" and

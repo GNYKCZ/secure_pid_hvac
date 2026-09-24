@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
+import sys
 from dataclasses import asdict
 from pathlib import Path
 
@@ -40,8 +42,21 @@ from .paper_pid_fig3 import SCENARIO_VERSION, load_definition
 from .plotting import redraw_control_triptych, verify_control_triptych, write_control_triptych
 from .provenance import collect_provenance
 
+_LAN_LOG = logging.getLogger("secure_control.lan")
+
+
+def _enable_terminal_progress() -> None:
+    """只在 CLI 启用可读进度；正式结果仍是 stdout 的单行 JSON。"""
+    if not _LAN_LOG.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        _LAN_LOG.addHandler(handler)
+    _LAN_LOG.setLevel(logging.INFO)
+    _LAN_LOG.propagate = False
+
 
 def _failure(role: str, code: int, category: str, error: Exception) -> int:
+    _LAN_LOG.error("%s 运行失败：%s（%s）。", role, category, type(error).__name__)
     print(
         json.dumps(
             {
@@ -183,6 +198,7 @@ def _run() -> int:
     redraw.add_argument("--run-dir", required=True, type=Path)
     redraw.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
+    _enable_terminal_progress()
     if args.role == "redraw":
         try:
             target = redraw_control_triptych(args.run_dir, args.output)
@@ -200,6 +216,8 @@ def _run() -> int:
             load_paper_pid_lan_profile(config.experiment_config)
     except (ValueError, TypeError, OSError) as error:
         return _failure(role, 2, "configuration", error)
+    mode = "无证书实验连接" if config.transport == "insecure_tcp" else "TLS 认证连接"
+    _LAN_LOG.info("%s 配置检查通过，开始运行（%s）。", role, mode)
     try:
         result = (
             (run_client_continuous(config) if config.experiment_config is not None
@@ -222,6 +240,10 @@ def _run() -> int:
         return _failure(role, 5, "uncertain_or_disconnected", error)
     except Exception as error:  # noqa: BLE001 - CLI 不把意外异常的 payload/traceback 输出到日志
         return _failure(role, 5, "uncertain_or_disconnected", error)
+    if role == "Client":
+        _LAN_LOG.info("Client 运行完成，图已保存：%s", result.get("figure_path", "单步模式无图"))
+    else:
+        _LAN_LOG.info("%s 运行完成，已提交 %s 步。", role, result.get("steps_committed", 1))
     print(json.dumps(result, ensure_ascii=False, sort_keys=True, allow_nan=False))
     return 0
 

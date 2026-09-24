@@ -7,6 +7,9 @@
 `scripts/run_continuous_p2.py`、`scripts/run_continuous_client.py`，分别点击
 **运行 Python 文件**，让每个程序占用自己的终端。此实验配置使用明文 TCP，
 **不需要生成或复制 TLS 证书，也不验证网络对端身份**；仅用于可信、隔离的实验网络。
+终端会显示“已启动/等待”“连接已建立”“三方已就绪”和“运行完成”；
+P1/P2 在等待 Client 时不持续输出。新终端默认使用命令提示符，避开 PowerShell 的
+`Set-ExecutionPolicy` 激活报错；改动 VS Code 设置后须关闭旧终端并新建终端。
 Client 完成后输出 run ID、结果目录与 `figure_path`（正式三栏 `control.png`）。
 失败时停止三方，再从 P1 重新开始。
 场景、精度、步数和输出目录只改 `configs/paper_pid_lan.example.yaml`；

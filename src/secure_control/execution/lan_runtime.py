@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import secrets
 import socket
@@ -57,6 +58,7 @@ from .localhost_transport import deadline_after, receive_envelope, send_envelope
 
 _FRAME_LIMIT = 8 * 1024 * 1024
 _MAX_CONTINUOUS_STEPS = 1000
+_LAN_LOG = logging.getLogger("secure_control.lan")
 
 
 def run_client_single_step(config: LanConfig, trial: Any) -> dict[str, object]:
@@ -79,14 +81,17 @@ def run_client_single_step(config: LanConfig, trial: Any) -> dict[str, object]:
     committed = False
     try:
         for role, address in (("P1", config.topology.p1_client), ("P2", config.topology.p2_client)):
+            _LAN_LOG.info("Client 正在连接 %s…", role)
             sock = connect_role(address, config, role, deadline_after(config.startup_timeout))
             sockets.append(sock)
             _hello(sock, "Client", role, session, hello, config.startup_timeout)
+            _LAN_LOG.info("Client 与 %s 的协议连接已建立。", role)
         stamps["tls_hello"] = time.perf_counter_ns()
         for party, sock in enumerate(sockets):
             _request(
                 sock, "P1" if party == 0 else "P2", 1, "lan_ready", session, config.startup_timeout
             )
+        _LAN_LOG.info("三方已就绪，开始计算。")
         stamps["peer_ready"] = time.perf_counter_ns()
         setup = LanSetupPayload(
             trial.fixed_point.modulus,
@@ -231,12 +236,15 @@ class LanContinuousRuntime:
         try:
             for role, address in (("P1", config.topology.p1_client),
                                   ("P2", config.topology.p2_client)):
+                _LAN_LOG.info("Client 正在连接 %s…", role)
                 sock = connect_role(address, config, role, deadline_after(config.startup_timeout))
                 self._sockets.append(sock)
                 _hello(sock, "Client", role, self.session_id, hello, config.startup_timeout)
+                _LAN_LOG.info("Client 与 %s 的协议连接已建立。", role)
             for party, sock in enumerate(self._sockets):
                 _request(sock, "P1" if party == 0 else "P2", 1, "lan_ready",
                          self.session_id, config.startup_timeout)
+            _LAN_LOG.info("三方已就绪，开始连续计算。")
             setup = LanContinuousSetupPayload(
                 fixed_point.modulus, fixed_point.integer_bits, fixed_point.fractional_bits,
                 security_parameter, range_contract.state_payload_bounds,
@@ -346,6 +354,8 @@ def run_party_single_step(config: LanConfig) -> dict[str, object]:
         if party == 0:
             peer_listener = listener(config.topology.p1_peer)
         startup_deadline = deadline_after(config.startup_timeout)
+        _LAN_LOG.info("%s 已启动，正在等待 Client（最多 %.0f 秒）。", role,
+                      config.startup_timeout)
         client_socket = accept_role(client_listener, config, "Client", startup_deadline)
         session, hello = _accept_hello(
             client_socket,
@@ -354,15 +364,18 @@ def run_party_single_step(config: LanConfig) -> dict[str, object]:
             config,
             startup_deadline,
         )
+        _LAN_LOG.info("%s 与 Client 的协议连接已建立。", role)
         if party == 0:
             assert peer_listener is not None
             peer_socket = accept_role(peer_listener, config, "P2", startup_deadline)
             _accept_hello(
                 peer_socket, "P2", "P1", config, startup_deadline, expected=(session, hello)
             )
+            _LAN_LOG.info("P1 与 P2 的协议连接已建立。")
         else:
             peer_socket = connect_role(config.topology.p1_peer, config, "P1", startup_deadline)
             _hello(peer_socket, "P2", "P1", session, hello, config.startup_timeout)
+            _LAN_LOG.info("P2 与 P1 的协议连接已建立。")
         _party_reply(
             client_socket,
             _party_receive(client_socket, role, 1, "lan_ready", session, config.startup_timeout),

@@ -17,6 +17,7 @@ wheels/
 # Editors and local configuration
 .vscode/*
 !.vscode/launch.json
+!.vscode/settings.json
 .idea/
 .env
 .tmp/
