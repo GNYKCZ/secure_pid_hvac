@@ -61,6 +61,9 @@ class LocalhostTimeoutError(LocalhostExecutionError, TimeoutError):
 class LocalhostProtocolError(LocalhostExecutionError):
     """framing、schema、方向、顺序或协议 identity 不匹配。"""
 
+    # 仅暴露固定故障类别；公开遥测不读取异常文本或 wire payload。
+    _public_fault_category = "protocol"
+
 
 class LocalhostPeerError(LocalhostExecutionError):
     """远端角色报告受限错误或提前断开。"""

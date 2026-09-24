@@ -45,6 +45,17 @@ def _times(sample_times: Array) -> np.ndarray:
     return np.array(times, copy=True)
 
 
+def _fault_category(error: Exception, phase: str) -> str:
+    """按错误所有者给出的受限类别分类，不依赖具体 runtime 实现。"""
+    if isinstance(error, TimeoutError):
+        return "timeout"
+    if isinstance(error, ConnectionError):
+        return "disconnected"
+    if phase == "control" and getattr(error, "_public_fault_category", None) == "protocol":
+        return "protocol"
+    return "plant" if phase == "plant" else "control"
+
+
 @dataclass(frozen=True, slots=True)
 class BranchTrajectory:
     """仅保存一支运行成功后的 reference、更新前 output 与 applied control。"""
@@ -212,13 +223,7 @@ def compare_closed_loops(
     except Exception as error:
         if telemetry is not None:
             # 故障类别固定，绝不复制异常字符串或原始 payload。
-            category = (
-                "timeout" if isinstance(error, TimeoutError)
-                else "disconnected" if isinstance(error, ConnectionError)
-                else "plant" if phase == "plant"
-                else "control"
-            )
-            telemetry.fault(step_in_progress, category)
+            telemetry.fault(step_in_progress, _fault_category(error, phase))
             telemetry.end("failed")
         raise
 
@@ -265,12 +270,6 @@ def run_secure_branch(
         telemetry.end("completed")
         return result
     except Exception as error:
-        category = (
-            "timeout" if isinstance(error, TimeoutError)
-            else "disconnected" if isinstance(error, ConnectionError)
-            else "plant" if phase == "plant"
-            else "control"
-        )
-        telemetry.fault(step_in_progress, category)
+        telemetry.fault(step_in_progress, _fault_category(error, phase))
         telemetry.end("failed")
         raise

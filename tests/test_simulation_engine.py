@@ -9,7 +9,12 @@ import numpy as np
 import pytest
 
 from secure_control.core import ControllerSpec
-from secure_control.execution import PlaintextStateSpaceRuntime
+from secure_control.execution import (
+    LocalhostPeerError,
+    LocalhostProtocolError,
+    LocalhostTimeoutError,
+    PlaintextStateSpaceRuntime,
+)
 from secure_control.simulation import (
     BoundedPublisher,
     ChannelMetadata,
@@ -344,3 +349,55 @@ def test_secure_only_and_failed_step_have_nullable_comparison_and_no_false_succe
     assert "share-triple-mask-secret" not in "".join(
         public_event_json(event) for event in events
     )
+
+
+@pytest.mark.parametrize("secure_only", [False, True])
+@pytest.mark.parametrize(
+    ("failure", "category"),
+    [
+        (LocalhostProtocolError, "protocol"),
+        (LocalhostTimeoutError, "timeout"),
+        # PeerError 也可能来自远端受限 error，不能一律声称连接断开。
+        (LocalhostPeerError, "control"),
+        (RuntimeError, "control"),
+    ],
+)
+def test_runtime_fault_category_uses_public_execution_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    secure_only: bool,
+    failure: type[Exception],
+    category: str,
+) -> None:
+    """真实 localhost 异常类型在第二步失败，故障固定分类且原异常仍传播。"""
+    plan = ToyScenario(1).build_plan()
+    original_step = plan.secure.runtime.step
+    calls = 0
+    secret = "share-triple-mask-private-payload"
+
+    def fail_second_step(value: np.ndarray) -> np.ndarray:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise failure(secret)
+        return original_step(value)
+
+    monkeypatch.setattr(plan.secure.runtime, "step", fail_second_step)
+    delivered: list[object] = []
+    publisher = BoundedPublisher(delivered.append)
+    telemetry = TelemetrySession(publisher, session_id="fault-public")
+    with pytest.raises(failure, match=secret):
+        if secure_only:
+            run_secure_branch(plan.secure, plan.sample_times, telemetry=telemetry)
+        else:
+            run(_FixedPlanScenario(plan), telemetry=telemetry)
+    events = _delivered_events(delivered, publisher)
+    assert [type(event) for event in events] == [
+        SessionStarted, Sample, SessionFault, SessionEnded
+    ]
+    assert events[1].step == 0
+    assert events[2].step == 1
+    assert events[2].category == category
+    assert events[3].status == "failed"
+    assert events[3].last_successful_step == 0
+    assert [event.event_seq for event in events] == [0, 1, 2, 3]
+    assert secret not in "".join(public_event_json(event) for event in events)

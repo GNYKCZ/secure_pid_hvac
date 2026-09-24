@@ -9,6 +9,7 @@ import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import fields
 from pathlib import Path
@@ -21,6 +22,7 @@ from secure_control.crypto import AdditiveShare, FixedPointContext
 from secure_control.execution import (
     LocalhostExecutionError,
     LocalhostPeerError,
+    LocalhostProtocolError,
     LocalhostSecureStateSpaceRuntime,
     LocalhostStateError,
     LocalhostTimeoutError,
@@ -63,6 +65,15 @@ from secure_control.protocol.messages import (
 )
 from secure_control.scenarios.hvac.integration import HvacScenario
 from secure_control.simulation.engine import compare_closed_loops
+from secure_control.simulation.telemetry import (
+    BoundedPublisher,
+    Sample,
+    SessionEnded,
+    SessionFault,
+    SessionStarted,
+    TelemetrySession,
+    public_event_json,
+)
 
 _DEFAULT_TRANSPORT = LocalhostTransportConfig()
 
@@ -1002,6 +1013,57 @@ def test_hvac_180_step_result_fields_match_issue16_without_semantic_drift() -> N
     finally:
         baseline.secure.runtime.close()
         localhost.secure.runtime.close()
+
+
+def test_localhost_step_identity_mismatch_publishes_protocol_fault(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """真实 Client 首步成功后伪造第二步回执 identity，验证运行时和公开故障边界。"""
+    config = Path(__file__).parents[1] / "configs" / "hvac_dual_loop.yaml"
+    plan = HvacScenario(
+        config, test_seed=905, secure_runtime_builder=LocalhostSecureStateSpaceRuntime
+    ).build_plan()
+    runtime = plan.secure.runtime
+    assert isinstance(runtime, LocalhostSecureStateSpaceRuntime)
+    delivered: list[object] = []
+    ended = threading.Event()
+
+    def consumer(event: object) -> None:
+        delivered.append(event)
+        if isinstance(event, SessionEnded):
+            ended.set()
+
+    publisher = BoundedPublisher(consumer)
+    telemetry = TelemetrySession(publisher, session_id="public-protocol-fault")
+    original_request = type(runtime._session).request
+
+    def mismatched_second_reply(
+        session: object, role: str, operation: str, timeout: float, **kwargs: object
+    ) -> object:
+        if role == "Client" and operation == "step" and kwargs.get("step") == 1:
+            return ClientStepResult(np.array([0.0]), "injected-round", 2, 0, 0)
+        return original_request(session, role, operation, timeout, **kwargs)
+
+    monkeypatch.setattr(type(runtime._session), "request", mismatched_second_reply)
+    try:
+        with pytest.raises(LocalhostProtocolError, match="step 不合法"):
+            compare_closed_loops(
+                plan.ideal, plan.secure, plan.sample_times[:2], telemetry=telemetry
+            )
+        assert ended.wait(2.0)
+        assert [type(event) for event in delivered] == [
+            SessionStarted, Sample, SessionFault, SessionEnded
+        ]
+        assert delivered[1].step == 0
+        assert delivered[2].step == 1
+        assert delivered[2].category == "protocol"
+        assert delivered[3].status == "failed"
+        assert delivered[3].last_successful_step == 0
+        assert "injected-round" not in "".join(public_event_json(event) for event in delivered)
+        assert runtime.topology.roles[0].status == "failed"
+    finally:
+        publisher.close()
+        runtime.close()
 
 
 def test_port_collision_is_reported_without_starting_children() -> None:

@@ -34,6 +34,8 @@ plant.step。没有测量的 prepare/stage/commit 为 null。时延不进入控�
 
 故障仅发布固定 `category`、step 和安全角色快照；不发布异常文本、路径、traceback、wire
 payload 或诊断对象。`public_event_json()` 显式列出允许字段，公开日志也应使用此函数。
+localhost 协议错配由 execution 异常类型提供固定 `protocol` 类别；通用 simulation 只读
+这个受限类别，不依赖 localhost wire 细节。远端受限错误并不必然等于连接断开。
 不能对事件对象递归 `asdict` 或记录原异常。可发布值不包括单方 share、triple、mask、
 nonce、controller state 或 combined-share 诊断。遥测本身不做量化、截断或模运算，不构成
 新的协议安全证明。
