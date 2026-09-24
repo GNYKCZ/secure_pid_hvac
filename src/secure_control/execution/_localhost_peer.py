@@ -51,6 +51,12 @@ class LocalhostProtocol3PeerPort:
             raise ValueError("peer session identity 必须且只能绑定一次。")
         self._session_id = session_id
 
+    def set_round_deadline(self, deadline: float) -> None:
+        """跨轮刷新绝对截止时间，同时保留双向 peer sequence。"""
+        if self._session_id is None:
+            raise ValueError("peer port 尚未绑定 session。")
+        self._deadline = deadline
+
     def send_product(self, metadata: ResourceMetadata, payload: ProductMaskPayload) -> None:
         if payload.party != (0 if self._role == "P1" else 1):
             raise ValueError("Protocol 1 peer payload 的发送方错误。")

@@ -13,6 +13,8 @@ Client/P1/P2 单进程协议核心、与明文接口兼容的通用安全状态�
 180 步 HVAC 明文/安全双闭环。现已提供显式选择的本机 multiprocessing 后端与仅绑定 loopback
 的 localhost TCP 后端；默认安全运行时不变。另有独立三角色、双向 TLS 的单步 LAN 命令入口；
 其本机示例、部署和未完成的真实三机验收见 [LAN 单步试验](docs/lan_single_step.md)。
+独立三终端连续 paper-inspired PID、本机 Client profile 与同次正式三栏控制图见
+[连续 LAN 实验](docs/lan_continuous.md)。
 现已提供显式场景选择的实验入口与通用 CSV/metadata/config 产物。
 
 ## 架构边界

@@ -11,7 +11,13 @@ from typing import Any, Literal
 
 import numpy as np
 
-from secure_control.crypto import AdditiveShare, PrimeModulusVerification
+from secure_control.crypto import (
+    AdditiveShare,
+    PocklingtonCertificate,
+    PocklingtonFactorEvidence,
+    PrimeModulusEvidence,
+    PrimeModulusVerification,
+)
 from secure_control.protocol import ControllerRangeVerification, ControllerScaleLedger
 from secure_control.protocol.messages import (
     ControllerLayout,
@@ -98,11 +104,11 @@ class RemoteErrorPayload:
 
 @dataclass(frozen=True, slots=True)
 class LanHelloPayload:
-    """mTLS 建立后对单步 LAN 模式、拓扑和新鲜 session nonce 再绑定。"""
+    """mTLS 建立后对 LAN 模式、拓扑和新鲜 session nonce 再绑定。"""
 
     profile_sha256: str
     nonce: str
-    mode: Literal["lan-single-step-v1"] = "lan-single-step-v1"
+    mode: Literal["lan-single-step-v1", "lan-continuous-v1"] = "lan-single-step-v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +122,20 @@ class LanSetupPayload:
     state_payload_bounds: tuple[int, ...]
     input_payload_bounds: tuple[int, ...]
     horizon_steps: int
+
+
+@dataclass(frozen=True, slots=True)
+class LanContinuousSetupPayload:
+    """连续模式公开数值 setup；证书不含任何单方秘密。"""
+
+    modulus: int
+    integer_bits: int
+    fractional_bits: int
+    security_parameter: int
+    state_payload_bounds: tuple[int, ...]
+    input_payload_bounds: tuple[int, ...]
+    horizon_steps: int
+    modulus_evidence: PrimeModulusEvidence | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,6 +356,18 @@ def _encode_value(value: object) -> object:
             "input_payload_bounds": list(value.input_payload_bounds),
             "horizon_steps": value.horizon_steps,
         }
+    if isinstance(value, LanContinuousSetupPayload):
+        return {
+            "type": "lan_continuous_setup",
+            "modulus": _decimal(value.modulus),
+            "integer_bits": value.integer_bits,
+            "fractional_bits": value.fractional_bits,
+            "security_parameter": value.security_parameter,
+            "state_payload_bounds": list(value.state_payload_bounds),
+            "input_payload_bounds": list(value.input_payload_bounds),
+            "horizon_steps": value.horizon_steps,
+            "modulus_evidence": _encode_prime_evidence(value.modulus_evidence),
+        }
     if isinstance(value, ClientStepResult):
         return {
             "type": "client_step_result",
@@ -526,6 +558,63 @@ def _encode_value(value: object) -> object:
     raise TypeError(f"不支持的 localhost wire payload：{type(value).__name__}")
 
 
+def _encode_prime_certificate(value: PocklingtonCertificate) -> dict[str, object]:
+    """证书整数用规范十进制字符串编码，避免 JSON 数值精度损失。"""
+    return {"candidate": _decimal(value.candidate), "factors": [
+        {"prime": _decimal(item.prime), "exponent": item.exponent,
+         "witness": _decimal(item.witness),
+         "certificate": _encode_prime_certificate(item.certificate)
+         if item.certificate is not None else None}
+        for item in value.factors
+    ]}
+
+
+def _encode_prime_evidence(value: PrimeModulusEvidence | None) -> object:
+    if value is None:
+        return None
+    return {"method": value.method, "source": value.source,
+            "source_version": value.source_version,
+            "certificate_id": value.certificate_id,
+            "certificate_sha256": value.certificate_sha256,
+            "certificate": _encode_prime_certificate(value.certificate)}
+
+
+def _decode_prime_certificate(value: object) -> PocklingtonCertificate:
+    item = _mapping(value, "prime certificate")
+    _exact_fields(item, {"candidate", "factors"}, "prime certificate")
+    factors = item["factors"]
+    if not isinstance(factors, list) or not factors or len(factors) > 1024:
+        raise LocalhostCodecError("prime factors 数量非法。")
+    decoded = []
+    for factor in factors:
+        entry = _mapping(factor, "prime factor")
+        _exact_fields(entry, {"prime", "exponent", "witness", "certificate"}, "prime factor")
+        child = entry["certificate"]
+        decoded.append(PocklingtonFactorEvidence(
+            _positive_decimal(entry["prime"], "prime"),
+            _positive(entry["exponent"], "exponent"),
+            _nonnegative_decimal(entry["witness"], "witness"),
+            _decode_prime_certificate(child) if child is not None else None,
+        ))
+    return PocklingtonCertificate(_positive_decimal(item["candidate"], "candidate"),
+                                  tuple(decoded))
+
+
+def _decode_prime_evidence(value: object) -> PrimeModulusEvidence | None:
+    if value is None:
+        return None
+    item = _mapping(value, "prime evidence")
+    _exact_fields(item, {"method", "source", "source_version", "certificate_id",
+                         "certificate_sha256", "certificate"}, "prime evidence")
+    return PrimeModulusEvidence(
+        _text(item["method"], "method"), _text(item["source"], "source"),
+        _text(item["source_version"], "source_version"),
+        _text(item["certificate_id"], "certificate_id"),
+        _required_sha256(item["certificate_sha256"], "certificate_sha256"),
+        _decode_prime_certificate(item["certificate"]),
+    )
+
+
 def _decode_value(value: object) -> object:
     mapping = _mapping(value, "wire value")
     kind = mapping.get("type")
@@ -563,7 +652,7 @@ def _decode_value(value: object) -> object:
     if kind == "lan_hello":
         _exact_fields(mapping, {"type", "profile_sha256", "nonce", "mode"}, kind)
         mode = _text(mapping["mode"], "mode")
-        if mode != "lan-single-step-v1":
+        if mode not in {"lan-single-step-v1", "lan-continuous-v1"}:
             raise LocalhostCodecError("不支持的 LAN 模式。")
         return LanHelloPayload(
             _required_sha256(mapping["profile_sha256"], "profile_sha256"),
@@ -597,6 +686,21 @@ def _decode_value(value: object) -> object:
                 mapping["input_payload_bounds"], "input_payload_bounds", nonnegative=True
             ),
             _positive(mapping["horizon_steps"], "horizon_steps"),
+        )
+    if kind == "lan_continuous_setup":
+        _exact_fields(mapping, {
+            "type", "modulus", "integer_bits", "fractional_bits", "security_parameter",
+            "state_payload_bounds", "input_payload_bounds", "horizon_steps", "modulus_evidence",
+        }, kind)
+        return LanContinuousSetupPayload(
+            _positive_decimal(mapping["modulus"], "modulus"),
+            _positive(mapping["integer_bits"], "integer_bits"),
+            _nonnegative(mapping["fractional_bits"], "fractional_bits"),
+            _positive(mapping["security_parameter"], "security_parameter"),
+            _integer_tuple(mapping["state_payload_bounds"], "state_payload_bounds", nonnegative=True),
+            _integer_tuple(mapping["input_payload_bounds"], "input_payload_bounds", nonnegative=True),
+            _positive(mapping["horizon_steps"], "horizon_steps"),
+            _decode_prime_evidence(mapping["modulus_evidence"]),
         )
     if kind == "client_step_result":
         _exact_fields(
@@ -945,7 +1049,7 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
     elif key == ("request", "offline"):
         expected = (PartyOfflineMaterial,)
     elif key == ("request", "lan_setup"):
-        expected = (LanSetupPayload,)
+        expected = (LanSetupPayload, LanContinuousSetupPayload)
     elif key == ("request", "online"):
         expected = (PartyOnlineMaterial,)
     elif (

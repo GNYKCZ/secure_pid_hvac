@@ -10,7 +10,13 @@ from typing import Any, Literal
 
 import numpy as np
 
-from secure_control.crypto import FixedPointContext, TwoPartySharing
+from secure_control.core import ControllerSpec
+from secure_control.crypto import (
+    FixedPointContext,
+    PrimeModulusEvidence,
+    TwoPartySharing,
+    verify_prime_modulus,
+)
 from secure_control.protocol import P1, P2, Client, ControllerRangeContract
 from secure_control.protocol.coordinator import (
     DirectProtocol3PartyEndpoint,
@@ -28,6 +34,7 @@ from secure_control.protocol.messages import (
     Protocol3StageReceipt,
 )
 
+from ._inputs import normalize_step_input
 from ._localhost_peer import LocalhostProtocol3PeerPort
 from ._localhost_workers import (
     _capture_stage_share,
@@ -39,6 +46,7 @@ from .lan_config import LanConfig, Role
 from .lan_transport import accept_tls, connect_tls, listener
 from .localhost_codec import (
     SCHEMA_VERSION,
+    LanContinuousSetupPayload,
     LanHelloPayload,
     LanSetupPayload,
     PartyStageResult,
@@ -48,6 +56,7 @@ from .localhost_codec import (
 from .localhost_transport import deadline_after, receive_envelope, send_envelope
 
 _FRAME_LIMIT = 8 * 1024 * 1024
+_MAX_CONTINUOUS_STEPS = 1000
 
 
 def run_client_single_step(config: LanConfig, trial: Any) -> dict[str, object]:
@@ -180,8 +189,148 @@ def run_client_single_step(config: LanConfig, trial: Any) -> dict[str, object]:
             sock.close()
 
 
+class LanContinuousRuntime:
+    """Client 独占一组 mTLS socket 与单方资源；每个 step 只在双提交后返回。"""
+
+    def __init__(
+        self, config: LanConfig, spec: ControllerSpec, fixed_point: FixedPointContext,
+        range_contract: ControllerRangeContract, security_parameter: int,
+        modulus_evidence: PrimeModulusEvidence | None,
+    ) -> None:
+        if config.role != "Client" or config.experiment_config is None:
+            raise ValueError("连续运行必须使用 Client experiment 配置。")
+        if (range_contract.horizon_steps is None
+                or not 1 <= range_contract.horizon_steps <= _MAX_CONTINUOUS_STEPS):
+            raise ValueError("LAN 连续会话步数超出有界范围。")
+        self.spec = spec
+        self.fixed_point = fixed_point
+        self.range_contract = range_contract
+        self.security_parameter = security_parameter
+        self.modulus_evidence = modulus_evidence
+        self.client = Client(fixed_point, TwoPartySharing(fixed_point.modulus),
+                             security_parameter=security_parameter,
+                             modulus_evidence=modulus_evidence)
+        # 所有参数、模数与范围验证在网络拨号及离线分享前完成。
+        self.distribution = self.client.distribute_controller(spec, range_contract)
+        self.scale_ledger = self.distribution.p1.layout.scale_ledger
+        self.range_verification = self.client.range_verification
+        self.modulus_verification = self.client.truncation.modulus_verification
+        self.config = config
+        self._sockets: list[ssl.SSLSocket] = []
+        self._sequences = [4, 4]
+        self._step = 0
+        self._products = 0
+        self._truncations = 0
+        self._confirmed_steps: list[dict[str, int | str]] = []
+        self._failed = False
+        self._finished = False
+        self.session_id = self.distribution.session_id
+        hello = LanHelloPayload(config.topology.digest, secrets.token_hex(32),
+                                "lan-continuous-v1")
+        try:
+            for role, address in (("P1", config.topology.p1_client),
+                                  ("P2", config.topology.p2_client)):
+                sock = connect_tls(address, config, role, deadline_after(config.startup_timeout))
+                self._sockets.append(sock)
+                _hello(sock, "Client", role, self.session_id, hello, config.startup_timeout)
+            for party, sock in enumerate(self._sockets):
+                _request(sock, "P1" if party == 0 else "P2", 1, "lan_ready",
+                         self.session_id, config.startup_timeout)
+            setup = LanContinuousSetupPayload(
+                fixed_point.modulus, fixed_point.integer_bits, fixed_point.fractional_bits,
+                security_parameter, range_contract.state_payload_bounds,
+                range_contract.input_payload_bounds, range_contract.horizon_steps,
+                modulus_evidence,
+            )
+            for party, sock in enumerate(self._sockets):
+                role = "P1" if party == 0 else "P2"
+                _request(sock, role, 2, "lan_setup", self.session_id,
+                         config.startup_timeout, setup)
+                material = self.distribution.p1 if party == 0 else self.distribution.p2
+                _request(sock, role, 3, "offline", self.session_id,
+                         config.startup_timeout, PartyOfflineMaterial.from_message(material))
+        except Exception:
+            self._failed = True
+            self.close()
+            raise
+
+    @property
+    def resource_counts(self) -> dict[str, int]:
+        return {"products_consumed": self._products,
+                "truncations_consumed": self._truncations}
+
+    @property
+    def confirmed_steps(self) -> tuple[dict[str, int | str], ...]:
+        """只导出双提交后确认的公开 step 与逻辑资源计数。"""
+        return tuple(dict(item) for item in self._confirmed_steps)
+
+    def step(self, v: Any) -> np.ndarray:
+        """同一 session 逐轮推进；任何未确认回执使整个运行时失效。"""
+        if self._failed or self._finished or self._step >= self.range_contract.horizon_steps:
+            raise RuntimeError("LAN session 已失败、结束或超出配置步数。")
+        try:
+            value = normalize_step_input(v, self.spec.input_dimension)
+            current = self.client.prepare_online(self.distribution, value, step=self._step)
+            plan = current.p1_resources.plan
+            if current.p2_resources.plan != plan:
+                raise ValueError("两方在线资源计划不一致。")
+            deadline = deadline_after(self.config.step_timeout)
+            endpoints: list[_ClientPartyEndpoint] = []
+            for party, sock in enumerate(self._sockets):
+                online = PartyOnlineRound(
+                    current.p1_input if party == 0 else current.p2_input,
+                    current.p1_resources if party == 0 else current.p2_resources,
+                )
+                _request(sock, "P1" if party == 0 else "P2", self._sequences[party],
+                         "online", self.session_id, self.config.step_timeout,
+                         PartyOnlineMaterial.from_round(online), plan.round_id,
+                         self._step, deadline=deadline)
+                endpoints.append(_ClientPartyEndpoint(
+                    sock, party, plan, self._sequences[party] + 1, _FRAME_LIMIT,
+                    self.config.step_timeout, deadline,
+                ))
+            result = _complete_client_round(self.client, endpoints[0], endpoints[1], plan)
+            self._sequences = [endpoint.sequence for endpoint in endpoints]
+            self._step += 1
+            self._products += result.products
+            self._truncations += result.truncations
+            self._confirmed_steps.append({
+                "step": plan.step, "status": "double_committed",
+                "products": result.products, "truncations": result.truncations,
+            })
+            return np.array(result.output, dtype=float, copy=True)
+        except Exception:
+            self._failed = True
+            self.close()
+            raise
+
+    def finish(self) -> None:
+        """只在全部 N 步、plant 更新成功后双角色关闭确认。"""
+        if self._failed or self._finished or self._step != self.range_contract.horizon_steps:
+            raise RuntimeError("LAN session 未完成全部配置步数。")
+        try:
+            for party, sock in enumerate(self._sockets):
+                _request(sock, "P1" if party == 0 else "P2", self._sequences[party],
+                         "shutdown", self.session_id, self.config.shutdown_timeout,
+                         shutdown=True)
+            self._finished = True
+        except Exception:
+            self._failed = True
+            raise
+        finally:
+            self.close()
+
+    def reset(self) -> None:
+        raise RuntimeError("LAN reset 必须重新启动三方并使用新 session。")
+
+    def close(self) -> None:
+        for sock in self._sockets:
+            sock.close()
+        self._sockets.clear()
+
+
 def run_party_single_step(config: LanConfig) -> dict[str, object]:
-    """P1/P2 只监听本机固定端口，接受一轮已认证会话后退出。"""
+    """P1/P2 只监听固定端口；由认证 hello 选择单步或有界连续模式。"""
     if config.role not in {"P1", "P2"}:
         raise ValueError("角色命令必须是 P1 或 P2。")
     role: Literal["P1", "P2"] = config.role
@@ -223,8 +372,18 @@ def run_party_single_step(config: LanConfig) -> dict[str, object]:
             client_socket, role, 2, "lan_setup", session, config.startup_timeout
         )
         setup = setup_request.payload
-        if not isinstance(setup, LanSetupPayload):
+        if hello.mode == "lan-single-step-v1" and not isinstance(setup, LanSetupPayload):
+            raise TypeError("单步模式的公开 setup 类型不合法。")
+        if hello.mode == "lan-continuous-v1" and not isinstance(setup, LanContinuousSetupPayload):
+            raise TypeError("连续模式的公开 setup 类型不合法。")
+        if not isinstance(setup, (LanSetupPayload, LanContinuousSetupPayload)):
             raise TypeError("公开 LAN setup 类型不合法。")
+        if (hello.mode == "lan-continuous-v1"
+                and not 1 <= setup.horizon_steps <= _MAX_CONTINUOUS_STEPS):
+            raise ValueError("LAN 连续 setup 步数超出有界范围。")
+        modulus_evidence = (setup.modulus_evidence
+                            if isinstance(setup, LanContinuousSetupPayload) else None)
+        verify_prime_modulus(setup.modulus, modulus_evidence)
         fixed = FixedPointContext(
             setup.modulus, integer_bits=setup.integer_bits, fractional_bits=setup.fractional_bits
         )
@@ -247,85 +406,77 @@ def run_party_single_step(config: LanConfig) -> dict[str, object]:
         offline = rehydrate_offline_material(material, range_contract)
         role_object = P1(offline) if party == 0 else P2(offline)
         _party_reply(client_socket, offline_request, None, config.startup_timeout)
-        step_deadline = deadline_after(config.step_timeout)
-        online_request = _party_receive(
-            client_socket,
-            role,
-            4,
-            "online",
-            session,
-            config.step_timeout,
-            deadline=step_deadline,
-        )
-        if online_request.step != 0 or online_request.round_id is None:
-            raise ValueError("LAN 单步只接受 step=0。")
-        online_material = online_request.payload
-        if not isinstance(online_material, PartyOnlineMaterial):
-            raise TypeError("在线单方材料类型错误。")
-        online = rehydrate_online_material(
-            online_material,
-            modulus=fixed.modulus,
-            security_parameter=setup.security_parameter,
-            modulus_evidence=None,
-        )
-        staged: list[ControlShareMessage] = []
+        sequence = 4
         peer_port = LocalhostProtocol3PeerPort(
-            peer_socket, role, _FRAME_LIMIT, config.step_timeout, step_deadline
+            peer_socket, role, _FRAME_LIMIT, config.step_timeout
         )
         peer_port.bind(session)
-        endpoint = LocalProtocol3PartyEndpoint(
-            role_object,
-            online,
-            lambda message: _capture_stage_share(message, staged),
-        )
-        if (endpoint.plan.round_id, endpoint.plan.step) != (online_request.round_id, 0):
-            raise ValueError("在线材料与信封 round identity 不匹配。")
-        direct = DirectProtocol3PartyEndpoint(endpoint, peer_port)
-        _party_reply(
-            client_socket, online_request, None, config.step_timeout, deadline=step_deadline
-        )
-        sequence = 5
-        while True:
-            command_request = receive_envelope(
-                client_socket,
-                deadline=step_deadline,
-                limit=_FRAME_LIMIT,
+        steps = 1 if hello.mode == "lan-single-step-v1" else setup.horizon_steps
+        for expected_step in range(steps):
+            # 首轮也允许等待 Client 先完成纯场景预检；每轮操作有独立总 deadline。
+            online_request = _party_receive(
+                client_socket, role, sequence, "online", session, config.idle_timeout
             )
-            _check_request(command_request, role, sequence, "endpoint", session)
-            if (command_request.round_id, command_request.step) != (
-                endpoint.plan.round_id,
-                endpoint.plan.step,
-            ) or not isinstance(command_request.payload, Protocol3EndpointCommand):
-                raise ValueError("endpoint command 与当前 round 不匹配。")
-            try:
-                result = dispatch_direct_protocol3_command(direct, command_request.payload)
-                if command_request.payload.operation == "stage_output":
-                    if not isinstance(result, Protocol3StageReceipt) or len(staged) != 1:
-                        raise ValueError("暂存回执与输出份额不完整。")
-                    result = PartyStageResult(result, staged[0])
-                _party_reply(
-                    client_socket,
-                    command_request,
-                    result,
-                    config.step_timeout,
-                    deadline=step_deadline,
-                )
-            except Exception as error:
-                _party_error(client_socket, command_request, error, config.step_timeout)
-                raise
+            if (online_request.step != expected_step or online_request.round_id is None
+                    or online_request.resource_id is not None):
+                raise ValueError("LAN online step 必须连续递增。")
+            online_material = online_request.payload
+            if not isinstance(online_material, PartyOnlineMaterial):
+                raise TypeError("在线单方材料类型错误。")
+            online = rehydrate_online_material(
+                online_material, modulus=fixed.modulus,
+                security_parameter=setup.security_parameter,
+                modulus_evidence=modulus_evidence,
+            )
+            staged: list[ControlShareMessage] = []
+            endpoint = LocalProtocol3PartyEndpoint(
+                role_object, online,
+                lambda message, collected=staged: _capture_stage_share(message, collected),
+            )
+            if (endpoint.plan.round_id, endpoint.plan.step) != (
+                online_request.round_id, expected_step
+            ):
+                raise ValueError("在线材料与信封 round identity 不匹配。")
+            step_deadline = deadline_after(config.step_timeout)
+            peer_port.set_round_deadline(step_deadline)
+            direct = DirectProtocol3PartyEndpoint(endpoint, peer_port)
+            _party_reply(client_socket, online_request, None, config.step_timeout,
+                         deadline=step_deadline)
             sequence += 1
-            if command_request.payload.operation == "commit":
-                # 单次试验提交后只能关闭；不接受第二轮或旧资源重放。
-                shutdown_request = _party_receive(
-                    client_socket, role, sequence, "shutdown", session, config.shutdown_timeout
+            while True:
+                command_request = receive_envelope(
+                    client_socket, deadline=step_deadline, limit=_FRAME_LIMIT
                 )
-                _party_reply(client_socket, shutdown_request, None, config.shutdown_timeout)
-                return {
-                    "status": "closed",
-                    "role": role,
-                    "pid": os.getpid(),
-                    "profile_sha256": config.topology.digest,
-                }
+                _check_request(command_request, role, sequence, "endpoint", session)
+                if (command_request.round_id, command_request.step) != (
+                    endpoint.plan.round_id, expected_step
+                ) or not isinstance(command_request.payload, Protocol3EndpointCommand):
+                    raise ValueError("endpoint command 与当前 round 不匹配。")
+                try:
+                    result = dispatch_direct_protocol3_command(direct, command_request.payload)
+                    if command_request.payload.operation == "stage_output":
+                        if not isinstance(result, Protocol3StageReceipt) or len(staged) != 1:
+                            raise ValueError("暂存回执与输出份额不完整。")
+                        result = PartyStageResult(result, staged[0])
+                    _party_reply(client_socket, command_request, result,
+                                 config.step_timeout, deadline=step_deadline)
+                except Exception as error:
+                    _party_error(client_socket, command_request, error, config.step_timeout)
+                    raise
+                sequence += 1
+                if command_request.payload.operation == "commit":
+                    break
+        shutdown_request = _party_receive(
+            client_socket, role, sequence, "shutdown", session, config.shutdown_timeout
+        )
+        _party_reply(client_socket, shutdown_request, None, config.shutdown_timeout)
+        summary: dict[str, object] = {
+            "status": "closed", "role": role, "pid": os.getpid(),
+            "profile_sha256": config.topology.digest,
+        }
+        if hello.mode == "lan-continuous-v1":
+            summary.update({"steps_committed": steps, "tls_version": client_socket.version()})
+        return summary
     finally:
         client_listener.close()
         if peer_listener is not None:

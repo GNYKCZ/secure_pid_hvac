@@ -8,7 +8,7 @@ import os
 import re
 import secrets
 import shutil
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -30,6 +30,7 @@ _SIGNAL_FIELDS = (
     "output_error",
 )
 _RUN_ID_PATTERN = re.compile(r"\A\d{8}T\d{12}Z-[0-9a-f]{12}\Z")
+_DERIVED_NAME_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,6 +198,7 @@ def write_artifacts(
     provenance: Mapping[str, Any],
     *,
     output_root: str | Path,
+    derived_writer: Callable[[ExperimentRecord, Path], tuple[str, ...]] | None = None,
 ) -> RunArtifacts:
     """用独占 staging claim 保存三个文件，复验后同盘 rename 为唯一成功目录。
 
@@ -266,7 +268,26 @@ def write_artifacts(
         }
         _write_bytes(metadata_path, _json_bytes(manifest))
         # 发布前按正式 reader 规则复验三个文件；不创建第二套 scenario/session。
-        _read_record(stage, allow_staging=True)
+        verified = _read_record(stage, allow_staging=True)
+        if derived_writer is not None:
+            names = derived_writer(verified, stage)
+            if (not isinstance(names, tuple) or not names or len(names) > 16
+                    or any(not isinstance(name, str) or not _DERIVED_NAME_PATTERN.fullmatch(name)
+                           for name in names) or len(set(names)) != len(names)):
+                raise ValueError("衍生文件名集合无效。")
+            expected = set(names)
+            if {path.name for path in stage.iterdir()} != {
+                "trajectory.csv", "config.json", "metadata.json", *expected
+            }:
+                raise ValueError("衍生文件集合不符合本次发布契约。")
+            if any(not (stage / name).is_file() or (stage / name).is_symlink()
+                   for name in expected):
+                raise ValueError("衍生文件必须是 staging 内的普通文件。")
+            manifest["derived_files_sha256"] = {
+                name: _digest(stage / name) for name in sorted(expected)
+            }
+            metadata_path.write_bytes(_json_bytes(manifest))
+            _read_record(stage, allow_staging=True)
         if os.path.lexists(final):
             raise FileExistsError(f"运行 ID 已存在：{run_id}")
         os.rename(stage, final)
@@ -363,6 +384,16 @@ def _read_record(run_dir: Path, *, allow_staging: bool) -> ExperimentRecord:
         "config.json": _digest(config_path),
     }:
         raise ValueError("CSV/config 文件摘要与 manifest 不一致。")
+    derived = manifest.get("derived_files_sha256")
+    if derived is not None:
+        if (not isinstance(derived, dict) or not derived or len(derived) > 16
+                or any(not isinstance(name, str) or not _DERIVED_NAME_PATTERN.fullmatch(name)
+                       for name in derived)):
+            raise ValueError("衍生文件清单无效。")
+        if any(not (run_dir / name).is_file() or (run_dir / name).is_symlink()
+               or not isinstance(value, str) or value != _digest(run_dir / name)
+               for name, value in derived.items()):
+            raise ValueError("衍生图或图清单摘要不匹配。")
     effective_config = _read_json(config_path)
     if effective_config.get("scenario") != scenario:
         raise ValueError("有效配置与 manifest 的 scenario name/version 不一致。")
