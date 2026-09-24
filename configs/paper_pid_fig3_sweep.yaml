@@ -1,0 +1,15 @@
+# #70: Fig. 3 method/threshold comparison on the #69 paper-inspired ZOH plant.
+schema_version: 1
+claim_level: paper-inspired
+baseline_config: paper_pid_cascade_zoh.yaml
+baseline_sha256: 2431449fad27a07863ec8b390c1ee7769b9bc6b8ddc4a0bd9d9aab6a622bda78
+prime_config: hvac_2r2c_sweep_prime.yaml
+prime_sha256: b8c5e9e779d945cfc19d0662b641cd1084acadd0907cc6b4e64ee4076455111b
+fractional_bits: [32, 40, 48, 56]
+paper_parameter_headroom_bits: 8
+runtime_payload_headroom_bits: 14
+security_parameter: 80
+measurement_absolute_bound: 128
+epsilon: 0.0009765625
+sample_count: 51
+reference_channel: unused_zero
