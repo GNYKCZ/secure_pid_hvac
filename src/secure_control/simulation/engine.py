@@ -51,8 +51,9 @@ def _fault_category(error: Exception, phase: str) -> str:
         return "timeout"
     if isinstance(error, ConnectionError):
         return "disconnected"
-    if phase == "control" and getattr(error, "_public_fault_category", None) == "protocol":
-        return "protocol"
+    category = getattr(error, "_public_fault_category", None)
+    if phase == "control" and category in ("protocol", "disconnected"):
+        return category
     return "plant" if phase == "plant" else "control"
 
 

@@ -42,6 +42,7 @@ from secure_control.execution.localhost_codec import (
     encode_envelope,
     encode_wire_value,
 )
+from secure_control.execution.localhost_runtime import _execution_error
 from secure_control.execution.localhost_transport import (
     LocalhostTimeouts,
     LocalhostTransportConfig,
@@ -756,7 +757,7 @@ def test_client_rejects_duplicate_step_and_discards_the_session() -> None:
     runtime = _runtime(horizon=3)
     try:
         runtime.step(0.0)
-        with pytest.raises(LocalhostPeerError, match="step identity"):
+        with pytest.raises(LocalhostPeerError, match="step identity") as remote_failure:
             runtime._session.request(
                 "Client",
                 "step",
@@ -764,6 +765,7 @@ def test_client_rejects_duplicate_step_and_discards_the_session() -> None:
                 step=0,
                 payload=np.array([0.0]),
             )
+        assert getattr(remote_failure.value, "_public_fault_category", None) is None
         with pytest.raises(LocalhostStateError, match="已失败"):
             runtime.step(0.0)
     finally:
@@ -1060,6 +1062,68 @@ def test_localhost_step_identity_mismatch_publishes_protocol_fault(
         assert delivered[3].status == "failed"
         assert delivered[3].last_successful_step == 0
         assert "injected-round" not in "".join(public_event_json(event) for event in delivered)
+        assert runtime.topology.roles[0].status == "failed"
+    finally:
+        publisher.close()
+        runtime.close()
+
+
+def test_localhost_socket_disconnect_publishes_disconnected_without_relabeling_peer_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """确认断开的控制 socket 保留原因；远端受限错误仍不冒充断线。"""
+    disconnected = _execution_error(LocalhostTransportDisconnected("private-wire"), "step")
+    remote_error = LocalhostPeerError("private-remote-error")
+    assert type(disconnected) is LocalhostPeerError
+    assert getattr(disconnected, "_public_fault_category", None) == "disconnected"
+    assert getattr(remote_error, "_public_fault_category", None) is None
+
+    config = Path(__file__).parents[1] / "configs" / "hvac_dual_loop.yaml"
+    plan = HvacScenario(
+        config, test_seed=905, secure_runtime_builder=LocalhostSecureStateSpaceRuntime
+    ).build_plan()
+    runtime = plan.secure.runtime
+    assert isinstance(runtime, LocalhostSecureStateSpaceRuntime)
+    delivered: list[object] = []
+    ended = threading.Event()
+
+    def consumer(event: object) -> None:
+        delivered.append(event)
+        if isinstance(event, SessionEnded):
+            ended.set()
+
+    publisher = BoundedPublisher(consumer)
+    telemetry = TelemetrySession(publisher, session_id="public-disconnect")
+    original_plant_step = plan.secure.plant.step
+    calls = 0
+
+    def disconnect_after_first_step(control: np.ndarray) -> np.ndarray:
+        nonlocal calls
+        output = original_plant_step(control)
+        calls += 1
+        if calls == 1:
+            runtime._session.controls["Client"].shutdown(socket.SHUT_RDWR)
+        return output
+
+    monkeypatch.setattr(plan.secure.plant, "step", disconnect_after_first_step)
+    try:
+        with pytest.raises(LocalhostPeerError) as caught:
+            compare_closed_loops(
+                plan.ideal, plan.secure, plan.sample_times[:2], telemetry=telemetry
+            )
+        assert isinstance(caught.value.__cause__, LocalhostTransportDisconnected)
+        assert getattr(caught.value, "_public_fault_category", None) == "disconnected"
+        assert ended.wait(2.0)
+        assert [type(event) for event in delivered] == [
+            SessionStarted, Sample, SessionFault, SessionEnded
+        ]
+        assert delivered[1].step == 0
+        assert delivered[2].step == 1
+        assert delivered[2].category == "disconnected"
+        assert delivered[3].status == "failed"
+        assert delivered[3].last_successful_step == 0
+        assert [event.event_seq for event in delivered] == [0, 1, 2, 3]
+        assert "private-wire" not in "".join(public_event_json(event) for event in delivered)
         assert runtime.topology.roles[0].status == "failed"
     finally:
         publisher.close()
