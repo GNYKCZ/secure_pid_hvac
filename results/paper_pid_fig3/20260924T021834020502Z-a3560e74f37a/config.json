@@ -1,0 +1,38 @@
+{
+  "definition": {
+    "baseline_config": "paper_pid_cascade_zoh.yaml",
+    "baseline_sha256": "2431449fad27a07863ec8b390c1ee7769b9bc6b8ddc4a0bd9d9aab6a622bda78",
+    "claim_level": "paper-inspired",
+    "epsilon": 0.0009765625,
+    "fractional_bits": [
+      32,
+      40,
+      48,
+      56
+    ],
+    "measurement_absolute_bound": 128,
+    "paper_parameter_headroom_bits": 8,
+    "prime_config": "hvac_2r2c_sweep_prime.yaml",
+    "prime_sha256": "b8c5e9e779d945cfc19d0662b641cd1084acadd0907cc6b4e64ee4076455111b",
+    "reference_channel": "unused_zero",
+    "runtime_payload_headroom_bits": 14,
+    "sample_count": 51,
+    "schema_version": 1,
+    "security_parameter": 80
+  },
+  "fractional_bits": 56,
+  "paper_parameter_bits": 64,
+  "q": 57919013630500220500943667918768663966531314514739586011956233569313332958947,
+  "range": {
+    "measurement_absolute_bound": 128,
+    "mode": "finite_horizon",
+    "steps": 51
+  },
+  "raw_equals_applied": true,
+  "reference_used": false,
+  "runtime_payload_bits": 70,
+  "scenario": {
+    "name": "paper_pid_fig3",
+    "version": "1"
+  }
+}
