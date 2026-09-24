@@ -137,13 +137,18 @@ def run_client_continuous(config: LanConfig) -> dict[str, object]:
         "backend": "lan_continuous", "claim_level": profile.claim_level,
         "session_id": runtime.session_id, "client_pid": os.getpid(),
         "topology_sha256": config.topology.digest,
+        "transport": config.transport,
         "resource_counts": counts,
         "confirmed_steps": confirmed,
         "prime_verification": asdict(runtime.modulus_verification),
         "range_verification": asdict(runtime.range_verification),
         "scale_ledger": asdict(runtime.scale_ledger),
         "kappa": profile.q.bit_length() - profile.security_parameter - 2,
-        "security_boundary": "local three-terminal TLS; no real three-machine validation",
+        "security_boundary": (
+            "local three-terminal TLS; no real three-machine validation"
+            if config.transport == "mutual_tls" else
+            "unauthenticated plaintext TCP lab simulation; no authenticated LAN claim"
+        ),
     })
     artifact = write_artifacts(
         result, plan.metadata, effective, provenance, output_root=profile.output_root,
@@ -163,12 +168,13 @@ def run_client_continuous(config: LanConfig) -> dict[str, object]:
         "figure_path": str((artifact.run_dir / "control.png").resolve()),
         "scenario": "paper_pid_fig3", "ell": profile.ell,
         "claim_level": profile.claim_level, "sample_count": profile.sample_count,
-        "resource_counts": counts, "tls_version": "TLSv1.3",
+        "resource_counts": counts, "transport": config.transport,
+        "tls_version": "TLSv1.3" if config.transport == "mutual_tls" else None,
     }
 
 
 def _run() -> int:
-    parser = argparse.ArgumentParser(prog="secure-control", description="Authenticated LAN experiment")
+    parser = argparse.ArgumentParser(prog="secure-control", description="Three-role LAN experiment")
     commands = parser.add_subparsers(dest="role", required=True)
     for role in ("p1", "p2", "client"):
         command = commands.add_parser(role)

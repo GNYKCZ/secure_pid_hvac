@@ -1,0 +1,9 @@
+role: Client
+transport: insecure_tcp
+topology: lab-deployment.example.yaml
+experiment: paper_pid_lan.example.yaml
+timeouts:
+  startup: 180
+  step: 30
+  idle: 30
+  shutdown: 5

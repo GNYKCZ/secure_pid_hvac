@@ -38,7 +38,7 @@ NAMES = {
 }
 
 # 故障进程仍使用仓库原有 LAN 入口、真实 TLS socket 与独立 PID；只在该进程内
-# 替换一个发送/回执边界。生产代码不提供故障开关或明文回退。
+# 替换一个发送/回执边界。生产代码不提供故障开关或 TLS 隐式明文回退。
 _FAULT_BOOTSTRAP = r"""
 import struct
 import sys

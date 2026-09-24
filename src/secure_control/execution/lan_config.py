@@ -1,4 +1,4 @@
-"""三机单步试验的严格角色配置与唯一拓扑 profile。"""
+"""三机试验的严格角色配置与唯一拓扑 profile。"""
 
 from __future__ import annotations
 
@@ -58,31 +58,40 @@ class LanTopology:
 
 @dataclass(frozen=True, slots=True)
 class LanConfig:
-    """一台主机的本地密钥路径、拓扑与有界 timeout。"""
+    """一台主机的连接模式、本地密钥路径、拓扑与有界 timeout。"""
 
     role: Role
     topology: LanTopology
-    ca: Path
-    certificate: Path
-    private_key: Path
+    ca: Path | None
+    certificate: Path | None
+    private_key: Path | None
     startup_timeout: float
     step_timeout: float
     shutdown_timeout: float
     controller_config: Path | None
     experiment_config: Path | None = None
     idle_timeout: float = 30.0
+    transport: Literal["mutual_tls", "insecure_tcp"] = "mutual_tls"
 
 
 def load_lan_config(path: str | Path, role: Role) -> LanConfig:
     """拒绝未知字段、缺项、动态端口和不一致角色，不读取私钥内容。"""
     source = Path(path).resolve()
     data = _load_yaml(source)
-    _fields(
-        data,
-        {"role", "topology", "tls", "timeouts"}
-        | ({"controller"} if role == "Client" and "controller" in data else set())
-        | ({"experiment"} if role == "Client" and "experiment" in data else set()),
-    )
+    transport = data.get("transport", "mutual_tls")
+    if transport not in ("mutual_tls", "insecure_tcp"):
+        raise ValueError("LAN transport 只能是 mutual_tls 或 insecure_tcp。")
+    fields = {"role", "topology", "timeouts"}
+    if transport == "mutual_tls":
+        fields.add("tls")
+        if "transport" in data:
+            fields.add("transport")
+    else:
+        # 明文仿真必须显式声明，且不能同时给出会被悄悄忽略的证书路径。
+        fields.add("transport")
+    if role == "Client":
+        fields.add("controller" if "controller" in data else "experiment")
+    _fields(data, fields)
     if data["role"] != role:
         raise ValueError("角色配置与命令角色不匹配。")
     topology_path = _relative(source, data["topology"])
@@ -99,20 +108,22 @@ def load_lan_config(path: str | Path, role: Role) -> LanConfig:
         )
         or len(set(identities.values())) != 3
     ):
-        raise ValueError("角色 TLS DNS 身份必须合法且唯一。")
+        raise ValueError("拓扑角色 DNS 名必须合法且唯一。")
     endpoints = tuple(_endpoint(profile[name]) for name in ("p1_client", "p2_client", "p1_peer"))
     if len({item.port for item in endpoints}) != 3:
         raise ValueError("三个固定监听端口不得冲突。")
     canonical = json.dumps(profile, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     topology = LanTopology(identities, *endpoints, sha256(canonical.encode()).hexdigest())
-    tls = data["tls"]
-    _fields(tls, {"ca", "certificate", "private_key"})
-    ca, certificate, private_key = (
-        _relative(source, tls[name]) for name in ("ca", "certificate", "private_key")
-    )
-    for name, file in (("CA", ca), ("证书", certificate), ("私钥", private_key)):
-        if not file.is_file():
-            raise ValueError(f"{name} 路径不是存在的普通文件。")
+    ca = certificate = private_key = None
+    if transport == "mutual_tls":
+        tls = data["tls"]
+        _fields(tls, {"ca", "certificate", "private_key"})
+        ca, certificate, private_key = (
+            _relative(source, tls[name]) for name in ("ca", "certificate", "private_key")
+        )
+        for name, file in (("CA", ca), ("证书", certificate), ("私钥", private_key)):
+            if not file.is_file():
+                raise ValueError(f"{name} 路径不是存在的普通文件。")
     timeouts = data["timeouts"]
     _fields(timeouts, {"startup", "step", "shutdown"} | ({"idle"} if "idle" in timeouts else set()))
     seconds = tuple(_timeout(timeouts[name], name) for name in ("startup", "step", "shutdown"))
@@ -126,7 +137,7 @@ def load_lan_config(path: str | Path, role: Role) -> LanConfig:
         raise ValueError("Client experiment 配置不存在。")
     idle = _timeout(timeouts.get("idle", timeouts["step"]), "idle")
     return LanConfig(role, topology, ca, certificate, private_key, *seconds, controller,
-                     experiment, idle)
+                     experiment, idle, transport)
 
 
 def _load_yaml(path: Path) -> dict[str, object]:

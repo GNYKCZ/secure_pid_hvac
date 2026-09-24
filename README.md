@@ -1,14 +1,17 @@
 # secure_pid_hvac
 
-## 本机连续实验：VS Code 三次 Run
+## 本机连续实验：直接运行三个 Python 文件
 
 在仓库根目录运行 `uv sync --locked`，在 VS Code 选择项目的 Python 3.11
-`.venv` 解释器，再运行 `uv run python scripts/prepare_local_lan_certs.py` 准备本机短期证书。
-从 Run and Debug 依次启动 **Continuous P1**、**Continuous P2**、**Continuous Client**；
-三项分别使用独立终端和固定端口，Client 完成后输出 run ID、结果目录与已校验的
-`figure_path`（正式三栏 `control.png`）。失败时停止三方，再从 P1 重新开始。
+`.venv` 解释器。依次打开 `scripts/run_continuous_p1.py`、
+`scripts/run_continuous_p2.py`、`scripts/run_continuous_client.py`，分别点击
+**运行 Python 文件**，让每个程序占用自己的终端。此实验配置使用明文 TCP，
+**不需要生成或复制 TLS 证书，也不验证网络对端身份**；仅用于可信、隔离的实验网络。
+Client 完成后输出 run ID、结果目录与 `figure_path`（正式三栏 `control.png`）。
+失败时停止三方，再从 P1 重新开始。
 场景、精度、步数和输出目录只改 `configs/paper_pid_lan.example.yaml`；
-其他配置归属、数值门禁及验证结果重绘见[连续 LAN 实验指南](docs/lan_continuous.md)。
+三机 IP、配置归属、原有 TLS 入口及验证结果重绘见
+[连续 LAN 实验指南](docs/lan_continuous.md)。
 当前只支持 `paper_pid_fig3`；网页 Dashboard 属 [#72](https://github.com/GNYKCZ/secure_pid_hvac/issues/72)，
 不属于这三项 Run。
 

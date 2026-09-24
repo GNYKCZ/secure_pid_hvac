@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from test_lan_single_step import ROOT, _finish, _run
+from test_lan_single_step import ROOT, _finish, _free_ports, _run
 from test_lan_single_step import deployment as _base_deployment
 
 from secure_control.execution.lan_config import load_lan_config
@@ -58,7 +58,8 @@ def _continuous_config(paths: dict[str, Path], count: int, ell: int = 32) -> Pat
     role.write_text(role.read_text(encoding="utf-8").replace(
         f"controller: {ROOT / 'configs' / 'hvac_dual_loop.yaml'}",
         f"experiment: {profile}",
-    ), encoding="utf-8")
+    ).replace("experiment: paper_pid_lan.example.yaml",
+              f"experiment: {profile}"), encoding="utf-8")
     return profile
 
 
@@ -79,6 +80,86 @@ def _run_module(role: str, config: Path) -> subprocess.Popen[str]:
          role.lower(), "--config", str(config)],
         cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
+
+
+def _plain_deployment(tmp_path: Path) -> dict[str, Path]:
+    """无证书文件的随机端口实验配置，验证三份直接运行脚本。"""
+    ports = _free_ports()
+    topology = ROOT / "configs" / "lab-deployment.example.yaml"
+    content = topology.read_text(encoding="utf-8")
+    for old, new in zip((34401, 34402, 34403), ports, strict=True):
+        content = content.replace(f"port: {old}", f"port: {new}")
+    topology_path = tmp_path / "topology.yaml"
+    topology_path.write_text(content, encoding="utf-8")
+    paths = {}
+    for role, name in (("P1", "lab-p1.example.yaml"), ("P2", "lab-p2.example.yaml"),
+                       ("Client", "lab-client-continuous.example.yaml")):
+        role_content = (ROOT / "configs" / name).read_text(encoding="utf-8")
+        role_content = role_content.replace("topology: lab-deployment.example.yaml",
+                                            f"topology: {topology_path}")
+        path = tmp_path / name
+        path.write_text(role_content, encoding="utf-8")
+        paths[role] = path
+    return paths
+
+
+def test_direct_python_files_run_three_role_lab_without_certificates(tmp_path: Path) -> None:
+    """三个独立 Python 文件各启动一角，Client 发布三步真实图。"""
+    paths = _plain_deployment(tmp_path)
+    _continuous_config(paths, 3)
+    assert not list(tmp_path.glob("*.pem"))
+    parties = [subprocess.Popen(
+        [sys.executable, str(ROOT / "scripts" / f"run_continuous_{role.lower()}.py"),
+         str(paths[role])], cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True,
+    ) for role in ("P1", "P2")]
+    try:
+        time.sleep(0.5)
+        client = subprocess.Popen(
+            [sys.executable, str(ROOT / "scripts" / "run_continuous_client.py"),
+             str(paths["Client"])], cwd=ROOT, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True,
+        )
+        code, result, errors = _finish(client, 100)
+        assert code == 0, (result, errors)
+        outcomes = [_finish(party, 100) for party in parties]
+        assert all(item[0] == 0 for item in outcomes), outcomes
+        assert len({result["pid"], *(item[1]["pid"] for item in outcomes)}) == 3
+        assert all(item[1]["steps_committed"] == 3 for item in outcomes)
+        assert all(item[1]["transport"] == "insecure_tcp" and
+                   item[1]["tls_version"] is None for item in outcomes)
+        assert result["transport"] == "insecure_tcp" and result["tls_version"] is None
+        run_dir = Path(result["run_dir"])
+        record = load_artifacts(run_dir)
+        assert record.result.time.size == 3
+        assert Path(result["figure_path"]).is_file()
+        assert record.provenance["transport"] == "insecure_tcp"
+        assert "unauthenticated plaintext" in record.provenance["security_boundary"]
+    finally:
+        for party in parties:
+            if party.poll() is None:
+                party.kill()
+            party.communicate()
+
+
+def test_plain_transport_must_be_explicit_and_must_not_ignore_tls(tmp_path: Path) -> None:
+    paths = _plain_deployment(tmp_path)
+    role = paths["P1"]
+    content = role.read_text(encoding="utf-8")
+    role.write_text(content.replace("transport: insecure_tcp\n", ""), encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_lan_config(role, "P1")
+    role.write_text(content + "tls:\n  ca: ignored.pem\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_lan_config(role, "P1")
+
+
+def test_default_lab_configs_need_no_certificate_files() -> None:
+    for role, name in (("P1", "lab-p1.example.yaml"), ("P2", "lab-p2.example.yaml"),
+                       ("Client", "lab-client-continuous.example.yaml")):
+        config = load_lan_config(ROOT / "configs" / name, role)
+        assert config.transport == "insecure_tcp"
+        assert (config.ca, config.certificate, config.private_key) == (None, None, None)
 
 
 def test_vscode_launch_maps_to_continuous_module() -> None:

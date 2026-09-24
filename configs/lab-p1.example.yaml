@@ -1,0 +1,7 @@
+role: P1
+transport: insecure_tcp
+topology: lab-deployment.example.yaml
+timeouts:
+  startup: 180
+  step: 30
+  shutdown: 5

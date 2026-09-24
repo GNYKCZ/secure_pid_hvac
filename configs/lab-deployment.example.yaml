@@ -1,0 +1,19 @@
+# 实验仿真拓扑。三台电脑使用相同内容；跨机器时把三个 host 改为各自的局域网 IP，bind 改为监听电脑的局域网 IP。
+# 本配置不认证连接者，只适用于可信且隔离的实验网络。
+version: 1
+identities:
+  Client: client.secure-control.test
+  P1: p1.secure-control.test
+  P2: p2.secure-control.test
+p1_client:
+  bind: 127.0.0.1
+  host: 127.0.0.1
+  port: 34401
+p2_client:
+  bind: 127.0.0.1
+  host: 127.0.0.1
+  port: 34402
+p1_peer:
+  bind: 127.0.0.1
+  host: 127.0.0.1
+  port: 34403
