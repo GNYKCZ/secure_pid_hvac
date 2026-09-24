@@ -15,6 +15,7 @@ Client 完成后输出 run ID、结果目录与 `figure_path`（正式三栏 `co
 场景、精度、步数和输出目录只改 `configs/paper_pid_lan.example.yaml`；
 三机 IP、配置归属、原有 TLS 入口及验证结果重绘见
 [连续 LAN 实验指南](docs/lan_continuous.md)。
+配置文件的日常用途和 Fig3 四精度批量入口见[配置索引](configs/README.md)。
 当前只支持 `paper_pid_fig3`；网页 Dashboard 属 [#72](https://github.com/GNYKCZ/secure_pid_hvac/issues/72)，
 不属于这三项 Run。
 

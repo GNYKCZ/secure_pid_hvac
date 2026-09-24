@@ -45,7 +45,7 @@ uv run python scripts/run_continuous_client.py
 `tls_version` 为 `null`，provenance 明确标记实验安全边界。仅在可信、隔离的
 实验网络使用，不能把它当作安全三机通信验收。
 
-分到三台电脑时，三台机器的 `configs/lab-deployment.example.yaml` 内容必须相同，
+分到三台电脑时，三台机器的 `configs/local-deployment.example.yaml` 内容必须相同，
 将 `p1_client.host`、`p1_peer.host` 和对应 `bind` 改成 P1 的局域网 IP，
 将 `p2_client.host` 和 `bind` 改成 P2 的局域网 IP。Client 无须监听；三台电脑
 之间应能访问三个固定端口 `34401`、`34402`、`34403`，防火墙需允许这些端口。
@@ -110,7 +110,7 @@ topology；实验模式无需证书，TLS 模式各自仅拥有本机证书与�
 | --- | --- | --- |
 | 场景、`ell`、`k`、`runtime_payload_bits`、`lambda`、步数、测量界、绘图通道、输出目录 | `configs/paper_pid_lan.example.yaml` | Client profile；场景目前只能是 `paper_pid_fig3`，`sample_count≥1`、`ell>0`、`k>ell`、runtime bits≥k、`lambda>0`、`κ=q.bit_length()-lambda-2>ell`；不合法在联网前失败。合法非冻结值标 `user-exploration`。四种精度须分别运行四次。 |
 | q 和公开 Pocklington 证据 | profile 的 `numeric.prime_source` 指向 `configs/shared_prime_256_pocklington.yaml` | 共享公开安全证据，不属于 HVAC plant；更换 q 时须提供匹配证书并通过启动前验证。历史旧名只供冻结读取。 |
-| 机器 IP、三条固定端口、角色名 | 实验用 `configs/lab-deployment.example.yaml`；TLS 用 `configs/local-deployment.example.yaml` | 三方共用同一份 topology 内容；真实三机部署与验收属于 #76。 |
+| 机器 IP、三条固定端口、角色名 | `configs/local-deployment.example.yaml` | 实验与 TLS 示例共用拓扑结构；三台电脑上的内容须相同。真实三机部署与验收属于 #76。 |
 | 连接方式 | 三份 `configs/lab-*.example.yaml` 的 `transport: insecure_tcp` | 明确选择无证书明文实验，不认证对端，不得当作安全 LAN 证据。 |
 | 证书与各自私钥路径 | `configs/local-{p1,p2,client-continuous}.example.yaml` 中对应角色的 `tls` | TLS 路径每方仅持本方私钥；示例证书只用于本机。 |
 
@@ -146,15 +146,16 @@ uv run secure-control redraw --run-dir results/lan_continuous/<run-id> --output 
 
 ## 文件用途与迁移审计（#84）
 
-按 Git 跟踪路径、CLI/import、测试、文档与正式 manifest 审计。以下文件均保留；
-本轮没有证据证明旧入口或测试可安全删除。命名规则：`shared_*` 是跨场景公开安全证据，
-`paper_pid_*`/`hvac_*` 是场景参数或历史定义，`local-deployment*` 与 `lab-deployment*`
-是 topology，`local-*` 与 `lab-*` 是角色配置。`configs/.gitkeep` 只保留目录。
+按 Git 跟踪路径、CLI/import、测试、文档与正式 manifest 审计。以下历史入口和证据文件均保留；
+没有证据证明它们可安全删除。仅删除规范内容重复的 `lab-deployment.example.yaml`
+和已有实际文件、不再需要占位的 `configs/.gitkeep`。命名规则：`shared_*` 是跨场景公开安全证据，
+`paper_pid_*`/`hvac_*` 是场景参数或历史定义，`local-deployment*`
+是共用 topology，`local-*` 与 `lab-*` 是角色配置；日常入口见[配置索引](../configs/README.md)。
 
 | `configs/` 下的文件 | owner／身份 | 引用、哈希与处置 |
 | --- | --- | --- |
-| `paper_pid_lan.example.yaml`, `lab-client-continuous.example.yaml`, `lab-p1.example.yaml`, `lab-p2.example.yaml`, `lab-deployment.example.yaml` | Client profile、三角色、部署；直运行入口 | 三个 `scripts/run_continuous_*.py` → `lan_config.py`/`lan_profile.py`；`test_lan_continuous.py`。 |
-| `local-client-continuous.example.yaml`, `local-p1.example.yaml`, `local-p2.example.yaml`, `local-deployment.example.yaml` | 原有认证连接入口 | `.vscode/launch.json` → `lan_config.py`/`lan_profile.py`；保留。 |
+| `paper_pid_lan.example.yaml`, `lab-client-continuous.example.yaml`, `lab-p1.example.yaml`, `lab-p2.example.yaml`, `local-deployment.example.yaml` | Client profile、三角色、共用拓扑；直运行入口 | 三个 `scripts/run_continuous_*.py` → `lan_config.py`/`lan_profile.py`；`test_lan_continuous.py`。原 `lab-deployment.example.yaml` 与 `local-deployment.example.yaml` 的规范拓扑完全相同，故合并为后者。 |
+| `local-client-continuous.example.yaml`, `local-p1.example.yaml`, `local-p2.example.yaml` | 原有认证连接入口 | `.vscode/launch.json` → `lan_config.py`/`lan_profile.py`；保留。 |
 | `shared_prime_256_pocklington.yaml`, `hvac_2r2c_sweep_prime.yaml` | 公开 q/证据；前者当前日常维护名，后者历史兼容路径 | 字节须一致；前者由 Client profile 使用，后者被 `paper_pid_fig3_sweep.yaml` 的 raw SHA、HVAC 定义的规范化 SHA 绑定。测试锁定证书及双 SHA；旧文件不得独立编辑。 |
 | `paper_pid_fig3_sweep.yaml`, `paper_pid_cascade_zoh.yaml` | paper PID 冻结定义与基线 | `paper_pid_fig3.py:load_definition`、正式 `results/paper_pid_fig3/manifest.json`；路径/raw SHA 不可改。 |
 | `hvac_2r2c_precision_sweep_definition.yaml`, `hvac_2r2c_precision_sweep.yaml`, `hvac_2r2c_infinite_safety.yaml`, `hvac_2r2c_infinite_safety_25_20_15_fast_response.yaml` | HVAC 历史扫描、安全定义 | `sweep_runner.py`、`infinite_safety_runner.py` 与对应测试；prime 路径与 LF 摘要绑定，保留。 |

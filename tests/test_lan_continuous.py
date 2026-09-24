@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import yaml
 from test_lan_single_step import ROOT, _finish, _free_ports, _run
 from test_lan_single_step import deployment as _base_deployment
 
@@ -40,20 +41,24 @@ def deployment(tmp_path: Path) -> dict[str, Path]:
 
 
 def _continuous_config(paths: dict[str, Path], count: int, ell: int = 32) -> Path:
-    source = ROOT / "configs" / "paper_pid_lan.example.yaml"
+    definition = yaml.safe_load((ROOT / "configs" / "paper_pid_fig3_sweep.yaml").read_text(
+        encoding="utf-8"
+    ))
     profile = paths["Client"].parent / "experiment.yaml"
-    content = source.read_text(encoding="utf-8")
-    content = content.replace("sample_count: 51", f"sample_count: {count}")
-    content = content.replace("ell: 32", f"ell: {ell}")
-    content = content.replace("k: 40", f"k: {ell + 8}")
-    content = content.replace("runtime_payload_bits: 46", f"runtime_payload_bits: {ell + 14}")
-    content = content.replace("prime_source: shared_prime_256_pocklington.yaml",
-                              f"prime_source: {ROOT / 'configs' / 'shared_prime_256_pocklington.yaml'}")
-    content = content.replace("frozen_definition: paper_pid_fig3_sweep.yaml",
-                              f"frozen_definition: {ROOT / 'configs' / 'paper_pid_fig3_sweep.yaml'}")
-    content = content.replace("output_root: ../results/lan_continuous",
-                              f"output_root: {profile.parent / 'runs'}")
-    profile.write_text(content, encoding="utf-8")
+    data = {
+        "schema_version": 1, "scenario": "paper_pid_fig3", "sample_count": count,
+        "numeric": {
+            "ell": ell, "k": ell + definition["paper_parameter_headroom_bits"],
+            "runtime_payload_bits": ell + definition["runtime_payload_headroom_bits"],
+            "lambda": definition["security_parameter"],
+            "prime_source": str(ROOT / "configs" / "shared_prime_256_pocklington.yaml"),
+        },
+        "range": {"measurement_absolute_bound": definition["measurement_absolute_bound"]},
+        "plot": {"control_channel": 0},
+        "frozen_definition": str(ROOT / "configs" / "paper_pid_fig3_sweep.yaml"),
+        "output_root": str(profile.parent / "runs"),
+    }
+    profile.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
     role = paths["Client"]
     role.write_text(role.read_text(encoding="utf-8").replace(
         f"controller: {ROOT / 'configs' / 'hvac_dual_loop.yaml'}",
@@ -85,7 +90,7 @@ def _run_module(role: str, config: Path) -> subprocess.Popen[str]:
 def _plain_deployment(tmp_path: Path) -> dict[str, Path]:
     """无证书文件的随机端口实验配置，验证三份直接运行脚本。"""
     ports = _free_ports()
-    topology = ROOT / "configs" / "lab-deployment.example.yaml"
+    topology = ROOT / "configs" / "local-deployment.example.yaml"
     content = topology.read_text(encoding="utf-8")
     for old, new in zip((34401, 34402, 34403), ports, strict=True):
         content = content.replace(f"port: {old}", f"port: {new}")
@@ -95,7 +100,7 @@ def _plain_deployment(tmp_path: Path) -> dict[str, Path]:
     for role, name in (("P1", "lab-p1.example.yaml"), ("P2", "lab-p2.example.yaml"),
                        ("Client", "lab-client-continuous.example.yaml")):
         role_content = (ROOT / "configs" / name).read_text(encoding="utf-8")
-        role_content = role_content.replace("topology: lab-deployment.example.yaml",
+        role_content = role_content.replace("topology: local-deployment.example.yaml",
                                             f"topology: {topology_path}")
         path = tmp_path / name
         path.write_text(role_content, encoding="utf-8")
@@ -135,6 +140,7 @@ def test_direct_python_files_run_three_role_lab_without_certificates(tmp_path: P
         assert all(item[1]["transport"] == "insecure_tcp" and
                    item[1]["tls_version"] is None for item in outcomes)
         assert result["transport"] == "insecure_tcp" and result["tls_version"] is None
+        assert result["ell"] == 32
         run_dir = Path(result["run_dir"])
         record = load_artifacts(run_dir)
         assert record.result.time.size == 3
@@ -282,6 +288,8 @@ def test_three_independent_continuous_roles_publish_one_verified_run(
         assert result["scenario"] == "paper_pid_fig3"
         assert result["ell"] == ell
         assert result["claim_level"] == record.effective_config["claim_level"]
+        if count == 51:
+            assert result["claim_level"] == "paper-inspired-frozen-parameter-point"
         assert record.result.time.size == count
         assert record.effective_config["fractional_bits"] == ell
         assert record.provenance["session_id"] == result["session_id"]
@@ -405,9 +413,6 @@ def test_shared_prime_and_frozen_compatibility_bytes() -> None:
     )
     assert sha256(definition).hexdigest() == (
         "16b635276927e4a14977ff7ac2d7baa67885fc3244017589fb2a638b5c6de39a"
-    )
-    assert load_paper_pid_lan_profile(ROOT / "configs" / "paper_pid_lan.example.yaml").claim_level == (
-        "paper-inspired-frozen-parameter-point"
     )
 
 

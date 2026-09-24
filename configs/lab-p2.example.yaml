@@ -1,6 +1,6 @@
 role: P2
 transport: insecure_tcp
-topology: lab-deployment.example.yaml
+topology: local-deployment.example.yaml
 timeouts:
   startup: 180
   step: 30

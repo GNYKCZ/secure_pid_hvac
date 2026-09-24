@@ -1,6 +1,6 @@
 role: Client
 transport: insecure_tcp
-topology: lab-deployment.example.yaml
+topology: local-deployment.example.yaml
 experiment: paper_pid_lan.example.yaml
 timeouts:
   startup: 180
