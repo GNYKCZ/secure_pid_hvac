@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import pairwise
+from time import perf_counter
 from typing import Any
 
 import numpy as np
@@ -11,6 +12,7 @@ from numpy.typing import NDArray
 
 from .contracts import SimulationBranch
 from .results import SimulationResult
+from .telemetry import TelemetrySession
 
 Array = NDArray[Any]
 
@@ -52,7 +54,13 @@ class BranchTrajectory:
     control: Array
 
 
-def simulate_branch(branch: SimulationBranch, sample_times: Array) -> BranchTrajectory:
+def simulate_branch(
+    branch: SimulationBranch,
+    sample_times: Array,
+    *,
+    _on_sample: Any = None,
+    _on_phase: Any = None,
+) -> BranchTrajectory:
     """按 reference→pre-plant output→v→raw u→actuator→plant 顺序执行单支。
 
     任一 hook 或状态更新失败时直接传播异常，不返回部分轨迹；plant.step 的后输出
@@ -69,7 +77,9 @@ def simulate_branch(branch: SimulationBranch, sample_times: Array) -> BranchTraj
     outputs: list[np.ndarray] = []
     controls: list[np.ndarray] = []
 
-    for time in times:
+    for step, time in enumerate(times):
+        if _on_phase is not None:
+            _on_phase(step, "control")
         reference = _vector(
             "reference", branch.adapter.reference_at(float(time)), reference_channels
         )
@@ -77,9 +87,14 @@ def simulate_branch(branch: SimulationBranch, sample_times: Array) -> BranchTraj
         controller_input = _vector(
             "controller input", branch.adapter.controller_input(reference, output)
         )
+        round_start = perf_counter() if _on_sample is not None else 0.0
         raw_control = _vector(
             "raw control", branch.runtime.step(controller_input), control_channels
         )
+        round_ms = (perf_counter() - round_start) * 1000 if _on_sample is not None else None
+        plant_start = perf_counter() if _on_sample is not None else 0.0
+        if _on_phase is not None:
+            _on_phase(step, "plant")
         applied_control = _vector(
             "applied control", branch.adapter.apply_control(raw_control), control_channels
         )
@@ -89,12 +104,26 @@ def simulate_branch(branch: SimulationBranch, sample_times: Array) -> BranchTraj
         references.append(reference)
         outputs.append(output)
         controls.append(applied_control)
+        if _on_sample is not None:
+            _on_sample(
+                step,
+                float(time),
+                reference,
+                output,
+                applied_control,
+                round_ms,
+                (perf_counter() - plant_start) * 1000,
+            )
 
     return BranchTrajectory(np.vstack(references), np.vstack(outputs), np.vstack(controls))
 
 
 def compare_closed_loops(
-    ideal: SimulationBranch, secure: SimulationBranch, sample_times: Array
+    ideal: SimulationBranch,
+    secure: SimulationBranch,
+    sample_times: Array,
+    *,
+    telemetry: TelemetrySession | None = None,
 ) -> SimulationResult:
     """先拒绝共享对象，再独立执行两支并计算逐时刻有符号误差。"""
     if not isinstance(ideal, SimulationBranch) or not isinstance(secure, SimulationBranch):
@@ -108,22 +137,140 @@ def compare_closed_loops(
     if ideal.adapter.metadata != secure.adapter.metadata:
         raise ValueError("ideal/secure 的 channel metadata 必须一致。")
     times = _times(sample_times)
-    ideal_log = simulate_branch(ideal, times)
-    secure_log = simulate_branch(secure, times)
-    if not np.array_equal(ideal_log.reference, secure_log.reference):
-        raise ValueError("ideal/secure 的 reference 时间轨迹必须一致。")
-    if ideal_log.output.shape != secure_log.output.shape:
-        raise ValueError("ideal/secure 的 output channel shape 必须一致。")
-    if ideal_log.control.shape != secure_log.control.shape:
-        raise ValueError("ideal/secure 的 control channel shape 必须一致。")
+    if telemetry is not None and not isinstance(telemetry, TelemetrySession):
+        raise TypeError("telemetry 必须是 TelemetrySession。")
+    step_in_progress: int | None = None
+    phase = "control"
+    if telemetry is not None:
+        telemetry.start(secure.adapter.metadata)
+    try:
+        ideal_log = simulate_branch(ideal, times)
 
-    return SimulationResult(
-        time=times,
-        reference=ideal_log.reference,
-        output_ideal=ideal_log.output,
-        output_secure=secure_log.output,
-        control_ideal=ideal_log.control,
-        control_secure=secure_log.control,
-        control_error=ideal_log.control - secure_log.control,
-        output_error=ideal_log.output - secure_log.output,
-    )
+        def publish_sample(
+            step: int,
+            time: float,
+            reference: np.ndarray,
+            output: np.ndarray,
+            control: np.ndarray,
+            round_ms: float,
+            plant_ms: float,
+        ) -> None:
+            """只从成功记录的 secure 步复制公开数值。"""
+            nonlocal step_in_progress
+            step_in_progress = step
+            if not np.array_equal(ideal_log.reference[step], reference):
+                raise ValueError("ideal/secure 的 reference 时间轨迹必须一致。")
+            assert telemetry is not None
+            telemetry.sample(
+                step=step,
+                time_s=time,
+                metadata=secure.adapter.metadata,
+                reference=tuple(map(float, reference)),
+                output_secure=tuple(map(float, output)),
+                control_secure=tuple(map(float, control)),
+                output_ideal=tuple(map(float, ideal_log.output[step])),
+                control_ideal=tuple(map(float, ideal_log.control[step])),
+                control_error=tuple(map(float, ideal_log.control[step] - control)),
+                output_error=tuple(map(float, ideal_log.output[step] - output)),
+                controller_round_ms=round_ms,
+                actuator_plant_ms=plant_ms,
+            )
+
+        def note_phase(step: int, current: str) -> None:
+            """只记录故障所在的公开步骤和边界，不读取 runtime 内部。"""
+            nonlocal step_in_progress, phase
+            step_in_progress = step
+            phase = current
+
+        secure_log = simulate_branch(
+            secure,
+            times,
+            _on_sample=publish_sample if telemetry is not None else None,
+            _on_phase=note_phase if telemetry is not None else None,
+        )
+        phase = "control"
+        if not np.array_equal(ideal_log.reference, secure_log.reference):
+            raise ValueError("ideal/secure 的 reference 时间轨迹必须一致。")
+        if ideal_log.output.shape != secure_log.output.shape:
+            raise ValueError("ideal/secure 的 output channel shape 必须一致。")
+        if ideal_log.control.shape != secure_log.control.shape:
+            raise ValueError("ideal/secure 的 control channel shape 必须一致。")
+
+        result = SimulationResult(
+            time=times,
+            reference=ideal_log.reference,
+            output_ideal=ideal_log.output,
+            output_secure=secure_log.output,
+            control_ideal=ideal_log.control,
+            control_secure=secure_log.control,
+            control_error=ideal_log.control - secure_log.control,
+            output_error=ideal_log.output - secure_log.output,
+        )
+        if telemetry is not None:
+            telemetry.end("completed")
+        return result
+    except Exception as error:
+        if telemetry is not None:
+            # 故障类别固定，绝不复制异常字符串或原始 payload。
+            category = (
+                "timeout" if isinstance(error, TimeoutError)
+                else "disconnected" if isinstance(error, ConnectionError)
+                else "plant" if phase == "plant"
+                else "control"
+            )
+            telemetry.fault(step_in_progress, category)
+            telemetry.end("failed")
+        raise
+
+
+def run_secure_branch(
+    branch: SimulationBranch, sample_times: Array, *, telemetry: TelemetrySession
+) -> BranchTrajectory:
+    """无 ideal 对照的 Client 运行，比较字段保持 null。"""
+    if not isinstance(telemetry, TelemetrySession):
+        raise TypeError("telemetry 必须是 TelemetrySession。")
+    telemetry.start(branch.adapter.metadata)
+    step_in_progress: int | None = None
+    phase = "control"
+
+    def note_phase(step: int, current: str) -> None:
+        nonlocal step_in_progress, phase
+        step_in_progress = step
+        phase = current
+
+    def publish_sample(
+        step: int,
+        time: float,
+        reference: np.ndarray,
+        output: np.ndarray,
+        control: np.ndarray,
+        round_ms: float,
+        plant_ms: float,
+    ) -> None:
+        telemetry.sample(
+            step=step,
+            time_s=time,
+            metadata=branch.adapter.metadata,
+            reference=tuple(map(float, reference)),
+            output_secure=tuple(map(float, output)),
+            control_secure=tuple(map(float, control)),
+            controller_round_ms=round_ms,
+            actuator_plant_ms=plant_ms,
+        )
+
+    try:
+        result = simulate_branch(
+            branch, sample_times, _on_sample=publish_sample, _on_phase=note_phase
+        )
+        telemetry.end("completed")
+        return result
+    except Exception as error:
+        category = (
+            "timeout" if isinstance(error, TimeoutError)
+            else "disconnected" if isinstance(error, ConnectionError)
+            else "plant" if phase == "plant"
+            else "control"
+        )
+        telemetry.fault(step_in_progress, category)
+        telemetry.end("failed")
+        raise

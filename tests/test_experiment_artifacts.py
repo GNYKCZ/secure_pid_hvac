@@ -11,7 +11,9 @@ import numpy as np
 import pytest
 
 from secure_control.experiments import artifacts
+from secure_control.experiments.telemetry_replay import replay_events
 from secure_control.simulation import ChannelMetadata, ScenarioMetadata, SimulationResult
+from secure_control.simulation.telemetry import Sample, SessionEnded, SessionStarted
 
 
 def _record(channels: int) -> tuple[SimulationResult, ScenarioMetadata]:
@@ -118,6 +120,42 @@ def test_scalar_and_vector_schema_round_trip_binary64_and_metadata(
     assert manifest["columns"][-1]["unit"] == "unit_y"
     assert manifest["columns"][-channels - 1]["unit"] == "unit_u"
     assert not list(published.run_dir.parent.glob(".incomplete-*"))
+
+
+@pytest.mark.parametrize("channels", [1, 3])
+def test_verified_artifact_replays_same_public_samples_with_unknown_history(
+    tmp_path: Path, channels: int
+) -> None:
+    """回放逐行使用 verified reader，不编造旧产物中的角色/时延。"""
+    expected, metadata = _record(channels)
+    published = _write(tmp_path, channels)
+    events = replay_events(published.run_dir)
+    assert isinstance(events[0], SessionStarted)
+    assert events[0].metadata == metadata
+    assert isinstance(events[-1], SessionEnded)
+    assert events[-1].status == "completed"
+    assert [event.event_seq for event in events] == list(range(5))
+    samples = [event for event in events if isinstance(event, Sample)]
+    assert [event.step for event in samples] == [0, 1, 2]
+    for step, event in enumerate(samples):
+        assert event.time_s == expected.time[step]
+        assert event.controller_round_ms is event.actuator_plant_ms is None
+        assert all(state == "unknown" for _, state, _ in event.roles)
+        for field in (
+            "reference", "output_ideal", "output_secure", "control_ideal",
+            "control_secure", "control_error", "output_error",
+        ):
+            np.testing.assert_array_equal(getattr(event, field), getattr(expected, field)[step])
+
+
+def test_replay_rejects_corrupt_or_unpublished_artifact(tmp_path: Path) -> None:
+    """回放不能绕过正式 reader 的 hash 与成功发布状态。"""
+    published = _write(tmp_path)
+    published.trajectory_path.write_text("corrupt", encoding="utf-8")
+    with pytest.raises(ValueError, match="摘要"):
+        replay_events(published.run_dir)
+    with pytest.raises(ValueError, match="已发布"):
+        replay_events(published.run_dir.parent / ".incomplete-unknown")
 
 
 def test_existing_run_id_fails_without_overwrite_or_staging(

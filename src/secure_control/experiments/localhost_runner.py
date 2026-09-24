@@ -16,10 +16,14 @@ from secure_control.execution import (
 )
 from secure_control.scenarios.hvac.integration import HvacScenario
 from secure_control.simulation.engine import compare_closed_loops
+from secure_control.simulation.telemetry import TelemetrySession, observe_roles
 
 
 def run_localhost_comparison(
-    config_path: str | Path, *, test_seed: int | None = None
+    config_path: str | Path,
+    *,
+    test_seed: int | None = None,
+    telemetry: TelemetrySession | None = None,
 ) -> dict[str, Any]:
     """以同一配置和 seed 比较两个隔离 backend，并返回不含秘密的摘要。"""
     process_scenario = HvacScenario(
@@ -44,6 +48,8 @@ def run_localhost_comparison(
         if not isinstance(candidate, LocalhostSecureStateSpaceRuntime):
             raise TypeError("localhost 场景未构造预期 runtime。")
         localhost_runtime = candidate
+        if telemetry is not None:
+            telemetry.roles = observe_roles(localhost_runtime.topology)
         process_result = compare_closed_loops(
             process_plan.ideal,
             process_plan.secure,
@@ -53,6 +59,7 @@ def run_localhost_comparison(
             localhost_plan.ideal,
             localhost_plan.secure,
             localhost_plan.sample_times,
+            telemetry=telemetry,
         )
         topology = localhost_runtime.topology
         return {

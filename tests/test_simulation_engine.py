@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -10,13 +11,23 @@ import pytest
 from secure_control.core import ControllerSpec
 from secure_control.execution import PlaintextStateSpaceRuntime
 from secure_control.simulation import (
+    BoundedPublisher,
     ChannelMetadata,
     ScenarioMetadata,
     SimulationBranch,
     SimulationPlan,
     SimulationResult,
+    TelemetrySession,
     run,
+    run_secure_branch,
     simulate_branch,
+)
+from secure_control.simulation.telemetry import (
+    Sample,
+    SessionEnded,
+    SessionFault,
+    SessionStarted,
+    public_event_json,
 )
 
 
@@ -250,3 +261,86 @@ class _FixedPlanScenario:
     def build_plan(self) -> SimulationPlan:
         """原样返回计划以验证执行前隔离检查。"""
         return self.plan
+
+
+def _delivered_events(consumer_events: list[object], publisher: BoundedPublisher) -> list[object]:
+    """仅测试线程等待派发完成，控制入口从不 flush/join。"""
+    deadline = time.monotonic() + 2.0
+    while publisher.status["pending"] and time.monotonic() < deadline:
+        time.sleep(0.01)
+    publisher.close()
+    deadline = time.monotonic() + 2.0
+    while not consumer_events or not isinstance(consumer_events[-1], SessionEnded):
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.01)
+    return consumer_events
+
+
+@pytest.mark.parametrize("channels", [1, 2])
+def test_live_events_match_successful_eight_field_result(channels: int) -> None:
+    """采样时间、更新前 output、applied control 与全部误差逐步等于正式轨迹。"""
+    delivered: list[object] = []
+    publisher = BoundedPublisher(delivered.append, capacity=16)
+    telemetry = TelemetrySession(publisher, session_id="toy-public")
+    result = run(ToyScenario(channels), telemetry=telemetry)
+    events = _delivered_events(delivered, publisher)
+    assert isinstance(events[0], SessionStarted)
+    assert isinstance(events[-1], SessionEnded)
+    assert events[-1].status == "completed"
+    samples = [event for event in events if isinstance(event, Sample)]
+    assert [event.step for event in samples] == [0, 1, 2]
+    assert [event.event_seq for event in events] == list(range(5))
+    for step, event in enumerate(samples):
+        assert event.time_s == result.time[step]
+        for field in (
+            "reference", "output_ideal", "output_secure", "control_ideal",
+            "control_secure", "control_error", "output_error",
+        ):
+            np.testing.assert_array_equal(getattr(event, field), getattr(result, field)[step])
+        assert event.controller_round_ms >= 0
+        assert event.actuator_plant_ms >= 0
+
+
+def test_secure_only_and_failed_step_have_nullable_comparison_and_no_false_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """无 ideal 时四字段为 null；plant 失败步没有 sample，原故障照常传播。"""
+    plan = ToyScenario(1).build_plan()
+    delivered: list[object] = []
+    publisher = BoundedPublisher(delivered.append)
+    telemetry = TelemetrySession(publisher, session_id="secure-only")
+    trajectory = run_secure_branch(plan.secure, plan.sample_times, telemetry=telemetry)
+    events = _delivered_events(delivered, publisher)
+    samples = [event for event in events if isinstance(event, Sample)]
+    assert len(samples) == len(trajectory.reference)
+    assert all(
+        event.output_ideal is event.control_ideal is event.control_error is event.output_error is None
+        for event in samples
+    )
+
+    plan = ToyScenario(1).build_plan()
+    original_step = plan.secure.plant.step
+    calls = 0
+
+    def fail_second_step(control: np.ndarray) -> np.ndarray:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("share-triple-mask-secret")
+        return original_step(control)
+
+    monkeypatch.setattr(plan.secure.plant, "step", fail_second_step)
+    delivered = []
+    publisher = BoundedPublisher(delivered.append)
+    telemetry = TelemetrySession(publisher, session_id="failed")
+    with pytest.raises(RuntimeError, match="share-triple-mask-secret"):
+        run(_FixedPlanScenario(plan), telemetry=telemetry)
+    events = _delivered_events(delivered, publisher)
+    assert [event.step for event in events if isinstance(event, Sample)] == [0]
+    faults = [event for event in events if isinstance(event, SessionFault)]
+    assert len(faults) == 1 and faults[0].step == 1 and faults[0].category == "plant"
+    assert isinstance(events[-1], SessionEnded) and events[-1].status == "failed"
+    assert "share-triple-mask-secret" not in "".join(
+        public_event_json(event) for event in events
+    )

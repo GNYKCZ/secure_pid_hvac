@@ -5,9 +5,10 @@ from __future__ import annotations
 from .contracts import Scenario, SimulationPlan
 from .engine import compare_closed_loops
 from .results import SimulationResult
+from .telemetry import TelemetrySession
 
 
-def run(scenario: Scenario) -> SimulationResult:
+def run(scenario: Scenario, *, telemetry: TelemetrySession | None = None) -> SimulationResult:
     """取得场景事前构造/证明的计划，再交给领域无关引擎执行。"""
     if not isinstance(scenario, Scenario):
         raise TypeError("scenario 必须提供 build_plan()。")
@@ -19,4 +20,4 @@ def run(scenario: Scenario) -> SimulationResult:
         or plan.secure.adapter.metadata != plan.metadata
     ):
         raise ValueError("场景计划 metadata 与两支 adapter 的 channel metadata 不一致。")
-    return compare_closed_loops(plan.ideal, plan.secure, plan.sample_times)
+    return compare_closed_loops(plan.ideal, plan.secure, plan.sample_times, telemetry=telemetry)

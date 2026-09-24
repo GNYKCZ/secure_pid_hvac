@@ -1,5 +1,8 @@
 # Issue #13 可复现实验产物 schema v1
 
+Issue #71 的公开直播/回放事件使用独立版本和有损展示队列；正式八字段产物仍是无损真值。
+见 [Client 公开遥测事件 v1](public_telemetry.md)。
+
 ## 入口与职责
 
 `experiments.runner` 解析外壳 YAML 的 `scenario.name`；当前只显式选择 `hvac`，
