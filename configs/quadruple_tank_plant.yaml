@@ -1,0 +1,16 @@
+schema_version: 1
+scenario: quadruple_tank
+physical:
+  tank_cross_sections_cm2: [28, 32, 28, 32]
+  outlet_cross_sections_cm2: [0.071, 0.057, 0.071, 0.057]
+  pump_flow_coefficients_cm3_per_v_s: [3.33, 3.35]
+  sensor_gain_v_per_cm: 0.50
+  gravity_cm_per_s2: 981
+operating_point:
+  heights_cm: [12.4, 12.7, 1.8, 1.4]
+  pump_voltages_v: [3, 3]
+  valve_fractions: [0.7, 0.6]
+sample_period_seconds: 0.5
+initial_state_deviation_cm: [10, 10, 10, 10]
+state_coordinate: height_deviation_cm
+discretization: zoh
