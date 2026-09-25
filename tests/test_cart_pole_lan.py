@@ -16,7 +16,7 @@ from test_cart_pole_balance import _independent_run
 from test_lan_continuous import _finish, _plain_deployment, _run
 
 from secure_control.crypto import TwoPartySharing
-from secure_control.experiments.artifacts import write_artifacts
+from secure_control.experiments.artifacts import load_artifacts, write_artifacts
 from secure_control.experiments.cart_pole_evidence import (
     EVIDENCE_NAME,
     load_verified_cart_pole_run,
@@ -219,6 +219,38 @@ def test_plaintext_oracle_and_verified_sidecar(tmp_path: Path) -> None:
         lambda data: data["branches"]["secure"]["stable_counts"].__setitem__(-1, 0),
         lambda data: data["branches"]["secure"]["observations"].__setitem__(-1,
                                                                                  [0, 0, 0, 0]),
+    ):
+        data = json.loads(original)
+        mutate(data)
+        (artifact.run_dir / EVIDENCE_NAME).write_text(json.dumps(data), encoding="utf-8")
+        with pytest.raises((ValueError, AssertionError)):
+            verify_cart_pole_evidence(record, artifact.run_dir)
+    (artifact.run_dir / EVIDENCE_NAME).write_text(original, encoding="utf-8")
+    load_verified_cart_pole_run(artifact.run_dir)
+
+    manifest_path = artifact.run_dir / "metadata.json"
+    original_manifest = manifest_path.read_text(encoding="utf-8")
+    manifest = json.loads(original_manifest)
+    del manifest["derived_files_sha256"][EVIDENCE_NAME]
+    if not manifest["derived_files_sha256"]:
+        del manifest["derived_files_sha256"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    load_artifacts(artifact.run_dir)
+    with pytest.raises(ValueError):
+        load_verified_cart_pole_run(artifact.run_dir)
+    manifest_path.write_text(original_manifest, encoding="utf-8")
+
+    (artifact.run_dir / EVIDENCE_NAME).write_text(original + " ", encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_verified_cart_pole_run(artifact.run_dir)
+    (artifact.run_dir / EVIDENCE_NAME).write_text(original, encoding="utf-8")
+
+    for mutate in (
+        lambda data: data.update({"schema_version": True}),
+        lambda data: data.update({"schema_version": 1.0}),
+        lambda data: data.update({"sample_count": True}),
+        lambda data: data.update({"sample_count": 400.0}),
+        lambda data: data["branches"]["ideal"]["observations"][0].__setitem__(0, False),
     ):
         data = json.loads(original)
         mutate(data)

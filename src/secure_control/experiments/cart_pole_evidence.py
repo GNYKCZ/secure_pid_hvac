@@ -17,9 +17,27 @@ from secure_control.scenarios.cart_pole.experiment import BalanceMonitor
 from secure_control.scenarios.cart_pole.plant import CartPolePlant
 from secure_control.scenarios.cart_pole.secure_experiment import CartPoleSecureExperiment
 
-from .artifacts import ExperimentRecord, load_artifacts
+from .artifacts import ExperimentRecord, _digest, _read_json, load_artifacts
 
 EVIDENCE_NAME = "cart_pole_evidence.json"
+
+
+def _numeric_array(value: object, shape: tuple[int, ...]) -> np.ndarray:
+    """保留 JSON 数值类型，避免 bool 在 NumPy 转换时变成 0/1。"""
+    def matches(items: object, dimensions: tuple[int, ...]) -> bool:
+        if not isinstance(items, list) or len(items) != dimensions[0]:
+            return False
+        if len(dimensions) == 1:
+            return all(type(item) in (int, float) for item in items)
+        return all(matches(item, dimensions[1:]) for item in items)
+
+    if not matches(value, shape):
+        raise ValueError("倒立摆证据数值数组 shape 或类型无效。")
+    array = np.asarray(value, dtype=np.float64)
+    if not np.isfinite(array).all():
+        raise ValueError("倒立摆证据数值数组必须有限。")
+    return array
+
 
 def verify_cart_pole_evidence(record: object, run_dir: Path) -> None:
     """从正式 CSV 和物理配置重放两支，核对 raw→applied 与 N+1 状态。"""
@@ -27,6 +45,8 @@ def verify_cart_pole_evidence(record: object, run_dir: Path) -> None:
         raise ValueError("倒立摆证据需要已验证的场景记录。")
     payload = json.loads((run_dir / EVIDENCE_NAME).read_text(encoding="utf-8"),
                          parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+    if not isinstance(payload, dict):
+        raise TypeError("倒立摆证据必须是 JSON 对象。")
     config = record.effective_config
     plant_contract = CartPoleContract(**config["plant_contract"])
     balance = CartPoleBalanceConfig(**config["balance_config"])
@@ -39,13 +59,19 @@ def verify_cart_pole_evidence(record: object, run_dir: Path) -> None:
                                 config["fractional_bits"])
     encoded_d = np.asarray(context.encode(spec.D), dtype=object).reshape(4)
     n = balance.horizon_steps
-    if (payload.get("schema_version") != 1 or payload.get("run_id") != record.run_id
-            or payload.get("sample_count") != n or record.result.time.size != n
+    evidence_time = _numeric_array(payload.get("time_s"), (n + 1,))
+    evidence_reference = _numeric_array(payload.get("reference"), (n + 1, 4))
+    if (type(payload.get("schema_version")) is not int or payload["schema_version"] != 1
+            or payload.get("run_id") != record.run_id
+            or type(payload.get("sample_count")) is not int or payload["sample_count"] != n
+            or record.result.time.size != n
+            or type(payload.get("sample_period_s")) not in (int, float)
             or payload.get("sample_period_s") != plant_contract.sample_period_s
+            or type(payload.get("terminal_time_s")) not in (int, float)
             or payload.get("terminal_time_s") != n * plant_contract.sample_period_s
-            or payload.get("time_s") != (np.arange(n + 1)
-                                         * plant_contract.sample_period_s).tolist()
-            or payload.get("reference") != [list(balance.target_state) for _ in range(n + 1)]
+            or evidence_time.tolist() != (np.arange(n + 1)
+                                          * plant_contract.sample_period_s).tolist()
+            or evidence_reference.tolist() != [list(balance.target_state) for _ in range(n + 1)]
             or payload.get("state_units") != list(record.metadata.output.units)
             or payload.get("force_unit") != "N" or payload.get("raw_error") != "ideal - secure"
             or not isinstance(payload.get("branches"), dict)
@@ -54,7 +80,7 @@ def verify_cart_pole_evidence(record: object, run_dir: Path) -> None:
     expected_times = np.arange(n) * plant_contract.sample_period_s
     np.testing.assert_allclose(record.result.time, expected_times, rtol=0, atol=1e-14)
     np.testing.assert_allclose(record.result.reference,
-                               np.asarray(payload["reference"])[:n], rtol=0, atol=0)
+                               evidence_reference[:n], rtol=0, atol=0)
     raw_by_branch = {}
     for name in ("ideal", "secure"):
         branch = payload["branches"][name]
@@ -62,13 +88,11 @@ def verify_cart_pole_evidence(record: object, run_dir: Path) -> None:
             "observations", "raw_force_n", "statuses", "stable_counts"
         }:
             raise ValueError("倒立摆分支证据字段无效。")
-        observations = np.asarray(branch["observations"], dtype=np.float64)
-        raw = np.asarray(branch["raw_force_n"], dtype=np.float64)
+        observations = _numeric_array(branch["observations"], (n + 1, 4))
+        raw = _numeric_array(branch["raw_force_n"], (n,))
         statuses = branch["statuses"]
         counts = branch["stable_counts"]
-        if (observations.shape != (n + 1, 4) or raw.shape != (n,)
-                or not np.isfinite(observations).all() or not np.isfinite(raw).all()
-                or not isinstance(statuses, list) or len(statuses) != n + 1
+        if (not isinstance(statuses, list) or len(statuses) != n + 1
                 or not isinstance(counts, list) or len(counts) != n + 1
                 or any(type(value) is not int or value < 0 for value in counts)):
             raise ValueError("倒立摆证据 shape 或有限性无效。")
@@ -105,9 +129,7 @@ def verify_cart_pole_evidence(record: object, run_dir: Path) -> None:
         if statuses[-1] != "stable":
             raise ValueError("倒立摆终点尚未稳定。")
         raw_by_branch[name] = raw
-    raw_error = np.asarray(payload.get("raw_force_error_n"), dtype=np.float64)
-    if raw_error.shape != (n,):
-        raise ValueError("倒立摆 raw force error shape 无效。")
+    raw_error = _numeric_array(payload.get("raw_force_error_n"), (n,))
     np.testing.assert_allclose(raw_error, raw_by_branch["ideal"] - raw_by_branch["secure"],
                                rtol=0, atol=0)
     np.testing.assert_allclose(record.result.control_error,
@@ -131,5 +153,10 @@ def load_verified_cart_pole_run(run_dir: str | Path) -> tuple[object, dict[str, 
     """先用 canonical v1 reader 校验 hash，再校验倒立摆场景语义。"""
     path = Path(run_dir)
     record = load_artifacts(path)
+    derived = _read_json(path / "metadata.json").get("derived_files_sha256")
+    if not isinstance(derived, dict) or EVIDENCE_NAME not in derived:
+        raise ValueError("倒立摆侧证据未列入正式产物摘要清单。")
+    if derived[EVIDENCE_NAME] != _digest(path / EVIDENCE_NAME):
+        raise ValueError("倒立摆侧证据摘要与正式产物清单不一致。")
     verify_cart_pole_evidence(record, path)
     return record, json.loads((path / EVIDENCE_NAME).read_text(encoding="utf-8"))
