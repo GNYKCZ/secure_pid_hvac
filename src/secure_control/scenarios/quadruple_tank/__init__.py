@@ -2,6 +2,7 @@
 
 from .adapter import QuadrupleTankAdapter
 from .contract import QuadrupleTankContract, load_quadruple_tank_contract
+from .observer import load_quadruple_tank_observer_spec
 from .plant import (
     QuadrupleTankPlant,
     QuadrupleTankStateSpace,
@@ -15,4 +16,5 @@ __all__ = [
     "QuadrupleTankStateSpace",
     "build_quadruple_tank_state_space",
     "load_quadruple_tank_contract",
+    "load_quadruple_tank_observer_spec",
 ]
