@@ -1,0 +1,13 @@
+schema_version: 1
+scenario: cart_pole
+cart_mass_kg: 0.5
+pole_mass_kg: 0.2
+com_length_m: 0.3
+pole_inertia_kg_m2: 0.006
+cart_friction_n_s_per_m: 0.1
+gravity_m_per_s2: 9.8
+sample_period_s: 0.02
+rk4_substeps: 4
+initial_state: [0, 0, 0.08726646259971647, 0]
+track_center_limit_m: 0.5
+max_applied_force_n: 10
