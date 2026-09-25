@@ -1,6 +1,6 @@
-# 独立三角色连续 LAN 实验（Issues #86、#84）
+# 独立三角色连续 LAN 实验（Issues #86、#84、#75）
 
-此入口在三个独立进程运行 paper-inspired PID 的连续安全闭环。三条连接
+此入口在三个独立进程运行 paper-inspired PID 或四水箱的连续安全闭环。三条连接
 Client→P1、Client→P2、P2→P1 使用无证书实验 TCP。P1/P2 只读角色配置、公开
 数值 setup 与本方 share/资源；plant、PID 场景、明文测量及两份输出重构只在 Client。
 本机实验不证明真实三台电脑的网络时延、采样周期或生产安全，也不宣称作者原 plant 的逐点复现。
@@ -49,21 +49,25 @@ uv run python scripts/run_continuous_client.py
 将 `p1_client.host`、`p1_peer.host` 和对应 `bind` 改成 P1 的局域网 IP，
 将 `p2_client.host` 和 `bind` 改成 P2 的局域网 IP。Client 无须监听；三台电脑
 之间应能访问三个固定端口 `34401`、`34402`、`34403`，防火墙需允许这些端口。
-只在 Client 修改 `configs/paper_pid_lan.example.yaml` 的实验参数；P1/P2 不需要
-复制场景或控制器参数。真正三机网络的可达性与图输出仍需在实际三台电脑上验证。
-当前只实现 `paper_pid_fig3` 场景，不能仅通过改一个场景名切换到尚未实现的水箱。
+只在 Client 修改所选实验 profile；P1/P2 不需要复制场景或控制器参数。
+真正三机网络的可达性与图输出仍需在实际三台电脑上验证。切换水箱时，将 Client
+角色配置的 `experiment` 指向 `configs/quadruple_tank_lan.example.yaml`；不能只改
+Paper PID profile 的 `scenario` 字段。
 
 ## Client 实验配置
 
 `configs/lab-client-continuous.example.yaml` 的 `experiment` 指向
-`configs/paper_pid_lan.example.yaml`。P1/P2 的 YAML 没有场景字段；三方仍引用同一
+`configs/paper_pid_lan.example.yaml`，也可指向 `configs/quadruple_tank_lan.example.yaml`。
+P1/P2 的 YAML 没有场景字段；三方仍引用同一
 topology。实验 profile 允许修改：
 
-- `sample_count`：真实执行的连续步数；当前场景采样时间为 `0.1 s`，从 step 0 开始。
+- `sample_count`：真实执行的连续步数；Paper PID 为 `0.1 s`，四水箱为 `0.5 s`，均从 step 0 开始。
 - `numeric.ell`：定点小数位；`numeric.k`：论文 `Q<k,ell>` 中参数/初态的**有符号总 payload 位宽**，并非整数位数；`runtime_payload_bits`：动态输入和 state 的总 payload 位宽。
 - `numeric.lambda`：Protocol 2 安全参数；`numeric.prime_source`：唯一公开 q/素数证据文件。不要在 profile 中复制 q。若 q 大于 64 位，角色必须收到并各自验证证书。
-- `range.measurement_absolute_bound`：每步真实测量绝对值的先验界；越界会使运行失败。
-- `plot.control_channel`：当前 SISO 场景只能选 0；`output_root`：正式 run 目录根。运行 ID、nonce、结果与私钥内容都不在实验 profile 中。
+- `range.measurement_absolute_bound`：Paper PID 单路测量界；四水箱改用
+  `measurement_absolute_bounds_v: [256, 256]`，两路界分别预证明并在线检查。
+- `plot.control_channel`：Paper PID 只能选 0，四水箱可选 0/1；`output_root`：正式 run 目录根。
+  运行 ID、nonce、结果与私钥内容都不在实验 profile 中。
 
 启动前校验重复/未知 YAML 键、q/证书、`k>ell`、runtime payload 位宽、
 `κ=q.bit_length()-lambda-2>ell`、参数编码及有限 horizon state/output 范围。
@@ -97,7 +101,8 @@ topology。实验 profile 允许修改：
 Client 成功 JSON 的 `figure_path` 与同一 `run_dir/control.png` 对应，且只在正式 reader
 和图清单验证后返回。`config.json` 记录有效 profile、来源 SHA、场景和精度，
 `metadata.json` 记录状态、通道、单位及 provenance；`trajectory.csv` 为逐步原始轨迹。
-当前 SISO 控制通道为 0，单位 `paper_unit_unspecified`。无真实 ideal 支的未来场景
+Paper PID 控制通道为 0，单位 `paper_unit_unspecified`；四水箱控制通道为 0/1，
+单位 `V_deviation`。无真实 ideal 支的未来场景
 不得伪造对比曲线。网页直播/回放仍见 [#72](https://github.com/GNYKCZ/secure_pid_hvac/issues/72)。
 
 仅从已验证结果单独重绘，不启动协议：
@@ -105,6 +110,41 @@ Client 成功 JSON 的 `figure_path` 与同一 `run_dir/control.png` 对应，�
 ```powershell
 uv run secure-control redraw --run-dir results/lan_continuous/<run-id> --output results/lan_continuous/redrawn.png
 ```
+
+重绘默认读取已验证的 `control_plot.json` 中的选定通道，因此四水箱原图选通道 1
+时不会误绘通道 0。
+
+## 四水箱 Fig. 4 对照
+
+Client profile 分别设 `ell=32/40/48/56`、`k=ell+8`、
+`runtime_payload_bits=ell+14`，每次重启 P1/P2/Client 并保留四个独立正式 run。
+固定定义在 `configs/quadruple_tank_fig4.yaml`，只读汇总命令为：
+
+```powershell
+uv run python -m secure_control.experiments.quadruple_tank_fig4 --run-dirs <ell32-run> <ell40-run> <ell48-run> <ell56-run> --output-root results/quadruple_tank_fig4
+uv run python -m secure_control.experiments.quadruple_tank_fig4 --verify-dir results/quadruple_tank_fig4
+```
+
+仓库中的 `results/quadruple_tank_lan/` 保存四次独立本机三进程 run，
+`results/quadruple_tank_fig4/` 保存来源清单和对照图。汇总只读取经 canonical
+reader 与单次图清单验证的结果，不运行协议。每次为 51 个更新前样本 `t=0…25 s`；
+两路有符号 `u−û` 从 CSV 重算 L2 范数，零值保留，并与 `ε=2^-10` 对照。
+51 步的实际资源证据为 1836 份乘法材料、204 份 Trunc 材料及逐步双提交。
+这采用 #73 的 ZOH/偏差初态解释和仓库已审计素数；`[256,256] V` 与动态
+payload 位宽是经范围证明的项目选择。论文未公开离散矩阵、精确素数、随机种子或
+Fig. 4 逐点数据，故图是论文参数衍生的线性数值/协议对照，不是作者原图逐点复刻。
+高精度结果在 binary64 分辨率附近时，清单记录 ULP 和零样本数。
+
+## 接入下一个离散状态空间场景
+
+新场景须在自身 `scenarios/<name>/` 中提供 `ControllerSpec` 来源、数值/测量界
+证明、独立 ideal/secure 的 `SimulationPlan` 与明文基线核对；在 `experiments/`
+中提供严格的 Client profile loader（含来源摘要、素数和绘图通道），并在
+`lan_continuous_profile.py` 的 `load_prepared_lan_experiment` 增加一个显式选择项，
+返回相同的 `PreparedLanExperiment` 记录。此记录给共用 Client 提供数值契约、
+双支计划、结果/来源复核及有效配置。`lan_runner.py` 只消费该记录；
+P1/P2、`LanContinuousRuntime`、crypto/protocol 与 schema v1 writer/reader
+均不需要场景分支。这个接点仅适用于现有 `ControllerSpec` 离散状态空间契约。
 
 自动拉起三个本地角色的 localhost 后端仍用于固定 seed 的数值/消息诊断；本入口验证
 独立命令的明文实验 session。两者复用 `Protocol3Orchestrator`、`_complete_client_round`

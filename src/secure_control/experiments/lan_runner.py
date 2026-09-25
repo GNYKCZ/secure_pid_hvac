@@ -8,10 +8,7 @@ import logging
 import os
 import sys
 from dataclasses import asdict
-from hashlib import sha256
 from pathlib import Path
-
-import numpy as np
 
 from secure_control.execution.lan_config import LanConfig, load_lan_config
 from secure_control.execution.lan_runtime import (
@@ -30,16 +27,10 @@ from secure_control.execution.localhost_transport import (
     LocalhostTransportTimeout,
 )
 from secure_control.scenarios.hvac.integration import HvacScenario
-from secure_control.scenarios.paper_pid.baseline import run_paper_pid_baseline
-from secure_control.scenarios.paper_pid.secure_experiment import (
-    SCENARIO_VERSION,
-    assemble_paper_pid_plan,
-    paper_pid_numeric_contract,
-)
 from secure_control.simulation import compare_closed_loops
 
 from .artifacts import SCHEMA_VERSION, load_artifacts, write_artifacts
-from .lan_profile import load_paper_pid_lan_profile
+from .lan_continuous_profile import load_prepared_lan_experiment
 from .plotting import redraw_control_triptych, verify_control_triptych, write_control_triptych
 from .provenance import collect_provenance
 
@@ -83,81 +74,45 @@ def run_client_continuous(config: LanConfig) -> dict[str, object]:
     """先预检 Client 场景，后建立单 session 多步 LAN，并一次性发布正式图。"""
     if config.experiment_config is None:
         raise ValueError("缺少 Client experiment profile。")
-    profile = load_paper_pid_lan_profile(config.experiment_config)
-    spec, context, contract = paper_pid_numeric_contract(
-        fractional_bits=profile.ell, parameter_bits=profile.parameter_bits,
-        runtime_payload_bits=profile.runtime_payload_bits, modulus=profile.q,
-        sample_count=profile.sample_count,
-        measurement_absolute_bound=profile.measurement_absolute_bound,
+    experiment = load_prepared_lan_experiment(config.experiment_config)
+    runtime = LanContinuousRuntime(
+        config, experiment.spec, experiment.context, experiment.contract,
+        experiment.security_parameter, experiment.evidence,
     )
-    runtime = LanContinuousRuntime(config, spec, context, contract,
-                                   profile.security_parameter, profile.evidence)
     try:
-        plan = assemble_paper_pid_plan(spec, runtime, profile.sample_count)
+        plan = experiment.build_plan(runtime)
         result = compare_closed_loops(plan.ideal, plan.secure, plan.sample_times)
-        if max(np.max(np.abs(result.output_ideal)),
-               np.max(np.abs(result.output_secure))) > profile.measurement_absolute_bound:
-            raise ValueError("plant y 超出声明的有限时域输入界。")
-        definition, baseline_config = profile.definition, profile.baseline_config
-        baseline = run_paper_pid_baseline(
-            alpha=baseline_config["plant"]["alpha"],
-            sample_period_seconds=baseline_config["plant"]["sample_period_seconds"],
-            plant_initial_state=baseline_config["plant"]["initial_state"],
-            sample_count=profile.sample_count,
-        )
-        np.testing.assert_allclose(result.output_ideal[:, 0], baseline.rows[:, 6],
-                                   rtol=0, atol=1e-12)
-        np.testing.assert_allclose(result.control_ideal[:, 0], baseline.rows[:, 9],
-                                   rtol=0, atol=1e-12)
-        if runtime.scale_ledger.state_truncation_bits != profile.ell:
-            raise ValueError("Protocol 2 截断尺度与 profile ell 不符。")
+        experiment.validate_result(result)
+        if runtime.scale_ledger.state_truncation_bits != experiment.expected_state_truncation_bits:
+            raise ValueError("Protocol 2 截断尺度与场景契约不符。")
+        spec = experiment.spec
+        products_per_step = sum(getattr(spec, name).size for name in ("A", "B", "C", "D"))
+        truncations_per_step = (spec.state_dimension
+                                if experiment.expected_state_truncation_bits else 0)
         counts = runtime.resource_counts
         confirmed = runtime.confirmed_steps
-        if len(confirmed) != profile.sample_count or any(
-            item["step"] != index or item["status"] != "double_committed"
+        if len(confirmed) != experiment.sample_count or any(
+            item != {"step": index, "status": "double_committed",
+                     "products": products_per_step, "truncations": truncations_per_step}
             for index, item in enumerate(confirmed)
         ):
             raise ValueError("LAN 逐步双提交确认不完整。")
         if counts != {
-            "products_consumed": 9 * profile.sample_count,
-            "truncations_consumed": 2 * profile.sample_count,
+            "products_consumed": products_per_step * experiment.sample_count,
+            "truncations_consumed": truncations_per_step * experiment.sample_count,
         }:
             raise ValueError("实际资源消费与逐步 Protocol 3 计划不符。")
-        if sha256(profile.baseline_path.read_bytes()).hexdigest() != profile.baseline_digest:
-            raise ValueError("paper PID 基线在运行期间变化。")
-        if (profile.definition_path is not None
-                and sha256(profile.definition_path.read_bytes()).hexdigest()
-                != profile.definition_digest):
-            raise ValueError("Fig3 冻结定义在运行期间变化。")
+        experiment.recheck_sources()
         runtime.finish()
     finally:
         runtime.close()
-    effective = {
-        "scenario": {"name": "paper_pid_fig3", "version": SCENARIO_VERSION},
-        "fractional_bits": profile.ell, "paper_parameter_bits": profile.parameter_bits,
-        "runtime_payload_bits": profile.runtime_payload_bits,
-        "security_parameter": profile.security_parameter, "q": profile.q,
-        "sample_count": profile.sample_count,
-        "range": {"mode": "finite_horizon", "steps": profile.sample_count,
-                  "measurement_absolute_bound": profile.measurement_absolute_bound},
-        "reference_used": False, "raw_equals_applied": True,
-        "claim_level": profile.claim_level,
-        "profile_sha256": profile.digest,
-        "prime_source_sha256": profile.prime_digest,
-        "frozen_definition_sha256": profile.definition_digest,
-        "definition": definition,
-        "baseline_source_sha256": profile.baseline_digest,
-        "baseline_plant": baseline_config["plant"],
-        "controller_spec": {
-            name: getattr(spec, name).tolist() for name in ("A", "B", "C", "D", "x0")
-        },
-    }
     provenance = collect_provenance(
-        scenario_name="paper_pid_fig3", scenario_version=SCENARIO_VERSION,
+        scenario_name=experiment.scenario_name,
+        scenario_version=experiment.scenario_version,
         schema_version=SCHEMA_VERSION, test_seed=None,
     )
     provenance.update({
-        "backend": "lan_continuous", "claim_level": profile.claim_level,
+        "backend": "lan_continuous", "claim_level": experiment.claim_level,
         "session_id": runtime.session_id, "client_pid": os.getpid(),
         "topology_sha256": config.topology.digest,
         "transport": config.transport,
@@ -166,7 +121,7 @@ def run_client_continuous(config: LanConfig) -> dict[str, object]:
         "prime_verification": asdict(runtime.modulus_verification),
         "range_verification": asdict(runtime.range_verification),
         "scale_ledger": asdict(runtime.scale_ledger),
-        "kappa": profile.q.bit_length() - profile.security_parameter - 2,
+        "kappa": experiment.q.bit_length() - experiment.security_parameter - 2,
         "security_boundary": (
             "local three-terminal TLS; no real three-machine validation"
             if config.transport == "mutual_tls" else
@@ -174,14 +129,15 @@ def run_client_continuous(config: LanConfig) -> dict[str, object]:
         ),
     })
     artifact = write_artifacts(
-        result, plan.metadata, effective, provenance, output_root=profile.output_root,
+        result, plan.metadata, experiment.effective_config, provenance,
+        output_root=experiment.output_root,
         derived_writer=lambda record, stage: write_control_triptych(
-            record, stage, profile.control_channel
+            record, stage, experiment.control_channel
         ),
     )
     record = load_artifacts(artifact.run_dir)
     verify_control_triptych(record, artifact.run_dir)
-    if record.run_id != artifact.run_id or record.result.time.size != profile.sample_count:
+    if record.run_id != artifact.run_id or record.result.time.size != experiment.sample_count:
         raise ValueError("发布后的 run 身份或行数不符。")
     return {
         "status": "complete", "role": "Client", "pid": os.getpid(),
@@ -189,8 +145,8 @@ def run_client_continuous(config: LanConfig) -> dict[str, object]:
         "session_id": runtime.session_id, "run_id": artifact.run_id,
         "run_dir": str(artifact.run_dir),
         "figure_path": str((artifact.run_dir / "control.png").resolve()),
-        "scenario": "paper_pid_fig3", "ell": profile.ell,
-        "claim_level": profile.claim_level, "sample_count": profile.sample_count,
+        "scenario": experiment.scenario_name, "ell": experiment.ell,
+        "claim_level": experiment.claim_level, "sample_count": experiment.sample_count,
         "resource_counts": counts, "transport": config.transport,
         "tls_version": "TLSv1.3" if config.transport == "mutual_tls" else None,
     }
@@ -221,7 +177,7 @@ def _run() -> int:
         trial = (HvacScenario(config.controller_config).build_lan_single_step()
                  if role == "Client" and config.controller_config is not None else None)
         if role == "Client" and config.experiment_config is not None:
-            load_paper_pid_lan_profile(config.experiment_config)
+            load_prepared_lan_experiment(config.experiment_config)
     except (ValueError, TypeError, OSError) as error:
         return _failure(role, 2, "configuration", error)
     mode = "无证书实验连接" if config.transport == "insecure_tcp" else "TLS 认证连接"

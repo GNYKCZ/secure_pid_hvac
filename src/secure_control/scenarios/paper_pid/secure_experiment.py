@@ -19,8 +19,10 @@ from secure_control.simulation import (
     ScenarioMetadata,
     SimulationBranch,
     SimulationPlan,
+    SimulationResult,
 )
 
+from .baseline import run_paper_pid_baseline
 from .pid import paper_sec_vii_controller_spec
 from .plant import PaperPidCascadePlant
 
@@ -124,3 +126,20 @@ def assemble_paper_pid_plan(spec: ControllerSpec, secure: object,
     plan = SimulationPlan(PaperPidOutputAdapter.metadata, np.arange(sample_count) * 0.1,
                           ideal, secure_branch)
     return plan
+
+
+def validate_paper_pid_baseline(result: SimulationResult, baseline_config: dict,
+                                sample_count: int, measurement_absolute_bound: int) -> None:
+    """场景侧用独立明文基线复核 ideal 支与两支的测量先验界。"""
+    plant = baseline_config["plant"]
+    baseline = run_paper_pid_baseline(
+        alpha=plant["alpha"], sample_period_seconds=plant["sample_period_seconds"],
+        plant_initial_state=plant["initial_state"], sample_count=sample_count,
+    )
+    np.testing.assert_allclose(result.output_ideal[:, 0], baseline.rows[:, 6],
+                               rtol=0, atol=1e-12)
+    np.testing.assert_allclose(result.control_ideal[:, 0], baseline.rows[:, 9],
+                               rtol=0, atol=1e-12)
+    if max(np.max(np.abs(result.output_ideal)),
+           np.max(np.abs(result.output_secure))) > measurement_absolute_bound:
+        raise ValueError("plant y 超出声明的有限时域输入界。")
