@@ -349,9 +349,13 @@ def verify_control_triptych(record: ExperimentRecord, run_dir: Path) -> None:
 
 
 def redraw_control_triptych(run_dir: str | Path, output_path: str | Path,
-                            control_index: int = 0) -> Path:
+                            control_index: int | None = None) -> Path:
     """只通过 canonical reader 重绘，不创建或恢复任何安全会话。"""
     record = load_artifacts(run_dir)
+    verify_control_triptych(record, Path(run_dir))
+    if control_index is None:
+        plot = json.loads((Path(run_dir) / "control_plot.json").read_text(encoding="utf-8"))
+        control_index = plot["control_channel"]
     target = Path(output_path)
     if target.exists():
         raise FileExistsError("重绘目标已存在。")

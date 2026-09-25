@@ -1,4 +1,4 @@
-"""Client 独占的 paper PID 连续 LAN 实验 profile 与启动前数值预检。"""
+"""Client 连续 LAN 的共享素数预检与 Paper PID profile。"""
 
 from __future__ import annotations
 
@@ -49,6 +49,27 @@ def _integer(value: object, name: str, *, minimum: int) -> int:
     return value
 
 
+def _load_prime(path: Path) -> tuple[int, PrimeModulusEvidence | None, str]:
+    """两种 Client 场景共用唯一素数证书解析和验证。"""
+    prime = _load_yaml(path)
+    _fields(prime, {"modulus", "evidence"})
+    q = _integer(prime["modulus"], "q", minimum=3)
+    raw_evidence = prime["evidence"]
+    if raw_evidence is None:
+        evidence = None
+    else:
+        _fields(raw_evidence, {"method", "source", "source_version",
+                               "certificate_id", "certificate_sha256", "certificate"})
+        evidence = PrimeModulusEvidence(
+            raw_evidence["method"], raw_evidence["source"],
+            raw_evidence["source_version"], raw_evidence["certificate_id"],
+            raw_evidence["certificate_sha256"],
+            parse_prime_certificate(raw_evidence["certificate"]),
+        )
+    verify_prime_modulus(q, evidence)
+    return q, evidence, sha256(path.read_bytes()).hexdigest()
+
+
 def load_paper_pid_lan_profile(path: str | Path) -> PaperPidLanProfile:
     """严格解析并验证 q、证书、位宽和 finite horizon，早于任何网络连接。"""
     source = Path(path).resolve()
@@ -80,22 +101,7 @@ def load_paper_pid_lan_profile(path: str | Path) -> PaperPidLanProfile:
     if channel != 0:
         raise ValueError("paper PID 只有控制通道 0。")
     prime_path = _relative(source, numeric["prime_source"])
-    prime = _load_yaml(prime_path)
-    _fields(prime, {"modulus", "evidence"})
-    q = _integer(prime["modulus"], "q", minimum=3)
-    raw_evidence = prime["evidence"]
-    if raw_evidence is None:
-        evidence = None
-    else:
-        _fields(raw_evidence, {"method", "source", "source_version",
-                               "certificate_id", "certificate_sha256", "certificate"})
-        evidence = PrimeModulusEvidence(
-            raw_evidence["method"], raw_evidence["source"],
-            raw_evidence["source_version"], raw_evidence["certificate_id"],
-            raw_evidence["certificate_sha256"],
-            parse_prime_certificate(raw_evidence["certificate"]),
-        )
-    verify_prime_modulus(q, evidence)
+    q, evidence, prime_digest = _load_prime(prime_path)
     if q.bit_length() - security - 2 <= ell:
         raise ValueError("q、lambda、ell 不满足 Protocol 2 的 κ>ell。")
     # 用场景唯一的 state/input 界公式与标准 Client 校验器复核完整 horizon。
@@ -147,7 +153,7 @@ def load_paper_pid_lan_profile(path: str | Path) -> PaperPidLanProfile:
         source, sha256(source.read_bytes()).hexdigest(),
         definition_digest, definition_path, definition, baseline_config,
         baseline_path, baseline_digest,
-        sha256(prime_path.read_bytes()).hexdigest(), count, ell, parameter_bits,
+        prime_digest, count, ell, parameter_bits,
         runtime_bits, security, q, evidence, bound, channel, root,
         "paper-inspired-frozen-parameter-point" if frozen else "user-exploration",
     )

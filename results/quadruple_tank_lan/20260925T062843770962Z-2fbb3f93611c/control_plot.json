@@ -1,0 +1,13 @@
+{
+  "control_channel": 0,
+  "control_name": "u1",
+  "control_unit": "V_deviation",
+  "figure_sha256": "7f3e9804a37d28fb7ced8abd0bc2cc523c5511ffddb00d2ec9b271ca5fbe5d13",
+  "sample_count": 51,
+  "shared_control_y_scale": true,
+  "signed_error": "control_ideal - control_secure",
+  "source_config_sha256": "5195aa5ecea20e9e9bfb203af362dafbccfd850697c0690190f420d5cf5ef84e",
+  "source_metadata_sha256": "5124bafef2e7e4cce4d6cd3683ac32592ba28e30a42ef262cba8f1882ba7a96a",
+  "source_run_id": "20260925T062843770962Z-2fbb3f93611c",
+  "source_trajectory_sha256": "c421e6b3d90040f48b768f3906cce1179b93ca3aa6d4f1c77f094652cd4ae70c"
+}

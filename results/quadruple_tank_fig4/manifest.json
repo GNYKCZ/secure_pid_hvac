@@ -1,0 +1,106 @@
+{
+  "definition": {
+    "claim_level": "paper-parameter-derived-linear-simulation",
+    "epsilon": 0.0009765625,
+    "error_metric": "control_error_l2_v",
+    "fractional_bits": [
+      32,
+      40,
+      48,
+      56
+    ],
+    "measurement_absolute_bounds_v": [
+      256,
+      256
+    ],
+    "observer_sha256": "b227ad5e9740109c7ee03300eed07f20f2d77a0c273b163ba9a0275f35bcb533",
+    "parameter_headroom_bits": 8,
+    "plant_sha256": "e48ea5edb55c2512c3bf1f11ed1ea46e7d2ac4f5841b875c6d27fba1273ff236",
+    "prime_sha256": "b8c5e9e779d945cfc19d0662b641cd1084acadd0907cc6b4e64ee4076455111b",
+    "runtime_headroom_bits": 14,
+    "sample_count": 51,
+    "sample_period_seconds": 0.5,
+    "scenario": "quadruple_tank",
+    "schema_version": 1,
+    "security_parameter": 80
+  },
+  "definition_path": "../../configs/quadruple_tank_fig4.yaml",
+  "definition_sha256": "dac8524e008877c8f4b91c8f72cd0f82c3962e1861388f62e990cebfdce62280",
+  "figure_sha256": "18c82608774b3dc73ab616ca56722a3af0adb1b228a961954fefab35811cf006",
+  "runs": [
+    {
+      "config_sha256": "38186f14aa74289962bad230d4dbd6a6b746ecbad693e1a2d076a8f6e3d7d7b9",
+      "ell": 32,
+      "metadata_sha256": "0941f5b5204de35996fa9382d44669cbc294142272b797cc625d474d4330d421",
+      "relative_run_dir": "../quadruple_tank_lan/20260925T062838483254Z-4f5094acafc8",
+      "run_id": "20260925T062838483254Z-4f5094acafc8",
+      "status": "success"
+    },
+    {
+      "config_sha256": "5195aa5ecea20e9e9bfb203af362dafbccfd850697c0690190f420d5cf5ef84e",
+      "ell": 40,
+      "metadata_sha256": "93d3f1cf37638d4ed0fdc4653dac2e4f4d570127926d152cdf2976bec8899b53",
+      "relative_run_dir": "../quadruple_tank_lan/20260925T062843770962Z-2fbb3f93611c",
+      "run_id": "20260925T062843770962Z-2fbb3f93611c",
+      "status": "success"
+    },
+    {
+      "config_sha256": "8f050d54aeafcff291ae5f96f5c856d201d6723bacc1ca414f72e86ebf96aa4c",
+      "ell": 48,
+      "metadata_sha256": "df390d4d3446ecf6e655a9a29f384bcd386bf5c1fd68729be9de2fcb9c8726cc",
+      "relative_run_dir": "../quadruple_tank_lan/20260925T062849000713Z-ae0f13d3f811",
+      "run_id": "20260925T062849000713Z-ae0f13d3f811",
+      "status": "success"
+    },
+    {
+      "config_sha256": "5b5a25649732ff873499994edf180b00c3b4b5194a6a1da0d89659948ec0297f",
+      "ell": 56,
+      "metadata_sha256": "db039c945cb3e64ad2c08697f5dc09a9c4d3028bb79d156a68cf6eb37eded76f",
+      "relative_run_dir": "../quadruple_tank_lan/20260925T062854498507Z-d4044140dc36",
+      "run_id": "20260925T062854498507Z-d4044140dc36",
+      "status": "success"
+    }
+  ],
+  "summaries": [
+    {
+      "at_or_below_numeric_resolution": false,
+      "below_epsilon": true,
+      "binary64_ulp_upper_v": 1.7763568394002505e-15,
+      "ell": 32,
+      "max_error_l2_v": 8.20637232487677e-09,
+      "run_id": "20260925T062838483254Z-4f5094acafc8",
+      "session_id": "controller-72df3357f9d9f777df161959331355e9",
+      "zero_samples": 1
+    },
+    {
+      "at_or_below_numeric_resolution": false,
+      "below_epsilon": true,
+      "binary64_ulp_upper_v": 1.7763568394002505e-15,
+      "ell": 40,
+      "max_error_l2_v": 1.2215597800858858e-11,
+      "run_id": "20260925T062843770962Z-2fbb3f93611c",
+      "session_id": "controller-1cebd06964854e8f26c90561bf52400f",
+      "zero_samples": 1
+    },
+    {
+      "at_or_below_numeric_resolution": false,
+      "below_epsilon": true,
+      "binary64_ulp_upper_v": 1.7763568394002505e-15,
+      "ell": 48,
+      "max_error_l2_v": 5.0313563229552993e-14,
+      "run_id": "20260925T062849000713Z-ae0f13d3f811",
+      "session_id": "controller-8481d4d5f892300a71d883dc602e7edb",
+      "zero_samples": 1
+    },
+    {
+      "at_or_below_numeric_resolution": true,
+      "below_epsilon": true,
+      "binary64_ulp_upper_v": 1.7763568394002505e-15,
+      "ell": 56,
+      "max_error_l2_v": 2.5121479338940403e-15,
+      "run_id": "20260925T062854498507Z-d4044140dc36",
+      "session_id": "controller-950ecb6f642770f3fe3494c9b348d798",
+      "zero_samples": 10
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+# 四次独立 LAN run 的只读汇总定义；不含仿真 seed 或原论文逐点数据。
+schema_version: 1
+scenario: quadruple_tank
+claim_level: paper-parameter-derived-linear-simulation
+plant_sha256: e48ea5edb55c2512c3bf1f11ed1ea46e7d2ac4f5841b875c6d27fba1273ff236
+observer_sha256: b227ad5e9740109c7ee03300eed07f20f2d77a0c273b163ba9a0275f35bcb533
+prime_sha256: b8c5e9e779d945cfc19d0662b641cd1084acadd0907cc6b4e64ee4076455111b
+fractional_bits: [32, 40, 48, 56]
+parameter_headroom_bits: 8
+runtime_headroom_bits: 14
+security_parameter: 80
+measurement_absolute_bounds_v: [256, 256]
+sample_count: 51
+sample_period_seconds: 0.5
+epsilon: 0.0009765625
+error_metric: control_error_l2_v

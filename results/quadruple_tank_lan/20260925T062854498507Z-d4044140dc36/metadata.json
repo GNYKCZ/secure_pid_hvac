@@ -1,0 +1,558 @@
+{
+  "channel_counts": {
+    "control": 2,
+    "output": 2,
+    "reference": 2
+  },
+  "channels": {
+    "control": {
+      "names": [
+        "u1",
+        "u2"
+      ],
+      "units": [
+        "V_deviation",
+        "V_deviation"
+      ]
+    },
+    "output": {
+      "names": [
+        "y1",
+        "y2"
+      ],
+      "units": [
+        "V_deviation",
+        "V_deviation"
+      ]
+    },
+    "reference": {
+      "names": [
+        "unused_zero_1",
+        "unused_zero_2"
+      ],
+      "units": [
+        "dimensionless",
+        "dimensionless"
+      ]
+    }
+  },
+  "columns": [
+    {
+      "channel_index": null,
+      "channel_name": null,
+      "column_name": "time",
+      "field": "time",
+      "unit": "seconds"
+    },
+    {
+      "channel_index": 0,
+      "channel_name": "unused_zero_1",
+      "column_name": "reference[0]",
+      "field": "reference",
+      "unit": "dimensionless"
+    },
+    {
+      "channel_index": 1,
+      "channel_name": "unused_zero_2",
+      "column_name": "reference[1]",
+      "field": "reference",
+      "unit": "dimensionless"
+    },
+    {
+      "channel_index": 0,
+      "channel_name": "y1",
+      "column_name": "output_ideal[0]",
+      "field": "output_ideal",
+      "unit": "V_deviation"
+    },
+    {
+      "channel_index": 1,
+      "channel_name": "y2",
+      "column_name": "output_ideal[1]",
+      "field": "output_ideal",
+      "unit": "V_deviation"
+    },
+    {
+      "channel_index": 0,
+      "channel_name": "y1",
+      "column_name": "output_secure[0]",
+      "field": "output_secure",
+      "unit": "V_deviation"
+    },
+    {
+      "channel_index": 1,
+      "channel_name": "y2",
+      "column_name": "output_secure[1]",
+      "field": "output_secure",
+      "unit": "V_deviation"
+    },
+    {
+      "channel_index": 0,
+      "channel_name": "u1",
+      "column_name": "control_ideal[0]",
+      "field": "control_ideal",
+      "unit": "V_deviation"
+    },
+    {
+      "channel_index": 1,
+      "channel_name": "u2",
+      "column_name": "control_ideal[1]",
+      "field": "control_ideal",
+      "unit": "V_deviation"
+    },
+    {
+      "channel_index": 0,
+      "channel_name": "u1",
+      "column_name": "control_secure[0]",
+      "field": "control_secure",
+      "unit": "V_deviation"
+    },
+    {
+      "channel_index": 1,
+      "channel_name": "u2",
+      "column_name": "control_secure[1]",
+      "field": "control_secure",
+      "unit": "V_deviation"
+    },
+    {
+      "channel_index": 0,
+      "channel_name": "u1",
+      "column_name": "control_error[0]",
+      "field": "control_error",
+      "unit": "V_deviation"
+    },
+    {
+      "channel_index": 1,
+      "channel_name": "u2",
+      "column_name": "control_error[1]",
+      "field": "control_error",
+      "unit": "V_deviation"
+    },
+    {
+      "channel_index": 0,
+      "channel_name": "y1",
+      "column_name": "output_error[0]",
+      "field": "output_error",
+      "unit": "V_deviation"
+    },
+    {
+      "channel_index": 1,
+      "channel_name": "y2",
+      "column_name": "output_error[1]",
+      "field": "output_error",
+      "unit": "V_deviation"
+    }
+  ],
+  "created_at_utc": "2026-09-25T06:28:54.507612+00:00",
+  "derived_files_sha256": {
+    "control.png": "ada1e4c4376f4b7594b2c5e4a4cc8254bddbb8338e9721aaf02cd3b5e6171927",
+    "control_plot.json": "2d0902674367da53627ca95769db7f72131caef076f849e73adbd54cfd493f80"
+  },
+  "files_sha256": {
+    "config.json": "5b5a25649732ff873499994edf180b00c3b4b5194a6a1da0d89659948ec0297f",
+    "trajectory.csv": "f5a063b89a7396ae32555c165ac9a027ae80329e95371717b3731052a42d6870"
+  },
+  "provenance": {
+    "backend": "lan_continuous",
+    "claim_level": "paper-parameter-derived-linear-simulation",
+    "client_pid": 18704,
+    "collected_at_utc": "2026-09-25T06:28:54.409139+00:00",
+    "configured_seeds": {},
+    "confirmed_steps": [
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 0,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 1,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 2,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 3,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 4,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 5,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 6,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 7,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 8,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 9,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 10,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 11,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 12,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 13,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 14,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 15,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 16,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 17,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 18,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 19,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 20,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 21,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 22,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 23,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 24,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 25,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 26,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 27,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 28,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 29,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 30,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 31,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 32,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 33,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 34,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 35,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 36,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 37,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 38,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 39,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 40,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 41,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 42,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 43,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 44,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 45,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 46,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 47,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 48,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 49,
+        "truncations": 4
+      },
+      {
+        "products": 36,
+        "status": "double_committed",
+        "step": 50,
+        "truncations": 4
+      }
+    ],
+    "dependency_versions": {
+      "matplotlib": "3.11.2",
+      "numpy": "2.4.6",
+      "pyyaml": "6.0.3",
+      "scipy": "1.17.1"
+    },
+    "git": {
+      "available": true,
+      "commit": "b96c9096d68cabad5ab658cc9ba2a95432a30778",
+      "dirty": false
+    },
+    "kappa": 174,
+    "platform": {
+      "machine": "AMD64",
+      "release": "10",
+      "system": "Windows"
+    },
+    "prime_verification": {
+      "bit_length": 256,
+      "certificate_id": "issue15-256bit-pocklington-v1",
+      "certificate_sha256": "aa15ad45266d1c1bffee97cb2626ba4940ffbc8c3472045e92696c196a06dc3b",
+      "method": "pocklington_v1",
+      "modulus": 57919013630500220500943667918768663966531314514739586011956233569313332958947,
+      "source": "secure_pid_hvac Issue",
+      "source_version": "1",
+      "status": "verified"
+    },
+    "project_version": "0.1.0",
+    "pyproject": {
+      "available": true,
+      "sha256": "9a0afa86ff43945ec7d7636f861d222236229d56fe0e85641cf7877cde599415"
+    },
+    "python": {
+      "implementation": "CPython",
+      "version": "3.11.16"
+    },
+    "range_verification": {
+      "centered_modulus_limit": 28959506815250110250471833959384331983265657257369793005978116784656666479473,
+      "certificate_sha256": null,
+      "maximum_truncation_message": 11972621413014756705924586149611790497021399392059391,
+      "output_accumulator_bounds": [
+        15841797920510648924682540634080755762,
+        18554964710856047313994487885000225600
+      ],
+      "proof_mode": "finite_horizon",
+      "state_accumulator_bounds": [
+        3872324616770995919465156726611573269,
+        3836560009206990766834489215594799424,
+        29197655057434392083017945508347562188,
+        32179975691733098342929415834526471608
+      ]
+    },
+    "resource_counts": {
+      "products_consumed": 1836,
+      "truncations_consumed": 204
+    },
+    "scale_ledger": {
+      "A": 56,
+      "B": 56,
+      "C": 56,
+      "D": 56,
+      "input": 56,
+      "output": 112,
+      "output_accumulator": 112,
+      "state": 56,
+      "state_accumulator": 112,
+      "state_truncation_bits": 56
+    },
+    "scenario_name": "quadruple_tank",
+    "scenario_version": "1",
+    "schema_version": 1,
+    "secure_material_randomness": "secure_random",
+    "security_boundary": "unauthenticated plaintext TCP lab simulation; no authenticated LAN claim",
+    "session_id": "controller-950ecb6f642770f3fe3494c9b348d798",
+    "topology_sha256": "88c6446b14f52f1a4115d539410fc355e6d6fa98be6202c168e7abc353dd8f6a",
+    "transport": "insecure_tcp",
+    "uv_lock": {
+      "available": true,
+      "sha256": "810af24ad18b128117a1a45ce4fbc11c038f3a511e2daf65a06f47b2e1a63a5a"
+    }
+  },
+  "run_id": "20260925T062854498507Z-d4044140dc36",
+  "sample_count": 51,
+  "scenario": {
+    "name": "quadruple_tank",
+    "version": "1"
+  },
+  "schema_version": 1,
+  "success": true
+}

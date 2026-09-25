@@ -26,6 +26,7 @@ from secure_control.execution.localhost_codec import (
 from secure_control.experiments.artifacts import load_artifacts, write_artifacts
 from secure_control.experiments.lan_profile import load_paper_pid_lan_profile
 from secure_control.experiments.plotting import plot_control_triptych, redraw_control_triptych
+from secure_control.experiments.quadruple_tank_lan_profile import load_quadruple_tank_lan_profile
 from secure_control.scenarios.paper_pid.plant import PaperPidCascadePlant
 from secure_control.scenarios.paper_pid.secure_experiment import (
     build_paper_pid_plan,
@@ -106,6 +107,85 @@ def _plain_deployment(tmp_path: Path) -> dict[str, Path]:
         path.write_text(role_content, encoding="utf-8")
         paths[role] = path
     return paths
+
+
+def _tank_profile(paths: dict[str, Path], count: int, ell: int = 32,
+                  channel: int = 1) -> Path:
+    """只改 Client profile；P1/P2 沿用与 PID 相同的场景无关入口。"""
+    profile = paths["Client"].parent / "tank-experiment.yaml"
+    data = yaml.safe_load((ROOT / "configs" / "quadruple_tank_lan.example.yaml").read_text(
+        encoding="utf-8"
+    ))
+    data["sample_count"] = count
+    data["numeric"].update({"ell": ell, "k": ell + 8, "runtime_payload_bits": ell + 14})
+    data["numeric"]["prime_source"] = str(ROOT / "configs" /
+                                            "shared_prime_256_pocklington.yaml")
+    data["plant_source"] = str(ROOT / "configs" / "quadruple_tank_plant.yaml")
+    data["observer_source"] = str(ROOT / "configs" / "quadruple_tank_observer.yaml")
+    data["plot"]["control_channel"] = channel
+    data["output_root"] = str(profile.parent / "tank-runs")
+    profile.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    role = paths["Client"]
+    role.write_text(role.read_text(encoding="utf-8").replace(
+        "experiment: paper_pid_lan.example.yaml", f"experiment: {profile}"
+    ), encoding="utf-8")
+    return profile
+
+
+def test_quadruple_tank_three_process_short_session_and_selected_redraw(tmp_path: Path) -> None:
+    """真实三进程 MIMO 每步消耗 36 triple/4 Trunc，通道 1 重绘保持选择。"""
+    paths = _plain_deployment(tmp_path)
+    _tank_profile(paths, 3)
+    parties = [_run(role, paths[role]) for role in ("P1", "P2")]
+    try:
+        time.sleep(0.5)
+        client = _run("Client", paths["Client"])
+        code, result, errors = _finish(client, 100)
+        assert code == 0, (result, errors)
+        outcomes = [_finish(party, 100) for party in parties]
+        assert all(item[0] == 0 for item in outcomes), outcomes
+        assert len({result["pid"], *(item[1]["pid"] for item in outcomes)}) == 3
+        assert result["scenario"] == "quadruple_tank"
+        assert result["resource_counts"] == {"products_consumed": 108,
+                                               "truncations_consumed": 12}
+        record = load_artifacts(result["run_dir"])
+        assert record.result.control_error.shape == (3, 2)
+        assert record.provenance["confirmed_steps"] == [
+            {"step": index, "status": "double_committed", "products": 36,
+             "truncations": 4} for index in range(3)
+        ]
+        assert record.provenance["scale_ledger"]["state_truncation_bits"] == 32
+        assert np.array_equal(record.result.control_error,
+                              record.result.control_ideal - record.result.control_secure)
+        selected = json.loads((Path(result["run_dir"]) / "control_plot.json").read_text(
+            encoding="utf-8"
+        ))
+        assert selected["control_channel"] == 1
+        redrawn = redraw_control_triptych(result["run_dir"], tmp_path / "redrawn.png")
+        assert redrawn.read_bytes() == (Path(result["run_dir"]) / "control.png").read_bytes()
+    finally:
+        for party in parties:
+            if party.poll() is None:
+                party.kill()
+            party.communicate()
+
+
+@pytest.mark.parametrize("change", [
+    lambda data: data["range"].update({"measurement_absolute_bounds_v": [4, 256]}),
+    lambda data: data["numeric"].update({"k": 32}),
+    lambda data: data["numeric"].update({"runtime_payload_bits": 40}),
+    lambda data: data["numeric"].update({"lambda": 230}),
+    lambda data: data["plot"].update({"control_channel": 2}),
+    lambda data: data.update({"observer_source": "missing.yaml"}),
+])
+def test_tank_bad_profile_fails_before_network(tmp_path: Path, change) -> None:
+    paths = _plain_deployment(tmp_path)
+    profile = _tank_profile(paths, 3)
+    data = yaml.safe_load(profile.read_text(encoding="utf-8"))
+    change(data)
+    profile.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    with pytest.raises((ValueError, TypeError, OSError)):
+        load_quadruple_tank_lan_profile(profile)
 
 
 def test_direct_python_files_run_three_role_lab_without_certificates(tmp_path: Path) -> None:

@@ -1,0 +1,17 @@
+# 一次运行对应一个 ell；Fig. 4 要分别重启三角色运行四次。
+schema_version: 1
+scenario: quadruple_tank
+plant_source: quadruple_tank_plant.yaml
+observer_source: quadruple_tank_observer.yaml
+sample_count: 51
+numeric:
+  ell: 32
+  k: 40
+  runtime_payload_bits: 46
+  lambda: 80
+  prime_source: shared_prime_256_pocklington.yaml
+range:
+  measurement_absolute_bounds_v: [256, 256]
+plot:
+  control_channel: 0
+output_root: ../results/lan_continuous

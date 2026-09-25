@@ -1,3 +1,12 @@
 configs/hvac_2r2c_sweep_prime.yaml text eol=crlf
 configs/shared_prime_256_pocklington.yaml text eol=crlf
 configs/paper_pid_fig3_sweep.yaml text eol=crlf
+configs/quadruple_tank_plant.yaml text eol=crlf
+configs/quadruple_tank_observer.yaml text eol=crlf
+configs/quadruple_tank_fig4.yaml text eol=lf
+results/quadruple_tank_lan/**/*.csv text eol=crlf
+results/quadruple_tank_lan/**/*.json text eol=lf
+results/quadruple_tank_lan/**/control_plot.json text eol=crlf
+results/quadruple_tank_lan/**/*.png -text
+results/quadruple_tank_fig4/*.json text eol=crlf
+results/quadruple_tank_fig4/*.png -text

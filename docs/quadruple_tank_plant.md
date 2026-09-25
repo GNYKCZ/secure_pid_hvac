@@ -5,6 +5,9 @@
 `load_quadruple_tank_contract` 加载并严格校验；运行时从物理参数派生矩阵，配置不保存第二份矩阵。
 它不包含 observer、控制器、参考阶跃、泵饱和、安全执行或 Fig. 4。
 
+Issue #75 的安全闭环与 Fig. 4 接入见本文末尾及
+[`docs/lan_continuous.md`](lan_continuous.md)；本段 #73 plant 定义仍是唯一物理来源。
+
 ## 来源与声明等级
 
 | 项 | 数值、单位 | 来源与性质 |
@@ -112,5 +115,19 @@ Johansson p.457 式 (1) 的非线性水量平衡在每个罐包含排水
 这是当前 ZOH 口径的明文
 数值交叉核查，不是任意模型的常数，也不是安全协议的范围证明。
 
-#75 可直接使用此 `ControllerSpec`、#73 plant/adapter 与 `0.5 s` 时间网格；
-仍需独立验证定点范围、Protocol 2/Trunc、真实安全执行和 Fig. 4。
+## 连续安全数值接入（Issue #75）
+
+`scenarios/quadruple_tank/secure_experiment.py` 从本页两份 canonical 配置装配
+互不共享状态的 ideal/secure 分支，并用独立的 `8×8 Φ^k` 验证 51 步明文基线。
+profile 的两路测量界 `[256,256] V` 通过耦合包络逐步证明：同时向外界定两支
+plant/observer、binary64 矩阵运算和每行 Trunc 的至多 1 payload 误差，再由
+Client 用精确整数复核每步 state/output accumulator、Protocol 2 κ 和中心化模范围。
+四种精度下保守测量上界约为 `[162.77,134.23] V`。这些界只证明冻结的线性
+模拟 plant，不是物理水箱测量界或实机网络安全证明。
+
+正式四次本机三进程 run 和只读 Fig. 4 图在 `results/quadruple_tank_lan/` 与
+`results/quadruple_tank_fig4/`。每个 run 的 `metadata.json` 记录 51 次双提交、
+1836 次乘法和 204 次 Trunc；Fig. 4 清单绑定来源摘要、四个不同 session、
+每点两路有符号控制误差的 L2 范数、零样本及 binary64 ULP。四种精度的最大
+范数均低于 `2^-10 V`，但 56 位差异已接近数值分辨率，不能视为精确零或
+作者论文原始 Fig. 4 逐点数据。运行和复验命令见 `docs/lan_continuous.md`。
