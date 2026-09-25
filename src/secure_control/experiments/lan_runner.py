@@ -128,15 +128,22 @@ def run_client_continuous(config: LanConfig) -> dict[str, object]:
             "unauthenticated plaintext TCP lab simulation; no authenticated LAN claim"
         ),
     })
+    def derived_writer(record, stage):
+        """一份正式 staging 同时收纳通用 applied 图和可选场景证据。"""
+        names = write_control_triptych(record, stage, experiment.control_channel)
+        if experiment.write_scenario_evidence is not None:
+            names += experiment.write_scenario_evidence(record, stage)
+        return names
+
     artifact = write_artifacts(
         result, plan.metadata, experiment.effective_config, provenance,
         output_root=experiment.output_root,
-        derived_writer=lambda record, stage: write_control_triptych(
-            record, stage, experiment.control_channel
-        ),
+        derived_writer=derived_writer,
     )
     record = load_artifacts(artifact.run_dir)
     verify_control_triptych(record, artifact.run_dir)
+    if experiment.verify_scenario_run is not None:
+        experiment.verify_scenario_run(artifact.run_dir)
     if record.run_id != artifact.run_id or record.result.time.size != experiment.sample_count:
         raise ValueError("发布后的 run 身份或行数不符。")
     return {

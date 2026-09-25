@@ -115,3 +115,54 @@ raw/applied 力及计数；默认 5° 的 `k=0/1/5/50/100/400` 还有冻结数�
 至多 10 N。此界未计定点编码误差、判定误差或网络故障，不替代 #92 的
 安全范围、模数或资源证明。动画、外力事件、起摆、真实硬件及急停也不属于
 本期结果。
+
+## 三角色有限步安全闭环（#92）
+
+Client 将 `configs/lab-client-continuous.example.yaml` 中的 `experiment` 指向
+`cart_pole_lan.example.yaml`。该小 profile 只引用本页的 plant、balance 来源和
+`shared_prime_256_pocklington.yaml`；采样周期、400 步、初态、Q/R、执行器界、
+稳定阈值不在 profile 再复制。P1/P2 仍使用原通用角色配置与同一 topology。
+先分别启动 P1、P2，再启动 Client：
+
+```powershell
+uv run python scripts/run_continuous_p1.py configs/lab-p1.example.yaml
+uv run python scripts/run_continuous_p2.py configs/lab-p2.example.yaml
+uv run python scripts/run_continuous_client.py configs/lab-client-continuous.example.yaml
+```
+
+三个命令在三个终端分别运行。若要保留原 Client 示例，另准备一份只改变
+`experiment` 的角色配置并传给 Client 脚本。三台电脑使用同一代码/锁文件，
+`uv sync --locked`，同一 topology 的三端口及正确的 P1/P2 地址，启动顺序不变。
+`insecure_tcp` 只证明隔离实验网的连通与协议数值，不提供对端身份认证或传输加密；
+现有 `mutual_tls` 路径仍可按正式证书配置使用。本机三进程结果不是三台电脑实测，
+也不证明 20 ms 墙钟采样、硬实时或 TLS 身份；这些项目目前均未验证。
+
+Client 在拨号前从 #91 的 ZOH/DARE 重新生成零维静态 `ControllerSpec`，
+以 `ell=32`、`k=40`、动态 payload 46 位和经证书验证的 256 位 `q` 编码。
+四路 `v=y-r` 的工作域为 `[.45,.6,.20,1.0]`（m、m/s、rad、rad/s）；
+编码采用 `floor(x·2^ell+1/2)` 并向外包络端点。默认逐路 payload 界为
+`[1932735283,2576980378,858993459,4294967296]`，`D` 的编码与这些界的
+精确整数乘积和为 `240907430145804608711`，小于 `(q−1)//2`。
+`κ=q.bit_length()−lambda−2=174>ell`。输出用中心化 `Z_q` 的 2ell 尺度解码；
+控制器状态维数为零，所以 400 步实际使用 1600 份乘法、0 份 Trunc。
+每步工作域门禁先于分享，Client 的标准在线预检再检查真实编码 payload。
+工作域并非对盒内所有初态的稳定性证明，代表 5° 初态另经逐点闭环核对。
+
+Client 正式 `trajectory.csv` 的 400 行是 `t_0…t_399` 的更新前观测、目标、
+两支 **applied** 力与有符号 `ideal−secure` 差；`control.png` 只画同一 run 的
+这三列，单位 N。`cart_pole_evidence.json` 同批保存两支 400 个 raw 力、
+401 个观测与连续稳定计数、`t_400=8 s` 的末端判定及 raw 力误差。
+发布前在 staging 中重算 `D·v`/编码乘积、raw→applied 裁剪、plant 推进和
+`BalanceMonitor` 判定，发布后再经 canonical v1 reader 与场景 reader 复验。
+只有 Client `complete` 且两支终点 `stable`、400 个 `double_committed`、
+正式结果可复读才代表本场景完整成功。失败或连接中断须重新启动三个角色，
+使用新 session 和新一次性材料；P1/P2 `closed` 自身不代表 Client 成功。
+Fig. 3/4 是其他场景的图，不能用作倒立摆性能图。
+
+代表 5° 初态在 `tests/test_cart_pole_lan.py` 再与 #91 的独立 CTMS+DOP853
+逐点比较：明文状态/raw/applied 仍用 `3e-8` 绝对容差；`ell=32` 四路输入与
+`D` 的定点量化每步约有 `4.51e-9 N` 的力包络，400 步原点线性化误差响应
+给出约 `3.27e-9` 状态分量和 `4.95e-8 N` 力的保守估计。测试为非线性轨迹
+预留余量，固定安全支对独立 oracle 的 `4e-8` 状态、`9e-8 N` 力，以及
+两支差值的 `1e-8` 状态、`6e-8 N` 力门限；这些是代表轨迹验收容差，
+并非整个工作域上的非线性误差不变集证明。稳定计数另逐步精确核对。

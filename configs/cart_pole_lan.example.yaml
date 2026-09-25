@@ -1,0 +1,11 @@
+schema_version: 1
+scenario: cart_pole
+plant_source: cart_pole_plant.yaml
+balance_source: cart_pole_balance.yaml
+numeric:
+  ell: 32
+  k: 40
+  runtime_payload_bits: 46
+  lambda: 80
+  prime_source: shared_prime_256_pocklington.yaml
+output_root: ../results/lan_continuous
