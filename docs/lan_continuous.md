@@ -1,6 +1,6 @@
-# 独立三角色连续 LAN 实验（Issues #86、#84、#75）
+# 独立三角色连续 LAN 实验（Issues #86、#84、#75、#92）
 
-此入口在三个独立进程运行 paper-inspired PID 或四水箱的连续安全闭环。三条连接
+此入口在三个独立进程运行 paper-inspired PID、四水箱或近直立倒立摆的连续安全闭环。三条连接
 Client→P1、Client→P2、P2→P1 使用无证书实验 TCP。P1/P2 只读角色配置、公开
 数值 setup 与本方 share/资源；plant、PID 场景、明文测量及两份输出重构只在 Client。
 本机实验不证明真实三台电脑的网络时延、采样周期或生产安全，也不宣称作者原 plant 的逐点复现。
@@ -19,7 +19,9 @@ Client→P1、Client→P2、P2→P1 使用无证书实验 TCP。P1/P2 只读角�
 Client”，等待期间终端保持安静是正常的；连接后会打印“协议连接已建立”，
 Client 收到三方就绪回执后打印“开始连续计算”，最后打印“运行完成”。
 这些提示会显示在终端里，不改变供脚本读取的最终单行 JSON。
-最终 JSON 中 Client 的 `status: complete` 与 P1/P2 的 `status: closed` 都表示成功；
+Paper PID/四水箱的最终 JSON 中 Client 的 `status: complete` 与 P1/P2 的 `status: closed` 表示各自运行结束；
+倒立摆只有 Client 完成末端稳定判定、正式 artifact 发布和复验后，整次运行才算成功，
+P1/P2 的 `closed` 单独不足以证明这一点。
 `status: failed` 表示失败。若等待超过角色配置的 `startup: 180` 秒，需重启三方。
 
 如果新电脑上的 PowerShell 出现 `Set-ExecutionPolicy` 激活报错，本仓库的
@@ -51,17 +53,20 @@ uv run python scripts/run_continuous_client.py
 之间应能访问三个固定端口 `34401`、`34402`、`34403`，防火墙需允许这些端口。
 只在 Client 修改所选实验 profile；P1/P2 不需要复制场景或控制器参数。
 真正三机网络的可达性与图输出仍需在实际三台电脑上验证。切换水箱时，将 Client
-角色配置的 `experiment` 指向 `configs/quadruple_tank_lan.example.yaml`；不能只改
+角色配置的 `experiment` 指向 `configs/quadruple_tank_lan.example.yaml`；倒立摆指向
+`configs/cart_pole_lan.example.yaml`。不能只改
 Paper PID profile 的 `scenario` 字段。
 
 ## Client 实验配置
 
 `configs/lab-client-continuous.example.yaml` 的 `experiment` 指向
-`configs/paper_pid_lan.example.yaml`，也可指向 `configs/quadruple_tank_lan.example.yaml`。
+`configs/paper_pid_lan.example.yaml`，也可指向 `configs/quadruple_tank_lan.example.yaml`
+或 `configs/cart_pole_lan.example.yaml`。
 P1/P2 的 YAML 没有场景字段；三方仍引用同一
 topology。实验 profile 允许修改：
 
-- `sample_count`：真实执行的连续步数；Paper PID 为 `0.1 s`，四水箱为 `0.5 s`，均从 step 0 开始。
+- `sample_count`：Paper PID/四水箱的真实连续步数，采样分别为 `0.1 s`/`0.5 s`；
+  倒立摆直接从 `cart_pole_balance.yaml` 读取 `horizon_steps` 和物理采样周期，profile 不重复这些值。
 - `numeric.ell`：定点小数位；`numeric.k`：论文 `Q<k,ell>` 中参数/初态的**有符号总 payload 位宽**，并非整数位数；`runtime_payload_bits`：动态输入和 state 的总 payload 位宽。
 - `numeric.lambda`：Protocol 2 安全参数；`numeric.prime_source`：唯一公开 q/素数证据文件。不要在 profile 中复制 q。若 q 大于 64 位，角色必须收到并各自验证证书。
 - `range.measurement_absolute_bound`：Paper PID 单路测量界；四水箱改用
@@ -91,8 +96,10 @@ topology。实验 profile 允许修改：
 ## 结果、图与重绘
 
 正式 `trajectory.csv/config.json/metadata.json` 保持八字段 v1。`control_ideal` 与
-`control_secure` 是 actual applied 控制量；当前恒等 actuator 使 raw=applied，单位
-`paper_unit_unspecified`。同批发布的 `control.png` 有三栏：上为 `u(t)`、中为
+`control_secure` 是 actual applied 控制量；Paper PID/四水箱当前恒等 actuator 使 raw=applied；
+倒立摆由场景侧将 raw force 裁剪为 ±10 N，单独保存和复验 raw 证据。
+Paper PID 的控制单位为 `paper_unit_unspecified`，倒立摆为 N。同批发布的
+`control.png` 有三栏：上为 `u(t)`、中为
 `û(t)`，两栏共享同一纵轴范围和刻度；下为有符号 `u−û`，共享秒时间轴。
 `control_plot.json` 绑定 run ID、CSV/config/图摘要、通道与样本数。reader 会复验附加文件；
 图生成失败没有可读为 success 的 run 目录。`reference=unused_zero` 只是 schema 占位，
@@ -112,7 +119,9 @@ uv run secure-control redraw --run-dir results/lan_continuous/<run-id> --output 
 ```
 
 重绘默认读取已验证的 `control_plot.json` 中的选定通道，因此四水箱原图选通道 1
-时不会误绘通道 0。
+时不会误绘通道 0。倒立摆的 `cart_pole_evidence.json` 还须由
+`load_verified_cart_pole_run` 在 canonical reader 之后重放四维轨迹、限幅及末端判定；
+普通 `redraw` 只验证通用 v1 图与文件摘要，不代替场景成功判定。
 
 ## 四水箱 Fig. 4 对照
 

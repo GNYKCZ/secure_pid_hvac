@@ -1,4 +1,4 @@
-"""两种连续 Client 场景的唯一分派与小型已预检装配记录。"""
+"""连续 Client 场景的唯一分派与小型已预检装配记录。"""
 
 from __future__ import annotations
 
@@ -11,6 +11,12 @@ from secure_control.core import ControllerSpec
 from secure_control.crypto import FixedPointContext, PrimeModulusEvidence
 from secure_control.execution.lan_config import _load_yaml
 from secure_control.protocol import ControllerRangeContract
+from secure_control.scenarios.cart_pole.secure_experiment import (
+    SCENARIO_VERSION as CART_POLE_VERSION,
+)
+from secure_control.scenarios.cart_pole.secure_experiment import (
+    CartPoleSecureExperiment,
+)
 from secure_control.scenarios.paper_pid.secure_experiment import (
     SCENARIO_VERSION as PAPER_VERSION,
 )
@@ -29,6 +35,9 @@ from secure_control.scenarios.quadruple_tank.secure_experiment import (
 )
 from secure_control.simulation import SimulationPlan, SimulationResult
 
+from .artifacts import ExperimentRecord
+from .cart_pole_evidence import load_verified_cart_pole_run, write_cart_pole_evidence
+from .cart_pole_lan_profile import load_cart_pole_lan_profile
 from .lan_profile import load_paper_pid_lan_profile
 from .quadruple_tank_lan_profile import load_quadruple_tank_lan_profile
 
@@ -55,6 +64,8 @@ class PreparedLanExperiment:
     build_plan: Callable[[object], SimulationPlan]
     validate_result: Callable[[SimulationResult], None]
     recheck_sources: Callable[[], None]
+    write_scenario_evidence: Callable[[ExperimentRecord, Path], tuple[str, ...]] | None = None
+    verify_scenario_run: Callable[[Path], None] | None = None
 
 
 def _paper(path: str | Path) -> PreparedLanExperiment:
@@ -147,6 +158,45 @@ def _tank(path: str | Path) -> PreparedLanExperiment:
     )
 
 
+def _cart_pole(path: str | Path) -> PreparedLanExperiment:
+    """#91 的唯一 plant/controller/adapter 来源仅在 Client 场景层装配。"""
+    profile = load_cart_pole_lan_profile(path)
+    scenario = CartPoleSecureExperiment(profile.plant, profile.balance, profile.spec)
+
+    def verify_run(run_dir: Path) -> None:
+        """发布后必须经 canonical 与场景双重 reader 才能返回 complete。"""
+        load_verified_cart_pole_run(run_dir)
+
+    effective = {
+        "scenario": {"name": "cart_pole", "version": CART_POLE_VERSION},
+        "fractional_bits": profile.ell, "paper_parameter_bits": profile.parameter_bits,
+        "runtime_payload_bits": profile.runtime_payload_bits,
+        "security_parameter": profile.security_parameter, "q": profile.q,
+        "sample_count": profile.balance.horizon_steps,
+        "range": {"mode": "finite_horizon", "steps": profile.balance.horizon_steps,
+                  "proof": profile.proof},
+        "reference_used": True, "raw_equals_applied": False,
+        "claim_level": "cart-pole-near-upright-simulation",
+        "profile_sha256": profile.digest,
+        "prime_source_sha256": profile.prime_digest,
+        "plant_source_sha256": profile.plant_digest,
+        "balance_source_sha256": profile.balance_digest,
+        "plant_contract": asdict(profile.plant),
+        "balance_config": asdict(profile.balance),
+        "controller_spec": {name: getattr(profile.spec, name).tolist()
+                            for name in ("A", "B", "C", "D", "x0")},
+    }
+    return PreparedLanExperiment(
+        "cart_pole", CART_POLE_VERSION, profile.balance.horizon_steps,
+        profile.ell, profile.ell, profile.q, profile.security_parameter,
+        profile.evidence, profile.spec, profile.context, profile.contract,
+        profile.output_root, 0, "cart-pole-near-upright-simulation", effective,
+        scenario.build_plan, scenario.validate_result, profile.recheck_sources,
+        lambda record, stage: write_cart_pole_evidence(record, stage, scenario),
+        verify_run,
+    )
+
+
 def load_prepared_lan_experiment(path: str | Path) -> PreparedLanExperiment:
     """唯一显式分派；未知场景在网络建立之前失败。"""
     scenario = _load_yaml(Path(path).resolve()).get("scenario")
@@ -154,4 +204,6 @@ def load_prepared_lan_experiment(path: str | Path) -> PreparedLanExperiment:
         return _paper(path)
     if scenario == "quadruple_tank":
         return _tank(path)
+    if scenario == "cart_pole":
+        return _cart_pole(path)
     raise ValueError("连续 LAN 实验场景无效。")
