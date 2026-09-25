@@ -155,6 +155,27 @@ def test_contract_validation_and_snapshot_isolation(contract, tmp_path: Path) ->
     np.testing.assert_array_equal(other.output(), [5, 5])
 
 
+@pytest.mark.parametrize(
+    ("original", "duplicate"),
+    [
+        ("initial_state_deviation_cm: [10, 10, 10, 10]",
+         "initial_state_deviation_cm: [0, 0, 0, 0]"),
+        ("  gravity_cm_per_s2: 981", "  gravity_cm_per_s2: 100"),
+        ("  valve_fractions: [0.7, 0.6]", "  valve_fractions: [0.6, 0.7]"),
+    ],
+)
+def test_config_rejects_duplicate_keys_at_each_mapping_level(
+    tmp_path: Path, original: str, duplicate: str
+) -> None:
+    """同一层重复字段必须在参数快照形成前失败，不能静默覆盖基线。"""
+    source = CONFIG.read_text(encoding="utf-8")
+    assert source.count(original) == 1
+    bad = tmp_path / "duplicate.yaml"
+    bad.write_text(source.replace(original, original + "\n" + duplicate), encoding="utf-8")
+    with pytest.raises(ValueError, match="重复"):
+        load_quadruple_tank_contract(bad)
+
+
 class _PulseRuntime:
     """只用于验证引擎对本场景的调用顺序，不代表论文 observer。"""
 

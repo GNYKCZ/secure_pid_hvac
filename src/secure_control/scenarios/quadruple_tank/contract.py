@@ -12,6 +12,19 @@ from typing import Any
 import yaml
 
 
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """在映射构造时拒绝重复键，避免覆盖物理参数后再进入契约校验。"""
+
+    def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict[object, object]:
+        mapping: dict[object, object] = {}
+        for key_node, value_node in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if key in mapping:
+                raise ValueError("四水箱 YAML 包含重复配置键")
+            mapping[key] = self.construct_object(value_node, deep=deep)
+        return mapping
+
+
 def _keys(value: Any, expected: set[str], name: str) -> Mapping[str, Any]:
     """拒绝漏项和拼错的配置键，避免静默改动物理模型。"""
     if not isinstance(value, Mapping) or set(value) != expected:
@@ -85,7 +98,7 @@ def load_quadruple_tank_contract(path: str | Path) -> QuadrupleTankContract:
     """从 YAML 加载单一物理来源；离散矩阵由 plant 计算，不从配置读取。"""
     with Path(path).open(encoding="utf-8") as stream:
         root = _keys(
-            yaml.safe_load(stream),
+            yaml.load(stream, Loader=_UniqueKeyLoader),
             {"schema_version", "scenario", "physical", "operating_point", "sample_period_seconds", "initial_state_deviation_cm", "state_coordinate", "discretization"},
             "root",
         )
