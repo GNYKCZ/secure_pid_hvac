@@ -1,0 +1,10 @@
+schema_version: 1
+scenario: cart_pole
+# 本项目自选 SI 坐标数值权重；离散 K 每次由 #90 plant 参数和 DARE 重算。
+q_state_weights: [10, 1, 100, 1]
+r_force_weight: 1
+target_state: [0, 0, 0, 0]
+safe_abs: [0.45, 0.6, 0.20, 1.0]
+stable_abs: [0.02, 0.03, 0.02, 0.05]
+hold_observations: 51
+horizon_steps: 400
