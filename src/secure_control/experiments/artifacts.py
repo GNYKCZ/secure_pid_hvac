@@ -9,6 +9,7 @@ import re
 import secrets
 import shutil
 from collections.abc import Callable, Mapping
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -205,6 +206,23 @@ def write_artifacts(
     失败只清理本调用拥有的 staging；崩溃残留 `.incomplete-*` 不会被 reader
     当成成功运行，也不会在下次运行被自动删除或覆盖。
     """
+    return _write_artifacts(
+        result, metadata, effective_config, provenance,
+        output_root=output_root, derived_writer=derived_writer,
+    )
+
+
+def _write_artifacts(
+    result: SimulationResult,
+    metadata: ScenarioMetadata,
+    effective_config: Mapping[str, Any],
+    provenance: Mapping[str, Any],
+    *,
+    output_root: str | Path,
+    derived_writer: Callable[[ExperimentRecord, Path], tuple[str, ...]] | None = None,
+    publication_guard: Callable[[], AbstractContextManager[None]] | None = None,
+) -> RunArtifacts:
+    """Canonical writer; internal guard makes the final rename a cancellation boundary."""
     columns, arrays = _validated_arrays(result, metadata)
     if not isinstance(effective_config, Mapping) or not isinstance(provenance, Mapping):
         raise TypeError("effective_config/provenance 必须是 JSON-safe 映射。")
@@ -288,9 +306,10 @@ def write_artifacts(
             }
             metadata_path.write_bytes(_json_bytes(manifest))
             _read_record(stage, allow_staging=True)
-        if os.path.lexists(final):
-            raise FileExistsError(f"运行 ID 已存在：{run_id}")
-        os.rename(stage, final)
+        with publication_guard() if publication_guard is not None else nullcontext():
+            if os.path.lexists(final):
+                raise FileExistsError(f"运行 ID 已存在：{run_id}")
+            os.rename(stage, final)
     except Exception:
         if _owned_stage(stage, root, stage_identity):
             shutil.rmtree(stage)

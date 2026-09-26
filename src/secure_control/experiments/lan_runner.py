@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import asdict
 from pathlib import Path
 from threading import Event
@@ -31,7 +32,7 @@ from secure_control.execution.localhost_transport import (
 from secure_control.scenarios.hvac.integration import HvacScenario
 from secure_control.simulation import compare_closed_loops
 
-from .artifacts import SCHEMA_VERSION, load_artifacts, write_artifacts
+from .artifacts import SCHEMA_VERSION, _write_artifacts, load_artifacts
 from .lan_continuous_profile import PreparedLanExperiment, load_prepared_lan_experiment
 from .plotting import redraw_control_triptych, verify_control_triptych, write_control_triptych
 from .provenance import collect_provenance
@@ -82,7 +83,9 @@ def run_client_continuous(config: LanConfig) -> dict[str, object]:
 
 def _run_prepared_client(config: LanConfig, experiment: PreparedLanExperiment,
                          *, phase: Callable[[str], None] | None = None,
-                         cancelled: Event | None = None) -> dict[str, object]:
+                         cancelled: Event | None = None,
+                         publication_guard: Callable[[], AbstractContextManager[None]]
+                         | None = None) -> dict[str, object]:
     """通用会话/资源/正式发布只保留一份；交互入口仅换执行计划。"""
     def check_cancelled() -> None:
         if cancelled is not None and cancelled.is_set():
@@ -163,10 +166,11 @@ def _run_prepared_client(config: LanConfig, experiment: PreparedLanExperiment,
         return names
 
     check_cancelled()
-    artifact = write_artifacts(
+    artifact = _write_artifacts(
         result, plan.metadata, experiment.effective_config, provenance,
         output_root=experiment.output_root,
         derived_writer=derived_writer,
+        publication_guard=publication_guard,
     )
     record = load_artifacts(artifact.run_dir)
     verify_control_triptych(record, artifact.run_dir)

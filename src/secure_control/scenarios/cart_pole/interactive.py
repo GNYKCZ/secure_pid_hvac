@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from queue import Empty, Full, Queue
 from threading import Event, Lock
 
@@ -66,6 +67,14 @@ class InteractiveSession:
             self.cancelled.set()
             self._accepting = False
             self._reject_pending()
+
+    @contextmanager
+    def publication_guard(self) -> Iterator[None]:
+        """Serialize close with the final artifact rename only."""
+        with self._lock:
+            if self.cancelled.is_set():
+                raise RuntimeError("Client 运行已取消。")
+            yield
 
     def stop_accepting(self) -> None:
         """安全支最后一步后拒绝未消费的请求，回放不再接收外力。"""

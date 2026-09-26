@@ -16,7 +16,7 @@ from test_cart_pole_lan import _SECOND_ROUND_DISCONNECT, _profile_for, _Quantize
 from test_lan_continuous import _finish, _plain_deployment, _run
 
 from secure_control.experiments import cart_pole_evidence
-from secure_control.experiments.artifacts import write_artifacts
+from secure_control.experiments.artifacts import _write_artifacts, write_artifacts
 from secure_control.experiments.cart_pole_evidence import (
     EVIDENCE_NAME,
     MOTION_MANIFEST_NAME,
@@ -93,12 +93,15 @@ def test_scheduled_pulse_replays_both_branches_and_v2_artifact(tmp_path: Path) -
         return (write_control_triptych(record, stage, 0)
                 + prepared.write_scenario_evidence(record, stage))
 
-    artifact = write_artifacts(
+    artifact = _write_artifacts(
         result, plan.metadata, prepared.effective_config,
         {"scenario_name": "cart_pole", "scenario_version": "2", "schema_version": 1},
         output_root=tmp_path / "runs", derived_writer=derived,
+        publication_guard=session.publication_guard,
     )
     record, sidecar = load_verified_cart_pole_run(artifact.run_dir)
+    session.close()
+    assert load_verified_cart_pole_run(artifact.run_dir)[0].run_id == artifact.run_id
     assert sidecar["schema_version"] == 2
     assert sidecar["events"] == [{
         "step": 200, "force_n": 1.0, "duration_steps": 1,
@@ -186,6 +189,7 @@ _CLIENT = r"""
 import json
 import sys
 from pathlib import Path
+from secure_control.experiments import artifacts
 from secure_control.execution.lan_config import load_lan_config
 from secure_control.experiments.lan_continuous_profile import load_interactive_cart_pole_experiment
 from secure_control.experiments.lan_runner import _run_prepared_client
@@ -196,10 +200,20 @@ def notify(kind, value):
     if mode == 'cancel' and kind == 'frame' and value['step'] == 10:
         session.close()
 session = InteractiveSession(scheduled={200: 1.0}, notify=notify)
+if mode == 'late_cancel':
+    original_digest = artifacts._digest
+    def cancel_during_derived_digest(path):
+        if path.name == 'cart_pole_evidence.json':
+            session.close()
+        return original_digest(path)
+    artifacts._digest = cancel_during_derived_digest
 config = load_lan_config(Path(sys.argv[1]), 'Client')
 prepared = load_interactive_cart_pole_experiment(config.experiment_config, session)
 try:
-    result = _run_prepared_client(config, prepared, cancelled=session.cancelled)
+    result = _run_prepared_client(
+        config, prepared, cancelled=session.cancelled,
+        publication_guard=session.publication_guard,
+    )
 except Exception:
     print(json.dumps({'status': 'failed'}))
     raise SystemExit(1)
@@ -207,7 +221,7 @@ print(json.dumps(result))
 """
 
 
-@pytest.mark.parametrize("mode", ["complete", "cancel"])
+@pytest.mark.parametrize("mode", ["complete", "cancel", "late_cancel"])
 def test_interactive_three_processes_and_cancel(tmp_path: Path, mode: str) -> None:
     """P1/P2 为独立真实进程，交互 Client 仍走唯一 runner 与会话资源门禁。"""
     paths = _plain_deployment(tmp_path)
@@ -220,7 +234,7 @@ def test_interactive_three_processes_and_cancel(tmp_path: Path, mode: str) -> No
             cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         code, result, errors = _finish(client, 600)
-        if mode == "cancel":
+        if mode in ("cancel", "late_cancel"):
             assert code != 0 and result["status"] == "failed", errors
             assert not list((tmp_path / "runs").glob("*/metadata.json"))
             return

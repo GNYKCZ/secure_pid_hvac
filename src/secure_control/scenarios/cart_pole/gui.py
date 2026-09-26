@@ -139,6 +139,7 @@ class CartPoleWindow:
                 self.config, self.prepared,
                 phase=lambda value: self._notify("phase", value),
                 cancelled=self.session.cancelled,
+                publication_guard=self.session.publication_guard,
             )
             record, sidecar = load_verified_cart_pole_run(result["run_dir"])
             self._notify("complete", (record, sidecar, Path(result["run_dir"])))
