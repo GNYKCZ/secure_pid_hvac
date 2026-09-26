@@ -9,6 +9,15 @@
 
 ## 三角色连续实验
 
+倒立摆专用入口仍先启动同一 P1/P2，再运行 `scripts/run_cart_pole_client.py`：
+默认持续 Tk 动画，`--segment-steps 400` 是每段容量，点击“停止并保存”才确定实际 N；
+不修改 `cart_pole_balance.yaml` 的有限 horizon。Client 使用
+`lab-client-cart-pole.example.yaml` → `cart_pole_lan.example.yaml` 的单一 profile，
+后者引用原 plant/balance 和共享素数证明。`--finite` 保留旧有限窗口，
+`--headless-continuous` 仅返回真实 stopped；这两个选项互斥。
+新的完整结果保留实际 N、独立对照、双回执和八字段有限块，
+详见[倒立摆操作指南](../docs/cart_pole_interactive.md)。
+
 - `lab-p1.example.yaml`、`lab-p2.example.yaml`、`lab-client-continuous.example.yaml`：三个脚本各自默认读取的角色配置；`transport: insecure_tcp` 明确表示网络连接不加密、不验证对端。P1/P2 不配置实验精度。
 - `paper_pid_lan.example.yaml`：**Client 的日常参数入口**，包含场景、`ell`、`k`、`runtime_payload_bits`、`lambda`、步数和结果目录。改 `ell` 时不能只改一个数字；当前 51 步配置建议同时保持 `k=ell+8`、`runtime_payload_bits=ell+14`，并让程序完成数值预检。该入口的合法组合均标记为 `user-exploration`；Fig3 的四个冻结精度只由它自己的定义管理。
 - `scenario: paper_pid_fig3` 是已有 paper PID 数学场景的标识；在三角色配置里出现这个名字不会启动 Fig3 四点扫描。
