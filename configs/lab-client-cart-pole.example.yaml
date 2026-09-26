@@ -1,0 +1,9 @@
+role: Client
+transport: insecure_tcp
+topology: local-deployment.example.yaml
+experiment: cart_pole_lan.example.yaml
+timeouts:
+  startup: 180
+  step: 30
+  idle: 30
+  shutdown: 5
