@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from queue import Empty, Full, Queue
-from threading import Event, Lock
+from threading import Event, RLock
 
 import numpy as np
 
@@ -36,7 +36,8 @@ class InteractiveSession:
         self._scheduled = dict(scheduled or {})
         self.cancelled = Event()
         self._accepting = True
-        self._lock = Lock()
+        # 首次 SIGINT 也可能打断持锁的请求/清理；同线程停止回调必须能设置拒绝门禁。
+        self._lock = RLock()
         self.notify = notify
 
     def request(self, force_n: float) -> bool:
@@ -82,6 +83,21 @@ class InteractiveSession:
             self._accepting = False
             self._reject_pending()
 
+    def reject_new(self) -> None:
+        """正常停止保留已排队请求给 in-flight 区间，不设置 cancellation。"""
+        with self._lock:
+            self._accepting = False
+
+    def latch(self, step: int, applied: float, limit: float) -> float:
+        """按全局区间锁存至多一项外力；合力超界拒绝外力，不额外裁剪。"""
+        if self.cancelled.is_set():
+            raise RuntimeError("倒立摆交互运行已取消。")
+        disturbance = self.take(step)
+        if abs(applied + disturbance) > limit:
+            self.emit("rejected", {"step": step, "reason": "total_force_limit"})
+            return 0.0
+        return disturbance
+
     def _reject_pending(self) -> None:
         while True:
             try:
@@ -121,9 +137,9 @@ class DisturbedCartPolePlant:
         applied = _finite_vector(control, 1, "controller applied force")
         step = len(self.forces)
         if self._session is not None:
-            if self._session.cancelled.is_set():
-                raise RuntimeError("倒立摆交互运行已取消。")
-            disturbance = self._session.take(step)
+            disturbance = self._session.latch(
+                step, float(applied[0]), self._scenario.plant_contract.max_applied_force_n,
+            )
         else:
             if self._replay is None or step >= len(self._replay):
                 raise ValueError("普通支缺少冻结的外力事件。")

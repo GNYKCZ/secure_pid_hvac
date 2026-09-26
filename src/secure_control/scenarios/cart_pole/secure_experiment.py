@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from math import inf, nextafter
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -17,6 +19,9 @@ from .contract import CartPoleContract
 from .controller import CartPoleBalanceConfig
 from .experiment import BalanceMonitor
 from .plant import CartPolePlant
+
+if TYPE_CHECKING:
+    from .interactive import InteractiveSession
 
 SCENARIO_VERSION = "1"
 
@@ -56,6 +61,69 @@ def cart_pole_numeric_contract(
         "output_fractional_bits": 2 * fractional_bits,
     }
     return context, contract, proof
+
+
+@dataclass(frozen=True, slots=True)
+class CartPoleStepSnapshot:
+    """一个已验证物理区间的公开不可变快照，观测与力保持原 SI 单位。"""
+
+    t_before_s: float
+    t_after_s: float
+    observation_before: tuple[float, ...]
+    observation_after: tuple[float, ...]
+    target: tuple[float, ...]
+    raw_force_n: float
+    applied_force_n: float
+    disturbance_force_n: float
+    observed_status: str
+    stable_count: int
+
+
+class SustainedCartPoleExperiment:
+    """整个 run 唯一的 plant/adapter/monitor，不累计全程轨迹或重复观测段界。"""
+
+    def __init__(self, plant: CartPoleContract, balance: CartPoleBalanceConfig,
+                 session: InteractiveSession) -> None:
+        self.plant = CartPolePlant(plant)
+        self.adapter = CartPoleAdapter(plant, balance)
+        self.monitor = BalanceMonitor(balance)
+        self.session = session
+        self.period = plant.sample_period_s
+        self.force_limit = plant.max_applied_force_n
+        self.output = _finite_vector(self.plant.output(), 4, "initial output")
+        if self.monitor.observe(self.output) == "failed":
+            raise ValueError("倒立摆初态离开工作域。")
+        self.next_step = 0
+
+    def controller_input(self) -> np.ndarray:
+        """缓存观测已通过上一物理区间门禁，段间不重新观察/重建初态。"""
+        return self.adapter.controller_input(
+            self.adapter.reference_at(self.next_step * self.period), self.output,
+        )
+
+    def advance(self, global_step: int, raw: tuple[float, ...]) -> CartPoleStepSnapshot:
+        """双提交之后完成执行器、外力、物理更新及工作域门禁才返回快照。"""
+        if global_step != self.next_step:
+            raise ValueError("物理区间不能重复或跳步。")
+        force = _finite_vector(raw, 1, "raw control")
+        applied = self.adapter.apply_control(force)
+        disturbance = self.session.latch(global_step, float(applied[0]), self.force_limit)
+        before = tuple(float(value) for value in self.output)
+        following = _finite_vector(
+            self.plant.step(np.array([float(applied[0]) + disturbance])), 4, "plant output",
+        )
+        if self.monitor.observe(following) == "failed":
+            raise ValueError(f"倒立摆推进后离开工作域：{self.monitor.failure_reason}")
+        snapshot = CartPoleStepSnapshot(
+            global_step * self.period, (global_step + 1) * self.period,
+            before, tuple(float(value) for value in following),
+            tuple(float(value) for value in self.adapter.reference_at(global_step * self.period)),
+            float(force[0]), float(applied[0]), disturbance,
+            self.monitor.status, self.monitor.stable_count,
+        )
+        self.output = following
+        self.next_step += 1
+        return snapshot
 
 
 class MonitoredCartPoleAdapter(CartPoleAdapter):

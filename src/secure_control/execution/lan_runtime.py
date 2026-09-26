@@ -7,6 +7,9 @@ import os
 import secrets
 import socket
 import time
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
+from threading import RLock
 from typing import Any, Literal
 
 import numpy as np
@@ -49,9 +52,12 @@ from .localhost_codec import (
     SCHEMA_VERSION,
     LanContinuousSetupPayload,
     LanHelloPayload,
+    LanSegmentedHelloPayload,
     LanSetupPayload,
     PartyStageResult,
     RemoteErrorPayload,
+    SegmentEndPayload,
+    SegmentEndReceipt,
     WireEnvelope,
 )
 from .localhost_transport import deadline_after, receive_envelope, send_envelope
@@ -202,6 +208,7 @@ class LanContinuousRuntime:
         self, config: LanConfig, spec: ControllerSpec, fixed_point: FixedPointContext,
         range_contract: ControllerRangeContract, security_parameter: int,
         modulus_evidence: PrimeModulusEvidence | None,
+        *, _segment_hello: LanSegmentedHelloPayload | None = None,
     ) -> None:
         if config.role != "Client" or config.experiment_config is None:
             raise ValueError("连续运行必须使用 Client experiment 配置。")
@@ -231,8 +238,11 @@ class LanContinuousRuntime:
         self._failed = False
         self._finished = False
         self.session_id = self.distribution.session_id
-        hello = LanHelloPayload(config.topology.digest, secrets.token_hex(32),
-                                "lan-continuous-v1")
+        hello = (_segment_hello if _segment_hello is not None else
+                 LanHelloPayload(config.topology.digest, secrets.token_hex(32),
+                                 "lan-continuous-v1"))
+        self._last_result = None
+        self._round_started = False
         try:
             for role, address in (("P1", config.topology.p1_client),
                                   ("P2", config.topology.p2_client)):
@@ -277,15 +287,18 @@ class LanContinuousRuntime:
         """同一 session 逐轮推进；任何未确认回执使整个运行时失效。"""
         if self._failed or self._finished or self._step >= self.range_contract.horizon_steps:
             raise RuntimeError("LAN session 已失败、结束或超出配置步数。")
+        self._round_started = False
         try:
             value = normalize_step_input(v, self.spec.input_dimension)
             current = self.client.prepare_online(self.distribution, value, step=self._step)
             plan = current.p1_resources.plan
             if current.p2_resources.plan != plan:
                 raise ValueError("两方在线资源计划不一致。")
+            self._last_plan = plan
             deadline = deadline_after(self.config.step_timeout)
             endpoints: list[_ClientPartyEndpoint] = []
             for party, sock in enumerate(self._sockets):
+                self._round_started = True
                 online = PartyOnlineRound(
                     current.p1_input if party == 0 else current.p2_input,
                     current.p1_resources if party == 0 else current.p2_resources,
@@ -307,6 +320,7 @@ class LanContinuousRuntime:
                 "step": plan.step, "status": "double_committed",
                 "products": result.products, "truncations": result.truncations,
             })
+            self._last_result = result
             return np.array(result.output, dtype=float, copy=True)
         except Exception:
             self._failed = True
@@ -338,6 +352,243 @@ class LanContinuousRuntime:
         self._sockets.clear()
 
 
+class RunControl:
+    """线程安全、幂等的正常停止请求；发起门禁与请求共享锁，不关闭网络。"""
+
+    def __init__(self) -> None:
+        self._lock = RLock()
+        self._stop = False
+        self._on_stop: Callable[[], None] | None = None
+
+    def request_stop(self) -> None:
+        """停止先取得门禁则不再发起下一轮；已发起轮继续双提交及物理推进。"""
+        with self._lock:
+            # 在场景回调前发布停止位，重复 SIGINT/回调重入只读取意图，不能再调回场景。
+            if self._stop:
+                return
+            self._stop = True
+            if self._on_stop is not None:
+                self._on_stop()
+
+    @property
+    def stop_requested(self) -> bool:
+        with self._lock:
+            return self._stop
+
+    def bind_stop(self, callback: Callable[[], None]) -> None:
+        """场景接入拒绝新扰动的回调；不消费或取消已排队的区间事件。"""
+        with self._lock:
+            self._on_stop = callback
+            if self._stop:
+                callback()
+
+
+@dataclass(frozen=True, slots=True)
+class SegmentedStep:
+    """双提交后的只读控制能力；物理确认只能消费同一个对象一次。"""
+
+    run_id: str
+    segment_index: int
+    session_id: str
+    round_id: str
+    local_step: int
+    global_step: int
+    raw_control: tuple[float, ...]
+    products: int
+    truncations: int
+    resource_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SegmentRecord:
+    """双方核验的公开段记录；调用者交接后运行时释放旧段全部列表。"""
+
+    hello: LanSegmentedHelloPayload
+    session_id: str
+    steps: tuple[SegmentedStep, ...]
+    receipts: tuple[SegmentEndReceipt, ...]
+    setup: LanContinuousSetupPayload
+    connection_seconds: float
+    scale_ledger: object
+    range_verification: object
+    modulus_verification: object
+
+
+class LanSegmentedRuntime:
+    """有限静态控制器 session 的持续协调；物理状态由上层唯一 worker 拥有。"""
+
+    def __init__(self, config: LanConfig, spec: ControllerSpec,
+                 fixed_point: FixedPointContext, range_contract: ControllerRangeContract,
+                 security_parameter: int, modulus_evidence: PrimeModulusEvidence | None,
+                 *, control: RunControl) -> None:
+        if spec.state_dimension != 0:
+            raise ValueError("持续模式不支持非零 controller state；不能重置秘密状态。")
+        if (type(range_contract.horizon_steps) is not int
+                or not 1 <= range_contract.horizon_steps <= _MAX_CONTINUOUS_STEPS):
+            raise ValueError("segment_steps 必须是 1…1000 的整数。")
+        self.config, self.spec, self.fixed_point = config, spec, fixed_point
+        self.contract, self.security_parameter = range_contract, security_parameter
+        self.evidence, self.control = modulus_evidence, control
+        self.run_id = secrets.token_hex(32)
+        self.segment_index = self.global_start = self.confirmed_step_count = 0
+        self._previous_session = None
+        self._segment: LanContinuousRuntime | None = None
+        self._pending: SegmentedStep | None = None
+        self._records: list[SegmentedStep] = []
+        self._products = self._truncations = 0
+        self.phase = "CONNECTING"
+        self._connect()
+
+    def _connect(self) -> None:
+        self.phase = "CONNECTING" if self.segment_index == 0 else "CONNECTING_NEXT"
+        self.hello = LanSegmentedHelloPayload(
+            self.config.topology.digest, secrets.token_hex(32), self.run_id,
+            self.segment_index, self.global_start, self._previous_session,
+        )
+        started = time.monotonic()
+        self._segment = LanContinuousRuntime(
+            self.config, self.spec, self.fixed_point, self.contract,
+            self.security_parameter, self.evidence, _segment_hello=self.hello,
+        )
+        self.connection_seconds = time.monotonic() - started
+        self.phase = "RUNNING"
+
+    @property
+    def protocol_committed_count(self) -> int:
+        return self.global_start + (self._segment._step if self._segment else 0)
+
+    @property
+    def resource_counts(self) -> dict[str, int]:
+        return {"products_consumed": self._products, "truncations_consumed": self._truncations}
+
+    @property
+    def segment_full(self) -> bool:
+        return self.confirmed_step_count - self.global_start == self.contract.horizon_steps
+
+    def step(self, v: Any) -> SegmentedStep | None:
+        """轮发起门禁成功后只完成该轮；停止请求不会中断 commit I/O。"""
+        if self.phase != "RUNNING" or self._pending is not None or self.segment_full:
+            raise RuntimeError("当前状态不能发起下一轮。")
+        with self.control._lock:
+            if self.control._stop:
+                return None
+            self.phase = "ROUND_IN_FLIGHT"
+        assert self._segment is not None
+        try:
+            raw = self._segment.step(v)
+            result = self._segment._last_result
+            # 资源身份由 Client 的原计划产生；不另造身份或重新生成材料。
+            plan = self._segment._last_plan
+            self._pending = SegmentedStep(
+                self.run_id, self.segment_index, self._segment.session_id,
+                result.round_id, result.step, self.confirmed_step_count,
+                tuple(float(value) for value in raw), result.products, result.truncations,
+                tuple(item.resource_id for item in (*plan.product_resources,
+                                                    *plan.state_truncation_resources)),
+            )
+            self._products += result.products
+            self._truncations += result.truncations
+            self.phase = "AWAITING_PLANT"
+            return self._pending
+        except Exception:
+            self.phase = "UNCERTAIN" if self._segment._round_started else "FAILED"
+            self.close()
+            raise
+
+    def confirm_applied(self, identity: SegmentedStep) -> None:
+        """场景推进并验证后消费控制能力，拒绝复制、重复和错段确认。"""
+        if self.phase != "AWAITING_PLANT" or identity is not self._pending:
+            self.phase = "FAILED"
+            self.close()
+            raise RuntimeError("物理确认不匹配当前唯一控制结果。")
+        self._records.append(identity)
+        self.confirmed_step_count += 1
+        self._pending = None
+        self.phase = "RUNNING"
+
+    def end_segment(self) -> SegmentRecord:
+        """向双方先发送同一个 action，再于共享 deadline 验证独立计数回执。"""
+        if self.phase != "RUNNING" or self._pending is not None:
+            raise RuntimeError("未确认物理推进或失败状态不得正常结束。")
+        assert self._segment is not None
+        segment = self._segment
+        with self.control._lock:
+            action = "stop" if self.control._stop else "continue"
+            if action == "continue" and not self.segment_full:
+                raise RuntimeError("只有满段才能继续。")
+            self.phase = "STOPPING" if action == "stop" else "ENDING_SEGMENT"
+        end = SegmentEndPayload(
+            self.run_id, self.segment_index, self.global_start, len(self._records),
+            self.confirmed_step_count,
+            self._records[-1].round_id if self._records else None, action,
+        )
+        deadline = deadline_after(self.config.shutdown_timeout)
+        requests = []
+        try:
+            for party, sock in enumerate(segment._sockets):
+                request = WireEnvelope(
+                    SCHEMA_VERSION, "request", "Client", "P1" if party == 0 else "P2",
+                    segment._sequences[party], "segment_end", segment.session_id,
+                    None, None, None, end,
+                )
+                requests.append(request)
+                send_envelope(sock, request, deadline=deadline, limit=_FRAME_LIMIT)
+            receipts = []
+            for sock, request in zip(segment._sockets, requests, strict=True):
+                response = receive_envelope(sock, deadline=deadline, limit=_FRAME_LIMIT)
+                _validate_party_reply(response, request)
+                receipt = response.payload
+                expected = SegmentEndReceipt(
+                    request.recipient, segment.session_id, end, self.confirmed_step_count,
+                    segment._products, segment._truncations,
+                )
+                if receipt != expected:
+                    raise ValueError("段关闭回执与双提交/物理确认前缀不一致。")
+                receipts.append(receipt)
+            setup = LanContinuousSetupPayload(
+                self.fixed_point.modulus, self.fixed_point.integer_bits,
+                self.fixed_point.fractional_bits, self.security_parameter,
+                self.contract.state_payload_bounds, self.contract.input_payload_bounds,
+                self.contract.horizon_steps, self.evidence,
+            )
+            record = SegmentRecord(
+                self.hello, segment.session_id, tuple(self._records), tuple(receipts), setup,
+                self.connection_seconds, segment.scale_ledger, segment.range_verification,
+                segment.modulus_verification,
+            )
+            self._records.clear()
+            self.phase = "STOPPED" if action == "stop" else "CONNECTING_NEXT"
+            return record
+        except Exception:
+            self.phase = "UNCERTAIN"
+            raise
+        finally:
+            segment.close()
+
+    def next_segment(self) -> None:
+        """只有双方 continue 已确认才能计划重连；停止位贯穿新握手。"""
+        if self.phase != "CONNECTING_NEXT":
+            raise RuntimeError("段过渡未确认，禁止重连。")
+        assert self._segment is not None
+        self._previous_session = self._segment.session_id
+        self.global_start = self.confirmed_step_count
+        self.segment_index += 1
+        self._segment = None
+        try:
+            self._connect()
+        except Exception:
+            self.phase = "FAILED"
+            self.close()
+            raise
+
+    def close(self) -> None:
+        """故障清理只关闭连接，不能产生正常停止结果。"""
+        if self.phase not in {"STOPPED", "FAILED", "UNCERTAIN", "CANCELLED"}:
+            self.phase = "FAILED"
+        if self._segment is not None:
+            self._segment.close()
+
+
 def run_party_single_step(config: LanConfig) -> dict[str, object]:
     """P1/P2 只监听固定端口；由 hello 选择单步或有界连续模式。"""
     if config.role not in {"P1", "P2"}:
@@ -347,12 +598,51 @@ def run_party_single_step(config: LanConfig) -> dict[str, object]:
     address = config.topology.p1_client if party == 0 else config.topology.p2_client
     client_listener = listener(address)
     peer_listener = None
-    client_socket: socket.socket | None = None
-    peer_socket: socket.socket | None = None
-    peer_port: LocalhostProtocol3PeerPort | None = None
     try:
         if party == 0:
             peer_listener = listener(config.topology.p1_peer)
+        tail = None
+        while True:
+            summary, tail = _run_party_session(config, client_listener, peer_listener, tail)
+            if tail is None:
+                return summary
+    finally:
+        client_listener.close()
+        if peer_listener is not None:
+            peer_listener.close()
+
+
+@dataclass(frozen=True, slots=True)
+class _PartyRunTail:
+    """角色仅保留已确认的公开链尾；旧协议对象和材料均随 session 释放。"""
+
+    run_id: str
+    next_segment: int
+    global_start: int
+    session_id: str
+    setup: LanContinuousSetupPayload
+    layout: object
+
+
+def _validate_segment_chain(hello: LanSegmentedHelloPayload, session: str,
+                            tail: _PartyRunTail | None) -> None:
+    if tail is None:
+        if (hello.segment_index, hello.global_start, hello.previous_session_id) != (0, 0, None):
+            raise ValueError("首段身份错误。")
+    elif (hello.run_id, hello.segment_index, hello.global_start, hello.previous_session_id) != (
+        tail.run_id, tail.next_segment, tail.global_start, tail.session_id
+    ) or session == tail.session_id:
+        raise ValueError("段链存在外来 run、跳段或旧 session。")
+
+
+def _run_party_session(config: LanConfig, client_listener: socket.socket,
+                       peer_listener: socket.socket | None,
+                       tail: _PartyRunTail | None) -> tuple[dict[str, object], _PartyRunTail | None]:
+    """旧模式与新模式共享唯一的握手、离线装配和 Protocol 3 单段计算。"""
+    role = config.role
+    party = 0 if role == "P1" else 1
+    client_socket = peer_socket = peer_port = None
+    try:
         startup_deadline = deadline_after(config.startup_timeout)
         _LAN_LOG.info("%s 已启动，正在等待 Client（最多 %.0f 秒）。", role,
                       config.startup_timeout)
@@ -364,6 +654,10 @@ def run_party_single_step(config: LanConfig) -> dict[str, object]:
             config,
             startup_deadline,
         )
+        if isinstance(hello, LanSegmentedHelloPayload):
+            _validate_segment_chain(hello, session, tail)
+        elif tail is not None:
+            raise ValueError("持续 run 不允许切回旧模式。")
         _LAN_LOG.info("%s 与 Client 的协议连接已建立。", role)
         if party == 0:
             assert peer_listener is not None
@@ -388,11 +682,12 @@ def run_party_single_step(config: LanConfig) -> dict[str, object]:
         setup = setup_request.payload
         if hello.mode == "lan-single-step-v1" and not isinstance(setup, LanSetupPayload):
             raise TypeError("单步模式的公开 setup 类型不合法。")
-        if hello.mode == "lan-continuous-v1" and not isinstance(setup, LanContinuousSetupPayload):
+        if (hello.mode in {"lan-continuous-v1", "lan-segmented-v1"}
+                and not isinstance(setup, LanContinuousSetupPayload)):
             raise TypeError("连续模式的公开 setup 类型不合法。")
         if not isinstance(setup, (LanSetupPayload, LanContinuousSetupPayload)):
             raise TypeError("公开 LAN setup 类型不合法。")
-        if (hello.mode == "lan-continuous-v1"
+        if (hello.mode in {"lan-continuous-v1", "lan-segmented-v1"}
                 and not 1 <= setup.horizon_steps <= _MAX_CONTINUOUS_STEPS):
             raise ValueError("LAN 连续 setup 步数超出有界范围。")
         modulus_evidence = (setup.modulus_evidence
@@ -406,6 +701,10 @@ def run_party_single_step(config: LanConfig) -> dict[str, object]:
             setup.input_payload_bounds,
             setup.horizon_steps,
         )
+        if isinstance(hello, LanSegmentedHelloPayload) and (
+            setup.state_payload_bounds or (tail is not None and setup != tail.setup)
+        ):
+            raise ValueError("持续模式只接受冻结的零维状态数值契约。")
         _party_reply(client_socket, setup_request, None, config.startup_timeout)
         offline_request = _party_receive(
             client_socket, role, 3, "offline", session, config.startup_timeout
@@ -417,6 +716,11 @@ def run_party_single_step(config: LanConfig) -> dict[str, object]:
             or material.session_id != session
         ):
             raise ValueError("离线单方材料的角色不匹配。")
+        if isinstance(hello, LanSegmentedHelloPayload) and (
+            material.layout.state_dimension != 0
+            or (tail is not None and material.layout != tail.layout)
+        ):
+            raise ValueError("持续模式只支持冻结的零维 controller layout。")
         offline = rehydrate_offline_material(material, range_contract)
         role_object = P1(offline) if party == 0 else P2(offline)
         _party_reply(client_socket, offline_request, None, config.startup_timeout)
@@ -426,11 +730,40 @@ def run_party_single_step(config: LanConfig) -> dict[str, object]:
         )
         peer_port.bind(session)
         steps = 1 if hello.mode == "lan-single-step-v1" else setup.horizon_steps
-        for expected_step in range(steps):
+        segmented = isinstance(hello, LanSegmentedHelloPayload)
+        products = truncations = committed = 0
+        last_round = None
+        while True:
             # 首轮也允许等待 Client 先完成纯场景预检；每轮操作有独立总 deadline。
-            online_request = _party_receive(
-                client_socket, role, sequence, "online", session, config.idle_timeout
+            if not segmented and committed == steps:
+                break
+            online_request = receive_envelope(
+                client_socket, deadline=deadline_after(config.idle_timeout), limit=_FRAME_LIMIT
             )
+            if segmented and online_request.operation == "segment_end":
+                _check_request(online_request, role, sequence, "segment_end", session)
+                end = online_request.payload
+                if not isinstance(end, SegmentEndPayload):
+                    raise TypeError("段结束请求类型错误。")
+                actual = SegmentEndPayload(
+                    hello.run_id, hello.segment_index, hello.global_start, committed,
+                    hello.global_start + committed, last_round, end.action,
+                )
+                if end != actual or (end.action == "continue" and committed != steps):
+                    raise ValueError("段结束与本方实际提交前缀不一致。")
+                receipt = SegmentEndReceipt(role, session, actual,
+                                            hello.global_start + committed, products, truncations)
+                _party_reply(client_socket, online_request, receipt, config.shutdown_timeout)
+                tail = _PartyRunTail(hello.run_id, hello.segment_index + 1,
+                                     hello.global_start + committed, session, setup, material.layout)
+                summary = {"status": "closed", "role": role, "pid": os.getpid(),
+                           "steps_committed": receipt.cumulative_committed_count,
+                           "final_receipt": asdict(receipt), "transport": config.transport}
+                return summary, tail if end.action == "continue" else None
+            _check_request(online_request, role, sequence, "online", session)
+            expected_step = committed
+            if expected_step >= steps:
+                raise ValueError("当前有限段已耗尽，必须先确认段结束。")
             if (online_request.step != expected_step or online_request.round_id is None
                     or online_request.resource_id is not None):
                 raise ValueError("LAN online step 必须连续递增。")
@@ -479,6 +812,10 @@ def run_party_single_step(config: LanConfig) -> dict[str, object]:
                     raise
                 sequence += 1
                 if command_request.payload.operation == "commit":
+                    committed += 1
+                    products += len(endpoint.plan.product_resources)
+                    truncations += len(endpoint.plan.state_truncation_resources)
+                    last_round = endpoint.plan.round_id
                     break
         shutdown_request = _party_receive(
             client_socket, role, sequence, "shutdown", session, config.shutdown_timeout
@@ -488,18 +825,15 @@ def run_party_single_step(config: LanConfig) -> dict[str, object]:
             "status": "closed", "role": role, "pid": os.getpid(),
             "profile_sha256": config.topology.digest,
         }
-        if hello.mode == "lan-continuous-v1":
+        if hello.mode in {"lan-continuous-v1", "lan-segmented-v1"}:
             summary.update({
                 "steps_committed": steps,
                 "transport": config.transport,
                 "tls_version": (client_socket.version()
                                 if config.transport == "mutual_tls" else None),
             })
-        return summary
+        return summary, None
     finally:
-        client_listener.close()
-        if peer_listener is not None:
-            peer_listener.close()
         if client_socket is not None:
             client_socket.close()
         if peer_port is not None:
@@ -513,7 +847,7 @@ def _hello(
     sender: Role,
     recipient: Role,
     session: str,
-    hello: LanHelloPayload,
+    hello: LanHelloPayload | LanSegmentedHelloPayload,
     timeout: float,
 ) -> None:
     envelope = WireEnvelope(
@@ -559,8 +893,8 @@ def _accept_hello(
     config: LanConfig,
     deadline: float,
     *,
-    expected: tuple[str, LanHelloPayload] | None = None,
-) -> tuple[str, LanHelloPayload]:
+    expected: tuple[str, LanHelloPayload | LanSegmentedHelloPayload] | None = None,
+) -> tuple[str, LanHelloPayload | LanSegmentedHelloPayload]:
     request = receive_envelope(sock, deadline=deadline, limit=_FRAME_LIMIT)
     payload = request.payload
     if (
@@ -573,7 +907,7 @@ def _accept_hello(
         or request.round_id is not None
         or request.step is not None
         or request.resource_id is not None
-        or not isinstance(payload, LanHelloPayload)
+        or not isinstance(payload, (LanHelloPayload, LanSegmentedHelloPayload))
         or payload.profile_sha256 != config.topology.digest
         or (expected is not None and (request.session_id, payload) != expected)
     ):
