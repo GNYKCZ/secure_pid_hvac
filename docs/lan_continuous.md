@@ -49,7 +49,12 @@ on_step=..., on_segment=..., session=...)` 是同步 worker。`control.request_s
 Client 保留唯一真实 plant、adapter、monitor、目标及扰动队列，段界不重置观测稳定计数。
 冻结数值来源每次续段重查，配置变化失败退出，不热切换增益或工作域。
 
-该后端不写长轨迹正式产物，不运行 ideal 重放，不显示 GUI 停止按钮；这些由 #101 实现。
+该 headless 后端不写长轨迹正式产物或运行 ideal 重放。
+默认 `scripts/run_cart_pole_client.py` 的 Tk 持续窗口在同一个 prepared 执行入口上
+增加“停止并保存”、可靠分段暂存、停后独立重放及 guarded 完整发布；
+用 `--finite` 保留有限窗口。操作和 format v1/v3 reader 见
+[倒立摆持续动画](cart_pole_interactive.md)。新 runner 可选 `phase` 回调在实际阶段通知，
+没有回调的 headless 调用仍返回原 stopped/失败契约。
 stopped 不是 artifact complete。控制律/阶段切换及非零秘密状态迁移由后续设计决定。
 本机三进程和 TLS/insecure 两种传输测试不替代 #76 的真实三机或实时验收。
 

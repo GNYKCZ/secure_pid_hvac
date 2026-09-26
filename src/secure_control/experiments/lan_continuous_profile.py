@@ -39,7 +39,7 @@ from secure_control.scenarios.quadruple_tank.secure_experiment import (
     assemble_quadruple_tank_plan,
     validate_quadruple_tank_result,
 )
-from secure_control.simulation import SimulationPlan, SimulationResult
+from secure_control.simulation import ScenarioMetadata, SimulationPlan, SimulationResult
 
 from .artifacts import ExperimentRecord
 from .cart_pole_evidence import (
@@ -169,20 +169,10 @@ def _tank(path: str | Path) -> PreparedLanExperiment:
     )
 
 
-def _cart_pole(path: str | Path,
-               session: InteractiveSession | None = None) -> PreparedLanExperiment:
-    """#91 的唯一 plant/controller/adapter 来源仅在 Client 场景层装配。"""
-    profile = load_cart_pole_lan_profile(path)
-    scenario = CartPoleSecureExperiment(profile.plant, profile.balance, profile.spec)
-    interactive = InteractiveCartPoleExperiment(scenario, session) if session is not None else None
-    scenario_version = "2" if interactive is not None else CART_POLE_VERSION
-
-    def verify_run(run_dir: Path) -> None:
-        """发布后必须经 canonical 与场景双重 reader 才能返回 complete。"""
-        load_verified_cart_pole_run(run_dir)
-
-    effective = {
-        "scenario": {"name": "cart_pole", "version": scenario_version},
+def _cart_pole_config(profile, version: str) -> dict:
+    """有限/持续路径共享同一次 profile 的公开定义，不制造第二份配置来源。"""
+    return {
+        "scenario": {"name": "cart_pole", "version": version},
         "fractional_bits": profile.ell, "paper_parameter_bits": profile.parameter_bits,
         "runtime_payload_bits": profile.runtime_payload_bits,
         "security_parameter": profile.security_parameter, "q": profile.q,
@@ -200,6 +190,21 @@ def _cart_pole(path: str | Path,
         "controller_spec": {name: getattr(profile.spec, name).tolist()
                             for name in ("A", "B", "C", "D", "x0")},
     }
+
+
+def _cart_pole(path: str | Path,
+               session: InteractiveSession | None = None) -> PreparedLanExperiment:
+    """#91 的唯一 plant/controller/adapter 来源仅在 Client 场景层装配。"""
+    profile = load_cart_pole_lan_profile(path)
+    scenario = CartPoleSecureExperiment(profile.plant, profile.balance, profile.spec)
+    interactive = InteractiveCartPoleExperiment(scenario, session) if session is not None else None
+    scenario_version = "2" if interactive is not None else CART_POLE_VERSION
+
+    def verify_run(run_dir: Path) -> None:
+        """发布后必须经 canonical 与场景双重 reader 才能返回 complete。"""
+        load_verified_cart_pole_run(run_dir)
+
+    effective = _cart_pole_config(profile, scenario_version)
     if interactive is not None:
         effective["disturbance_policy"] = dict(DISTURBANCE_POLICY)
     return PreparedLanExperiment(
@@ -248,6 +253,9 @@ class PreparedSegmentedExperiment:
     evidence: PrimeModulusEvidence | None
     scene: SustainedCartPoleExperiment
     recheck_sources: Callable[[], None]
+    metadata: ScenarioMetadata
+    effective_config: dict
+    output_root: Path
 
 
 def load_segmented_experiment(path: str | Path, segment_steps: int,
@@ -263,8 +271,13 @@ def load_segmented_experiment(path: str | Path, segment_steps: int,
         fractional_bits=profile.ell, parameter_bits=profile.parameter_bits,
         runtime_payload_bits=profile.runtime_payload_bits, modulus=profile.q,
     )
+    scene = SustainedCartPoleExperiment(profile.plant, profile.balance, session)
+    effective = _cart_pole_config(profile, "3")
+    effective.update({"mode": "segmented", "segment_capacity": segment_steps,
+                      "segment_range": {"contract": asdict(contract), "proof": _proof},
+                      "disturbance_policy": dict(DISTURBANCE_POLICY),
+                      "modulus_evidence": asdict(profile.evidence) if profile.evidence else None})
     return PreparedSegmentedExperiment(
         profile.spec, context, contract, profile.security_parameter, profile.evidence,
-        SustainedCartPoleExperiment(profile.plant, profile.balance, session),
-        profile.recheck_sources,
+        scene, profile.recheck_sources, scene.adapter.metadata, effective, profile.output_root,
     )

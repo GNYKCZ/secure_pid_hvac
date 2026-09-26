@@ -111,6 +111,7 @@ def run_client_segmented(config: LanConfig, *, segment_steps: int = 400,
                          control: RunControl,
                          on_step: Callable[[ConfirmedStep], None] | None = None,
                          on_segment: Callable[[CompletedSegment], None] | None = None,
+                         phase: Callable[[str], None] | None = None,
                          session=None) -> dict[str, object]:
     """运行到正常停止请求或故障；不将后端 stopped 冒充正式 artifact complete。"""
     # 队列与场景选择由装配层拥有；核心仅处理协议身份、双提交及确认前缀。
@@ -122,25 +123,42 @@ def run_client_segmented(config: LanConfig, *, segment_steps: int = 400,
     if not isinstance(session, InteractiveSession) or not isinstance(control, RunControl):
         raise TypeError("持续模式需要 RunControl 和 InteractiveSession。")
     experiment = load_segmented_experiment(config.experiment_config, segment_steps, session)
+    return _run_prepared_segmented(config, experiment, control=control, session=session,
+                                   on_step=on_step, on_segment=on_segment, phase=phase)
+
+
+def _run_prepared_segmented(config, experiment, *, control, session,
+                            on_step=None, on_segment=None, phase=None) -> dict[str, object]:
+    """唯一持续循环接收已装配场景；保存/GUI 与 headless 不重复 parse 或创建 plant。"""
     control.bind_stop(session.reject_new)
     runtime = None
     records: list[ConfirmedStep] = []
-    phase = "CONNECTING"
+    phase_name = "CONNECTING"
+
+    def progress(value, display=None):
+        """处理实际进入该阶段后才发通知，失败出口保留同一阶段事实。"""
+        nonlocal phase_name
+        phase_name = value
+        if phase is not None:
+            phase(display if display is not None else value)
+
     try:
+        progress("CONNECTING")
         experiment.recheck_sources()
         runtime = LanSegmentedRuntime(
             config, experiment.spec, experiment.context, experiment.contract,
             experiment.security_parameter, experiment.evidence, control=control,
         )
+        progress("RUNNING")
         while True:
             if session.cancelled.is_set():
                 raise RuntimeError("Client 运行已取消。")
             if control.stop_requested or runtime.segment_full:
-                phase = "ENDING_SEGMENT"
+                progress("ENDING_SEGMENT", "STOPPING" if control.stop_requested else None)
                 segment = runtime.end_segment()
                 if session.cancelled.is_set():
                     raise RuntimeError("Client 运行已取消。")
-                phase = "RECORDING_SEGMENT"
+                progress("RECORDING_SEGMENT")
                 if on_segment is not None:
                     on_segment(CompletedSegment(segment, tuple(records)))
                 records.clear()
@@ -162,22 +180,23 @@ def run_client_segmented(config: LanConfig, *, segment_steps: int = 400,
                     }
                 # 发布公开段后不保留它；握手/材料重建期间场景状态及停止位继续有效。
                 del segment
-                phase = "CONNECTING_NEXT"
+                progress("CONNECTING_NEXT")
                 experiment.recheck_sources()
                 runtime.next_segment()
+                progress("RUNNING")
                 continue
-            phase = "INPUT"
+            progress("INPUT")
             value = experiment.scene.controller_input()
-            phase = "ROUND_IN_FLIGHT"
+            progress("ROUND_IN_FLIGHT")
             identity = runtime.step(value)
             if identity is None:
                 continue
-            phase = "AWAITING_PLANT"
+            progress("AWAITING_PLANT")
             snapshot = experiment.scene.advance(identity.global_step, identity.raw_control)
             runtime.confirm_applied(identity)
             record = ConfirmedStep(identity, snapshot)
             records.append(record)
-            phase = "RECORDING_STEP"
+            progress("RECORDING_STEP")
             if on_step is not None:
                 on_step(record)
     except Exception as error:  # noqa: BLE001 - 生命周期出口不披露协议秘密或异常载荷
@@ -185,7 +204,7 @@ def run_client_segmented(config: LanConfig, *, segment_steps: int = 400,
         return {
             "status": ("cancelled" if session.cancelled.is_set() else
                        "uncertain" if uncertain else "failed"),
-            "category": type(error).__name__, "failure_phase": phase,
+            "category": type(error).__name__, "failure_phase": phase_name,
             "run_id": runtime.run_id if runtime is not None else None,
             "segment_index": runtime.segment_index if runtime is not None else 0,
             "session_id": runtime._segment.session_id if runtime and runtime._segment else None,
@@ -325,7 +344,18 @@ def _run() -> int:
     _enable_terminal_progress()
     if args.role == "redraw":
         try:
-            target = redraw_control_triptych(args.run_dir, args.output)
+            if (args.run_dir / "run.json").exists():
+                from .cart_pole_segmented_evidence import (
+                    FORMAT,
+                    HEADER_LIMIT,
+                    _read,
+                    redraw_segmented_control,
+                )
+                if _read(args.run_dir / "run.json", HEADER_LIMIT).get("format") != FORMAT:
+                    raise ValueError("未知聚合产物格式。")
+                target = redraw_segmented_control(args.run_dir, args.output)
+            else:
+                target = redraw_control_triptych(args.run_dir, args.output)
         except (ValueError, TypeError, OSError) as error:
             return _failure("Client", 2, "verified_redraw", error)
         print(json.dumps({"status": "complete", "figure": str(target)},
