@@ -7,8 +7,10 @@ import json
 import logging
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
+from threading import Event
 
 from secure_control.execution.lan_config import LanConfig, load_lan_config
 from secure_control.execution.lan_runtime import (
@@ -30,7 +32,7 @@ from secure_control.scenarios.hvac.integration import HvacScenario
 from secure_control.simulation import compare_closed_loops
 
 from .artifacts import SCHEMA_VERSION, load_artifacts, write_artifacts
-from .lan_continuous_profile import load_prepared_lan_experiment
+from .lan_continuous_profile import PreparedLanExperiment, load_prepared_lan_experiment
 from .plotting import redraw_control_triptych, verify_control_triptych, write_control_triptych
 from .provenance import collect_provenance
 
@@ -75,13 +77,36 @@ def run_client_continuous(config: LanConfig) -> dict[str, object]:
     if config.experiment_config is None:
         raise ValueError("缺少 Client experiment profile。")
     experiment = load_prepared_lan_experiment(config.experiment_config)
+    return _run_prepared_client(config, experiment)
+
+
+def _run_prepared_client(config: LanConfig, experiment: PreparedLanExperiment,
+                         *, phase: Callable[[str], None] | None = None,
+                         cancelled: Event | None = None) -> dict[str, object]:
+    """通用会话/资源/正式发布只保留一份；交互入口仅换执行计划。"""
+    def check_cancelled() -> None:
+        if cancelled is not None and cancelled.is_set():
+            raise RuntimeError("Client 运行已取消。")
+
+    check_cancelled()
+    if phase is not None:
+        phase("connecting")
     runtime = LanContinuousRuntime(
         config, experiment.spec, experiment.context, experiment.contract,
         experiment.security_parameter, experiment.evidence,
     )
     try:
+        check_cancelled()
+        if phase is not None:
+            phase("connected")
         plan = experiment.build_plan(runtime)
-        result = compare_closed_loops(plan.ideal, plan.secure, plan.sample_times)
+        if phase is not None:
+            phase("running")
+        result = (experiment.execute_plan(plan) if experiment.execute_plan is not None
+                  else compare_closed_loops(plan.ideal, plan.secure, plan.sample_times))
+        check_cancelled()
+        if phase is not None:
+            phase("verifying")
         experiment.validate_result(result)
         if runtime.scale_ledger.state_truncation_bits != experiment.expected_state_truncation_bits:
             raise ValueError("Protocol 2 截断尺度与场景契约不符。")
@@ -103,6 +128,7 @@ def run_client_continuous(config: LanConfig) -> dict[str, object]:
         }:
             raise ValueError("实际资源消费与逐步 Protocol 3 计划不符。")
         experiment.recheck_sources()
+        check_cancelled()
         runtime.finish()
     finally:
         runtime.close()
@@ -133,8 +159,10 @@ def run_client_continuous(config: LanConfig) -> dict[str, object]:
         names = write_control_triptych(record, stage, experiment.control_channel)
         if experiment.write_scenario_evidence is not None:
             names += experiment.write_scenario_evidence(record, stage)
+        check_cancelled()
         return names
 
+    check_cancelled()
     artifact = write_artifacts(
         result, plan.metadata, experiment.effective_config, provenance,
         output_root=experiment.output_root,

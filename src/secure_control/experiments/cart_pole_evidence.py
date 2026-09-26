@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 
 import numpy as np
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
 
 from secure_control.crypto import FixedPointContext
 from secure_control.scenarios.cart_pole.contract import CartPoleContract
@@ -14,12 +16,19 @@ from secure_control.scenarios.cart_pole.controller import (
     build_cart_pole_controller_spec,
 )
 from secure_control.scenarios.cart_pole.experiment import BalanceMonitor
+from secure_control.scenarios.cart_pole.interactive import PULSE_FORCE_N, PULSE_PHASE
 from secure_control.scenarios.cart_pole.plant import CartPolePlant
 from secure_control.scenarios.cart_pole.secure_experiment import CartPoleSecureExperiment
 
 from .artifacts import ExperimentRecord, _digest, _read_json, load_artifacts
 
 EVIDENCE_NAME = "cart_pole_evidence.json"
+MOTION_NAME = "cart_pole_motion.png"
+MOTION_MANIFEST_NAME = "cart_pole_motion_plot.json"
+DISTURBANCE_POLICY = {
+    "kind": "horizontal_cart_force_pulse", "force_n": PULSE_FORCE_N,
+    "duration_steps": 1, "phase": PULSE_PHASE,
+}
 
 
 def _numeric_array(value: object, shape: tuple[int, ...]) -> np.ndarray:
@@ -59,9 +68,42 @@ def verify_cart_pole_evidence(record: object, run_dir: Path) -> None:
                                 config["fractional_bits"])
     encoded_d = np.asarray(context.encode(spec.D), dtype=object).reshape(4)
     n = balance.horizon_steps
+    scenario = config.get("scenario")
+    version = scenario.get("version") if isinstance(scenario, dict) else None
+    if version == "1":
+        if payload.get("schema_version") != 1 or any(
+            name in payload for name in ("disturbance_force_n", "events")
+        ):
+            raise ValueError("无扰倒立摆证据版本不一致。")
+        disturbance = np.zeros(n, dtype=np.float64)
+    elif version == "2":
+        if (config.get("disturbance_policy") != DISTURBANCE_POLICY
+                or type(payload.get("schema_version")) is not int
+                or payload["schema_version"] != 2):
+            raise ValueError("有扰倒立摆证据版本或策略不一致。")
+        disturbance = _numeric_array(payload.get("disturbance_force_n"), (n,))
+        if any(force not in (-PULSE_FORCE_N, 0.0, PULSE_FORCE_N)
+               for force in disturbance):
+            raise ValueError("倒立摆外力仅允许单步 ±1 N 脉冲。")
+        events = payload.get("events")
+        expected_events = [
+            {"step": index, "force_n": float(force), "duration_steps": 1,
+             "phase": PULSE_PHASE}
+            for index, force in enumerate(disturbance) if force != 0
+        ]
+        if (not isinstance(events, list) or len(events) != len(expected_events)
+                or any(not isinstance(event, dict) or set(event) != set(expected)
+                       or type(event["step"]) is not int
+                       or type(event["duration_steps"]) is not int
+                       or type(event["force_n"]) not in (int, float)
+                       or event != expected
+                       for event, expected in zip(events, expected_events, strict=True))):
+            raise ValueError("倒立摆事件表与逐步外力不一致。")
+    else:
+        raise ValueError("倒立摆场景版本无效。")
     evidence_time = _numeric_array(payload.get("time_s"), (n + 1,))
     evidence_reference = _numeric_array(payload.get("reference"), (n + 1, 4))
-    if (type(payload.get("schema_version")) is not int or payload["schema_version"] != 1
+    if (type(payload.get("schema_version")) is not int
             or payload.get("run_id") != record.run_id
             or type(payload.get("sample_count")) is not int or payload["sample_count"] != n
             or record.result.time.size != n
@@ -125,7 +167,10 @@ def verify_cart_pole_evidence(record: object, run_dir: Path) -> None:
             if status != statuses[index] or monitor.stable_count != counts[index]:
                 raise ValueError("倒立摆稳定判定或连续计数无效。")
             if index < n:
-                plant.step(np.array([applied[index]], dtype=np.float64))
+                total = applied[index] + disturbance[index]
+                if abs(total) > plant_contract.max_applied_force_n:
+                    raise ValueError("倒立摆外力与控制器合力超出物理输入界。")
+                plant.step(np.array([total], dtype=np.float64))
         if statuses[-1] != "stable":
             raise ValueError("倒立摆终点尚未稳定。")
         raw_by_branch[name] = raw
@@ -138,15 +183,82 @@ def verify_cart_pole_evidence(record: object, run_dir: Path) -> None:
 
 
 def write_cart_pole_evidence(record: object, stage: Path,
-                             experiment: CartPoleSecureExperiment) -> tuple[str, ...]:
+                             experiment: CartPoleSecureExperiment,
+                             disturbances: tuple[float, ...] | None = None) -> tuple[str, ...]:
     """在正式 staging 写场景证据并于原子发布前进行语义重放。"""
     payload = experiment.evidence(record.run_id, record.result)
+    if disturbances is not None:
+        if len(disturbances) != payload["sample_count"]:
+            raise ValueError("倒立摆逐步外力记录不完整。")
+        payload["schema_version"] = 2
+        payload["disturbance_force_n"] = list(disturbances)
+        payload["events"] = [
+            {"step": step, "force_n": float(force), "duration_steps": 1,
+             "phase": PULSE_PHASE}
+            for step, force in enumerate(disturbances) if force != 0
+        ]
     (stage / EVIDENCE_NAME).write_text(
         json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False) + "\n",
         encoding="utf-8",
     )
     verify_cart_pole_evidence(record, stage)
-    return (EVIDENCE_NAME,)
+    if disturbances is None:
+        return (EVIDENCE_NAME,)
+    _write_motion_plot(record, payload, stage)
+    _verify_motion_plot(record, stage)
+    return (EVIDENCE_NAME, MOTION_NAME, MOTION_MANIFEST_NAME)
+
+
+def _write_motion_plot(record: ExperimentRecord, payload: dict[str, object], stage: Path) -> None:
+    """仅从本次正式轨迹与已重放的侧证据画位置、摆角和事件。"""
+    figure = Figure(figsize=(9, 6), layout="constrained")
+    FigureCanvasAgg(figure)
+    axes = figure.subplots(2, 1, sharex=True)
+    times = np.asarray(payload["time_s"])
+    for name, color in (("ideal", "tab:blue"), ("secure", "tab:orange")):
+        values = np.asarray(payload["branches"][name]["observations"])
+        axes[0].plot(times, values[:, 0], color=color, label=f"{name} p")
+        axes[1].plot(times, values[:, 2], color=color, label=f"{name} theta")
+        stable = np.asarray(payload["branches"][name]["statuses"]) == "stable"
+        axes[0].plot(times[stable], values[stable, 0], ".", color=color,
+                     markersize=3, label=f"{name} stable observations")
+    for axis, ylabel in zip(axes, ("Cart position p (m)", "Pole angle theta (rad)"),
+                            strict=True):
+        axis.axhline(0, color="black", linestyle="--", linewidth=.7, label="target 0")
+        for event in payload["events"]:
+            axis.axvline(times[event["step"]], color="tab:red", alpha=.35)
+        axis.set_ylabel(ylabel)
+        axis.grid(True, alpha=.3)
+        axis.legend()
+    axes[1].set_xlabel("Simulation time (s); red lines: applied disturbance")
+    figure.suptitle(f"Cart-pole motion · {record.run_id}")
+    try:
+        figure.savefig(stage / MOTION_NAME, dpi=160, format="png")
+    finally:
+        figure.clear()
+    manifest = {
+        "run_id": record.run_id,
+        "sample_count": int(record.result.time.size),
+        "trajectory_sha256": _digest(stage / "trajectory.csv"),
+        "evidence_sha256": _digest(stage / EVIDENCE_NAME),
+        "figure_sha256": _digest(stage / MOTION_NAME),
+    }
+    (stage / MOTION_MANIFEST_NAME).write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _verify_motion_plot(record: ExperimentRecord, run_dir: Path) -> None:
+    manifest = _read_json(run_dir / MOTION_MANIFEST_NAME)
+    if manifest != {
+        "run_id": record.run_id,
+        "sample_count": int(record.result.time.size),
+        "trajectory_sha256": _digest(run_dir / "trajectory.csv"),
+        "evidence_sha256": _digest(run_dir / EVIDENCE_NAME),
+        "figure_sha256": _digest(run_dir / MOTION_NAME),
+    }:
+        raise ValueError("倒立摆运动图与正式证据来源不一致。")
 
 
 def load_verified_cart_pole_run(run_dir: str | Path) -> tuple[object, dict[str, object]]:
@@ -159,4 +271,8 @@ def load_verified_cart_pole_run(run_dir: str | Path) -> tuple[object, dict[str, 
     if derived[EVIDENCE_NAME] != _digest(path / EVIDENCE_NAME):
         raise ValueError("倒立摆侧证据摘要与正式产物清单不一致。")
     verify_cart_pole_evidence(record, path)
+    if record.effective_config["scenario"]["version"] == "2":
+        if not {MOTION_NAME, MOTION_MANIFEST_NAME} <= derived.keys():
+            raise ValueError("倒立摆运动图未列入正式产物摘要清单。")
+        _verify_motion_plot(record, path)
     return record, json.loads((path / EVIDENCE_NAME).read_text(encoding="utf-8"))
