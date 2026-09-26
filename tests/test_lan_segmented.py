@@ -208,15 +208,44 @@ print(json.dumps({'result':result,'frames':frames,'segments':segments,'live_segm
 """
 
 _SCRIPT_CLIENT = r"""
-import contextlib, io, json, runpy, signal, sys
+import contextlib, faulthandler, inspect, io, json, runpy, signal, sys
 from pathlib import Path
 from secure_control.experiments import lan_runner
+from secure_control.scenarios.cart_pole.interactive import InteractiveSession
+mode = sys.argv[2]
+windows = []
+session = InteractiveSession()
+if mode != 'script':
+    # 按原函数行事件选取已持锁窗口，不替换锁、停止回调或协议计算。
+    targets = {InteractiveSession.reject_new.__code__: 'callback',
+               InteractiveSession.stop_accepting.__code__: 'cleanup'}
+    lines = {}
+    for code in targets:
+        source, start = inspect.getsourcelines(code)
+        lines[code] = start + next(i for i, text in enumerate(source)
+                                   if text.strip() == 'self._accepting = False')
+    def trace(frame, event, arg):
+        code = frame.f_code
+        if code not in targets:
+            return None
+        if event == 'line' and frame.f_lineno == lines[code]:
+            window = targets[code]
+            if window not in windows:
+                windows.append(window)
+                signal.raise_signal(signal.SIGINT)
+                signal.raise_signal(signal.SIGINT)
+        return trace
+    sys.settrace(trace)
+    faulthandler.dump_traceback_later(8)
 original = lan_runner.run_client_segmented
 def worker(config, **kwargs):
     def stop_at_five(record):
         if record.protocol.global_step == 4:
+            assert session.request(1.)
+            if mode == 'script_first_sigint_cleanup':
+                raise ValueError('record sink failed before any stop request')
             signal.raise_signal(signal.SIGINT)
-    return original(config, **kwargs, on_step=stop_at_five)
+    return original(config, **kwargs, session=session, on_step=stop_at_five)
 lan_runner.run_client_segmented = worker
 config = sys.argv[1]
 sys.argv = ['run_cart_pole_client.py', config, '--headless-continuous', '--segment-steps', '3']
@@ -225,9 +254,13 @@ with contextlib.redirect_stdout(output):
     try:
         runpy.run_path('scripts/run_cart_pole_client.py', run_name='__main__')
     except SystemExit as error:
-        assert error.code == 0, error.code
+        assert error.code == (1 if mode == 'script_first_sigint_cleanup' else 0), error.code
+sys.settrace(None)
+faulthandler.cancel_dump_traceback_later()
 assert 'tkinter' not in sys.modules
-print(json.dumps({'result':json.loads(output.getvalue())}))
+assert not session.cancelled.is_set()
+assert not session.request(-1.) and session.take(5) == 0.
+print(json.dumps({'result':json.loads(output.getvalue()), 'signal_windows':windows}))
 """
 
 
@@ -253,14 +286,15 @@ def _three(tmp_path, mode="normal", count=7, capacity=3, transport="insecure_tcp
         [sys.executable, "-c", _PARTY, role, str(paths[role]), fault],
         cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     ) for role in ("P1", "P2")]
+    client = None
     try:
         client = subprocess.Popen(
-            [sys.executable, "-c", _SCRIPT_CLIENT if mode == "script" else _CLIENT,
+            [sys.executable, "-c", _SCRIPT_CLIENT if mode.startswith("script") else _CLIENT,
              str(paths["Client"]), mode, str(count), str(capacity),
              str(paths["P1"])],
             cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
-        code, report, errors = _finish(client, 100)
+        code, report, errors = _finish(client, 12 if mode.startswith("script") else 100)
         assert code == 0, (report, errors)
         if report["result"]["status"] == "stopped":
             outcomes = [_finish(party, 30) for party in parties]
@@ -271,10 +305,10 @@ def _three(tmp_path, mode="normal", count=7, capacity=3, transport="insecure_tcp
         assert not list(tmp_path.glob("runs/*/metadata.json"))
         return report
     finally:
-        for party in parties:
-            if party.poll() is None:
-                party.kill()
-            party.communicate()
+        for process in [*parties, *([client] if client is not None else [])]:
+            if process.poll() is None:
+                process.kill()
+            process.communicate()
 
 
 @pytest.mark.parametrize("transport", ["insecure_tcp", "mutual_tls"])
@@ -481,6 +515,61 @@ def test_headless_script_sigint_is_normal_stop_without_loading_tk(tmp_path):
     report = _three(tmp_path, mode="script")
     assert report["result"]["status"] == "stopped"
     assert report["result"]["confirmed_step_count"] == 5
+
+
+@pytest.mark.parametrize("mode", ["script_repeated_sigint", "script_first_sigint_cleanup"])
+def test_headless_script_sigint_in_locked_stop_and_cleanup_windows_returns(tmp_path, mode):
+    """RV-001：原脚本和真实双方进程在确定持锁窗口接受信号，有界返回。"""
+    report = _three(tmp_path, mode=mode)
+    result = report["result"]
+    assert result["confirmed_step_count"] == result["protocol_committed_count"] == 5
+    assert result["resource_counts"] == {"products_consumed": 20, "truncations_consumed": 0}
+    if mode == "script_repeated_sigint":
+        assert report["signal_windows"] == ["callback", "cleanup"]
+        assert result["status"] == "stopped"
+        assert len(result["final_segment"]["steps"]) == 2
+        assert all(receipt["end"]["action"] == "stop"
+                   and receipt["cumulative_committed_count"] == 5
+                   for receipt in result["final_segment"]["receipts"])
+    else:
+        assert report["signal_windows"] == ["cleanup"]
+        assert result["status"] == "failed" and result["failure_phase"] == "RECORDING_STEP"
+        assert "final_segment" not in result
+
+
+@pytest.mark.parametrize("stop_before_bind", [False, True])
+def test_stop_callback_is_once_only_for_reentrant_and_concurrent_requests(stop_before_bind):
+    """RV-001：包括先 stop 后绑定，重入/并发请求都不能重复场景回调。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    control = RunControl()
+    calls = []
+
+    def callback():
+        calls.append("stop")
+        control.request_stop()
+
+    if stop_before_bind:
+        control.request_stop()
+    control.bind_stop(callback)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(lambda _: control.request_stop(), range(8)))
+    assert control.stop_requested and calls == ["stop"]
+
+
+def test_concurrent_stop_preserves_pending_queue_and_rejects_later_requests():
+    """停止返回后跨线程新请求被拒绝，旧请求仍可供唯一 worker 的在途步锁存。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    session, control = InteractiveSession(), RunControl()
+    control.bind_stop(session.reject_new)
+    assert session.request(1.)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(lambda _: control.request_stop(), range(8)))
+        assert not any(pool.map(lambda _: session.request(-1.), range(8)))
+    assert not session.cancelled.is_set()
+    assert session.latch(5, 0., 10.) == 1.
+    assert session.latch(6, 0., 10.) == 0.
 
 
 @pytest.fixture

@@ -363,6 +363,9 @@ class RunControl:
     def request_stop(self) -> None:
         """停止先取得门禁则不再发起下一轮；已发起轮继续双提交及物理推进。"""
         with self._lock:
+            # 在场景回调前发布停止位，重复 SIGINT/回调重入只读取意图，不能再调回场景。
+            if self._stop:
+                return
             self._stop = True
             if self._on_stop is not None:
                 self._on_stop()

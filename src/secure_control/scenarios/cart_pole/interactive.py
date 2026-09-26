@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from queue import Empty, Full, Queue
-from threading import Event, Lock
+from threading import Event, RLock
 
 import numpy as np
 
@@ -36,7 +36,8 @@ class InteractiveSession:
         self._scheduled = dict(scheduled or {})
         self.cancelled = Event()
         self._accepting = True
-        self._lock = Lock()
+        # 首次 SIGINT 也可能打断持锁的请求/清理；同线程停止回调必须能设置拒绝门禁。
+        self._lock = RLock()
         self.notify = notify
 
     def request(self, force_n: float) -> bool:

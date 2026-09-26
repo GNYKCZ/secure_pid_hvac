@@ -26,6 +26,8 @@ session、控制器分享、round 和一次性材料。段链核对 run/段索�
 `experiments.lan_runner.run_client_segmented(config, segment_steps=400, control=RunControl(),
 on_step=..., on_segment=..., session=...)` 是同步 worker。`control.request_stop()` 线程安全、
 幂等，不关闭连接；`session` 是可选的原 `InteractiveSession` 扰动队列。
+重复停止不会再次执行场景拒绝回调；SIGINT 在场景持锁或收尾期间也可返回，
+首次停止仍串行设置扰动门禁，不清空在途步所需的请求。
 停止接纳后拒绝新扰动，已发起区间仍可锁存一项此前请求，完成后拒绝剩余队列。
 
 - `LanSegmentedRuntime.step(v)` 返回冻结的 `SegmentedStep`（或停止先获门禁时返回 None）；
