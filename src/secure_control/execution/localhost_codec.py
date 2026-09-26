@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from math import isfinite, prod
 from numbers import Integral
 from typing import Any, Literal
@@ -48,6 +48,7 @@ _OPERATIONS = {
     "lan_hello",
     "lan_ready",
     "lan_setup",
+    "segment_end",
     "step",
     "endpoint",
     "peer_product",
@@ -125,6 +126,71 @@ class LanSetupPayload:
 
 
 @dataclass(frozen=True, slots=True)
+class LanSegmentedHelloPayload:
+    """新模式独立的段链身份；旧 hello 的字段集合保持不变。"""
+
+    profile_sha256: str
+    nonce: str
+    run_id: str
+    segment_index: int
+    global_start: int
+    previous_session_id: str | None
+    mode: Literal["lan-segmented-v1"] = "lan-segmented-v1"
+
+    def __post_init__(self) -> None:
+        _required_sha256(self.profile_sha256, "profile_sha256")
+        _required_sha256(self.nonce, "nonce")
+        _text(self.run_id, "run_id")
+        _require_nonnegative_integer(self.segment_index, "segment_index")
+        _require_nonnegative_integer(self.global_start, "global_start")
+        _require_optional_identity(self.previous_session_id, "previous_session_id")
+        if self.mode != "lan-segmented-v1":
+            raise LocalhostCodecError("分段 hello 模式错误。")
+
+
+@dataclass(frozen=True, slots=True)
+class SegmentEndPayload:
+    """仅步边界可发送的连续前缀结束声明，角色必须独立核对。"""
+
+    run_id: str
+    segment_index: int
+    global_start: int
+    confirmed_count: int
+    global_end_exclusive: int
+    last_round_id: str | None
+    action: Literal["continue", "stop"]
+
+    def __post_init__(self) -> None:
+        _text(self.run_id, "run_id")
+        for name in ("segment_index", "global_start", "confirmed_count", "global_end_exclusive"):
+            _require_nonnegative_integer(getattr(self, name), name)
+        _require_optional_identity(self.last_round_id, "last_round_id")
+        if (self.action not in {"continue", "stop"}
+                or self.global_end_exclusive != self.global_start + self.confirmed_count
+                or (self.last_round_id is None) != (self.confirmed_count == 0)):
+            raise LocalhostCodecError("段结束前缀或末轮无效。")
+
+
+@dataclass(frozen=True, slots=True)
+class SegmentEndReceipt:
+    """本方实际提交、资源消费与段链尾；不含任何秘密份额。"""
+
+    role: Literal["P1", "P2"]
+    session_id: str
+    end: SegmentEndPayload
+    cumulative_committed_count: int
+    products: int
+    truncations: int
+
+    def __post_init__(self) -> None:
+        if self.role not in {"P1", "P2"} or not isinstance(self.end, SegmentEndPayload):
+            raise LocalhostCodecError("段结束回执角色或类型错误。")
+        _text(self.session_id, "session_id")
+        for name in ("cumulative_committed_count", "products", "truncations"):
+            _require_nonnegative_integer(getattr(self, name), name)
+
+
+@dataclass(frozen=True, slots=True)
 class LanContinuousSetupPayload:
     """连续模式公开数值 setup；证书不含任何单方秘密。"""
 
@@ -198,6 +264,10 @@ WirePayload = (
     | PartyStageResult
     | LanHelloPayload
     | LanSetupPayload
+    | LanContinuousSetupPayload
+    | LanSegmentedHelloPayload
+    | SegmentEndPayload
+    | SegmentEndReceipt
     | None
 )
 
@@ -345,6 +415,12 @@ def _encode_value(value: object) -> object:
             "nonce": value.nonce,
             "mode": value.mode,
         }
+    if isinstance(value, LanSegmentedHelloPayload):
+        return {"type": "lan_segmented_hello", **asdict(value)}
+    if isinstance(value, SegmentEndPayload):
+        return {"type": "segment_end", **asdict(value)}
+    if isinstance(value, SegmentEndReceipt):
+        return {"type": "segment_end_receipt", **asdict(value), "end": _encode_value(value.end)}
     if isinstance(value, LanSetupPayload):
         return {
             "type": "lan_setup",
@@ -659,6 +735,14 @@ def _decode_value(value: object) -> object:
             _required_sha256(mapping["nonce"], "nonce"),
             mode,
         )
+    if kind in {"lan_segmented_hello", "segment_end", "segment_end_receipt"}:
+        cls = {"lan_segmented_hello": LanSegmentedHelloPayload,
+               "segment_end": SegmentEndPayload, "segment_end_receipt": SegmentEndReceipt}[kind]
+        _exact_fields(mapping, {"type", *cls.__dataclass_fields__}, kind)
+        fields = {name: mapping[name] for name in cls.__dataclass_fields__}
+        if cls is SegmentEndReceipt:
+            fields["end"] = _typed(mapping["end"], SegmentEndPayload)
+        return cls(**fields)
     if kind == "lan_setup":
         _exact_fields(
             mapping,
@@ -997,6 +1081,9 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
         ("request", "lan_setup"): to_party,
         ("reply", "lan_setup"): to_client,
         ("error", "lan_setup"): to_client,
+        ("request", "segment_end"): to_party,
+        ("reply", "segment_end"): to_client,
+        ("error", "segment_end"): to_client,
         ("request", "step"): {("Supervisor", "Client")},
         ("reply", "step"): {("Client", "Supervisor")},
         ("error", "step"): {("Client", "Supervisor")},
@@ -1029,7 +1116,7 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
     if key == ("hello", "hello"):
         expected = (HelloPayload,)
     elif key == ("hello", "lan_hello"):
-        expected = (LanHelloPayload,)
+        expected = (LanHelloPayload, LanSegmentedHelloPayload)
     elif key == ("ready", "ready"):
         expected = (ReadyPayload,)
     elif message.kind == "error":
@@ -1050,6 +1137,10 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
         expected = (PartyOfflineMaterial,)
     elif key == ("request", "lan_setup"):
         expected = (LanSetupPayload, LanContinuousSetupPayload)
+    elif key == ("request", "segment_end"):
+        expected = (SegmentEndPayload,)
+    elif key == ("reply", "segment_end"):
+        expected = (SegmentEndReceipt,)
     elif key == ("request", "online"):
         expected = (PartyOnlineMaterial,)
     elif (
@@ -1069,6 +1160,13 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
         expected = None
     if expected is None or not isinstance(payload, expected):
         raise LocalhostCodecError("wire kind/operation 与 payload 类型组合非法。")
+    if message.operation == "segment_end" and (
+        message.session_id is None or message.round_id is not None
+        or message.step is not None or message.resource_id is not None
+        or (isinstance(payload, SegmentEndReceipt)
+            and (payload.role != message.sender or payload.session_id != message.session_id))
+    ):
+        raise LocalhostCodecError("段结束回执身份不符或携带 round identity。")
     if message.operation == "endpoint" and isinstance(payload, Protocol3EndpointCommand):
         expected_resource = payload.metadata.resource_id if payload.metadata is not None else None
         if message.resource_id != expected_resource:

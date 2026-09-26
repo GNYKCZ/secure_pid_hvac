@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
 from pathlib import Path
 
@@ -20,6 +20,8 @@ from secure_control.scenarios.cart_pole.secure_experiment import (
 )
 from secure_control.scenarios.cart_pole.secure_experiment import (
     CartPoleSecureExperiment,
+    SustainedCartPoleExperiment,
+    cart_pole_numeric_contract,
 )
 from secure_control.scenarios.paper_pid.secure_experiment import (
     SCENARIO_VERSION as PAPER_VERSION,
@@ -233,3 +235,36 @@ def load_prepared_lan_experiment(path: str | Path) -> PreparedLanExperiment:
     if scenario == "cart_pole":
         return _cart_pole(path)
     raise ValueError("连续 LAN 实验场景无效。")
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedSegmentedExperiment:
+    """持续 worker 所需的最小装配；场景方法不进入通用执行层。"""
+
+    spec: ControllerSpec
+    context: FixedPointContext
+    contract: ControllerRangeContract
+    security_parameter: int
+    evidence: PrimeModulusEvidence | None
+    scene: SustainedCartPoleExperiment
+    recheck_sources: Callable[[], None]
+
+
+def load_segmented_experiment(path: str | Path, segment_steps: int,
+                              session: InteractiveSession) -> PreparedSegmentedExperiment:
+    """唯一场景选择点仅启用已设计的倒立摆静态反馈持续装配。"""
+    if type(segment_steps) is not int or not 1 <= segment_steps <= 1000:
+        raise ValueError("segment_steps 必须是 1…1000 的整数。")
+    if _load_yaml(Path(path).resolve()).get("scenario") != "cart_pole":
+        raise ValueError("当前 profile 尚不支持持续模式。")
+    profile = load_cart_pole_lan_profile(path)
+    context, contract, _proof = cart_pole_numeric_contract(
+        profile.spec, replace(profile.balance, horizon_steps=segment_steps),
+        fractional_bits=profile.ell, parameter_bits=profile.parameter_bits,
+        runtime_payload_bits=profile.runtime_payload_bits, modulus=profile.q,
+    )
+    return PreparedSegmentedExperiment(
+        profile.spec, context, contract, profile.security_parameter, profile.evidence,
+        SustainedCartPoleExperiment(profile.plant, profile.balance, session),
+        profile.recheck_sources,
+    )

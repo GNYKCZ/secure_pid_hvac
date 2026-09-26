@@ -1,5 +1,56 @@
 # 独立三角色连续 LAN 实验（Issues #86、#84、#75、#92）
 
+## 持续分段后端（#100）
+
+三个终端仍分别启动原 P1、P2、Client 文件；持续模式由 Client 显式选择：
+
+```powershell
+uv run python scripts/run_continuous_p1.py
+uv run python scripts/run_continuous_p2.py
+uv run python scripts/run_cart_pole_client.py --headless-continuous --segment-steps 400
+```
+
+Client 可照旧传入第一个配置路径参数。按 Ctrl+C 提交**正常停止请求**：若本轮已发起，
+完成双提交、执行器、物理推进和场景验证，再取得双方段结束回执。没有 in-flight 轮时不再
+发起新轮；已建立的会话允许 0 步停止。窗口关闭/硬取消仍属于 cancellation。
+
+`lan-segmented-v1` 每段容量为 1…1000 的整数，默认 400，整次运行没有预设总 N。
+P1/P2 同一次启动保持监听；双方确认 continue 后计划关闭旧连接并重新认证，生成新
+session、控制器分享、round 和一次性材料。段链核对 run/段索引/全局前缀/上一 session；
+公开 setup/layout 必须不变。仅支持零维控制器状态，非零状态明确拒绝，不重构秘密状态。
+旧模式的 schema 3、None shutdown、exact-N finish、动态/Trunc 和末端稳定要求不变。
+旧服务不能处理新模式；各角色应使用同一版本代码。
+
+### 给 #101 / #103 的后端契约
+
+`experiments.lan_runner.run_client_segmented(config, segment_steps=400, control=RunControl(),
+on_step=..., on_segment=..., session=...)` 是同步 worker。`control.request_stop()` 线程安全、
+幂等，不关闭连接；`session` 是可选的原 `InteractiveSession` 扰动队列。
+停止接纳后拒绝新扰动，已发起区间仍可锁存一项此前请求，完成后拒绝剩余队列。
+
+- `LanSegmentedRuntime.step(v)` 返回冻结的 `SegmentedStep`（或停止先获门禁时返回 None）；
+  raw control 是 tuple。只有上层完成实际推进及验证后才可 `confirm_applied(identity)`，
+  同一对象一次确认，未确认时禁止下一轮/续段/正常结束。
+- `on_step(ConfirmedStep)` 只在协议与物理均确认后调用；包含只读协议身份/资源和场景快照，
+  时间为全局整数步乘 Ts。`on_segment(CompletedSegment)` 只在双方结束回执匹配后调用；
+  包含当前段步骤、setup、prime/range/scale 摘要、连接耗时及双方本地计数回执。
+  两个可靠记录回调抛错都使 run 失败。运行时仅持有当前段 O(L) 记录，不保存全程列表。
+- 正常结果是 `status=stopped, stop_reason=user_requested`，公开 C、next_global_step、
+  C*Ts、observed_status、资源累计数和最终段/双方回执。recovering 也可正常停止。
+- 故障结果为 failed/uncertain/cancelled，含 failure_phase、已知协议提交计数和物理确认
+  前缀、可能未确定的 round/session。uncertain 中计数是已知下界，不推测丢失回执对应的
+  远端提交，也不重试旧轮或续段。已知故障即使两个计数相同也不能变成 stopped。
+
+停止若到达已发送 continue 之后，先核对该次过渡，然后建立新容量正数但实际 0 步的
+末段，并取得双方 stop 回执；不能把 continue 回执当最终停止。握手/idle/step/shutdown
+均保留有界 timeout；计划重连的墙钟开销不会推进仿真时间，不承诺 20 ms 实时控制。
+Client 保留唯一真实 plant、adapter、monitor、目标及扰动队列，段界不重置观测稳定计数。
+冻结数值来源每次续段重查，配置变化失败退出，不热切换增益或工作域。
+
+该后端不写长轨迹正式产物，不运行 ideal 重放，不显示 GUI 停止按钮；这些由 #101 实现。
+stopped 不是 artifact complete。控制律/阶段切换及非零秘密状态迁移由后续设计决定。
+本机三进程和 TLS/insecure 两种传输测试不替代 #76 的真实三机或实时验收。
+
 此入口在三个独立进程运行 paper-inspired PID、四水箱或近直立倒立摆的连续安全闭环。三条连接
 Client→P1、Client→P2、P2→P1 使用无证书实验 TCP。P1/P2 只读角色配置、公开
 数值 setup 与本方 share/资源；plant、PID 场景、明文测量及两份输出重构只在 Client。

@@ -9,13 +9,17 @@ import os
 import sys
 from collections.abc import Callable
 from contextlib import AbstractContextManager
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from threading import Event
 
 from secure_control.execution.lan_config import LanConfig, load_lan_config
 from secure_control.execution.lan_runtime import (
     LanContinuousRuntime,
+    LanSegmentedRuntime,
+    RunControl,
+    SegmentedStep,
+    SegmentRecord,
     run_client_single_step,
     run_party_single_step,
 )
@@ -33,7 +37,11 @@ from secure_control.scenarios.hvac.integration import HvacScenario
 from secure_control.simulation import compare_closed_loops
 
 from .artifacts import SCHEMA_VERSION, _write_artifacts, load_artifacts
-from .lan_continuous_profile import PreparedLanExperiment, load_prepared_lan_experiment
+from .lan_continuous_profile import (
+    PreparedLanExperiment,
+    load_prepared_lan_experiment,
+    load_segmented_experiment,
+)
 from .plotting import redraw_control_triptych, verify_control_triptych, write_control_triptych
 from .provenance import collect_provenance
 
@@ -79,6 +87,119 @@ def run_client_continuous(config: LanConfig) -> dict[str, object]:
         raise ValueError("缺少 Client experiment profile。")
     experiment = load_prepared_lan_experiment(config.experiment_config)
     return _run_prepared_client(config, experiment)
+
+
+@dataclass(frozen=True, slots=True)
+class ConfirmedStep:
+    """双方协议提交与场景物理推进均已确认的公开记录。"""
+
+    protocol: SegmentedStep
+    snapshot: object
+    double_committed: bool = True
+    physically_confirmed: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class CompletedSegment:
+    """双方结束确认后可交给 #101 的有界公开段，接收方负责持久保存。"""
+
+    protocol: SegmentRecord
+    steps: tuple[ConfirmedStep, ...]
+
+
+def run_client_segmented(config: LanConfig, *, segment_steps: int = 400,
+                         control: RunControl,
+                         on_step: Callable[[ConfirmedStep], None] | None = None,
+                         on_segment: Callable[[CompletedSegment], None] | None = None,
+                         session=None) -> dict[str, object]:
+    """运行到正常停止请求或故障；不将后端 stopped 冒充正式 artifact complete。"""
+    # 队列与场景选择由装配层拥有；核心仅处理协议身份、双提交及确认前缀。
+    from secure_control.scenarios.cart_pole.interactive import InteractiveSession
+
+    if config.experiment_config is None:
+        raise ValueError("持续 Client 缺少 experiment profile。")
+    session = InteractiveSession() if session is None else session
+    if not isinstance(session, InteractiveSession) or not isinstance(control, RunControl):
+        raise TypeError("持续模式需要 RunControl 和 InteractiveSession。")
+    experiment = load_segmented_experiment(config.experiment_config, segment_steps, session)
+    control.bind_stop(session.reject_new)
+    runtime = None
+    records: list[ConfirmedStep] = []
+    phase = "CONNECTING"
+    try:
+        experiment.recheck_sources()
+        runtime = LanSegmentedRuntime(
+            config, experiment.spec, experiment.context, experiment.contract,
+            experiment.security_parameter, experiment.evidence, control=control,
+        )
+        while True:
+            if session.cancelled.is_set():
+                raise RuntimeError("Client 运行已取消。")
+            if control.stop_requested or runtime.segment_full:
+                phase = "ENDING_SEGMENT"
+                segment = runtime.end_segment()
+                if session.cancelled.is_set():
+                    raise RuntimeError("Client 运行已取消。")
+                phase = "RECORDING_SEGMENT"
+                if on_segment is not None:
+                    on_segment(CompletedSegment(segment, tuple(records)))
+                records.clear()
+                if runtime.phase == "STOPPED":
+                    experiment.recheck_sources()
+                    if session.cancelled.is_set():
+                        raise RuntimeError("Client 运行已取消。")
+                    return {
+                        "status": "stopped", "stop_reason": "user_requested",
+                        "role": "Client", "pid": os.getpid(), "run_id": runtime.run_id,
+                        "confirmed_step_count": runtime.confirmed_step_count,
+                        "protocol_committed_count": runtime.protocol_committed_count,
+                        "next_global_step": runtime.confirmed_step_count,
+                        "terminal_time_s": runtime.confirmed_step_count * experiment.scene.period,
+                        "observed_status": experiment.scene.monitor.status,
+                        "stable_count": experiment.scene.monitor.stable_count,
+                        "resource_counts": runtime.resource_counts,
+                        "final_segment": asdict(segment), "transport": config.transport,
+                    }
+                # 发布公开段后不保留它；握手/材料重建期间场景状态及停止位继续有效。
+                del segment
+                phase = "CONNECTING_NEXT"
+                experiment.recheck_sources()
+                runtime.next_segment()
+                continue
+            phase = "INPUT"
+            value = experiment.scene.controller_input()
+            phase = "ROUND_IN_FLIGHT"
+            identity = runtime.step(value)
+            if identity is None:
+                continue
+            phase = "AWAITING_PLANT"
+            snapshot = experiment.scene.advance(identity.global_step, identity.raw_control)
+            runtime.confirm_applied(identity)
+            record = ConfirmedStep(identity, snapshot)
+            records.append(record)
+            phase = "RECORDING_STEP"
+            if on_step is not None:
+                on_step(record)
+    except Exception as error:  # noqa: BLE001 - 生命周期出口不披露协议秘密或异常载荷
+        uncertain = runtime is not None and runtime.phase == "UNCERTAIN"
+        return {
+            "status": ("cancelled" if session.cancelled.is_set() else
+                       "uncertain" if uncertain else "failed"),
+            "category": type(error).__name__, "failure_phase": phase,
+            "run_id": runtime.run_id if runtime is not None else None,
+            "segment_index": runtime.segment_index if runtime is not None else 0,
+            "session_id": runtime._segment.session_id if runtime and runtime._segment else None,
+            "round_id": (runtime._segment._last_plan.round_id
+                         if runtime and runtime._segment
+                         and hasattr(runtime._segment, "_last_plan") else None),
+            "protocol_committed_count": runtime.protocol_committed_count if runtime else 0,
+            "confirmed_step_count": runtime.confirmed_step_count if runtime else 0,
+            "resource_counts": runtime.resource_counts if runtime else {},
+        }
+    finally:
+        session.stop_accepting()
+        if runtime is not None:
+            runtime.close()
 
 
 def _run_prepared_client(config: LanConfig, experiment: PreparedLanExperiment,
