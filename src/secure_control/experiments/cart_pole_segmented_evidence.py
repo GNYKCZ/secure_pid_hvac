@@ -13,6 +13,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
+from fractions import Fraction
 from hashlib import sha256
 from pathlib import Path
 from types import MappingProxyType
@@ -21,17 +22,24 @@ import numpy as np
 
 from secure_control.crypto import TwoPartySharing
 from secure_control.execution import PlaintextStateSpaceRuntime
-from secure_control.execution.lan_runtime import RunControl
+from secure_control.execution.lan_runtime import RunControl, _public_reachability_digest
 from secure_control.execution.localhost_codec import (
     LanContinuousSetupPayload,
     LanSegmentedHelloPayload,
+    LanSegmentedSetupV2Payload,
     SegmentEndPayload,
     SegmentEndReceipt,
     decode_wire_value,
     encode_wire_value,
 )
 from secure_control.protocol import Client
-from secure_control.scenarios.cart_pole.adapter import CartPoleAdapter
+from secure_control.protocol.messages import _PROTOCOL3_TERM_ORDER
+from secure_control.protocol.roles import _bounded_input_reachability
+from secure_control.scenarios.cart_pole.adapter import (
+    CartPoleAdapter,
+    MeasurementSample,
+    _disturbance_plan,
+)
 from secure_control.scenarios.cart_pole.contract import CartPoleContract
 from secure_control.scenarios.cart_pole.controller import (
     CartPoleBalanceConfig,
@@ -39,12 +47,25 @@ from secure_control.scenarios.cart_pole.controller import (
 )
 from secure_control.scenarios.cart_pole.experiment import BalanceMonitor
 from secure_control.scenarios.cart_pole.interactive import PULSE_PHASE, InteractiveSession
+from secure_control.scenarios.cart_pole.observer import (
+    CartPoleObserverConfig,
+    build_cart_pole_observer_design,
+)
 from secure_control.scenarios.cart_pole.plant import CartPolePlant
-from secure_control.scenarios.cart_pole.secure_experiment import cart_pole_numeric_contract
+from secure_control.scenarios.cart_pole.secure_experiment import (
+    cart_pole_numeric_contract,
+    sustained_observer_numeric_contract,
+)
 from secure_control.simulation import SimulationResult
 
 from .artifacts import _RUN_ID_PATTERN, _new_run_id, _owned_stage, load_artifacts, write_artifacts
-from .cart_pole_evidence import DISTURBANCE_POLICY, _numeric_array, plot_motion_overview
+from .cart_pole_evidence import (
+    DISTURBANCE_POLICY,
+    _json_normal,
+    _matches_derived_json,
+    _numeric_array,
+    plot_motion_overview,
+)
 from .lan_continuous_profile import PreparedSegmentedExperiment, load_segmented_experiment
 from .lan_runner import _run_prepared_segmented
 from .plotting import OVERVIEW_BUCKETS, BoundedOverview, _control_axes
@@ -177,6 +198,53 @@ def _members(folder, expected):
         raise ValueError("缺少声明的产物内容。")
 
 
+def _iter_journal(path, count, byte_count, tail_hash, *, allow_extra=False):
+    """Read only the checkpointed prefix; a crash may leave an unclaimed append tail."""
+    _int(count)
+    _int(byte_count)
+    if (tail_hash is not None and not _HEX.fullmatch(tail_hash)) or (count == 0) != (tail_hash is None):
+        raise ValueError("逐步日志摘要无效。")
+    if not path.is_file() or path.is_symlink():
+        raise ValueError("缺少逐步日志。")
+    previous = None
+    total = 0
+    with path.open("rb") as source:
+        for _ in range(count):
+            raw = source.readline(INDEX_LINE_LIMIT + 1)
+            if not raw or len(raw) > INDEX_LINE_LIMIT or not raw.endswith(b"\n"):
+                raise ValueError("逐步日志行缺失或超界。")
+            total += len(raw)
+            if total > byte_count:
+                raise ValueError("逐步日志超过 checkpoint。")
+            item = _decode(raw)
+            _keys(item, {"step", "prev_sha256", "sha256"})
+            if raw != _bytes(item) or item["prev_sha256"] != previous:
+                raise ValueError("逐步日志链断裂。")
+            digest = sha256(_bytes({"step": item["step"],
+                                    "prev_sha256": previous})).hexdigest()
+            if item["sha256"] != digest:
+                raise ValueError("逐步日志摘要不符。")
+            previous = digest
+            yield item["step"]
+    if total != byte_count or previous != tail_hash:
+        raise ValueError("逐步日志与 checkpoint 不符。")
+    if not allow_extra and path.stat().st_size != byte_count:
+        raise ValueError("逐步日志有未声明字节。")
+
+
+def _journal_rows(path, count, byte_count, tail_hash, expected):
+    for actual, item in zip(_iter_journal(path, count, byte_count, tail_hash),
+                            expected, strict=True):
+        _same(actual, item)
+
+
+def _expected_journal_tail(steps):
+    previous = None
+    for step in steps:
+        previous = sha256(_bytes({"step": step, "prev_sha256": previous})).hexdigest()
+    return previous
+
+
 @contextmanager
 def _identities():
     """跨段唯一性使用临时磁盘索引，固定 4 MiB cache；不保留全 run 的 set。"""
@@ -279,6 +347,137 @@ class _Definition:
         self.products = sum(getattr(self.spec, name).size for name in ("A", "B", "C", "D"))
 
 
+class _DynamicDefinition:
+    """Rebuild the approved v2 proof and observer spec from frozen public inputs."""
+
+    def __init__(self, config):
+        _keys(config, {"definition", "setup", "topology_sha256", "transport", "channels"})
+        self.config = config
+        self.effective = effective = config["definition"]
+        _keys(effective, {"scenario", "controller_mode", "fractional_bits",
+                          "paper_parameter_bits", "runtime_payload_bits",
+                          "security_parameter", "q", "profile_horizon_steps", "range",
+                          "reference_used", "raw_equals_applied", "claim_level",
+                          "profile_sha256", "prime_source_sha256", "prime_evidence",
+                          "plant_source_sha256", "balance_source_sha256",
+                          "observer_source_sha256", "plant_contract", "balance_config",
+                          "observer_config", "observer_design", "initialization",
+                          "disturbances", "controller_spec", "mode", "segment_capacity",
+                          "segment_range", "disturbance_policy", "modulus_evidence"})
+        if (effective.get("scenario") != {"name": "cart_pole", "version": "5"}
+                or effective.get("mode") != "segmented_dynamic"
+                or effective.get("controller_mode") != "observer_two_measurement"
+                or config["transport"] not in ("insecure_tcp", "mutual_tls")
+                or not _HEX.fullmatch(config["topology_sha256"])):
+            raise ValueError("动态分段定义无效。")
+        self.capacity = _int(effective["segment_capacity"], 1)
+        if self.capacity > 1000:
+            raise ValueError("动态段容量超界。")
+        self.plant = CartPoleContract(**effective["plant_contract"])
+        self.balance = CartPoleBalanceConfig(**effective["balance_config"])
+        self.balance.validate_plant(self.plant)
+        _same([effective["profile_horizon_steps"], effective["reference_used"],
+               effective["raw_equals_applied"], effective["claim_level"]],
+              [self.balance.horizon_steps, True, True,
+               "cart-pole-observer-sustained-simulation"])
+        for name in ("profile_sha256", "prime_source_sha256", "plant_source_sha256",
+                     "balance_source_sha256", "observer_source_sha256"):
+            if not isinstance(effective[name], str) or not _HEX.fullmatch(effective[name]):
+                raise ValueError("动态来源摘要无效。")
+        design = build_cart_pole_observer_design(
+            self.plant, self.balance, CartPoleObserverConfig(**effective["observer_config"]),
+        )
+        snapshot = effective["observer_design"]
+        _same({key: value for key, value in snapshot.items() if key != "source_snapshots"},
+              {key: value for key, value in design.to_snapshot().items()
+               if key != "source_snapshots"})
+        sources = snapshot.get("source_snapshots")
+        if (not isinstance(sources, list) or len(sources) != 3
+                or {item.get("role"): item.get("sha256") for item in sources
+                    if isinstance(item, dict)} != {
+                        "observer": effective["observer_source_sha256"],
+                        "plant": effective["plant_source_sha256"],
+                        "balance": effective["balance_source_sha256"],
+                    }):
+            raise ValueError("动态三源身份快照不符。")
+        by_role = {item["role"]: item for item in sources}
+        for role, parameters in (("plant", effective["plant_contract"]),
+                                 ("balance", effective["balance_config"]),
+                                 ("observer", effective["observer_config"])):
+            source = by_role[role]
+            _keys(source, {"role", "filename", "sha256", "yaml"})
+            if not isinstance(source["filename"], str) or not source["filename"]:
+                raise ValueError("动态来源文件名无效。")
+            expected = {"schema_version": 1, "scenario": "cart_pole", **parameters}
+            if role == "observer":
+                for field, dependency in (("plant_source", "plant"),
+                                          ("balance_source", "balance")):
+                    reference = source["yaml"].get(field)
+                    if (not isinstance(reference, str)
+                            or Path(reference).name != by_role[dependency]["filename"]):
+                        raise ValueError("动态 observer 来源引用不符。")
+                    expected[field] = reference
+            if not _matches_derived_json(source["yaml"], _json_normal(expected)):
+                raise ValueError("动态来源 YAML 与有效参数不符。")
+        first = MeasurementSample(**effective["initialization"]["first_measurement"])
+        truth = CartPolePlant(self.plant).output()
+        _same([first.sample_id, first.time_s, first.p_m, first.theta_rad],
+              [0, 0., truth[0], truth[2]])
+        self.initialization = initialization = design.initialize(
+            first, tuple(effective["initialization"]["velocity_seed"]),
+        )
+        _same(effective["initialization"], {
+            "first_measurement": asdict(first), "branch": initialization.branch,
+            "theta_star": initialization.theta_star,
+            "velocity_seed": list(initialization.velocity_seed),
+            "initial_error_abs": list(initialization.initial_error_abs),
+            "y_abs": list(initialization.y_abs),
+        })
+        self.spec = initialization.spec
+        if not _matches_derived_json(effective["disturbances"], [list(event) for event in
+                _disturbance_plan(effective["disturbances"], self.balance.horizon_steps)]):
+            raise ValueError("动态预定外力定义无效。")
+        _same(effective["controller_spec"],
+              {name: getattr(self.spec, name).tolist()
+               for name in ("A", "B", "C", "D", "x0")})
+        self.context, self.contract, proof = sustained_observer_numeric_contract(
+            initialization, fractional_bits=effective["fractional_bits"],
+            parameter_bits=effective["paper_parameter_bits"],
+            runtime_payload_bits=effective["runtime_payload_bits"], modulus=effective["q"],
+        )
+        _same(effective["segment_range"], {"contract": asdict(self.contract), "proof": proof})
+        _same(effective["range"], {"mode": "bounded_input_reachability", "proof": proof})
+        _same(effective["disturbance_policy"], DISTURBANCE_POLICY)
+        self.setup = decode_wire_value(_bytes(config["setup"]))
+        if not isinstance(self.setup, LanSegmentedSetupV2Payload):
+            raise TypeError("动态运行需要 v2 setup。")
+        client = Client(self.context, TwoPartySharing(self.context.modulus),
+                        security_parameter=effective["security_parameter"],
+                        modulus_evidence=self.setup.modulus_evidence)
+        layout = client._layout_from_spec(self.spec)
+        payloads = {name: np.asarray(self.context.encode(getattr(self.spec, name)), dtype=object)
+                    for name in ("A", "B", "C", "D", "x0")}
+        verification = client._validate_range_contract(payloads, layout, self.contract)
+        self.range = asdict(verification)
+        self.ledger = asdict(layout.scale_ledger)
+        self.prime = asdict(client.truncation.modulus_verification)
+        digest = _public_reachability_digest(self.contract, verification)
+        _same(asdict(self.setup), asdict(LanSegmentedSetupV2Payload(
+            self.context.modulus, self.context.integer_bits, self.context.fractional_bits,
+            effective["security_parameter"], self.contract.state_payload_bounds,
+            self.contract.input_payload_bounds, self.contract.reachability_block_steps,
+            self.capacity, self.setup.controller_epoch, digest, self.setup.modulus_evidence,
+        )))
+        _same(effective["modulus_evidence"],
+              asdict(self.setup.modulus_evidence) if self.setup.modulus_evidence else None)
+        _same(effective["prime_evidence"], effective["modulus_evidence"])
+        self.adapter = CartPoleAdapter(self.plant, self.balance)
+        _same(config["channels"], asdict(self.adapter.metadata))
+        self.products = sum(getattr(self.spec, name).size for name in ("A", "B", "C", "D"))
+        self.truncations = self.spec.state_dimension if layout.scale_ledger.state_truncation_bits else 0
+        self.encoded = payloads
+
+
 def _protocol(data, definition, db, index, start, previous, run_id):
     """核对原双回执及逐步能力/资源路由；计数不信任自报 root。"""
     _keys(data, {"protocol", "steps"})
@@ -340,6 +539,84 @@ def _protocol(data, definition, db, index, start, previous, run_id):
     for party, receipt in zip(("P1", "P2"), receipts, strict=True):
         _same(receipt, asdict(SegmentEndReceipt(party, session, end, start + len(steps),
                                               len(steps) * definition.products, 0)))
+    db.commit()
+    return action, session, start + len(steps)
+
+
+def _dynamic_protocol(data, definition, db, index, start, previous, run_id):
+    """Verify one v2 logical segment against the single live session and global ledger."""
+    _keys(data, {"protocol", "steps"})
+    protocol = data["protocol"]
+    _keys(protocol, {"hello", "session_id", "steps", "receipts", "setup",
+                     "connection_seconds", "scale_ledger", "range_verification",
+                     "modulus_verification"})
+    hello = protocol["hello"]
+    parsed = LanSegmentedHelloPayload(**hello)
+    _same(hello, asdict(LanSegmentedHelloPayload(
+        definition.config["topology_sha256"], parsed.nonce, run_id, index, start,
+        previous, "lan-segmented-v2",
+    )))
+    session = protocol["session_id"]
+    if not isinstance(session, str) or not _SESSION.fullmatch(session):
+        raise ValueError("v2 session 身份无效。")
+    if index == 0:
+        _identity(db, "session", session)
+    elif session != previous:
+        raise ValueError("v2 段边界不得重建秘密状态 session。")
+    _same(protocol["setup"], asdict(definition.setup))
+    _same(protocol["scale_ledger"], definition.ledger)
+    _same(protocol["range_verification"], definition.range)
+    _same(protocol["modulus_verification"], definition.prime)
+    seconds = protocol["connection_seconds"]
+    if type(seconds) not in (int, float) or not np.isfinite(seconds) or seconds < 0:
+        raise ValueError("连接耗时无效。")
+    steps = data["steps"]
+    if (not isinstance(steps, list) or len(steps) > definition.capacity
+            or not isinstance(protocol["steps"], list)
+            or len(protocol["steps"]) != len(steps)):
+        raise ValueError("v2 段步骤数无效。")
+    shapes = {"A": (definition.spec.state_dimension, definition.spec.state_dimension),
+              "B": (definition.spec.state_dimension, definition.spec.input_dimension),
+              "C": (definition.spec.output_dimension, definition.spec.state_dimension),
+              "D": (definition.spec.output_dimension, definition.spec.input_dimension)}
+    for local, item in enumerate(steps):
+        _keys(item, {"protocol", "snapshot", "double_committed", "physically_confirmed"})
+        if item["double_committed"] is not True or item["physically_confirmed"] is not True:
+            raise ValueError("v2 未确认步骤不得发布。")
+        step = item["protocol"]
+        round_id = step["round_id"]
+        if not isinstance(round_id, str) or not _ROUND.fullmatch(round_id):
+            raise ValueError("v2 round 身份无效。")
+        _identity(db, "round", round_id)
+        resources = [f"{round_id}:{term}[{row},{column}]"
+                     for term in _PROTOCOL3_TERM_ORDER
+                     for row in range(shapes[term][0])
+                     for column in range(shapes[term][1])]
+        resources.extend(f"{round_id}:state[{row}]"
+                         for row in range(definition.truncations))
+        _same(step, {"run_id": run_id, "segment_index": index, "session_id": session,
+                     "round_id": round_id, "local_step": local, "global_step": start + local,
+                     "raw_control": step["raw_control"], "products": definition.products,
+                     "truncations": definition.truncations, "resource_ids": resources})
+        _same(step, protocol["steps"][local])
+        _numeric_array(step["raw_control"], (definition.spec.output_dimension,))
+        for resource in resources:
+            _identity(db, "resource", resource)
+    receipts = protocol["receipts"]
+    if not isinstance(receipts, list) or len(receipts) != 2:
+        raise ValueError("v2 缺少双方段回执。")
+    action = receipts[0]["end"]["action"]
+    if action not in ("continue", "stop") or (action == "continue"
+                                                and len(steps) != definition.capacity):
+        raise ValueError("v2 只有满段能继续。")
+    end = SegmentEndPayload(run_id, index, start, len(steps), start + len(steps),
+                            steps[-1]["protocol"]["round_id"] if steps else None, action)
+    for party, receipt in zip(("P1", "P2"), receipts, strict=True):
+        _same(receipt, asdict(SegmentEndReceipt(
+            party, session, end, start + len(steps),
+            (start + len(steps)) * definition.products,
+            (start + len(steps)) * definition.truncations,
+        )))
     db.commit()
     return action, session, start + len(steps)
 
@@ -441,6 +718,151 @@ class _Replay:
             y1 = np.asarray(branches["secure"]["observations"][:-1])
             result = SimulationResult(np.arange(before, self.step) * ts,
                                       np.tile(target, (n, 1)), y0, y1, u0, u1, u0-u1, y0-y1)
+        return result, evidence
+
+
+class _DynamicReplay:
+    """Continuous physical oracle and fixed-size encoded nominal/error envelope."""
+
+    def __init__(self, definition):
+        self.definition = definition
+        self.plants = {name: CartPolePlant(definition.plant) for name in ("ideal", "secure")}
+        self.monitors = {name: BalanceMonitor(definition.balance) for name in self.plants}
+        self.ideal = PlaintextStateSpaceRuntime(definition.spec)
+        self.step = 0
+        self.nominal = [int(x) for x in definition.encoded["x0"].flat]
+        zero = {**definition.encoded,
+                "B": np.zeros_like(definition.encoded["B"], dtype=object),
+                "x0": np.zeros_like(definition.encoded["x0"], dtype=object)}
+        self.error = _bounded_input_reachability(
+            zero, (0,) * definition.spec.input_dimension,
+            definition.context.fractional_bits, definition.contract.reachability_block_steps,
+            additive_error=Fraction(2),
+        )
+        for name, plant in self.plants.items():
+            truth = plant.output().copy()
+            truth[2] -= definition.initialization.theta_star
+            if self.monitors[name].observe(truth) == "failed":
+                raise ValueError("动态初态越域。")
+
+    def convert(self, data, parent, index, check):
+        definition = self.definition
+        spec = definition.spec
+        context = definition.context
+        scale = context.scale
+        ts = definition.plant.sample_period_s
+        theta_star = definition.initialization.theta_star
+        target = np.asarray(definition.balance.target_state).copy()
+        target[2] += theta_star
+        branches = {name: {"observations": [plant.output().tolist()], "raw_force_n": [],
+                           "statuses": [self.monitors[name].status],
+                           "stable_counts": [self.monitors[name].stable_count]}
+                    for name, plant in self.plants.items()}
+        applied = {name: [] for name in self.plants}
+        disturbances = []
+        requested_values = []
+        dispositions = []
+        before = self.step
+        for item in data["steps"]:
+            check()
+            g = self.step
+            snap = item["snapshot"]
+            _keys(snap, {"t_before_s", "t_after_s", "measurement", "local_measurement",
+                         "observation_before", "observation_after", "raw_force_n",
+                         "applied_force_n", "requested_disturbance_n",
+                         "disturbance_force_n", "total_force_n", "force_disposition",
+                         "observed_status", "stable_count"})
+            secure_before = self.plants["secure"].output()
+            _same([snap["t_before_s"], snap["t_after_s"]], [g*ts, (g+1)*ts])
+            _close(_numeric_array(snap["observation_before"], (4,)), secure_before)
+            _close(_numeric_array(snap["measurement"], (2,)),
+                   secure_before[[0, 2]])
+            local = np.array([secure_before[0], secure_before[2]-theta_star])
+            _close(_numeric_array(snap["local_measurement"], (2,)), local)
+            if np.any(np.abs(local) > definition.initialization.y_abs):
+                raise ValueError("动态重放测量越域。")
+            encoded_v = [int(x) for x in context.encode(local)]
+            if any(abs(x) > bound for x, bound in
+                   zip(encoded_v, definition.contract.input_payload_bounds, strict=True)):
+                raise ValueError("动态编码输入超界。")
+            a, b, c, d = (definition.encoded[key] for key in ("A", "B", "C", "D"))
+            nominal_output = sum(int(c[0, j]) * self.nominal[j]
+                                 for j in range(spec.state_dimension))
+            nominal_output += sum(int(d[0, j]) * encoded_v[j]
+                                  for j in range(spec.input_dimension))
+            uncertainty = sum(abs(int(c[0, j])) * self.error[j]
+                              for j in range(spec.state_dimension))
+            raw = item["protocol"]["raw_control"][0]
+            _same([snap["raw_force_n"], snap["applied_force_n"]], [raw, raw])
+            if (type(raw) not in (int, float) or not np.isfinite(raw)
+                    or abs(raw) > definition.plant.max_applied_force_n
+                    or abs(raw - nominal_output/scale**2) > uncertainty/scale**2 + 1e-12):
+                raise ValueError("动态安全输出超出编码 Trunc 包络。")
+            requested = snap["requested_disturbance_n"]
+            actual = snap["disturbance_force_n"]
+            disposition = snap["force_disposition"]
+            if (type(requested) not in (int, float) or requested not in (-1., 0., 1.)
+                    or type(actual) not in (int, float)):
+                raise ValueError("动态外力请求无效。")
+            expected_actual = (requested if abs(raw+requested)
+                               <= definition.plant.max_applied_force_n else 0.)
+            expected_disposition = ("accepted" if expected_actual == requested
+                                    else "rejected_total_force_limit")
+            _same([actual, disposition, snap["total_force_n"]],
+                  [expected_actual, expected_disposition, raw+expected_actual])
+            for name, plant in self.plants.items():
+                if name == "secure":
+                    force = raw
+                else:
+                    ideal_before = plant.output()
+                    ideal_local = np.array([ideal_before[0], ideal_before[2]-theta_star])
+                    force = float(self.ideal.step(ideal_local)[0])
+                if abs(force) > definition.plant.max_applied_force_n or abs(force+actual) > definition.plant.max_applied_force_n:
+                    raise ValueError("动态对照合力越界。")
+                after = plant.step(np.array([force+actual]))
+                local_after = after.copy()
+                local_after[2] -= theta_star
+                monitor = self.monitors[name]
+                if monitor.observe(local_after) == "failed":
+                    raise ValueError("动态重放物理状态越域。")
+                branches[name]["raw_force_n"].append(force)
+                branches[name]["observations"].append(after.tolist())
+                branches[name]["statuses"].append(monitor.status)
+                branches[name]["stable_counts"].append(monitor.stable_count)
+                applied[name].append([force])
+                if name == "secure":
+                    _close(_numeric_array(snap["observation_after"], (4,)), after)
+                    _same([snap["observed_status"], snap["stable_count"]],
+                          [monitor.status, monitor.stable_count])
+            # A second rounded, public nominal state is kept in integer payload units.
+            accumulators = [sum(int(a[row, col])*self.nominal[col]
+                                for col in range(spec.state_dimension))
+                            + sum(int(b[row, col])*encoded_v[col]
+                                  for col in range(spec.input_dimension))
+                            for row in range(spec.state_dimension)]
+            self.nominal = [(value + scale//2)//scale for value in accumulators]
+            self.step += 1
+            disturbances.append(actual)
+            requested_values.append(requested)
+            dispositions.append(disposition)
+        n = self.step - before
+        evidence = {"schema_version": 4, "scope": "segment_fragment",
+                    "artifact_run_id": parent, "segment_index": index,
+                    "global_start": before, "global_end": self.step,
+                    "branches": branches, "disturbance_force_n": disturbances,
+                    "requested_disturbance_n": requested_values,
+                    "force_dispositions": dispositions,
+                    "events": [{"step": before+j, "force_n": d, "duration_steps": 1,
+                                "phase": PULSE_PHASE}
+                               for j, d in enumerate(disturbances) if d]}
+        result = None
+        if n:
+            u0, u1 = np.array(applied["ideal"]), np.array(applied["secure"])
+            y0 = np.asarray(branches["ideal"]["observations"][:-1])
+            y1 = np.asarray(branches["secure"]["observations"][:-1])
+            result = SimulationResult(np.arange(before, self.step)*ts,
+                                      np.tile(target, (n, 1)), y0, y1, u0, u1,
+                                      u0-u1, y0-y1)
         return result, evidence
 
 
@@ -552,7 +974,7 @@ def _header(root, check, *, allow_staging=False, plots=True):
                      "N", "capacity", "segment_count", "tail", "termination", "config_sha256",
                      "index_sha256", "plots_sha256"})
     if (manifest["format"] != FORMAT or type(manifest["format_version"]) is not int
-            or manifest["format_version"] != 1 or manifest["status"] != "complete"
+            or manifest["format_version"] not in (1, 2) or manifest["status"] != "complete"
             or not _RUN_ID_PATTERN.fullmatch(manifest["artifact_run_id"])
             or not _HEX.fullmatch(manifest["backend_run_id"])
             or root.name != ((".incomplete-" if allow_staging else "")
@@ -568,6 +990,24 @@ def _header(root, check, *, allow_staging=False, plots=True):
         raise ValueError("根配置摘要不一致。")
     config = _read(config_file, HEADER_LIMIT)
     expected = {"run.json", "config.json", "segments.jsonl", "segments"}
+    if manifest["format_version"] == 2:
+        expected |= {"checkpoint.json", "journal"}
+        checkpoint = _read(_path(root, "checkpoint.json", limit=HEADER_LIMIT), HEADER_LIMIT)
+        _keys(checkpoint, {"format_version", "status", "artifact_run_id",
+                           "backend_run_id", "sealed_segment_count",
+                           "confirmed_step_count", "active_count", "active_sha256",
+                           "active_bytes", "failure"})
+        _same({key: checkpoint[key] for key in ("format_version", "artifact_run_id",
+                                               "backend_run_id", "sealed_segment_count",
+                                               "confirmed_step_count", "active_count",
+                                               "active_sha256", "active_bytes", "failure")},
+              {"format_version": 2, "artifact_run_id": manifest["artifact_run_id"],
+               "backend_run_id": manifest["backend_run_id"],
+               "sealed_segment_count": manifest["segment_count"],
+               "confirmed_step_count": manifest["N"], "active_count": 0,
+               "active_sha256": None, "active_bytes": 0, "failure": None})
+        if checkpoint["status"] != ("complete" if plots else "publishing"):
+            raise ValueError("v2 checkpoint 状态与发布阶段不符。")
     if plots:
         expected |= {"plots.json", "control.png", "cart_pole_motion.png"}
         plot_file = _path(root, "plots.json", limit=HEADER_LIMIT)
@@ -598,18 +1038,26 @@ def _header(root, check, *, allow_staging=False, plots=True):
 
 def _verify(root, check, *, allow_staging=False, plots=True):
     manifest, config = _header(root, check, allow_staging=allow_staging, plots=plots)
-    definition = _Definition(config)
+    dynamic = manifest["format_version"] == 2
+    definition = _DynamicDefinition(config) if dynamic else _Definition(config)
     if manifest["capacity"] != definition.capacity:
         raise ValueError("根与配置段容量不一致。")
-    replay = _Replay(definition)
+    replay = _DynamicReplay(definition) if dynamic else _Replay(definition)
     previous = None
     last = None
     with _identities() as db:
         for entry in _entries(root, manifest, check):
             check()
             data, record, evidence = _load_chunk(root, entry)
-            action, previous, end = _protocol(data, definition, db, entry["index"],
-                                              replay.step, previous, manifest["backend_run_id"])
+            if dynamic:
+                journal = _path(root, f"journal/{entry['index']}.jsonl", limit=float("inf"))
+                _journal_rows(journal, len(data["steps"]), journal.stat().st_size,
+                              _expected_journal_tail(data["steps"]), data["steps"])
+            protocol_check = _dynamic_protocol if dynamic else _protocol
+            action, previous, end = protocol_check(
+                data, definition, db, entry["index"], replay.step, previous,
+                manifest["backend_run_id"],
+            )
             if action != ("stop" if entry["index"] == manifest["segment_count"]-1 else "continue"):
                 raise ValueError("只能最后一段正常 stop。")
             expected, expected_evidence = replay.convert(data, manifest["artifact_run_id"],
@@ -620,20 +1068,36 @@ def _verify(root, check, *, allow_staging=False, plots=True):
                 _same(record.effective_config,
                       _fragment_config(definition.effective, manifest["artifact_run_id"], entry))
                 _same(asdict(record.metadata), config["channels"])
-                _same(record.provenance, {"scenario_name": "cart_pole", "scenario_version": "3",
+                _same(record.provenance, {"scenario_name": "cart_pole",
+                                          "scenario_version": "5" if dynamic else "3",
                                           "schema_version": 1, "backend": "lan_segmented_fragment"})
                 _same(evidence, {**expected_evidence, "run_id": record.run_id})
                 for name in SimulationResult.__dataclass_fields__:
                     _close(getattr(record.result, name), getattr(expected, name))
             last = data["protocol"]
     n = replay.step
+    if dynamic:
+        journal_folder = _path(root, "journal", directory=True)
+        count = 0
+        with os.scandir(journal_folder) as journals:
+            for item in journals:
+                if (not item.name.endswith(".jsonl")
+                        or not item.name[:-6].isdecimal()
+                        or str(int(item.name[:-6])) != item.name[:-6]
+                        or not 0 <= int(item.name[:-6]) < manifest["segment_count"]
+                        or item.is_symlink() or not item.is_file(follow_symlinks=False)):
+                    raise ValueError("额外或无效的 v2 日志。")
+                count += 1
+        if count != manifest["segment_count"]:
+            raise ValueError("v2 日志段数不符。")
     monitor = replay.monitors["secure"]
     _same(manifest["termination"], {
         "status": "stopped", "stop_reason": "user_requested", "confirmed_step_count": n,
         "protocol_committed_count": n, "next_global_step": n,
         "terminal_time_s": n * definition.plant.sample_period_s,
         "observed_status": monitor.status, "stable_count": monitor.stable_count,
-        "resource_counts": {"products_consumed": definition.products*n, "truncations_consumed": 0},
+        "resource_counts": {"products_consumed": definition.products*n,
+                            "truncations_consumed": definition.truncations*n if dynamic else 0},
         "final_receipts": last["receipts"],
     })
     return manifest, config
@@ -693,8 +1157,9 @@ class VerifiedSegmentedRun:
             if entry["global_start"] <= k <= entry["global_end"]:
                 _data, record, evidence = self._chunk(entry)
                 if record is None:
-                    definition = _Definition(self._config)
-                    initial = _Replay(definition)
+                    dynamic = self._manifest["format_version"] == 2
+                    definition = _DynamicDefinition(self._config) if dynamic else _Definition(self._config)
+                    initial = _DynamicReplay(definition) if dynamic else _Replay(definition)
                     return _freeze({"step": k, "time_s": k*definition.plant.sample_period_s,
                                     "state": list(definition.plant.initial_state),
                                     "ideal_state": list(definition.plant.initial_state),
@@ -725,6 +1190,112 @@ def open_verified_cart_pole_segmented_run(path: str | Path, *, check=lambda: Non
     root = Path(path)
     manifest, config = _verify(root, check)
     return VerifiedSegmentedRun(root, manifest, config, _hash(root / "run.json", check), OrderedDict())
+
+
+def open_verified_cart_pole_segmented_prefix(path: str | Path, *, check=lambda: None
+                                            ) -> Mapping:
+    """Verify a durable v2 prefix without treating an unsealed tail as a finished run."""
+    root = Path(path)
+    if (not root.is_dir() or root.is_symlink()
+            or not root.name.startswith(".incomplete-")):
+        raise ValueError("失败前缀必须是未发布的 owned v2 目录。")
+    checkpoint = _read(_path(root, "checkpoint.json", limit=HEADER_LIMIT), HEADER_LIMIT)
+    _keys(checkpoint, {"format_version", "status", "artifact_run_id",
+                       "backend_run_id", "sealed_segment_count",
+                       "confirmed_step_count", "active_count", "active_sha256",
+                       "active_bytes", "failure"})
+    if (checkpoint["format_version"] != 2
+            or checkpoint["status"] not in {"running", "failed", "cancelled", "uncertain",
+                                           "publishing", "complete"}
+            or root.name != ".incomplete-" + checkpoint["artifact_run_id"]
+            or not _RUN_ID_PATTERN.fullmatch(checkpoint["artifact_run_id"])
+            or not isinstance(checkpoint["backend_run_id"], str)
+            or not _HEX.fullmatch(checkpoint["backend_run_id"])):
+        raise ValueError("v2 失败前缀身份或状态无效。")
+    sealed = _int(checkpoint["sealed_segment_count"])
+    active = _int(checkpoint["active_count"])
+    total = _int(checkpoint["confirmed_step_count"])
+    if active > 1000 or checkpoint["failure"] is not None and checkpoint["status"] not in {
+            "failed", "cancelled", "uncertain"}:
+        raise ValueError("v2 失败前缀计数或终止状态无效。")
+    config = _read(_path(root, "config.json", limit=HEADER_LIMIT), HEADER_LIMIT)
+    definition = _DynamicDefinition(config)
+    if active > definition.capacity:
+        raise ValueError("v2 未封段超出容量。")
+    replay = _DynamicReplay(definition)
+    previous = None
+    with _identities() as db:
+        for index in range(sealed):
+            check()
+            spool = root / f"spool-{index}.json"
+            if not spool.is_file():
+                spool = root / "segments" / str(index) / "protocol.json"
+            data = _read(_path(root, spool.relative_to(root).as_posix()))
+            action, _, _ = _dynamic_protocol(data, definition, db, index, replay.step,
+                                             previous, checkpoint["backend_run_id"])
+            if index < sealed-1 and action != "continue":
+                raise ValueError("v2 封段之后不能继续。")
+            previous = data["protocol"]["session_id"]
+            journal = _path(root, f"journal/{index}.jsonl", limit=float("inf"))
+            _journal_rows(journal, len(data["steps"]), journal.stat().st_size,
+                          _expected_journal_tail(data["steps"]), data["steps"])
+            replay.convert(data, checkpoint["artifact_run_id"], index, check)
+        if active:
+            journal = _path(root, f"journal/{sealed}.jsonl", limit=float("inf"))
+            for local, item in enumerate(_iter_journal(
+                    journal, active, _int(checkpoint["active_bytes"]),
+                    checkpoint["active_sha256"], allow_extra=True)):
+                check()
+                _keys(item, {"protocol", "snapshot", "double_committed",
+                             "physically_confirmed"})
+                if item["double_committed"] is not True or item["physically_confirmed"] is not True:
+                    raise ValueError("未封段记录缺少双提交/物理确认。")
+                step = item["protocol"]
+                round_id = step["round_id"]
+                if not isinstance(round_id, str) or not _ROUND.fullmatch(round_id):
+                    raise ValueError("未封段 round 身份无效。")
+                _identity(db, "round", round_id)
+                session = step["session_id"]
+                if not isinstance(session, str) or not _SESSION.fullmatch(session):
+                    raise ValueError("未封段 session 身份无效。")
+                if previous is None:
+                    previous = session
+                    _identity(db, "session", session)
+                elif session != previous:
+                    raise ValueError("未封段秘密 session 改变。")
+                shapes = {"C": (definition.spec.output_dimension, definition.spec.state_dimension),
+                          "D": (definition.spec.output_dimension, definition.spec.input_dimension),
+                          "A": (definition.spec.state_dimension, definition.spec.state_dimension),
+                          "B": (definition.spec.state_dimension, definition.spec.input_dimension)}
+                resources = [f"{round_id}:{term}[{row},{col}]"
+                             for term in _PROTOCOL3_TERM_ORDER
+                             for row in range(shapes[term][0])
+                             for col in range(shapes[term][1])]
+                resources.extend(f"{round_id}:state[{row}]"
+                                 for row in range(definition.truncations))
+                _same(step, {"run_id": checkpoint["backend_run_id"],
+                             "segment_index": sealed, "session_id": session,
+                             "round_id": round_id, "local_step": local,
+                             "global_step": replay.step, "raw_control": step["raw_control"],
+                             "products": definition.products,
+                             "truncations": definition.truncations,
+                             "resource_ids": resources})
+                for resource in resources:
+                    _identity(db, "resource", resource)
+                replay.convert({"steps": [item]}, checkpoint["artifact_run_id"], sealed, check)
+    if replay.step != total or total < active:
+        raise ValueError("v2 checkpoint 与重放前缀不一致。")
+    status = checkpoint["status"]
+    return _freeze({"status": status if status in {"failed", "cancelled", "uncertain"}
+                    else "in_progress_or_crashed" if status == "running"
+                    else "unpublished",
+                    "source_status": status, "artifact_run_id": checkpoint["artifact_run_id"],
+                    "backend_run_id": checkpoint["backend_run_id"],
+                    "confirmed_step_count": total,
+                    "sealed_segment_count": sealed,
+                    "sealed_step_count": total-active, "unsealed_step_count": active,
+                    "unsealed_tail_is_complete": False,
+                    "failure": checkpoint["failure"]})
 
 
 def _segment_overview(source, check, staging):
@@ -847,6 +1418,7 @@ class _Spool:
 
     def __init__(self, prepared, config, session, phase):
         self.prepared, self.session, self.phase = prepared, session, phase
+        self.dynamic = prepared.spec.state_dimension != 0
         self.root = prepared.output_root.resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.run_id = _new_run_id()
@@ -855,20 +1427,90 @@ class _Spool:
         if os.path.lexists(self.final):
             raise FileExistsError("不覆盖已有结果。")
         self.count = self.end = 0
+        self.tail_count = self.tail_bytes = 0
+        self.tail_hash = None
         self.backend_id = None
         self.published = False
-        setup = LanContinuousSetupPayload(
+        setup = (None if self.dynamic else LanContinuousSetupPayload(
             prepared.context.modulus, prepared.context.integer_bits,
             prepared.context.fractional_bits, prepared.security_parameter,
             (), prepared.contract.input_payload_bounds, prepared.contract.horizon_steps,
             prepared.evidence,
-        )
+        ))
         self.config = {"definition": prepared.effective_config,
-                       "setup": _decode(encode_wire_value(setup)),
+                       "setup": _decode(encode_wire_value(setup)) if setup else None,
                        "topology_sha256": config.topology.digest, "transport": config.transport,
                        "channels": asdict(prepared.metadata)}
         self.stage.mkdir()
+        if self.dynamic:
+            (self.stage / "journal").mkdir()
         self.identity = self.stage.stat(follow_symlinks=False).st_ino
+
+    def _checkpoint(self, status, failure=None):
+        """Journal bytes are flushed before an atomic public-prefix checkpoint."""
+        value = {"format_version": 2, "status": status,
+                 "artifact_run_id": self.run_id, "backend_run_id": self.backend_id,
+                 "sealed_segment_count": self.count,
+                 "confirmed_step_count": self.end + self.tail_count,
+                 "active_count": self.tail_count, "active_sha256": self.tail_hash,
+                 "active_bytes": self.tail_bytes, "failure": failure}
+        temporary = self.stage / "checkpoint.tmp"
+        with temporary.open("wb") as output:
+            output.write(_bytes(value))
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, self.stage / "checkpoint.json")
+
+    def begin(self, lifecycle, setup):
+        if not self.dynamic:
+            return
+        if (self.backend_id is not None or lifecycle.controller_epoch != setup.controller_epoch
+                or lifecycle.run_id is None
+                or not isinstance(setup, LanSegmentedSetupV2Payload)):
+            raise ValueError("动态公开 setup 与生命周期不一致。")
+        self.backend_id = lifecycle.run_id
+        self.config["setup"] = _decode(encode_wire_value(setup))
+        _DynamicDefinition(self.config)
+        _write(self.stage / "config.json", self.config, HEADER_LIMIT)
+        self._checkpoint("running")
+
+    def record_step(self, step):
+        if not self.dynamic:
+            return
+        self.check()
+        if self.backend_id is None:
+            raise ValueError("动态 setup 尚未冻结。")
+        data = asdict(step)
+        identity = data["protocol"]
+        if (identity["run_id"] != self.backend_id
+                or identity["segment_index"] != self.count
+                or identity["global_step"] != self.end + self.tail_count
+                or identity["local_step"] != self.tail_count):
+            raise ValueError("动态公开步骤不连续。")
+        entry = {"step": data, "prev_sha256": self.tail_hash}
+        digest = sha256(_bytes(entry)).hexdigest()
+        raw = _bytes({**entry, "sha256": digest})
+        if len(raw) > INDEX_LINE_LIMIT:
+            raise ValueError("动态步骤记录超出行界。")
+        with (self.stage / "journal" / f"{self.count}.jsonl").open("ab") as output:
+            output.write(raw)
+            output.flush()
+            os.fsync(output.fileno())
+        self.tail_bytes += len(raw)
+        self.tail_count += 1
+        self.tail_hash = digest
+        self._checkpoint("running")
+
+    def fail(self, result):
+        if (not self.dynamic or self.published or self.backend_id is None
+                or not (self.stage / "checkpoint.json").is_file()):
+            return
+        status = result.get("status", "failed")
+        if status not in ("failed", "cancelled", "uncertain"):
+            status = "failed"
+        self._checkpoint(status, {"backend_status": result.get("status"),
+                                  "category": result.get("category"),
+                                  "failure_phase": result.get("failure_phase")})
 
     def check(self):
         if self.session.cancelled.is_set():
@@ -876,7 +1518,9 @@ class _Spool:
         self.prepared.recheck_sources()
 
     def cleanup(self):
-        if not self.published and _owned_stage(self.stage, self.root, self.identity):
+        if ((not self.dynamic or not (self.stage / "checkpoint.json").is_file())
+                and not self.published
+                and _owned_stage(self.stage, self.root, self.identity)):
             shutil.rmtree(self.stage)
 
     def record(self, segment):
@@ -890,9 +1534,23 @@ class _Spool:
             self.backend_id = hello["run_id"]
         if hello["run_id"] != self.backend_id:
             raise ValueError("暂存 run 身份变化。")
+        if self.dynamic:
+            setup = data["protocol"]["setup"]
+            _same(setup, asdict(decode_wire_value(_bytes(self.config["setup"]))))
+            if len(data["steps"]) != self.tail_count:
+                raise ValueError("已封段步骤与可靠逐步前缀不一致。")
+            journal = self.stage / "journal" / f"{self.count}.jsonl"
+            if not journal.exists():
+                journal.touch()
+            _journal_rows(journal, self.tail_count, self.tail_bytes, self.tail_hash,
+                          data["steps"])
         _write(self.stage / f"spool-{self.count}.json", data)
         self.end += len(data["steps"])
         self.count += 1
+        if self.dynamic:
+            self.tail_count = self.tail_bytes = 0
+            self.tail_hash = None
+            self._checkpoint("running")
 
     def publish(self, stopped):
         """只接受真正 stopped；重放、图、reader 全部成功后由原 guard 发布。"""
@@ -902,11 +1560,12 @@ class _Spool:
                 or stopped["protocol_committed_count"] != self.end or self.count < 1):
             raise ValueError("后端停止结果与暂存前缀不一致。")
         self.phase("BACKEND_STOPPED")
-        definition = _Definition(self.config)
-        replay = _Replay(definition)
+        definition = _DynamicDefinition(self.config) if self.dynamic else _Definition(self.config)
+        replay = _DynamicReplay(definition) if self.dynamic else _Replay(definition)
         self.phase("REPLAYING")
         (self.stage / "segments").mkdir()
-        _write(self.stage / "config.json", self.config, HEADER_LIMIT)
+        if not self.dynamic:
+            _write(self.stage / "config.json", self.config, HEADER_LIMIT)
         previous = tail = None
         last = None
         with _identities() as db, (self.stage / "segments.jsonl").open("xb") as index_file:
@@ -915,8 +1574,10 @@ class _Spool:
                 spool_path = self.stage / f"spool-{i}.json"
                 data = _read(spool_path)
                 start = replay.step
-                action, previous, end = _protocol(data, definition, db, i, start, previous,
-                                                  self.backend_id)
+                protocol_check = _dynamic_protocol if self.dynamic else _protocol
+                action, previous, end = protocol_check(
+                    data, definition, db, i, start, previous, self.backend_id,
+                )
                 if action != ("stop" if i == self.count-1 else "continue"):
                     raise ValueError("暂存结束 action 无效。")
                 result, evidence = replay.convert(data, self.run_id, i, self.check)
@@ -934,7 +1595,8 @@ class _Spool:
                     artifact = write_artifacts(
                         result, self.prepared.metadata,
                         _fragment_config(definition.effective, self.run_id, entry),
-                        {"scenario_name": "cart_pole", "scenario_version": "3",
+                        {"scenario_name": "cart_pole",
+                         "scenario_version": "5" if self.dynamic else "3",
                          "schema_version": 1, "backend": "lan_segmented_fragment"},
                         output_root=folder, derived_writer=derived,
                     )
@@ -955,7 +1617,8 @@ class _Spool:
             "status", "stop_reason", "confirmed_step_count", "protocol_committed_count",
             "next_global_step", "terminal_time_s", "observed_status", "stable_count", "resource_counts")}
         terminal["final_receipts"] = last["receipts"]
-        manifest = {"format": FORMAT, "format_version": 1, "status": "complete",
+        manifest = {"format": FORMAT, "format_version": 2 if self.dynamic else 1,
+                    "status": "complete",
                     "artifact_run_id": self.run_id, "backend_run_id": self.backend_id,
                     "N": self.end, "capacity": definition.capacity, "segment_count": self.count,
                     "tail": tail, "termination": terminal,
@@ -963,6 +1626,8 @@ class _Spool:
                     "index_sha256": _hash(self.stage / "segments.jsonl", self.check),
                     "plots_sha256": None}
         _write(self.stage / "run.json", manifest, HEADER_LIMIT)
+        if self.dynamic:
+            self._checkpoint("publishing")
         self.phase("VERIFYING")
         _verify(self.stage, self.check, allow_staging=True, plots=False)
         # 绘图读取刚完整校验过的源，不在 Matplotlib 内隐藏执行控制/plant。
@@ -972,6 +1637,8 @@ class _Spool:
         write_segmented_overview(source, self.stage, check=self.check, staging=True)
         manifest["plots_sha256"] = _hash(self.stage / "plots.json", self.check)
         (self.stage / "run.json").write_bytes(_bytes(manifest))
+        if self.dynamic:
+            self._checkpoint("complete")
         self.phase("VERIFYING")
         _verify(self.stage, self.check, allow_staging=True)
         self.check()
@@ -1000,15 +1667,33 @@ def run_cart_pole_segmented(config, *, control: RunControl, session: Interactive
     if prepared is None:
         prepared = load_segmented_experiment(config.experiment_config, segment_steps, session)
     elif (prepared.scene.session is not session
-          or prepared.contract.horizon_steps != segment_steps):
+          or prepared.segment_capacity != segment_steps):
         raise ValueError("必须消费同一次持续装配与队列。")
     phase = phase if phase is not None else lambda _: None
     transaction = _Spool(prepared, config, session, phase)
     try:
+        def durable_step(record):
+            transaction.record_step(record)
+            if on_step is not None:
+                on_step(record)
+
         stopped = _run_prepared_segmented(config, prepared, control=control, session=session,
-                                          on_step=on_step, on_segment=transaction.record, phase=phase)
+                                          on_step=durable_step, on_segment=transaction.record,
+                                          on_start=transaction.begin, phase=phase)
         if stopped["status"] != "stopped":
+            transaction.fail(stopped)
+            if transaction.dynamic and (transaction.stage / "checkpoint.json").is_file():
+                stopped["prefix_dir"] = str(transaction.stage)
             return stopped
-        return transaction.publish(stopped)
+        try:
+            return transaction.publish(stopped)
+        except Exception as error:
+            if not transaction.dynamic:
+                raise
+            failure = {"status": "failed", "category": type(error).__name__,
+                       "failure_phase": "PUBLISHING", "backend": stopped,
+                       "prefix_dir": str(transaction.stage)}
+            transaction.fail(failure)
+            return failure
     finally:
         transaction.cleanup()

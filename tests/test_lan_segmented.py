@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, asdict, replace
 
 import numpy as np
 import pytest
@@ -83,7 +83,7 @@ if fault == 'peer_disconnect':
 try:
     result = lan.run_party_single_step(load_lan_config(Path(sys.argv[2]), sys.argv[1]))
 except Exception as error:
-    print(json.dumps({'status':'failed', 'category':type(error).__name__}))
+    print(json.dumps({'status':'failed', 'category':type(error).__name__, 'message':str(error)}))
     raise SystemExit(1)
 print(json.dumps(result))
 """
@@ -618,6 +618,74 @@ def test_generic_static_segments_use_fresh_parameter_shares_and_exact_prefix(gen
     final = runtime.end_segment()
     assert final.steps == () and final.receipts[0].cumulative_committed_count == 2
     assert all(_finish(party, 20)[0] == 0 for party in parties)
+
+
+def test_dynamic_v2_keeps_secret_state_in_one_session_across_segments(tmp_path):
+    """#109：真实双方进程按全局 step 续算，不重分发 x0 或换 session。"""
+    paths = _plain_deployment(tmp_path)
+    _profile_for(paths)
+    parties = [subprocess.Popen(
+        [sys.executable, "-c", _PARTY, role, str(paths[role]), "none"],
+        cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    ) for role in ("P1", "P2")]
+    runtime = None
+    try:
+        spec = ControllerSpec(np.array([[.5]]), np.array([[.25]]),
+                              np.array([[1.]]), np.array([[0.]]), np.array([0.]))
+        runtime = LanSegmentedRuntime(
+            load_lan_config(paths["Client"], "Client"), spec,
+            FixedPointContext(2147483647, 8, 4),
+            ControllerRangeContract((11,), (16,), reachability_block_steps=1),
+            8, None, control=RunControl(), segment_capacity=2,
+        )
+        session = runtime._segment.session_id
+        epoch = runtime.controller_epoch
+        outputs = []
+        for segment_index in range(3):
+            for _ in range(2):
+                identity = runtime.step(np.array([1.]))
+                assert identity.global_step == len(outputs)
+                assert identity.local_step == len(outputs) % 2
+                assert identity.session_id == session
+                public = runtime.snapshot()
+                assert public.attempted_round == identity.global_step
+                assert public.attempted_round_id == identity.round_id
+                assert not {"state", "shares", "mask", "secret"} & asdict(public).keys()
+                with pytest.raises(FrozenInstanceError):
+                    public.phase = "forged"
+                outputs.append(identity.raw_control[0])
+                runtime.confirm_applied(identity)
+            if segment_index < 2:
+                record = runtime.end_segment()
+                assert record.hello.mode == "lan-segmented-v2"
+                assert record.setup.controller_epoch == epoch
+                assert all(receipt.cumulative_committed_count == len(outputs)
+                           for receipt in record.receipts)
+                runtime.next_segment()
+                assert runtime._segment.session_id == session
+                assert runtime.snapshot().physically_confirmed_count == len(outputs)
+        assert outputs[0] == 0. and outputs[2] > 0.
+        runtime.control.request_stop()
+        final = runtime.end_segment()
+        assert all(receipt.cumulative_committed_count == 6 for receipt in final.receipts)
+        assert runtime.snapshot().phase == "STOPPED"
+        assert all(_finish(party, 20)[0] == 0 for party in parties)
+    except Exception as error:
+        diagnostics = []
+        for party in parties:
+            try:
+                party.wait(timeout=2)
+                diagnostics.append(party.communicate())
+            except subprocess.TimeoutExpired:
+                diagnostics.append(("running", ""))
+        raise AssertionError(f"v2 parties: {diagnostics}") from error
+    finally:
+        if runtime is not None:
+            runtime.close()
+        for party in parties:
+            if party.poll() is None:
+                party.kill()
+            party.communicate()
 
 
 @pytest.mark.parametrize("misuse", ["copy", "duplicate", "close"])

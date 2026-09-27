@@ -5,8 +5,10 @@
 不会在第 400 步自动结束。保留显式 `--finite` 的原 400 步有限窗口。
 需要仅运行 #100 的无 GUI 后端时，可使用：
 `uv run python scripts/run_cart_pole_client.py --headless-continuous --segment-steps 400`。
-先分别启动原 P1/P2；它们会在同一次启动中服务后续段。Ctrl+C 请求正常停止，Client
-返回双方确认的 `stopped` 与准确步数；这个 headless 入口不产生正式长轨迹结果。
+先分别启动原 P1/P2；它们会在同一次启动中服务后续段。静态 profile 的 headless
+入口返回双方确认的 `stopped` 与准确步数，不产生正式长轨迹结果。两测量 observer
+profile 使用 #109 动态 v2，同一 session 跨段续算；正常停止并验证发布后返回
+`complete` 和正式结果目录，故障时返回可核验的未发布前缀路径。
 `--finite` 与 `--headless-continuous` 互斥。生命周期 API、失败计数与回调见
 [持续分段后端](lan_continuous.md#持续分段后端100)。
 
@@ -37,13 +39,16 @@ uv run python scripts/run_cart_pole_client.py
 两图是固定 2048 桶的首/末/min/max 概要，逐步原值始终保留在数据块及精确回放中。
 默认输出在 `results/lan_continuous/<run-id>/`。
 
-持续结果使用独立 `cart_pole_segmented_run` format v1：根 `run.json/config.json`、
+静态持续结果使用独立 `cart_pole_segmented_run` format v1：根 `run.json/config.json`、
 有序摘要链 `segments.jsonl`、各段 `protocol.json`，以及 n>0 段的 canonical 八字段 v1
 数据块和倒立摆 v3 侧证据。完整 reader 从唯一初态连续复核两支、事件、跨段 monitor、
 身份/资源及双回执；最后 0 步 stop 段保留回执但没有空 CSV 或虚构 SimulationResult。
 分段数据块的 scope 是 `segment_fragment`，单块成功不表示整个 run 完成。
 正式根仅在 reader、两图和取消门禁均通过后原子发布；磁盘不足、源变化或任何处理失败
 不会发布完整成功。摘要/回执是原 Client 来源信任下的一致性证据，不是签名证明。
+动态 v2 结果在相同根结构中另存逐步 journal 和原子 checkpoint；失败前缀由
+`open_verified_cart_pole_segmented_prefix` 读取。#109 验证的动态仿真入口是 headless；
+窗口的动态阶段/交互全集仍归 #103。
 
 ```python
 from secure_control.experiments.cart_pole_segmented_evidence import (

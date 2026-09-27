@@ -132,7 +132,8 @@ def run_client_segmented(config: LanConfig, *, segment_steps: int = 400,
 
 
 def _run_prepared_segmented(config, experiment, *, control, session,
-                            on_step=None, on_segment=None, phase=None) -> dict[str, object]:
+                            on_step=None, on_segment=None, on_start=None,
+                            phase=None) -> dict[str, object]:
     """唯一持续循环接收已装配场景；保存/GUI 与 headless 不重复 parse 或创建 plant。"""
     control.bind_stop(session.reject_new)
     runtime = None
@@ -152,7 +153,11 @@ def _run_prepared_segmented(config, experiment, *, control, session,
         runtime = LanSegmentedRuntime(
             config, experiment.spec, experiment.context, experiment.contract,
             experiment.security_parameter, experiment.evidence, control=control,
+            segment_capacity=(experiment.segment_capacity
+                              if experiment.spec.state_dimension else None),
         )
+        if on_start is not None:
+            on_start(runtime.snapshot(), runtime.public_setup)
         progress("RUNNING")
         while True:
             if session.cancelled.is_set():
@@ -176,9 +181,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                         "confirmed_step_count": runtime.confirmed_step_count,
                         "protocol_committed_count": runtime.protocol_committed_count,
                         "next_global_step": runtime.confirmed_step_count,
-                        "terminal_time_s": runtime.confirmed_step_count * experiment.scene.period,
-                        "observed_status": experiment.scene.monitor.status,
-                        "stable_count": experiment.scene.monitor.stable_count,
+                        **experiment.scene.terminal_summary(),
                         "resource_counts": runtime.resource_counts,
                         "final_segment": asdict(segment), "transport": config.transport,
                     }
@@ -204,20 +207,23 @@ def _run_prepared_segmented(config, experiment, *, control, session,
             if on_step is not None:
                 on_step(record)
     except Exception as error:  # noqa: BLE001 - 生命周期出口不披露协议秘密或异常载荷
-        uncertain = runtime is not None and runtime.phase == "UNCERTAIN"
+        lifecycle = runtime.snapshot() if runtime is not None else None
+        uncertain = lifecycle is not None and lifecycle.phase == "UNCERTAIN"
         return {
             "status": ("cancelled" if session.cancelled.is_set() else
                        "uncertain" if uncertain else "failed"),
             "category": type(error).__name__, "failure_phase": phase_name,
-            "run_id": runtime.run_id if runtime is not None else None,
-            "segment_index": runtime.segment_index if runtime is not None else 0,
-            "session_id": runtime._segment.session_id if runtime and runtime._segment else None,
-            "round_id": (runtime._segment._last_plan.round_id
-                         if runtime and runtime._segment
-                         and hasattr(runtime._segment, "_last_plan") else None),
-            "protocol_committed_count": runtime.protocol_committed_count if runtime else 0,
-            "confirmed_step_count": runtime.confirmed_step_count if runtime else 0,
-            "resource_counts": runtime.resource_counts if runtime else {},
+            "run_id": lifecycle.run_id if lifecycle else None,
+            "segment_index": lifecycle.segment_index if lifecycle else 0,
+            "session_id": lifecycle.session_id if lifecycle else None,
+            "attempted_round": lifecycle.attempted_round if lifecycle else None,
+            "round_id": lifecycle.attempted_round_id if lifecycle else None,
+            "protocol_committed_count": lifecycle.protocol_committed_count if lifecycle else 0,
+            "confirmed_step_count": lifecycle.physically_confirmed_count if lifecycle else 0,
+            "resource_counts": ({"products_consumed": lifecycle.products_consumed,
+                                 "truncations_consumed": lifecycle.truncations_consumed}
+                                if lifecycle else {}),
+            "lifecycle": asdict(lifecycle) if lifecycle else None,
         }
     finally:
         session.stop_accepting()

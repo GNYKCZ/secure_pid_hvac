@@ -122,6 +122,69 @@ def _finite_horizon_encoded_trace(payloads: dict[str, np.ndarray],
                  for row in range(dimension)]
 
 
+def _bounded_input_reachability(
+    payloads: dict[str, np.ndarray], input_bounds: tuple[int, ...],
+    scale_bits: int, block_steps: int,
+    *, additive_error: Fraction | None = None,
+) -> tuple[int, ...]:
+    """从实际编码矩阵精确证明所有轮次的 controller state payload 界。
+
+    使用 |F^m| 的收缩而非 |F| 的逐步收缩，保留矩阵幂中的符号抵消。
+    返回的向上取整界同时覆盖初态、有界输入和每次 Trunc 的误差。
+    """
+    if type(block_steps) is not int or not 1 <= block_steps <= 128:
+        raise ValueError("reachability block_steps 必须是 1…128 的整数")
+    n = payloads["A"].shape[0]
+    scale = 1 << scale_bits
+    f = [[Fraction(int(payloads["A"][row, col]), scale)
+          for col in range(n)] for row in range(n)]
+    identity = [[Fraction(int(row == col)) for col in range(n)] for row in range(n)]
+    power = identity
+    sum_abs = [[Fraction(0) for _ in range(n)] for _ in range(n)]
+    for _ in range(block_steps):
+        for row in range(n):
+            for col in range(n):
+                sum_abs[row][col] += abs(power[row][col])
+        power = [[sum(power[row][mid] * f[mid][col] for mid in range(n))
+                  for col in range(n)] for row in range(n)]
+    t = [[abs(value) for value in row] for row in power]
+    if max((sum(row) for row in t), default=Fraction(0)) >= 1:
+        raise ValueError("编码 controller 的 block power 不收缩，不能证明持续界")
+
+    # Gauss-Jordan 在有理数上解 (I-|F^m|)^-1 b；严格收缩保证可逆。
+    augmented = [[identity[row][col] - t[row][col] for col in range(n)]
+                 + identity[row][:] for row in range(n)]
+    for col in range(n):
+        pivot = next((row for row in range(col, n) if augmented[row][col]), None)
+        if pivot is None:
+            raise ValueError("reachability block inverse 不存在")
+        augmented[col], augmented[pivot] = augmented[pivot], augmented[col]
+        divisor = augmented[col][col]
+        augmented[col] = [value / divisor for value in augmented[col]]
+        for row in range(n):
+            if row != col:
+                factor = augmented[row][col]
+                augmented[row] = [value - factor * base
+                                  for value, base in zip(augmented[row], augmented[col], strict=True)]
+    inverse = [row[n:] for row in augmented]
+    error = ((Fraction(3, 2) if scale_bits else Fraction(0))
+             if additive_error is None else additive_error)
+    if error < 0:
+        raise ValueError("reachability additive error 不得为负")
+    drift = [
+        abs(int(payloads["x0"][row])) + error
+        + sum(Fraction(abs(int(payloads["B"][row, col])) * input_bounds[col], scale)
+              for col in range(payloads["B"].shape[1]))
+        for row in range(n)
+    ]
+    tail = [sum(inverse[row][col] * drift[col] for col in range(n)) for row in range(n)]
+    bound = [sum(sum_abs[row][col] * tail[col] for col in range(n)) for row in range(n)]
+    if any(value < 0 for value in bound):
+        raise ValueError("reachability 上界不可为负")
+    return tuple((value.numerator + value.denominator - 1) // value.denominator
+                 for value in bound)
+
+
 def _scalar_from_array(share: AdditiveShare, index: tuple[int, ...]) -> AdditiveShare:
     """从本地向量或矩阵份额中取标量，不组合另一方份额。"""
     values = np.asarray(share.value, dtype=object)
@@ -592,6 +655,24 @@ class Client:
             state_raw_bounds, output_raw_bounds = self._validate_finite_horizon(
                 payloads, layout, contract
             )
+            return self._range_verification_summary(
+                contract, state_raw_bounds, output_raw_bounds, None
+            )
+
+        if contract.reachability_block_steps is not None:
+            reachable = _bounded_input_reachability(
+                payloads, input_bounds, layout.scale_ledger.state_truncation_bits,
+                contract.reachability_block_steps,
+            )
+            if any(value > bound for value, bound in zip(reachable, state_bounds, strict=True)):
+                raise ValueError("state_payload_bounds 未覆盖精确持续可达界")
+            state_raw_bounds = self._row_bounds(
+                payloads["A"], state_bounds, payloads["B"], input_bounds
+            )
+            output_raw_bounds = self._row_bounds(
+                payloads["C"], state_bounds, payloads["D"], input_bounds
+            )
+            self._validate_accumulator_limits(state_raw_bounds, output_raw_bounds, layout)
             return self._range_verification_summary(
                 contract, state_raw_bounds, output_raw_bounds, None
             )

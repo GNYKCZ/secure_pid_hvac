@@ -49,6 +49,7 @@ _OPERATIONS = {
     "lan_ready",
     "lan_setup",
     "segment_end",
+    "segment_begin",
     "step",
     "endpoint",
     "peer_product",
@@ -63,6 +64,7 @@ _RANGE_PROOF_MODES = {
     "finite_horizon",
     "closed_loop_invariant",
     "independent_input_invariant",
+    "bounded_input_reachability",
 }
 _PRIME_VERIFICATION_METHODS = {
     "deterministic_miller_rabin_64_v1",
@@ -135,7 +137,7 @@ class LanSegmentedHelloPayload:
     segment_index: int
     global_start: int
     previous_session_id: str | None
-    mode: Literal["lan-segmented-v1"] = "lan-segmented-v1"
+    mode: Literal["lan-segmented-v1", "lan-segmented-v2"] = "lan-segmented-v1"
 
     def __post_init__(self) -> None:
         _required_sha256(self.profile_sha256, "profile_sha256")
@@ -144,7 +146,7 @@ class LanSegmentedHelloPayload:
         _require_nonnegative_integer(self.segment_index, "segment_index")
         _require_nonnegative_integer(self.global_start, "global_start")
         _require_optional_identity(self.previous_session_id, "previous_session_id")
-        if self.mode != "lan-segmented-v1":
+        if self.mode not in {"lan-segmented-v1", "lan-segmented-v2"}:
             raise LocalhostCodecError("分段 hello 模式错误。")
 
 
@@ -191,6 +193,24 @@ class SegmentEndReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class SegmentBeginPayload:
+    """v2 同会话下一段的公开屏障，不包含秘密状态或新离线分享。"""
+
+    run_id: str
+    segment_index: int
+    global_start: int
+    controller_epoch: str
+    previous_round_id: str | None
+
+    def __post_init__(self) -> None:
+        _text(self.run_id, "run_id")
+        _require_nonnegative_integer(self.segment_index, "segment_index")
+        _require_nonnegative_integer(self.global_start, "global_start")
+        _required_sha256(self.controller_epoch, "controller_epoch")
+        _require_optional_identity(self.previous_round_id, "previous_round_id")
+
+
+@dataclass(frozen=True, slots=True)
 class LanContinuousSetupPayload:
     """连续模式公开数值 setup；证书不含任何单方秘密。"""
 
@@ -202,6 +222,31 @@ class LanContinuousSetupPayload:
     input_payload_bounds: tuple[int, ...]
     horizon_steps: int
     modulus_evidence: PrimeModulusEvidence | None
+
+
+@dataclass(frozen=True, slots=True)
+class LanSegmentedSetupV2Payload:
+    """公开且无限时域的 v2 setup；block 不是段容量或有限 horizon。"""
+
+    modulus: int
+    integer_bits: int
+    fractional_bits: int
+    security_parameter: int
+    state_payload_bounds: tuple[int, ...]
+    input_payload_bounds: tuple[int, ...]
+    reachability_block_steps: int
+    segment_capacity: int
+    controller_epoch: str
+    proof_sha256: str
+    modulus_evidence: PrimeModulusEvidence | None
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.segment_capacity <= 1000:
+            raise LocalhostCodecError("v2 segment_capacity 超出范围")
+        if not 1 <= self.reachability_block_steps <= 128:
+            raise LocalhostCodecError("v2 reachability block 超出范围")
+        _required_sha256(self.controller_epoch, "controller_epoch")
+        _required_sha256(self.proof_sha256, "proof_sha256")
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,7 +310,9 @@ WirePayload = (
     | LanHelloPayload
     | LanSetupPayload
     | LanContinuousSetupPayload
+    | LanSegmentedSetupV2Payload
     | LanSegmentedHelloPayload
+    | SegmentBeginPayload
     | SegmentEndPayload
     | SegmentEndReceipt
     | None
@@ -421,6 +468,8 @@ def _encode_value(value: object) -> object:
         return {"type": "segment_end", **asdict(value)}
     if isinstance(value, SegmentEndReceipt):
         return {"type": "segment_end_receipt", **asdict(value), "end": _encode_value(value.end)}
+    if isinstance(value, SegmentBeginPayload):
+        return {"type": "segment_begin", **asdict(value)}
     if isinstance(value, LanSetupPayload):
         return {
             "type": "lan_setup",
@@ -442,6 +491,21 @@ def _encode_value(value: object) -> object:
             "state_payload_bounds": list(value.state_payload_bounds),
             "input_payload_bounds": list(value.input_payload_bounds),
             "horizon_steps": value.horizon_steps,
+            "modulus_evidence": _encode_prime_evidence(value.modulus_evidence),
+        }
+    if isinstance(value, LanSegmentedSetupV2Payload):
+        return {
+            "type": "lan_segmented_setup_v2",
+            "modulus": _decimal(value.modulus),
+            "integer_bits": value.integer_bits,
+            "fractional_bits": value.fractional_bits,
+            "security_parameter": value.security_parameter,
+            "state_payload_bounds": list(value.state_payload_bounds),
+            "input_payload_bounds": list(value.input_payload_bounds),
+            "reachability_block_steps": value.reachability_block_steps,
+            "segment_capacity": value.segment_capacity,
+            "controller_epoch": value.controller_epoch,
+            "proof_sha256": value.proof_sha256,
             "modulus_evidence": _encode_prime_evidence(value.modulus_evidence),
         }
     if isinstance(value, ClientStepResult):
@@ -735,9 +799,11 @@ def _decode_value(value: object) -> object:
             _required_sha256(mapping["nonce"], "nonce"),
             mode,
         )
-    if kind in {"lan_segmented_hello", "segment_end", "segment_end_receipt"}:
+    if kind in {"lan_segmented_hello", "segment_end", "segment_end_receipt",
+                "segment_begin"}:
         cls = {"lan_segmented_hello": LanSegmentedHelloPayload,
-               "segment_end": SegmentEndPayload, "segment_end_receipt": SegmentEndReceipt}[kind]
+               "segment_end": SegmentEndPayload, "segment_end_receipt": SegmentEndReceipt,
+               "segment_begin": SegmentBeginPayload}[kind]
         _exact_fields(mapping, {"type", *cls.__dataclass_fields__}, kind)
         fields = {name: mapping[name] for name in cls.__dataclass_fields__}
         if cls is SegmentEndReceipt:
@@ -784,6 +850,21 @@ def _decode_value(value: object) -> object:
             _integer_tuple(mapping["state_payload_bounds"], "state_payload_bounds", nonnegative=True),
             _integer_tuple(mapping["input_payload_bounds"], "input_payload_bounds", nonnegative=True),
             _positive(mapping["horizon_steps"], "horizon_steps"),
+            _decode_prime_evidence(mapping["modulus_evidence"]),
+        )
+    if kind == "lan_segmented_setup_v2":
+        _exact_fields(mapping, {"type", *LanSegmentedSetupV2Payload.__dataclass_fields__}, kind)
+        return LanSegmentedSetupV2Payload(
+            _positive_decimal(mapping["modulus"], "modulus"),
+            _positive(mapping["integer_bits"], "integer_bits"),
+            _nonnegative(mapping["fractional_bits"], "fractional_bits"),
+            _positive(mapping["security_parameter"], "security_parameter"),
+            _integer_tuple(mapping["state_payload_bounds"], "state_payload_bounds", nonnegative=True),
+            _integer_tuple(mapping["input_payload_bounds"], "input_payload_bounds", nonnegative=True),
+            _positive(mapping["reachability_block_steps"], "reachability_block_steps"),
+            _positive(mapping["segment_capacity"], "segment_capacity"),
+            _required_sha256(mapping["controller_epoch"], "controller_epoch"),
+            _required_sha256(mapping["proof_sha256"], "proof_sha256"),
             _decode_prime_evidence(mapping["modulus_evidence"]),
         )
     if kind == "client_step_result":
@@ -1084,6 +1165,9 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
         ("request", "segment_end"): to_party,
         ("reply", "segment_end"): to_client,
         ("error", "segment_end"): to_client,
+        ("request", "segment_begin"): to_party,
+        ("reply", "segment_begin"): to_client,
+        ("error", "segment_begin"): to_client,
         ("request", "step"): {("Supervisor", "Client")},
         ("reply", "step"): {("Client", "Supervisor")},
         ("error", "step"): {("Client", "Supervisor")},
@@ -1136,7 +1220,9 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
     elif key == ("request", "offline"):
         expected = (PartyOfflineMaterial,)
     elif key == ("request", "lan_setup"):
-        expected = (LanSetupPayload, LanContinuousSetupPayload)
+        expected = (LanSetupPayload, LanContinuousSetupPayload, LanSegmentedSetupV2Payload)
+    elif message.operation == "segment_begin" and message.kind in {"request", "reply"}:
+        expected = (SegmentBeginPayload,)
     elif key == ("request", "segment_end"):
         expected = (SegmentEndPayload,)
     elif key == ("reply", "segment_end"):
@@ -1160,7 +1246,7 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
         expected = None
     if expected is None or not isinstance(payload, expected):
         raise LocalhostCodecError("wire kind/operation 与 payload 类型组合非法。")
-    if message.operation == "segment_end" and (
+    if message.operation in {"segment_end", "segment_begin"} and (
         message.session_id is None or message.round_id is not None
         or message.step is not None or message.resource_id is not None
         or (isinstance(payload, SegmentEndReceipt)

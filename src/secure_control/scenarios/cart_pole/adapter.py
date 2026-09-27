@@ -262,6 +262,17 @@ class CartPoleObserverSimulation:
             raise ValueError("没有已完成区间")
         return self._last_forces
 
+    def request_disturbance(self, step: int, force_n: float) -> None:
+        """Bind a live one-interval request to the global sample before actuation."""
+        _index(step, "disturbance step")
+        force = _number(force_n, "disturbance force")
+        if self._ended or step != self._step or force not in (-1., 0., 1.):
+            raise ValueError("invalid_live_disturbance")
+        if step in self._scheduled and force:
+            raise ValueError("duplicate_disturbance")
+        if force:
+            self._scheduled[step] = force
+
     def send_control(self, command: ControlCommand) -> ActuationReceipt:
         """原plant原子完成才发完成回执；失败后拒绝重发，不冒充硬件回滚。"""
         if self._ended:

@@ -33,6 +33,7 @@ from secure_control.experiments.cart_pole_evidence import (
 from secure_control.experiments.cart_pole_lan_profile import load_cart_pole_lan_profile
 from secure_control.experiments.lan_continuous_profile import load_prepared_lan_experiment
 from secure_control.protocol import Client
+from secure_control.protocol.roles import _bounded_input_reachability
 from secure_control.scenarios.cart_pole.adapter import MeasurementSample
 from secure_control.scenarios.cart_pole.observer import build_cart_pole_observer_design
 from secure_control.scenarios.cart_pole.secure_experiment import (
@@ -386,6 +387,35 @@ def test_observer_numeric_profile_rejects_insufficient_widths(
     path.write_text(yaml.safe_dump(profile), encoding="utf-8")
     with pytest.raises(ValueError):
         load_cart_pole_lan_profile(path)
+
+
+def test_bounded_input_reachability_uses_encoded_block_contraction() -> None:
+    """#109：持续界复核实际编码矩阵，保留块幂抵消并拒绝不足的状态界。"""
+    nilpotent = {"A": np.array([[1, 1], [-1, -1]], dtype=object),
+                 "B": np.zeros((2, 1), dtype=object),
+                 "x0": np.array([1, 0], dtype=object)}
+    with pytest.raises(ValueError, match="不收缩"):
+        _bounded_input_reachability(nilpotent, (0,), 0, 1)
+    assert _bounded_input_reachability(nilpotent, (0,), 0, 2) == (2, 1)
+
+    profile = load_cart_pole_lan_profile(OBSERVER_PROFILE)
+    encoded = {name: np.asarray(profile.context.encode(getattr(profile.spec, name)), dtype=object)
+               for name in ("A", "B", "C", "D", "x0")}
+    bounds = _bounded_input_reachability(encoded, profile.contract.input_payload_bounds,
+                                         profile.ell, 22)
+    assert len(bounds) == 4 and all(0 < value <= profile.context.maximum_payload
+                                    for value in bounds)
+    contract = replace(profile.contract, state_payload_bounds=bounds, horizon_steps=None,
+                       reachability_block_steps=22)
+    client = Client(profile.context, TwoPartySharing(profile.q),
+                    security_parameter=profile.security_parameter,
+                    modulus_evidence=profile.evidence)
+    client.distribute_controller(profile.spec, contract)
+    assert client.range_verification.proof_mode == "bounded_input_reachability"
+    with pytest.raises(ValueError, match="未覆盖"):
+        client.distribute_controller(profile.spec, replace(
+            contract, state_payload_bounds=(bounds[0] - 1, *bounds[1:])
+        ))
 
 
 def test_observer_cli_fault_reports_attempted_vs_physical(
