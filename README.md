@@ -87,7 +87,11 @@ uv run python path\to\script.py
 uv run python -c "import secure_control; print(secure_control.__version__)"
 ```
 
-当前日常实验只需选择三角色连续运行或 Fig3 四点图，入口与配置见上方快速开始。旧 HVAC 命令不再作为用户入口展示，示例输入移入测试夹具；底层实现和相应回归仍供内部验证。
+三角色连续运行或 Fig3 四点图的入口与配置见上方快速开始。独立的
+[下垂起摆明文可行性实验](docs/cart_pole_swing_up.md) 使用
+`uv run python scripts/run_cart_pole_swing_up.py configs/cart_pole_swing_up.yaml`，
+无需启动 P1/P2；其明文报告不代表已实现安全起摆。
+旧 HVAC 命令不再作为用户入口展示，示例输入移入测试夹具；底层实现和相应回归仍供内部验证。
 
 ## 安全算术基线
 
