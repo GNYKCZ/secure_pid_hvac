@@ -232,3 +232,44 @@ def test_generic_engine_records_pre_step_output(contract) -> None:
         ).y[:, -1]
         np.testing.assert_allclose(observed, expected, rtol=0, atol=1e-8)
     assert not np.array_equal(plant.output(), log.output[-1])
+
+
+@pytest.mark.parametrize("theta", [np.pi, -np.pi, 2 * np.pi, 3 * np.pi])
+def test_large_angle_periodicity_and_hanging_force_direction(contract, theta):
+    """大角度保留原 θ；周期平移不改变速度/非角导数及物理力方向。"""
+    state = np.array([.1, -.2, theta, .3])
+    plant = CartPolePlant(replace(contract, initial_state=tuple(state)))
+    shifted = CartPolePlant(replace(contract, initial_state=tuple(state + [0, 0, 2 * np.pi, 0])))
+    np.testing.assert_allclose(plant._rhs(state, 1), _independent_rhs(0, state, 1), rtol=0, atol=2e-14)
+    np.testing.assert_allclose(shifted._rhs(shifted.state, 1), plant._rhs(state, 1), rtol=0, atol=2e-14)
+    np.testing.assert_allclose(shifted.step(np.array([1.])) - [0, 0, 2 * np.pi, 0],
+                               plant.step(np.array([1.])), rtol=0, atol=2e-14)
+    if abs(np.cos(theta) + 1) < 1e-14:
+        acceleration = plant._rhs(np.array([0., 0., theta, 0.]), 1.)
+        np.testing.assert_allclose(acceleration[[1, 3]], [1.8181818181818181, -4.545454545454545], rtol=0, atol=2e-14)
+
+
+@pytest.mark.parametrize("theta,omega", [(np.pi - .001, 1.), (-np.pi + .001, -1.),
+                                        (2 * np.pi - .001, 1.)])
+def test_step_crosses_angle_chart_boundaries_without_wrapping(contract, theta, omega):
+    """真实 RK4 步跨±π及2π；角度继续累计，角速度不是 wrapped 角差分。"""
+    plant = CartPolePlant(replace(contract, initial_state=(0, 0, theta, omega)))
+    actual = plant.step(np.array([0.]))
+    expected = solve_ivp(_independent_rhs, (0., .02), [0, 0, theta, omega], args=(0.,),
+                         method="DOP853", rtol=1e-13, atol=1e-15).y[:, -1]
+    np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-8)
+    boundary = np.pi if theta > 0 and theta < np.pi else -np.pi if theta < 0 else 2 * np.pi
+    assert (actual[2] - boundary) * omega > 0 and actual[3] * omega > 0
+
+
+def test_hanging_track_failure_and_interior_stage_crossing_are_atomic(contract):
+    """采样末端回到轨道内也不能掩盖 RK4 中间越界；失败保持 step 前值。"""
+    for initial, force in [((.499, 1, np.pi, 0), 0.), ((.49998, .05, np.pi, 0), -10.)]:
+        plant = CartPolePlant(replace(contract, initial_state=initial))
+        before = plant.state
+        with pytest.raises(ValueError, match="track_center_limit_m"):
+            plant.step(np.array([force]))
+        np.testing.assert_array_equal(plant.state, before)
+    solved = solve_ivp(_independent_rhs, (0., .02), [.49998, .05, np.pi, 0], args=(-10.,),
+                       method="DOP853", rtol=1e-13, atol=1e-15, t_eval=np.linspace(0., .02, 101))
+    assert solved.y[0, -1] < .5 and np.max(solved.y[0]) > .5

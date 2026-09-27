@@ -1,0 +1,24 @@
+schema_version: 1
+scenario: cart_pole
+plant_source: cart_pole_plant.yaml
+balance_source: cart_pole_balance.yaml
+# 本次实例从严格下垂开始；不修改物理源的近直立默认初态。
+initial_state: [0, 0, 3.141592653589793, 0]
+kick_direction: 1
+kick_force_n: 1
+kick_steps: 10
+energy_gain_m_per_j_s: 8
+cart_position_gain_per_s2: 16
+cart_velocity_gain_per_s: 8
+capture_enter_abs: [0.35, 0.5, 0.15, 0.8]
+capture_exit_abs: [0.40, 0.55, 0.18, 0.9]
+capture_hold_observations: 3
+swing_reentry_dwell_steps: 5
+capture_timeout_steps: 100
+capture_max_attempts: 3
+acquisition_deadline_steps: 600
+max_cart_speed_m_per_s: 3
+max_pole_speed_rad_per_s: 15
+horizon_steps: 1500
+# 每项为 {step: 整数区间索引, force_n: ±1}；启动控制力不属于外力。
+disturbances: []
