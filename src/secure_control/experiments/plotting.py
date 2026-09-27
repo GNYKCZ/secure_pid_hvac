@@ -181,6 +181,50 @@ class FigureSet:
     manifest_path: Path
 
 
+OVERVIEW_BUCKETS = 2048
+
+
+class BoundedOverview:
+    """固定分桶的首/末/min/max；内存只与桶数有关，绝不保存全程轨迹。"""
+
+    def __init__(self, total: int, buckets: int = OVERVIEW_BUCKETS) -> None:
+        if type(total) is not int or total < 0 or type(buckets) is not int or buckets < 1:
+            raise ValueError("概要容量无效。")
+        self.total, self.buckets = total, buckets
+        self._items: dict[int, list[tuple[int, float, float]]] = {}
+
+    def add(self, index: int, time: float, value: float) -> None:
+        """保留原索引，桶内极值和首尾按原时序输出，不平均掉尖峰。"""
+        if (type(index) is not int or not 0 <= index <= self.total
+                or not np.isfinite(time) or not np.isfinite(value)):
+            raise ValueError("概要点无效。")
+        bucket = min(self.buckets-1, index*self.buckets // max(1, self.total))
+        point = (index, float(time), float(value))
+        items = self._items.get(bucket)
+        if items is None:
+            self._items[bucket] = [point, point, point, point]
+        else:
+            items[1] = point
+            if value < items[2][2]:
+                items[2] = point
+            if value > items[3][2]:
+                items[3] = point
+
+    def points(self) -> list[tuple[int, float, float]]:
+        """返回 ≤4B+2 个真实点；仅该有界结果可交给 Matplotlib。"""
+        return sorted({point for items in self._items.values() for point in items})
+
+
+def _control_axes(title):
+    """有限与分桶控制图共享三栏及前两栏同尺度，不重定义 error 口径。"""
+    figure = Figure(figsize=(9, 9), layout="constrained")
+    FigureCanvasAgg(figure)
+    axes = figure.subplots(3, 1, sharex=True)
+    axes[1].sharey(axes[0])
+    figure.suptitle(title)
+    return figure, axes
+
+
 def _channel(channels: ChannelMetadata, index: int, field: str) -> tuple[str, str]:
     """选择只能落在场景声明的通道内，不能依赖固定领域列名。"""
     if type(index) is not int or index < 0 or index >= len(channels.names):
@@ -271,14 +315,10 @@ def plot_control_triptych(record: ExperimentRecord, control_index: int) -> Figur
     secure = _series(record, "control_secure", record.metadata.control, control_index)
     error = _series(record, "control_error", record.metadata.control, control_index)
     name, unit = _channel(record.metadata.control, control_index, "control")
-    figure = Figure(figsize=(9, 9), layout="constrained")
-    FigureCanvasAgg(figure)
-    axes = figure.subplots(3, 1, sharex=True)
-    axes[1].sharey(axes[0])
     config = record.effective_config
     provenance = record.provenance
     relation = "raw=applied" if config.get("raw_equals_applied") is True else "applied control"
-    figure.suptitle(
+    figure, axes = _control_axes(
         f"{record.run_id} · {provenance.get('backend', 'unknown')} · "
         f"ell={config.get('fractional_bits', 'unknown')}\n{relation}"
     )

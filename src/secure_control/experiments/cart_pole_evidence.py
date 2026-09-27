@@ -209,11 +209,44 @@ def write_cart_pole_evidence(record: object, stage: Path,
     return (EVIDENCE_NAME, MOTION_NAME, MOTION_MANIFEST_NAME)
 
 
-def _write_motion_plot(record: ExperimentRecord, payload: dict[str, object], stage: Path) -> None:
-    """仅从本次正式轨迹与已重放的侧证据画位置、摆角和事件。"""
+def _motion_axes(title):
+    """只创建场景运动画布；有限与长结果的 renderer 共享单位/布局。"""
     figure = Figure(figsize=(9, 6), layout="constrained")
     FigureCanvasAgg(figure)
     axes = figure.subplots(2, 1, sharex=True)
+    figure.suptitle(title)
+    return figure, axes
+
+
+def plot_motion_overview(series, events, stable, title):
+    """消费已验证、有界实际点；用固定 artist 数量表示分桶事件/稳定标记。"""
+    figure, axes = _motion_axes(title)
+    for axis, signal, label in zip(axes, ("p", "theta"), ("Position (m)", "Angle (rad)"),
+                                   strict=True):
+        for branch, color in (("ideal", "tab:blue"), ("secure", "tab:orange")):
+            points = series[f"{signal}_{branch}"]
+            axis.plot([p[1] for p in points], [p[2] for p in points], label=branch, color=color,
+                      marker="." if len(points) == 1 else None)
+        if events:
+            low, high = axis.get_ylim()
+            axis.vlines([p[0] for p in events], low, high, colors="tab:red", alpha=.3,
+                        label="applied disturbances (bucket markers)")
+        axis.set_ylabel(label)
+        axis.grid(True, alpha=.3)
+        axis.legend()
+    if stable:
+        axes[0].scatter([p[0] for p in stable], [p[1] for p in stable], s=5,
+                        label="secure stable observations (bucket markers)")
+    axes[1].set_xlabel("Simulation time (s) · bucket overview; raw values in playback")
+    if len(series["p_secure"]) == 1:
+        axes[0].text(.5, .9, "Initial observation; no control intervals", ha="center",
+                     transform=axes[0].transAxes)
+    return figure
+
+
+def _write_motion_plot(record: ExperimentRecord, payload: dict[str, object], stage: Path) -> None:
+    """仅从本次正式轨迹与已重放的侧证据画位置、摆角和事件。"""
+    figure, axes = _motion_axes(f"Cart-pole motion · {record.run_id}")
     times = np.asarray(payload["time_s"])
     for name, color in (("ideal", "tab:blue"), ("secure", "tab:orange")):
         values = np.asarray(payload["branches"][name]["observations"])
@@ -231,7 +264,6 @@ def _write_motion_plot(record: ExperimentRecord, payload: dict[str, object], sta
         axis.grid(True, alpha=.3)
         axis.legend()
     axes[1].set_xlabel("Simulation time (s); red lines: applied disturbance")
-    figure.suptitle(f"Cart-pole motion · {record.run_id}")
     try:
         figure.savefig(stage / MOTION_NAME, dpi=160, format="png")
     finally:

@@ -7,11 +7,13 @@ import sys
 from pathlib import Path
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="倒立摆 Client：有限动画或持续后端")
+    parser = argparse.ArgumentParser(description="倒立摆 Client：默认持续动画与停止保存")
     parser.add_argument("config", nargs="?", type=Path,
                         default=Path(__file__).resolve().parents[1]
                         / "configs/lab-client-cart-pole.example.yaml")
-    parser.add_argument("--headless-continuous", action="store_true")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--headless-continuous", action="store_true")
+    modes.add_argument("--finite", action="store_true")
     parser.add_argument("--segment-steps", type=int, default=400)
     args = parser.parse_args()
     if args.headless_continuous:
@@ -34,4 +36,5 @@ if __name__ == "__main__":
     # 其他场景和 P1/P2 从不导入 Tk；只有专用入口创建窗口。
     from secure_control.scenarios.cart_pole.gui import run_window
 
-    run_window(args.config)
+    run_window(args.config, segment_steps=args.segment_steps,
+               mode="finite" if args.finite else "segmented")
