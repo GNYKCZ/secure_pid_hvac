@@ -19,6 +19,7 @@ from secure_control.scenarios.cart_pole.secure_experiment import (
     SCENARIO_VERSION as CART_POLE_VERSION,
 )
 from secure_control.scenarios.cart_pole.secure_experiment import (
+    CartPoleObserverSecureExperiment,
     CartPoleSecureExperiment,
     SustainedCartPoleExperiment,
     cart_pole_numeric_contract,
@@ -77,6 +78,8 @@ class PreparedLanExperiment:
     write_scenario_evidence: Callable[[ExperimentRecord, Path], tuple[str, ...]] | None = None
     verify_scenario_run: Callable[[Path], None] | None = None
     execute_plan: Callable[[SimulationPlan], SimulationResult] | None = None
+    include_round_ledger: bool = False
+    physical_completed_count: Callable[[], int] | None = None
 
 
 def _paper(path: str | Path) -> PreparedLanExperiment:
@@ -196,6 +199,10 @@ def _cart_pole(path: str | Path,
                session: InteractiveSession | None = None) -> PreparedLanExperiment:
     """#91 的唯一 plant/controller/adapter 来源仅在 Client 场景层装配。"""
     profile = load_cart_pole_lan_profile(path)
+    if profile.observer_design is not None:
+        if session is not None:
+            raise ValueError("observer 动态 profile 仅支持有限实验。")
+        return _cart_pole_observer(profile)
     scenario = CartPoleSecureExperiment(profile.plant, profile.balance, profile.spec)
     interactive = InteractiveCartPoleExperiment(scenario, session) if session is not None else None
     scenario_version = "2" if interactive is not None else CART_POLE_VERSION
@@ -219,6 +226,63 @@ def _cart_pole(path: str | Path,
         ),
         verify_run,
         interactive.execute_plan if interactive is not None else None,
+    )
+
+
+def _cart_pole_observer(profile) -> PreparedLanExperiment:
+    """#107 两测量 spec 接入原有限三角色与正式发布流程。"""
+    from secure_control.scenarios.cart_pole.adapter import MeasurementSample
+
+    design = profile.observer_design
+    initialization = profile.observer_initialization
+    assert design is not None and initialization is not None
+    scenario = CartPoleObserverSecureExperiment(design, initialization, profile.disturbances)
+    first = profile.plant.initial_state
+    effective = {
+        "scenario": {"name": "cart_pole", "version": "4"},
+        "controller_mode": "observer_two_measurement",
+        "fractional_bits": profile.ell, "paper_parameter_bits": profile.parameter_bits,
+        "runtime_payload_bits": profile.runtime_payload_bits,
+        "security_parameter": profile.security_parameter, "q": profile.q,
+        "sample_count": profile.balance.horizon_steps,
+        "range": {"mode": "finite_horizon", "steps": profile.balance.horizon_steps,
+                  "proof": profile.proof},
+        "reference_used": True, "raw_equals_applied": True,
+        "claim_level": "cart-pole-observer-finite-simulation",
+        "profile_sha256": profile.digest,
+        "prime_source_sha256": profile.prime_digest,
+        "prime_evidence": asdict(profile.evidence) if profile.evidence else None,
+        "plant_source_sha256": profile.plant_digest,
+        "balance_source_sha256": profile.balance_digest,
+        "observer_source_sha256": profile.observer_digest,
+        "plant_contract": asdict(profile.plant),
+        "balance_config": asdict(profile.balance),
+        "observer_config": asdict(design.config),
+        "observer_design": design.to_snapshot(),
+        "initialization": {
+            "first_measurement": asdict(MeasurementSample(0, 0., first[0], first[2])),
+            "branch": initialization.branch, "theta_star": initialization.theta_star,
+            "velocity_seed": list(initialization.velocity_seed),
+            "initial_error_abs": list(initialization.initial_error_abs),
+            "y_abs": list(initialization.y_abs),
+        },
+        "disturbances": [list(event) for event in profile.disturbances],
+        "controller_spec": {name: getattr(profile.spec, name).tolist()
+                            for name in ("A", "B", "C", "D", "x0")},
+    }
+
+    def verify_run(run_dir: Path) -> None:
+        load_verified_cart_pole_run(run_dir)
+
+    return PreparedLanExperiment(
+        "cart_pole", "4", profile.balance.horizon_steps, profile.ell, profile.ell,
+        profile.q, profile.security_parameter, profile.evidence, profile.spec,
+        profile.context, profile.contract, profile.output_root, 0,
+        "cart-pole-observer-finite-simulation", effective,
+        scenario.build_plan, scenario.validate_result, profile.recheck_sources,
+        lambda record, stage: write_cart_pole_evidence(record, stage, scenario),
+        verify_run, scenario.execute_plan, True,
+        lambda: scenario.secure_physical_completed,
     )
 
 
@@ -266,6 +330,8 @@ def load_segmented_experiment(path: str | Path, segment_steps: int,
     if _load_yaml(Path(path).resolve()).get("scenario") != "cart_pole":
         raise ValueError("当前 profile 尚不支持持续模式。")
     profile = load_cart_pole_lan_profile(path)
+    if profile.observer_design is not None:
+        raise ValueError("observer 动态控制器的跨段续算归 #109；此处仅静态持续模式。")
     context, contract, _proof = cart_pole_numeric_contract(
         profile.spec, replace(profile.balance, horizon_steps=segment_steps),
         fractional_bits=profile.ell, parameter_bits=profile.parameter_bits,

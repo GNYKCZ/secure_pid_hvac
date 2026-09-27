@@ -182,3 +182,37 @@ raw界abs(C)h_k+abs(D)y_abs（本期D=0）。这是实数保守界，不是实�
 输出2ell解码、floor(x·2^ell+1/2)及中心化Zq；#108必须针对实际矩阵/初态约束
 重新证明每个累加器和Protocol 2前提/±1误差，不能用Fmax或静态0-Trunc代替。
 本期没有安全执行、Trunc成本、LAN动态reader或秘密跨段实现。
+
+## #108 有限三方动态闭环
+
+`configs/cart_pole_observer_lan.example.yaml` 显式选择 schema 2 的
+`observer_two_measurement`，只引用上文的 observer 配置；该配置继续引用原 plant 与
+balance。Client 在拨号前从仿真首样本的 `p,theta`、声明的速度种子重建 spec/x0，
+并核对仿真真值只作为初始误差前提。更换 plant 初态或任何来源文件都必须新建会话和
+范围证明；已加载 profile 在发布前重查原始来源字节。
+
+通用 `Client` 对编码后的 A/B/C/D/x0 先检查参数位宽，再用精确有理数矩阵幂
+证明每个 `k=0…N` 的 state payload、每个 `k<N` 的 state/output 累加器；
+证明包含输入端点和逐状态行 Trunc 的舍入/±1 裕量，并保存在有效配置的
+`range.proof.step_bounds`。终点只验证后继 state，不执行第 N+1 轮。
+`ControllerLayout` 决定每步资源；当前四维/两输入 dense 布局派生出30个乘法材料、
+4个状态 Trunc，输出保持2ell尺度直接解码，不增加输出 Trunc。
+
+有限两支分别持有 plant、episode、监视器与运行时。理想支使用明文状态空间运行时；
+安全支只调用原 LAN runtime 的 `step([p,theta−theta_star])`，秘密四维估计始终留在
+P1/P2。两支仅用独立诊断真值做工作域/稳定监督；raw 超过±Fmax时协议轮次可能已提交，
+但不得发送力或发布成功。`insecure_tcp` 仅供无认证、无加密本机实验；原 mTLS 路径
+仍可用。仿真 20ms 网格不构成 20ms 墙钟或真实硬件保证。
+
+正式结果沿用八字段 `trajectory.csv` 与原子 writer。动态场景 version 4 的
+`cart_pole_evidence.json` schema 3 另记 N+1 两测量/物理真值、N个公开 raw/施力/
+扰动、监督和终点；metadata 记双提交轮次、唯一 round/resource ID 与实耗。
+reader 从有效配置重建 spec 与编码范围，独立重放物理/理想递推，并以编码矩阵和
+Trunc误差包络核验安全 raw；随机秘密估计本身不能由公开结果精确重建。
+hash/reader 检测不一致，不对能重写全部文件者提供密码学真实性。旧静态侧证据
+version 1/2 的 reader 分支保持原行为。
+
+本期交给 #109 的后继含义是：完成第 N−1 轮后双方各持有 `x̄_N mod q` 的一份份额，
+尺度为 `2^ell`；它与控制器指纹、q/κ、session/全局步 N 及新鲜材料边界绑定。
+Client 只知公开输出和确认的物理前缀，不知道 `x̄_N`。本期没有跨段续算；下一段
+不能重用初态 `x0`、旧材料或本期有限范围证明。
