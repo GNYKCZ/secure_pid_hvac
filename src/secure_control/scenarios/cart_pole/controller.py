@@ -103,10 +103,10 @@ def _linearized_model(plant: CartPoleContract) -> tuple[np.ndarray, np.ndarray]:
     return a, b
 
 
-def build_cart_pole_controller_spec(
+def _feedback_design(
     plant: CartPoleContract, config: CartPoleBalanceConfig
-) -> ControllerSpec:
-    """从 #90 参数与本期 Q/R 重算 ZOH/DARE，返回零维状态反馈规格。"""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """静态反馈与动态观测器共用同一次模型/ZOH/DARE推导，避免增益双来源。"""
     if not isinstance(plant, CartPoleContract) or not isinstance(config, CartPoleBalanceConfig):
         raise TypeError("plant/config 类型无效")
     config.validate_plant(plant)
@@ -131,6 +131,14 @@ def build_cart_pole_controller_spec(
     stability = check_discrete_schur_stability(a_d - b_d @ gain)
     if stability.status != "stable":
         raise ValueError(f"原点无饱和线性闭环未被数值确认为稳定: {stability.status}")
+    return a_c, b_c, a_d, b_d, gain
+
+
+def build_cart_pole_controller_spec(
+    plant: CartPoleContract, config: CartPoleBalanceConfig
+) -> ControllerSpec:
+    """从 #90 参数与本期 Q/R 重算 ZOH/DARE，返回零维状态反馈规格。"""
+    _, _, _, _, gain = _feedback_design(plant, config)
     # 静态全状态反馈不虚构 controller state；输入为 y−r，输出 raw 力为 −K(y−r)。
     return ControllerSpec(
         A=np.empty((0, 0), dtype=np.float64),

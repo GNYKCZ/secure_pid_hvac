@@ -26,6 +26,15 @@
 
 旧 TLS 和单步 LAN 示例配置已从当前目录移除；安全协议的回归测试仍保留。
 
+## 倒立摆两测量明文研究
+
+倒立摆两测量**有限明文**研究使用 `cart_pole_observer.yaml`，只定义观测器衰减率、
+速度种子和初误差假设，引用 `cart_pole_plant.yaml` / `cart_pole_balance.yaml` 的
+唯一物理、Q/R、阈值和horizon来源；矩阵由统一builder派生，不手写到YAML。
+运行 `uv run python scripts/run_cart_pole_observer.py configs/cart_pole_observer.yaml`，
+结果/非饱和契约/理想监督限制见[观测器指南](../docs/cart_pole_observer.md)。
+这条入口不会启动P1/P2或GUI。
+
 ## Fig3 四精度批量图
 
 在项目根目录用 PowerShell 或命令提示符运行。先只查看已经发布的四点结果，**不重新计算**：

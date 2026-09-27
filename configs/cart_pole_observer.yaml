@@ -1,0 +1,9 @@
+schema_version: 1
+scenario: cart_pole
+plant_source: cart_pole_plant.yaml
+balance_source: cart_pole_balance.yaml
+# 本项目离散对偶极点设计选择，非CTMS/论文印刷增益；Ts改变时自动重算。
+observer_decay_rates_per_s: [12, 14, 16, 18]
+initial_velocity_estimate: [0, 0]
+# 误差假设，不是两个位置测量能在线证明的速度保证。
+initial_error_abs: [0, 0.1, 0, 0.15]
