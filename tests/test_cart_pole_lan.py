@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 import time
+from copy import deepcopy
 from dataclasses import replace
 from hashlib import sha256
 from math import pi
@@ -14,6 +15,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import yaml
+from matplotlib.figure import Figure
 from test_cart_pole_balance import _independent_run
 from test_cart_pole_observer import oracle_closed_loop
 from test_lan_continuous import _finish, _plain_deployment, _run
@@ -125,6 +127,171 @@ def _observer_profile_for(paths: dict[str, Path], *, horizon: int = 60,
         "experiment: paper_pid_lan.example.yaml", f"experiment: {profile_path}"
     ), encoding="utf-8")
     return profile_path
+
+
+@pytest.fixture(scope="module")
+def observer_verified_run(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """复用一份真实非零chart三进程产物，类型篡改逐案恢复原字节。"""
+    paths = _plain_deployment(tmp_path_factory.mktemp("observer-evidence"))
+    _observer_profile_for(paths, initial_state=(0, 0, 2 * pi + .005, 0))
+    parties = [_run(role, paths[role]) for role in ("P1", "P2")]
+    try:
+        time.sleep(.5)
+        code, result, errors = _finish(_run("Client", paths["Client"]), 600)
+        assert code == 0, (result, errors)
+        outcomes = [_finish(party, 60) for party in parties]
+        assert all(item[0] == 0 for item in outcomes), outcomes
+        assert len({result["pid"], *(item[1]["pid"] for item in outcomes)}) == 3
+        run_dir = Path(result["run_dir"])
+        load_verified_cart_pole_run(run_dir)
+        return run_dir
+    finally:
+        for party in parties:
+            if party.poll() is None:
+                party.kill()
+            party.communicate()
+
+
+@pytest.mark.parametrize("filename,keys", [
+    (EVIDENCE_NAME, ("schema_version",)),
+    (EVIDENCE_NAME, ("sample_count",)),
+    ("metadata.json", ("provenance", "confirmed_steps", 0, "step")),
+    ("metadata.json", ("provenance", "confirmed_steps", 0, "products")),
+    ("metadata.json", ("provenance", "resource_counts", "truncations_consumed")),
+    ("metadata.json", ("provenance", "scale_ledger", "state_truncation_bits")),
+    ("config.json", ("observer_design", "source_snapshots", 0, "yaml", "schema_version")),
+    ("config.json", ("observer_design", "source_snapshots", 1, "yaml", "schema_version")),
+    ("config.json", ("observer_design", "source_snapshots", 2, "yaml", "schema_version")),
+    ("config.json", ("observer_design", "contract_version")),
+    ("config.json", ("observer_design", "pole_placement", "maxiter")),
+    ("config.json", ("initialization", "branch")),
+    ("config.json", ("sample_count",)),
+    ("config.json", ("range", "steps")),
+    ("config.json", ("range", "proof", "horizon_steps")),
+    ("config.json", ("range", "proof", "step_bounds", 0, "step")),
+    ("config.json", ("range", "proof", "initial_payload", 0)),
+    ("config.json", ("range", "proof", "input_payload_bounds", 0)),
+    (MOTION_MANIFEST_NAME, ("sample_count",)),
+])
+def test_observer_reader_rejects_equal_noninteger_fields(
+    observer_verified_run: Path, filename: str, keys: tuple,
+) -> None:
+    """RV-001：刷新全部摘要后，数值相等的bool/float仍须被正式入口拒绝。"""
+    run_dir = observer_verified_run
+    originals = {name: (run_dir / name).read_bytes() for name in (
+        "metadata.json", "config.json", EVIDENCE_NAME, MOTION_MANIFEST_NAME,
+    )}
+    for kind in (float, bool):
+        documents = {name: json.loads(blob) for name, blob in originals.items()}
+        parent = documents[filename]
+        for key in keys[:-1]:
+            parent = parent[key]
+        value = parent[keys[-1]]
+        assert type(value) is int
+        replacement = kind(value)
+        if replacement != value:
+            continue  # bool只在0/1处数值相等，其余字段用float覆盖。
+        parent[keys[-1]] = replacement
+        try:
+            for name in ("config.json", EVIDENCE_NAME):
+                (run_dir / name).write_text(json.dumps(documents[name]), encoding="utf-8")
+            motion = documents[MOTION_MANIFEST_NAME]
+            motion["evidence_sha256"] = sha256((run_dir / EVIDENCE_NAME).read_bytes()).hexdigest()
+            (run_dir / MOTION_MANIFEST_NAME).write_text(json.dumps(motion), encoding="utf-8")
+            manifest = documents["metadata.json"]
+            manifest["files_sha256"]["config.json"] = sha256(
+                (run_dir / "config.json").read_bytes()
+            ).hexdigest()
+            for name in (EVIDENCE_NAME, MOTION_MANIFEST_NAME):
+                manifest["derived_files_sha256"][name] = sha256((run_dir / name).read_bytes()).hexdigest()
+            (run_dir / "metadata.json").write_text(json.dumps(manifest), encoding="utf-8")
+            with pytest.raises((ValueError, TypeError)):
+                load_verified_cart_pole_run(run_dir)
+        finally:
+            for name, blob in originals.items():
+                (run_dir / name).write_bytes(blob)
+        load_verified_cart_pole_run(run_dir)
+
+
+def _capture_motion_artists(record, payload, run_dir: Path,
+                            monkeypatch: pytest.MonkeyPatch) -> list[dict]:
+    """核对正式renderer实际artist；保留原PNG/manifest，不引入另一套绘图。"""
+    from secure_control.experiments import cart_pole_evidence
+
+    paths = (run_dir / cart_pole_evidence.MOTION_NAME, run_dir / MOTION_MANIFEST_NAME)
+    originals = {path: path.read_bytes() for path in paths}
+    axes_data = []
+    original_save = Figure.savefig
+
+    def capture(figure, *args, **kwargs):
+        for axis in figure.axes:
+            axes_data.append({
+                "lines": [(line.get_label(), list(line.get_xdata()), list(line.get_ydata()))
+                          for line in axis.lines],
+                "ylim": axis.get_ylim(), "xlabel": axis.get_xlabel(),
+            })
+        return original_save(figure, *args, **kwargs)
+
+    try:
+        with monkeypatch.context() as scoped:
+            scoped.setattr(Figure, "savefig", capture)
+            cart_pole_evidence._write_motion_plot(record, payload, run_dir)
+    finally:
+        for path, blob in originals.items():
+            path.write_bytes(blob)
+    return axes_data
+
+
+@pytest.mark.parametrize("theta_star", [0., 2 * pi, -4 * pi])
+def test_observer_motion_targets_use_saved_reference(
+    observer_verified_run: Path, theta_star: float, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RV-002：连续角曲线和目标在同一chart，零线不压缩整圈transient。"""
+    record, payload = load_verified_cart_pole_run(observer_verified_run)
+    payload = deepcopy(payload)
+    shift = theta_star - payload["reference"][0][2]
+    for row in payload["reference"]:
+        row[2] += shift
+    for branch in payload["branches"].values():
+        for row in branch["observations"]:
+            row[2] += shift
+    axes = _capture_motion_artists(record, payload, observer_verified_run, monkeypatch)
+    for axis, index in ((axes[0], 0), (axes[1], 2)):
+        target = next((line for line in axis["lines"] if line[0].startswith("target")), None)
+        assert target is not None
+        np.testing.assert_array_equal(target[2],
+                                      [payload["reference"][0][index]] * len(target[2]))
+        if index == 2 and theta_star != 0:
+            assert target[0] != "target 0"
+    assert axes[1]["ylim"][1] - axes[1]["ylim"][0] < .02
+
+
+@pytest.mark.parametrize("ideal,secure", [(0., 0.), (1., 1.), (1., 0.), (0., -1.)])
+def test_observer_motion_marks_actual_disturbance_by_branch(
+    observer_verified_run: Path, ideal: float, secure: float, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RV-003：展示层消费实际外力；相同请求不能冒充两支相同执行结果。"""
+    record, payload = load_verified_cart_pole_run(observer_verified_run)
+    payload = deepcopy(payload)
+    payload["events"] = [{"step": 0, "force_n": 1., "duration_steps": 1}]
+    for name, force in (("ideal", ideal), ("secure", secure)):
+        branch = payload["branches"][name]
+        branch["disturbance_force_n"][0] = force
+        branch["force_dispositions"][0] = ("accepted" if force else "rejected_total_force_limit")
+    axes = _capture_motion_artists(record, payload, observer_verified_run, monkeypatch)
+    for axis in axes:
+        verticals = [line for line in axis["lines"]
+                     if len(line[1]) == 2 and line[1][0] == line[1][1]]
+        assert {line[0] for line in verticals} == {
+            f"{name} applied disturbance" for name, force in (("ideal", ideal), ("secure", secure))
+            if force != 0
+        }
+        for name, force in (("ideal", ideal), ("secure", secure)):
+            markers = [line for line in axis["lines"] if line[0] == f"{name} applied disturbance"]
+            assert len(markers) == int(force != 0)
+            if markers:
+                assert markers[0][1] == [payload["time_s"][0]] * 2
+        assert "red lines" not in axis["xlabel"]
 
 
 def test_observer_profile_and_plaintext_scene_are_dynamic() -> None:
@@ -344,7 +511,9 @@ def test_observer_three_process_finite_resources_and_reader(tmp_path: Path) -> N
             party.communicate()
 
 
-def test_observer_three_process_400_steps_disturbance(tmp_path: Path) -> None:
+def test_observer_three_process_400_steps_disturbance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """正式400步5°+1N扰动仍非饱和成功，资源从plan/实耗派生。"""
     paths = _plain_deployment(tmp_path)
     _observer_profile_for(
@@ -378,6 +547,61 @@ def test_observer_three_process_400_steps_disturbance(tmp_path: Path) -> None:
             assert evidence["branches"][name]["stable_counts"] == counts
         assert np.max(np.abs(record.result.output_error)) < 3e-8
         assert np.max(np.abs(evidence["raw_force_error_n"])) < 1e-7
+        axes = _capture_motion_artists(record, evidence, Path(result["run_dir"]), monkeypatch)
+        for name in ("ideal", "secure"):
+            marker = next(line for line in axes[1]["lines"]
+                          if line[0] == f"{name} applied disturbance")
+            assert marker[1] == [4., 4.]
+    finally:
+        for party in parties:
+            if party.poll() is None:
+                party.kill()
+            party.communicate()
+
+
+def test_observer_rejected_pulse_is_not_plotted_as_applied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RV-003：真实400步合法拒绝外扰仍成功，正式图不能宣称施加该脉冲。"""
+    paths = _plain_deployment(tmp_path)
+    _observer_profile_for(paths, horizon=400,
+                          initial_state=(0, 0, .08726646259971647, 0),
+                          disturbances=((0, -1.),))
+    plant_path = tmp_path / "observer-plant.yaml"
+    plant = yaml.safe_load(plant_path.read_text(encoding="utf-8"))
+    plant["max_applied_force_n"] = 2.440242909979021
+    plant_path.write_text(yaml.safe_dump(plant), encoding="utf-8")
+    parties = [_run(role, paths[role]) for role in ("P1", "P2")]
+    try:
+        time.sleep(.5)
+        code, result, errors = _finish(_run("Client", paths["Client"]), 1200)
+        assert code == 0, (result, errors)
+        outcomes = [_finish(party, 60) for party in parties]
+        assert all(item[0] == 0 for item in outcomes), outcomes
+        assert len({result["pid"], *(item[1]["pid"] for item in outcomes)}) == 3
+        run_dir = Path(result["run_dir"])
+        record, evidence = load_verified_cart_pole_run(run_dir)
+        for branch in evidence["branches"].values():
+            assert branch["requested_disturbance_n"][0] == -1.
+            assert branch["disturbance_force_n"][0] == 0.
+            assert branch["force_dispositions"][0] == "rejected_total_force_limit"
+            assert branch["statuses"][-1] == "stable"
+        axes = _capture_motion_artists(record, evidence, run_dir, monkeypatch)
+        for axis in axes:
+            assert not any(len(line[1]) == 2 and line[1][0] == line[1][1]
+                           for line in axis["lines"])
+        # 同一正式拒绝run的step0/duration也须严格整数。
+        original = (run_dir / EVIDENCE_NAME).read_bytes()
+        for field in ("step", "duration_steps"):
+            changed = deepcopy(evidence)
+            changed["events"][0][field] = float(changed["events"][0][field])
+            try:
+                (run_dir / EVIDENCE_NAME).write_text(json.dumps(changed), encoding="utf-8")
+                with pytest.raises(ValueError, match="事件"):
+                    verify_cart_pole_evidence(record, run_dir)
+            finally:
+                (run_dir / EVIDENCE_NAME).write_bytes(original)
+        load_verified_cart_pole_run(run_dir)
     finally:
         for party in parties:
             if party.poll() is None:

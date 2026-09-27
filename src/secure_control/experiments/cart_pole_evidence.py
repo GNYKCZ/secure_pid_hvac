@@ -104,6 +104,24 @@ def _json_normal(value: object) -> object:
     return json.loads(json.dumps(value, allow_nan=False))
 
 
+def _matches_derived_json(actual: object, expected: object) -> bool:
+    """按重派生JSON的类型比较；整数契约不能被bool/等值float绕过。
+
+    实数参数仍允许合法的整数写法（如YAML的0），不把物理量误收紧为float。
+    """
+    if isinstance(expected, dict):
+        return (isinstance(actual, dict) and actual.keys() == expected.keys()
+                and all(_matches_derived_json(actual[key], value)
+                        for key, value in expected.items()))
+    if isinstance(expected, list):
+        return (isinstance(actual, list) and len(actual) == len(expected)
+                and all(_matches_derived_json(item, value)
+                        for item, value in zip(actual, expected, strict=True)))
+    if type(expected) is float:
+        return type(actual) in (int, float) and actual == expected
+    return type(actual) is type(expected) and actual == expected
+
+
 def _verify_observer_resources(record: ExperimentRecord, spec, context, contract) -> None:
     """重新运行 canonical 数值预检并核对每轮双提交资源身份和实耗。"""
     config, provenance = record.effective_config, record.provenance
@@ -114,13 +132,14 @@ def _verify_observer_resources(record: ExperimentRecord, spec, context, contract
     )
     distribution = client.distribute_controller(spec, contract)
     proof = config["range"]["proof"]
-    if (proof.get("range_verification") != _json_normal(asdict(client.range_verification))
-            or provenance.get("range_verification")
-            != _json_normal(asdict(client.range_verification))
-            or provenance.get("prime_verification")
-            != _json_normal(asdict(client.truncation.modulus_verification))
-            or provenance.get("scale_ledger")
-            != _json_normal(asdict(distribution.p1.layout.scale_ledger))):
+    if (not _matches_derived_json(proof.get("range_verification"),
+                                 _json_normal(asdict(client.range_verification)))
+            or not _matches_derived_json(provenance.get("range_verification"),
+                                         _json_normal(asdict(client.range_verification)))
+            or not _matches_derived_json(provenance.get("prime_verification"),
+                         _json_normal(asdict(client.truncation.modulus_verification)))
+            or not _matches_derived_json(provenance.get("scale_ledger"),
+                         _json_normal(asdict(distribution.p1.layout.scale_ledger)))):
         raise ValueError("倒立摆动态范围、素数或尺度证据与重新预检不符。")
     n = contract.horizon_steps
     elapsed = provenance.get("wall_elapsed_ms")
@@ -137,15 +156,15 @@ def _verify_observer_resources(record: ExperimentRecord, spec, context, contract
     rounds = provenance.get("round_ledger")
     if (type(n) is not int or not isinstance(confirmed, list) or len(confirmed) != n
             or not isinstance(rounds, list) or len(rounds) != n
-            or provenance.get("resource_counts") != {
+            or not _matches_derived_json(provenance.get("resource_counts"), {
                 "products_consumed": products * n,
                 "truncations_consumed": truncations * n,
-            } or truncations == 0):
+            }) or truncations == 0):
         raise ValueError("倒立摆动态资源实耗或轮次长度无效。")
     seen = set()
     for step, (count, round_record) in enumerate(zip(confirmed, rounds, strict=True)):
-        if count != {"step": step, "status": "double_committed",
-                     "products": products, "truncations": truncations}:
+        if not _matches_derived_json(count, {"step": step, "status": "double_committed",
+                                            "products": products, "truncations": truncations}):
             raise ValueError("倒立摆动态逐步双提交实耗不符。")
         if not isinstance(round_record, dict) or set(round_record) != {
             "step", "round_id", "product_resource_ids", "truncation_resource_ids"
@@ -177,11 +196,11 @@ def _verify_observer_evidence(record: ExperimentRecord, payload: dict) -> None:
         plant, balance, CartPoleObserverConfig(**config["observer_config"])
     )
     snapshot = config.get("observer_design")
-    if not isinstance(snapshot, dict) or {k: v for k, v in snapshot.items()
-                                            if k != "source_snapshots"} != {
+    if not isinstance(snapshot, dict) or not _matches_derived_json(
+        {k: v for k, v in snapshot.items() if k != "source_snapshots"}, {
         k: v for k, v in _json_normal(design.to_snapshot()).items()
         if k != "source_snapshots"
-    }:
+    }):
         raise ValueError("倒立摆动态设计快照与三源参数不符。")
     sources = snapshot.get("source_snapshots")
     if (not isinstance(sources, list) or len(sources) != 3
@@ -213,7 +232,7 @@ def _verify_observer_evidence(record: ExperimentRecord, payload: dict) -> None:
                         or Path(reference).name != by_role[dependency]["filename"]):
                     raise ValueError("倒立摆动态来源引用不符。")
                 expected[field] = reference
-        if original != _json_normal(expected):
+        if not _matches_derived_json(original, _json_normal(expected)):
             raise ValueError("倒立摆动态来源 YAML 与有效参数不符。")
     initial = config["initialization"]
     first = MeasurementSample(**initial["first_measurement"])
@@ -222,13 +241,13 @@ def _verify_observer_evidence(record: ExperimentRecord, payload: dict) -> None:
             or first.p_m != truth0[0] or first.theta_rad != truth0[2]):
         raise ValueError("倒立摆动态首样本不是物理初态的两测量。")
     initialization = design.initialize(first, tuple(initial["velocity_seed"]))
-    if initial != {
+    if not _matches_derived_json(initial, {
         "first_measurement": _json_normal(asdict(first)),
         "branch": initialization.branch, "theta_star": initialization.theta_star,
         "velocity_seed": list(initialization.velocity_seed),
         "initial_error_abs": list(initialization.initial_error_abs),
         "y_abs": list(initialization.y_abs),
-    }:
+    }):
         raise ValueError("倒立摆动态首测量、chart 或 seed 快照不符。")
     local0 = truth0.copy()
     local0[2] -= initialization.theta_star
@@ -249,15 +268,18 @@ def _verify_observer_evidence(record: ExperimentRecord, payload: dict) -> None:
     )
     proof = config["range"]["proof"]
     if (config["range"].get("mode") != "finite_horizon"
-            or config["range"].get("steps") != balance.horizon_steps
+            or not _matches_derived_json(config["range"].get("steps"), balance.horizon_steps)
             or not isinstance(proof, dict)
-            or {key: value for key, value in proof.items() if key != "range_verification"}
-            != expected_proof):
+            or not _matches_derived_json(
+                {key: value for key, value in proof.items() if key != "range_verification"},
+                expected_proof)):
         raise ValueError("倒立摆动态编码范围证明字段不符。")
     _verify_observer_resources(record, spec, context, contract)
     n = balance.horizon_steps
-    if (payload.get("schema_version") != 3 or payload.get("run_id") != record.run_id
-            or payload.get("sample_count") != n
+    if (not _matches_derived_json(payload.get("schema_version"), 3)
+            or payload.get("run_id") != record.run_id
+            or not _matches_derived_json(payload.get("sample_count"), n)
+            or not _matches_derived_json(config.get("sample_count"), n)
             or payload.get("sample_period_s") != plant.sample_period_s
             or payload.get("terminal_time_s") != n * plant.sample_period_s
             or payload.get("state_units") != list(record.metadata.output.units)
@@ -277,7 +299,7 @@ def _verify_observer_evidence(record: ExperimentRecord, payload: dict) -> None:
     expected_events = [{"step": step, "force_n": force, "duration_steps": 1,
                         "phase": "after_controller_commit_before_plant_step"}
                        for step, force in disturbances]
-    if payload.get("events") != expected_events or set(payload.get("branches", {})) != {
+    if not _matches_derived_json(payload.get("events"), expected_events) or set(payload.get("branches", {})) != {
         "ideal", "secure"
     }:
         raise ValueError("倒立摆动态事件或双支记录无效。")
@@ -622,15 +644,26 @@ def _write_motion_plot(record: ExperimentRecord, payload: dict[str, object], sta
         stable = np.asarray(payload["branches"][name]["statuses"]) == "stable"
         axes[0].plot(times[stable], values[stable, 0], ".", color=color,
                      markersize=3, label=f"{name} stable observations")
-    for axis, ylabel in zip(axes, ("Cart position p (m)", "Pole angle theta (rad)"),
-                            strict=True):
-        axis.axhline(0, color="black", linestyle="--", linewidth=.7, label="target 0")
-        for event in payload["events"]:
-            axis.axvline(times[event["step"]], color="tab:red", alpha=.35)
+        # 事件表是请求计划；标记只消费本支实际外力，不能把拒绝当作施加。
+        actual = (payload["branches"][name]["disturbance_force_n"]
+                  if payload["schema_version"] == 3 else payload["disturbance_force_n"])
+        for event_index, step in enumerate(np.flatnonzero(np.asarray(actual) != 0)):
+            for axis in axes:
+                axis.axvline(times[step], color=color, alpha=.5,
+                             linestyle=":" if name == "secure" else "--",
+                             label=f"{name} applied disturbance" if event_index == 0 else None)
+    reference = np.asarray(payload["reference"])
+    for axis, index, signal, ylabel in zip(
+        axes, (0, 2), ("p", "theta"), ("Cart position p (m)", "Pole angle theta (rad)"),
+        strict=True,
+    ):
+        # 连续物理theta在非零整圈chart的目标是theta_star，直接消费保存的reference。
+        axis.plot(times, reference[:, index], color="black", linestyle="--", linewidth=.7,
+                  label=f"target {signal}")
         axis.set_ylabel(ylabel)
         axis.grid(True, alpha=.3)
         axis.legend()
-    axes[1].set_xlabel("Simulation time (s); red lines: applied disturbance")
+    axes[1].set_xlabel("Simulation time (s); vertical lines: applied disturbances by branch")
     try:
         figure.savefig(stage / MOTION_NAME, dpi=160, format="png")
     finally:
@@ -650,13 +683,13 @@ def _write_motion_plot(record: ExperimentRecord, payload: dict[str, object], sta
 
 def _verify_motion_plot(record: ExperimentRecord, run_dir: Path) -> None:
     manifest = _read_json(run_dir / MOTION_MANIFEST_NAME)
-    if manifest != {
+    if not _matches_derived_json(manifest, {
         "run_id": record.run_id,
         "sample_count": int(record.result.time.size),
         "trajectory_sha256": _digest(run_dir / "trajectory.csv"),
         "evidence_sha256": _digest(run_dir / EVIDENCE_NAME),
         "figure_sha256": _digest(run_dir / MOTION_NAME),
-    }:
+    }):
         raise ValueError("倒立摆运动图与正式证据来源不一致。")
 
 
