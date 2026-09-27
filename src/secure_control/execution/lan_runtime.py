@@ -235,6 +235,7 @@ class LanContinuousRuntime:
         self._products = 0
         self._truncations = 0
         self._confirmed_steps: list[dict[str, int | str]] = []
+        self._confirmed_plans: list[dict[str, object]] = []
         self._failed = False
         self._finished = False
         self.session_id = self.distribution.session_id
@@ -283,6 +284,11 @@ class LanContinuousRuntime:
         """只导出双提交后确认的公开 step 与逻辑资源计数。"""
         return tuple(dict(item) for item in self._confirmed_steps)
 
+    @property
+    def confirmed_plans(self) -> tuple[dict[str, object], ...]:
+        """只公开已双提交轮次的身份与资源索引，不暴露随机材料。"""
+        return tuple(dict(item) for item in self._confirmed_plans)
+
     def step(self, v: Any) -> np.ndarray:
         """同一 session 逐轮推进；任何未确认回执使整个运行时失效。"""
         if self._failed or self._finished or self._step >= self.range_contract.horizon_steps:
@@ -319,6 +325,12 @@ class LanContinuousRuntime:
             self._confirmed_steps.append({
                 "step": plan.step, "status": "double_committed",
                 "products": result.products, "truncations": result.truncations,
+            })
+            self._confirmed_plans.append({
+                "step": plan.step, "round_id": plan.round_id,
+                "product_resource_ids": [item.resource_id for item in plan.product_resources],
+                "truncation_resource_ids": [item.resource_id
+                                            for item in plan.state_truncation_resources],
             })
             self._last_result = result
             return np.array(result.output, dtype=float, copy=True)

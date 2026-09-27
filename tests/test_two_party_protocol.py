@@ -901,3 +901,62 @@ def test_finite_horizon_proves_general_trunc_path_with_rounding_margin() -> None
     )
     online = client.prepare_online(distribution, [0.25], step=0)
     assert online.p1_resources.plan.truncation_count == 1
+
+
+def test_finite_horizon_keeps_encoded_matrix_cancellation() -> None:
+    """幂次先合成再取绝对值；符号抵消的 nilpotent 控制器不被 |A|^N 误拒。"""
+    fixed_point = FixedPointContext(2_147_483_647, integer_bits=16, fractional_bits=8)
+    client = Client(fixed_point, TwoPartySharing(fixed_point.modulus), security_parameter=8)
+    spec = ControllerSpec(
+        A=np.array([[.8, .8], [-.8, -.8]]), B=np.zeros((2, 1)),
+        C=np.array([[1., 0.]]), D=np.zeros((1, 1)), x0=np.array([.1, .1]),
+    )
+    contract = ControllerRangeContract(
+        state_payload_bounds=(1000, 1000), input_payload_bounds=(0,), horizon_steps=100,
+    )
+    client.distribute_controller(spec, contract)
+    assert client.range_verification.proof_mode == "finite_horizon"
+    assert client.range_verification.state_accumulator_bounds[0] < 1000 * 256
+
+
+def test_encoded_power_bounds_cover_all_small_rounding_paths() -> None:
+    """枚举负系数、全部有界输入及±1误差，独立检查每步累加器与终点。"""
+    from itertools import product
+
+    from secure_control.protocol.roles import _finite_horizon_encoded_trace
+
+    payloads = {
+        "A": np.array([[3, 3], [-3, -3]], dtype=object),
+        "B": np.array([[1], [-2]], dtype=object),
+        "C": np.array([[3, -2]], dtype=object),
+        "D": np.array([[1]], dtype=object), "x0": np.array([2, -1], dtype=object),
+    }
+    trace = list(_finite_horizon_encoded_trace(payloads, (2,), 2, 4))
+    states = {(2, -1)}
+    for step in range(5):
+        certificate = trace[step]
+        following = set()
+        for state in states:
+            assert all(abs(value) <= bound for value, bound in zip(
+                state, certificate["state_payload_bounds"], strict=True
+            ))
+            if step == 4:
+                continue
+            for measurement in range(-2, 3):
+                raw = payloads["A"] @ np.array(state, dtype=object) + (
+                    payloads["B"][:, 0] * measurement
+                )
+                assert all(abs(value) <= bound for value, bound in zip(
+                    raw, certificate["state_accumulator_bounds"], strict=True
+                ))
+                output = 3 * state[0] - 2 * state[1] + measurement
+                assert abs(output) <= certificate["output_accumulator_bounds"][0]
+                # floor(m/S+1/2) 的整数形式，避免用被测实现或 Python round。
+                rounded = [(2 * int(value) + 4) // 8 for value in raw]
+                for errors in product((-1, 0, 1), repeat=2):
+                    following.add(tuple(value + error for value, error in zip(
+                        rounded, errors, strict=True
+                    )))
+        states = following
+    assert trace[-1]["state_accumulator_bounds"] == []
+    assert trace[-1]["output_accumulator_bounds"] == []

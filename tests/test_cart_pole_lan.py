@@ -7,18 +7,23 @@ import subprocess
 import sys
 import time
 from dataclasses import replace
+from hashlib import sha256
+from math import pi
 from pathlib import Path
 
 import numpy as np
 import pytest
 import yaml
 from test_cart_pole_balance import _independent_run
+from test_cart_pole_observer import oracle_closed_loop
 from test_lan_continuous import _finish, _plain_deployment, _run
+from test_lan_continuous import deployment as _tls_deployment
 
 from secure_control.crypto import TwoPartySharing
 from secure_control.experiments.artifacts import load_artifacts, write_artifacts
 from secure_control.experiments.cart_pole_evidence import (
     EVIDENCE_NAME,
+    MOTION_MANIFEST_NAME,
     load_verified_cart_pole_run,
     verify_cart_pole_evidence,
     write_cart_pole_evidence,
@@ -26,7 +31,10 @@ from secure_control.experiments.cart_pole_evidence import (
 from secure_control.experiments.cart_pole_lan_profile import load_cart_pole_lan_profile
 from secure_control.experiments.lan_continuous_profile import load_prepared_lan_experiment
 from secure_control.protocol import Client
+from secure_control.scenarios.cart_pole.adapter import MeasurementSample
+from secure_control.scenarios.cart_pole.observer import build_cart_pole_observer_design
 from secure_control.scenarios.cart_pole.secure_experiment import (
+    CartPoleObserverSecureExperiment,
     CartPoleSecureExperiment,
     cart_pole_numeric_contract,
 )
@@ -34,6 +42,7 @@ from secure_control.simulation import compare_closed_loops
 
 ROOT = Path(__file__).resolve().parents[1]
 PROFILE = ROOT / "configs" / "cart_pole_lan.example.yaml"
+OBSERVER_PROFILE = ROOT / "configs" / "cart_pole_observer_lan.example.yaml"
 # ell=32 时每步四路编码及 D 量化的力误差上界约 4.51e-9 N；
 # 400 步原点线性化响应包络约 3.27e-9（最大状态分量）/4.95e-8 N。
 # 对非线性代表轨迹留余量，且保留 #91 明文 oracle 原有 3e-8 门限。
@@ -74,6 +83,327 @@ def _profile_for(paths: dict[str, Path]) -> Path:
         "experiment: paper_pid_lan.example.yaml", f"experiment: {profile}"
     ), encoding="utf-8")
     return profile
+
+
+def _observer_profile_for(paths: dict[str, Path], *, horizon: int = 60,
+                          initial_state: tuple[float, ...] = (0, 0, .005, 0),
+                          disturbances: tuple[tuple[int, float], ...] = ()) -> Path:
+    """有限动态集成测试沿用三份角色配置，仅换 Client 的场景来源。"""
+    root = paths["Client"].parent
+    plant = yaml.safe_load((ROOT / "configs" / "cart_pole_plant.yaml").read_text(
+        encoding="utf-8"
+    ))
+    plant["initial_state"] = list(initial_state)
+    plant_path = root / "observer-plant.yaml"
+    plant_path.write_text(yaml.safe_dump(plant), encoding="utf-8")
+    balance = yaml.safe_load((ROOT / "configs" / "cart_pole_balance.yaml").read_text(
+        encoding="utf-8"
+    ))
+    balance["horizon_steps"] = horizon
+    balance_path = root / "observer-balance.yaml"
+    balance_path.write_text(yaml.safe_dump(balance), encoding="utf-8")
+    observer = yaml.safe_load((ROOT / "configs" / "cart_pole_observer.yaml").read_text(
+        encoding="utf-8"
+    ))
+    observer.update({"plant_source": str(plant_path), "balance_source": str(balance_path)})
+    observer_path = root / "observer.yaml"
+    observer_path.write_text(yaml.safe_dump(observer), encoding="utf-8")
+    profile = yaml.safe_load(OBSERVER_PROFILE.read_text(encoding="utf-8"))
+    profile["observer_source"] = str(observer_path)
+    profile["numeric"]["prime_source"] = str(
+        ROOT / "configs" / "shared_prime_256_pocklington.yaml"
+    )
+    profile["output_root"] = str(root / "observer-runs")
+    profile["disturbances"] = [list(event) for event in disturbances]
+    profile_path = root / "observer-profile.yaml"
+    profile_path.write_text(yaml.safe_dump(profile), encoding="utf-8")
+    client = paths["Client"]
+    client.write_text(client.read_text(encoding="utf-8").replace(
+        f"controller: {ROOT / 'tests' / 'fixtures' / 'legacy_hvac' / 'hvac_dual_loop.yaml'}",
+        f"experiment: {profile_path}",
+    ).replace(
+        "experiment: paper_pid_lan.example.yaml", f"experiment: {profile_path}"
+    ), encoding="utf-8")
+    return profile_path
+
+
+def test_observer_profile_and_plaintext_scene_are_dynamic() -> None:
+    """真实配置的首样本直接决定4×2 spec，双支无网络仍按两测量闭环。"""
+    profile = load_cart_pole_lan_profile(OBSERVER_PROFILE)
+    assert (profile.spec.state_dimension, profile.spec.input_dimension) == (4, 2)
+    assert profile.contract.horizon_steps == 400
+    assert profile.proof["range_verification"]["state_accumulator_bounds"][0] > 0
+    scene = CartPoleObserverSecureExperiment(
+        profile.observer_design, profile.observer_initialization
+    )
+    from secure_control.execution import PlaintextStateSpaceRuntime
+
+    plan = scene.build_plan(PlaintextStateSpaceRuntime(profile.spec))
+    result = scene.execute_plan(plan)
+    scene.validate_result(result)
+    assert scene.records["secure"]["statuses"][-1] == "stable"
+    assert len(scene.records["secure"]["measurements"]) == 401
+    assert np.max(np.abs(result.control_error)) == 0
+
+
+@pytest.mark.parametrize("theta,disturbance", [
+    (-.08726646259971647, ((200, -1.),)),
+    (2 * pi + .08726646259971647, ((200, 1.),)),
+])
+def test_observer_scene_keeps_fixed_angle_branch_and_disturbance(
+    theta: float, disturbance: tuple[tuple[int, float], ...]
+) -> None:
+    """负角和整圈角都沿首测量chart运行，未知外力只进入物理适配器。"""
+    profile = load_cart_pole_lan_profile(OBSERVER_PROFILE)
+    design = build_cart_pole_observer_design(
+        replace(profile.plant, initial_state=(0, 0, theta, 0)),
+        profile.balance, profile.observer_design.config,
+    )
+    initialization = design.initialize(MeasurementSample(0, 0., 0., theta))
+    scene = CartPoleObserverSecureExperiment(design, initialization, disturbance)
+    from secure_control.execution import PlaintextStateSpaceRuntime
+
+    plan = scene.build_plan(PlaintextStateSpaceRuntime(initialization.spec))
+    result = scene.execute_plan(plan)
+    scene.validate_result(result)
+    assert scene.records["secure"]["statuses"][-1] == "stable"
+    assert scene.records["secure"]["requested_disturbance_n"][200] == disturbance[0][1]
+    assert result.reference[0, 2] == initialization.theta_star
+    assert np.max(np.abs(result.control_error)) == 0
+
+
+def test_observer_profile_source_drift_and_runtime_failure(tmp_path: Path) -> None:
+    """新 profile 来源变化在联网前拒绝；raw 越界/超时不产生成功结果。"""
+    paths = _plain_deployment(tmp_path)
+    path = _observer_profile_for(paths)
+    profile = load_cart_pole_lan_profile(path)
+    with path.open("a", encoding="utf-8") as target:
+        target.write("\n# changed after preflight\n")
+    with pytest.raises(ValueError, match="来源"):
+        profile.recheck_sources()
+    scene = CartPoleObserverSecureExperiment(
+        profile.observer_design, profile.observer_initialization
+    )
+
+    class BadRuntime:
+        def __init__(self, error: Exception | None = None) -> None:
+            self.error = error
+
+        def step(self, _value):
+            if self.error is not None:
+                raise self.error
+            return np.array([11.])
+
+    plan = scene.build_plan(BadRuntime())
+    with pytest.raises(ValueError, match="saturation_outside_contract"):
+        scene.execute_plan(plan)
+    np.testing.assert_array_equal(plan.secure.plant.state, profile.plant.initial_state)
+    assert scene.records == {}
+    scene = CartPoleObserverSecureExperiment(
+        profile.observer_design, profile.observer_initialization
+    )
+    with pytest.raises(TimeoutError):
+        scene.execute_plan(scene.build_plan(BadRuntime(TimeoutError("injected"))))
+    assert scene.records == {}
+
+
+@pytest.mark.parametrize("field,value", [("k", 33), ("runtime_payload_bits", 39),
+                                         ("lambda", 224)])
+def test_observer_numeric_profile_rejects_insufficient_widths(
+    tmp_path: Path, field: str, value: int,
+) -> None:
+    """参数、状态payload与Protocol2 κ各自有独立门禁，不借raw力限幅掩盖。"""
+    path = _observer_profile_for(_plain_deployment(tmp_path), horizon=400)
+    profile = yaml.safe_load(path.read_text(encoding="utf-8"))
+    profile["numeric"][field] = value
+    path.write_text(yaml.safe_dump(profile), encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_cart_pole_lan_profile(path)
+
+
+def test_observer_cli_fault_reports_attempted_vs_physical(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """协议已提交但raw越界时公开attempt=1、物理前缀=0，不称complete。"""
+    from secure_control.execution.lan_config import load_lan_config
+    from secure_control.experiments import lan_runner
+
+    paths = _plain_deployment(tmp_path)
+    _observer_profile_for(paths)
+
+    class AttemptedRuntime:
+        def __init__(self, *_args) -> None:
+            self.confirmed_steps = []
+            self.resource_counts = {"products_consumed": 0, "truncations_consumed": 0}
+
+        def step(self, _value):
+            self.confirmed_steps.append({"step": 0, "status": "double_committed",
+                                         "products": 30, "truncations": 4})
+            self.resource_counts = {"products_consumed": 30, "truncations_consumed": 4}
+            return np.array([11.])
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(lan_runner, "LanContinuousRuntime", AttemptedRuntime)
+    with pytest.raises(ValueError, match="saturation_outside_contract") as failure:
+        lan_runner.run_client_continuous(load_lan_config(paths["Client"], "Client"))
+    assert failure.value._public_lan_progress == {
+        "protocol_double_committed_count": 1, "physically_confirmed_count": 0,
+        "resource_counts": {"products_consumed": 30, "truncations_consumed": 4},
+        "uncertain": False,
+    }
+    lan_runner._failure("Client", 4, "identity_or_protocol", failure.value)
+    report = json.loads(capsys.readouterr().out)
+    assert report["status"] == "failed" and report["progress"] == (
+        failure.value._public_lan_progress
+    )
+
+
+def test_observer_three_process_finite_resources_and_reader(tmp_path: Path) -> None:
+    """真实三PID递推60步，逐轮消费30 triple/4 Trunc 并正式读回。"""
+    paths = _plain_deployment(tmp_path)
+    _observer_profile_for(paths)
+    parties = [_run(role, paths[role]) for role in ("P1", "P2")]
+    try:
+        time.sleep(.5)
+        code, result, errors = _finish(_run("Client", paths["Client"]), 600)
+        assert code == 0, (result, errors)
+        outcomes = [_finish(party, 600) for party in parties]
+        assert all(item[0] == 0 for item in outcomes), outcomes
+        assert len({result["pid"], *(item[1]["pid"] for item in outcomes)}) == 3
+        assert result["resource_counts"] == {
+            "products_consumed": 60 * 30, "truncations_consumed": 60 * 4,
+        }
+        record, sidecar = load_verified_cart_pole_run(result["run_dir"])
+        assert len(record.provenance["round_ledger"]) == 60
+        assert len({item["round_id"] for item in record.provenance["round_ledger"]}) == 60
+        assert sidecar["branches"]["secure"]["statuses"][-1] == "stable"
+        assert Path(result["figure_path"]).is_file()
+        from copy import deepcopy
+
+        altered = deepcopy(record)
+        altered.effective_config["observer_design"]["source_snapshots"][1]["yaml"][
+            "sample_period_s"
+        ] *= 2
+        with pytest.raises(ValueError, match="来源 YAML"):
+            verify_cart_pole_evidence(altered, Path(result["run_dir"]))
+        altered = deepcopy(record)
+        altered.provenance["round_ledger"][1]["round_id"] = altered.provenance[
+            "round_ledger"
+        ][0]["round_id"]
+        with pytest.raises(ValueError, match="轮次身份"):
+            verify_cart_pole_evidence(altered, Path(result["run_dir"]))
+        altered = deepcopy(record)
+        altered.effective_config["controller_spec"]["B"][0][0] += 1e-4
+        with pytest.raises(ValueError, match="控制器"):
+            verify_cart_pole_evidence(altered, Path(result["run_dir"]))
+        altered = deepcopy(record)
+        altered.effective_config["range"]["proof"]["step_bounds"][3][
+            "state_payload_bounds"
+        ][0] += 1
+        with pytest.raises(ValueError, match="范围证明"):
+            verify_cart_pole_evidence(altered, Path(result["run_dir"]))
+        altered = deepcopy(record)
+        altered.provenance["resource_counts"]["truncations_consumed"] -= 1
+        with pytest.raises(ValueError, match="资源实耗"):
+            verify_cart_pole_evidence(altered, Path(result["run_dir"]))
+        sidecar_path = Path(result["run_dir"]) / EVIDENCE_NAME
+        original = sidecar_path.read_text(encoding="utf-8")
+        run_dir = Path(result["run_dir"])
+        manifest_path = run_dir / "metadata.json"
+        motion_path = run_dir / MOTION_MANIFEST_NAME
+        original_manifest = manifest_path.read_text(encoding="utf-8")
+        original_motion = motion_path.read_text(encoding="utf-8")
+        try:
+            changed = deepcopy(sidecar)
+            changed["branches"]["secure"]["measurements"][3][0] += .001
+            sidecar_path.write_text(json.dumps(changed), encoding="utf-8")
+            with pytest.raises((ValueError, AssertionError)):
+                verify_cart_pole_evidence(record, Path(result["run_dir"]))
+            # 即使篡改者刷新了所有相关文件摘要，独立语义重放仍拒绝测量错位。
+            manifest = json.loads(original_manifest)
+            motion = json.loads(original_motion)
+            motion["evidence_sha256"] = sha256(sidecar_path.read_bytes()).hexdigest()
+            motion_path.write_text(json.dumps(motion), encoding="utf-8")
+            manifest["derived_files_sha256"][EVIDENCE_NAME] = motion["evidence_sha256"]
+            manifest["derived_files_sha256"][MOTION_MANIFEST_NAME] = sha256(
+                motion_path.read_bytes()
+            ).hexdigest()
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with pytest.raises((ValueError, AssertionError)):
+                load_verified_cart_pole_run(run_dir)
+        finally:
+            sidecar_path.write_text(original, encoding="utf-8")
+            manifest_path.write_text(original_manifest, encoding="utf-8")
+            motion_path.write_text(original_motion, encoding="utf-8")
+    finally:
+        for party in parties:
+            if party.poll() is None:
+                party.kill()
+            party.communicate()
+
+
+def test_observer_three_process_400_steps_disturbance(tmp_path: Path) -> None:
+    """正式400步5°+1N扰动仍非饱和成功，资源从plan/实耗派生。"""
+    paths = _plain_deployment(tmp_path)
+    _observer_profile_for(
+        paths, horizon=400, initial_state=(0, 0, .08726646259971647, 0),
+        disturbances=((200, 1.),),
+    )
+    parties = [_run(role, paths[role]) for role in ("P1", "P2")]
+    try:
+        time.sleep(.5)
+        code, result, errors = _finish(_run("Client", paths["Client"]), 1200)
+        assert code == 0, (result, errors)
+        outcomes = [_finish(party, 1200) for party in parties]
+        assert all(item[0] == 0 for item in outcomes), outcomes
+        record, evidence = load_verified_cart_pole_run(result["run_dir"])
+        assert len({result["pid"], *(item[1]["pid"] for item in outcomes)}) == 3
+        assert result["resource_counts"] == {
+            "products_consumed": 400 * 30, "truncations_consumed": 400 * 4,
+        }
+        assert len(record.provenance["round_ledger"]) == 400
+        assert evidence["branches"]["secure"]["statuses"][-1] == "stable"
+        assert evidence["branches"]["secure"]["requested_disturbance_n"][200] == 1.
+        oracle_state, _, oracle_force, statuses, counts = oracle_closed_loop(
+            (0, 0, .08726646259971647, 0), (0, 0), 1,
+        )
+        for name in ("ideal", "secure"):
+            np.testing.assert_allclose(evidence["branches"][name]["observations"],
+                                       oracle_state, rtol=0, atol=3e-8)
+            np.testing.assert_allclose(evidence["branches"][name]["raw_force_n"],
+                                       oracle_force, rtol=0, atol=1e-7)
+            assert evidence["branches"][name]["statuses"] == statuses
+            assert evidence["branches"][name]["stable_counts"] == counts
+        assert np.max(np.abs(record.result.output_error)) < 3e-8
+        assert np.max(np.abs(evidence["raw_force_error_n"])) < 1e-7
+    finally:
+        for party in parties:
+            if party.poll() is None:
+                party.kill()
+            party.communicate()
+
+
+def test_observer_three_process_mutual_tls(tmp_path: Path) -> None:
+    """动态控制器沿原mTLS角色链路完成有限会话与正式读回。"""
+    paths = _tls_deployment.__wrapped__(tmp_path)
+    _observer_profile_for(paths)
+    parties = [_run(role, paths[role]) for role in ("P1", "P2")]
+    try:
+        time.sleep(.5)
+        code, result, errors = _finish(_run("Client", paths["Client"]), 600)
+        assert code == 0, (result, errors)
+        outcomes = [_finish(party, 600) for party in parties]
+        assert all(item[0] == 0 for item in outcomes), outcomes
+        assert result["transport"] == "mutual_tls" and result["tls_version"] == "TLSv1.3"
+        assert all(item[1]["tls_version"] == "TLSv1.3" for item in outcomes)
+        load_verified_cart_pole_run(result["run_dir"])
+    finally:
+        for party in parties:
+            if party.poll() is None:
+                party.kill()
+            party.communicate()
 
 
 def test_profile_and_exact_static_lqr_bounds() -> None:

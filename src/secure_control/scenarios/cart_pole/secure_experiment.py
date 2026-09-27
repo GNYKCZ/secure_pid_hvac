@@ -12,18 +12,70 @@ from secure_control.core import ControllerSpec
 from secure_control.crypto import FixedPointContext
 from secure_control.execution import PlaintextStateSpaceRuntime
 from secure_control.protocol import ControllerRangeContract
+from secure_control.protocol.roles import _finite_horizon_encoded_trace
 from secure_control.simulation import SimulationBranch, SimulationPlan, SimulationResult
 
-from .adapter import CartPoleAdapter, _finite_vector
+from .adapter import (
+    CartPoleAdapter,
+    CartPoleObserverSimulation,
+    ControlCommand,
+    ObserverBalanceEpisode,
+    _disturbance_plan,
+    _finite_vector,
+)
 from .contract import CartPoleContract
 from .controller import CartPoleBalanceConfig
 from .experiment import BalanceMonitor
+from .observer import CartPoleObserverDesign, ObserverInitialization
 from .plant import CartPolePlant
 
 if TYPE_CHECKING:
     from .interactive import InteractiveSession
 
 SCENARIO_VERSION = "1"
+
+
+def cart_pole_observer_numeric_contract(
+    initialization: ObserverInitialization, horizon_steps: int, *,
+    fractional_bits: int, parameter_bits: int, runtime_payload_bits: int, modulus: int,
+) -> tuple[FixedPointContext, ControllerRangeContract, dict[str, object]]:
+    """从已确定的两测量初态派生编码范围，交由通用 Client 精确复核。"""
+    spec = initialization.spec
+    if (spec.state_dimension != 4 or spec.input_dimension != 2 or spec.output_dimension != 1
+            or type(horizon_steps) is not int or not 1 <= horizon_steps <= 1000
+            or type(fractional_bits) is not int or type(parameter_bits) is not int
+            or type(runtime_payload_bits) is not int
+            or not runtime_payload_bits >= parameter_bits > fractional_bits >= 1):
+        raise ValueError("observer 数值位宽、维度或有限时域无效。")
+    parameters = FixedPointContext(modulus, parameter_bits, fractional_bits)
+    for name in ("A", "B", "C", "D", "x0"):
+        parameters.encode(getattr(spec, name))
+    context = FixedPointContext(modulus, runtime_payload_bits, fractional_bits)
+    input_bounds = tuple(max(abs(int(context.encode(-nextafter(limit, inf)))),
+                             abs(int(context.encode(nextafter(limit, inf)))))
+                         for limit in initialization.y_abs)
+    if any(bound > context.maximum_payload for bound in input_bounds):
+        raise ValueError("observer 两测量超过 runtime payload 位宽。")
+    contract = ControllerRangeContract(
+        (context.maximum_payload,) * spec.state_dimension, input_bounds,
+        horizon_steps=horizon_steps,
+    )
+    proof = {
+        "algorithm": "encoded-matrix-power-rational-v1",
+        "horizon_steps": horizon_steps,
+        "state_payload_bounds": list(contract.state_payload_bounds),
+        "input_payload_bounds": list(input_bounds),
+        "initial_payload": [int(value) for value in np.asarray(context.encode(spec.x0)).flat],
+        "output_fractional_bits": 2 * fractional_bits,
+        "parameter_bits": parameter_bits,
+        "runtime_payload_bits": runtime_payload_bits,
+        "step_bounds": list(_finite_horizon_encoded_trace(
+            {name: np.asarray(context.encode(getattr(spec, name)), dtype=object)
+             for name in ("A", "B", "C", "D", "x0")},
+            input_bounds, fractional_bits, horizon_steps,
+        )),
+    }
+    return context, contract, proof
 
 
 def cart_pole_numeric_contract(
@@ -230,4 +282,164 @@ class CartPoleSecureExperiment:
                                   - np.asarray(self.secure_adapter.raw_forces)).tolist(),
             "terminal_time_s": self.balance.horizon_steps * self.plant_contract.sample_period_s,
             "branches": branches,
+        }
+
+
+class CartPoleObserverSecureExperiment:
+    """#108 有限双支仿真；秘密估计只留在 P1/P2 的原 runtime。"""
+
+    def __init__(self, design: CartPoleObserverDesign, initialization: ObserverInitialization,
+                 disturbances: tuple[tuple[int, float], ...] = ()) -> None:
+        if not isinstance(design, CartPoleObserverDesign):
+            raise TypeError("需要已编译 observer design。")
+        self.design = design
+        self.initialization = initialization
+        self.disturbances = _disturbance_plan(disturbances, design.balance.horizon_steps)
+        self.records: dict[str, dict[str, list]] = {}
+        self.secure_physical_completed = 0
+
+    def build_plan(self, secure: object) -> SimulationPlan:
+        """构造两份 plant/运行时；此 plan 由本类的两测量循环消费。"""
+        plant, balance = self.design.plant, self.design.balance
+        ideal = SimulationBranch(CartPolePlant(plant), CartPoleAdapter(plant, balance),
+                                 PlaintextStateSpaceRuntime(self.initialization.spec))
+        protected = SimulationBranch(CartPolePlant(plant), CartPoleAdapter(plant, balance), secure)
+        return SimulationPlan(
+            ideal.adapter.metadata,
+            np.arange(balance.horizon_steps, dtype=np.float64) * plant.sample_period_s,
+            ideal, protected,
+        )
+
+    def _run_branch(self, branch: SimulationBranch, name: str) -> dict[str, list]:
+        """只从成功完成的仿真区间记录力；终点仅观测，不多消费一轮材料。"""
+        plant, balance = self.design.plant, self.design.balance
+        device = CartPoleObserverSimulation(branch.plant, plant, self.disturbances)
+        episode = ObserverBalanceEpisode(self.initialization, branch.runtime,
+                                         episode_id=f"finite-{name}")
+        monitor = BalanceMonitor(balance)
+        record: dict[str, list] = {key: [] for key in (
+            "observations", "measurements", "local_measurements", "raw_force_n",
+            "applied_force_n", "disturbance_force_n", "requested_disturbance_n",
+            "total_force_n", "force_dispositions", "statuses", "stable_counts",
+        )}
+        if name == "ideal":
+            record["ideal_estimates"] = []
+        try:
+            for step in range(balance.horizon_steps + 1):
+                sample = device.read_measurement()
+                local = episode.local_measurement(sample)
+                truth = device.read_diagnostic_truth()
+                local_truth = truth.copy()
+                local_truth[2] -= self.initialization.theta_star
+                status = monitor.observe(local_truth)
+                if status == "failed":
+                    raise ValueError(f"倒立摆 {name} 第 {step} 步超出工作域。")
+                record["observations"].append(truth.tolist())
+                record["measurements"].append([sample.p_m, sample.theta_rad])
+                record["local_measurements"].append(local.tolist())
+                record["statuses"].append(status)
+                record["stable_counts"].append(monitor.stable_count)
+                if name == "ideal":
+                    record["ideal_estimates"].append(branch.runtime.state.tolist())
+                if step == balance.horizon_steps:
+                    if status != "stable":
+                        raise ValueError(f"倒立摆 {name} 终点尚未稳定。")
+                    break
+                raw = float(episode.step(sample)[0])
+                if abs(raw) > plant.max_applied_force_n:
+                    raise ValueError("saturation_outside_contract")
+                receipt = device.send_control(ControlCommand(
+                    step, episode.episode_id, sample.sample_id, raw,
+                ))
+                if (receipt.disposition != "simulated_interval_completed"
+                        or receipt.applied_force_n != raw
+                        or receipt.applied_source != "canonical_simulation"):
+                    raise ValueError("物理区间未确认；不得发布完整结果。")
+                requested, actual, total, disposition = device.read_interval_forces()
+                record["raw_force_n"].append(raw)
+                record["applied_force_n"].append(float(receipt.applied_force_n))
+                record["requested_disturbance_n"].append(requested)
+                record["disturbance_force_n"].append(actual)
+                record["total_force_n"].append(total)
+                record["force_dispositions"].append(disposition)
+                if name == "secure":
+                    self.secure_physical_completed += 1
+        finally:
+            episode.end("finite_complete_or_failed")
+        return record
+
+    def execute_plan(self, plan: SimulationPlan) -> SimulationResult:
+        """理想和安全支独立完成；只有两支完整 N 区间才生成正式结果。"""
+        ideal = self._run_branch(plan.ideal, "ideal")
+        secure = self._run_branch(plan.secure, "secure")
+        self.records = {"ideal": ideal, "secure": secure}
+        reference = np.tile(np.asarray(self.design.balance.target_state),
+                            (self.design.balance.horizon_steps, 1))
+        reference[:, 2] += self.initialization.theta_star
+        output_ideal = np.asarray(ideal["observations"][:-1])
+        output_secure = np.asarray(secure["observations"][:-1])
+        control_ideal = np.asarray(ideal["applied_force_n"]).reshape(-1, 1)
+        control_secure = np.asarray(secure["applied_force_n"]).reshape(-1, 1)
+        return SimulationResult(
+            plan.sample_times, reference, output_ideal, output_secure,
+            control_ideal, control_secure, control_ideal - control_secure,
+            output_ideal - output_secure,
+        )
+
+    def validate_result(self, result: SimulationResult) -> None:
+        """确认执行后所有公开数组及成功终点来自同一实际轨迹。"""
+        n = self.design.balance.horizon_steps
+        if set(self.records) != {"ideal", "secure"} or result.time.size != n:
+            raise ValueError("observer 双支记录不完整。")
+        for name in ("ideal", "secure"):
+            record = self.records[name]
+            if (len(record["observations"]) != n + 1
+                    or len(record["raw_force_n"]) != n
+                    or record["statuses"][-1] != "stable"):
+                raise ValueError("observer 物理前缀或终点不完整。")
+            np.testing.assert_array_equal(
+                getattr(result, f"output_{name}"), record["observations"][:-1]
+            )
+            np.testing.assert_array_equal(
+                getattr(result, f"control_{name}")[:, 0], record["applied_force_n"]
+            )
+
+    def evidence(self, run_id: str, result: SimulationResult) -> dict[str, object]:
+        """公开两测量、真实区间和监督结果，不复制任何秘密估计或份额。"""
+        n = self.design.balance.horizon_steps
+        local_truth = np.asarray(self.records["ideal"]["observations"]).copy()
+        local_truth[:, 2] -= self.initialization.theta_star
+        ideal_estimation_error = local_truth - np.asarray(
+            self.records["ideal"]["ideal_estimates"]
+        )
+        raw_difference = (np.asarray(self.records["ideal"]["raw_force_n"])
+                          - np.asarray(self.records["secure"]["raw_force_n"]))
+        return {
+            "schema_version": 3, "run_id": run_id, "sample_count": n,
+            "sample_period_s": self.design.plant.sample_period_s,
+            "terminal_time_s": n * self.design.plant.sample_period_s,
+            "time_s": (np.arange(n + 1) * self.design.plant.sample_period_s).tolist(),
+            "reference": [list(row) for row in np.vstack((
+                result.reference, result.reference[-1]
+            ))],
+            "state_units": list(CartPoleAdapter(self.design.plant, self.design.balance)
+                                .metadata.output.units),
+            "force_unit": "N", "raw_error": "ideal - secure",
+            "raw_force_error_n": raw_difference.tolist(),
+            "metrics": {
+                "ideal_estimation_error_max_abs_si": np.max(
+                    np.abs(ideal_estimation_error), axis=0
+                ).tolist(),
+                "branch_state_difference_max_abs_si": np.max(
+                    np.abs(result.output_error), axis=0
+                ).tolist(),
+                "raw_force_difference_max_abs_n": float(np.max(np.abs(raw_difference))),
+                "secure_raw_peak_abs_n": float(np.max(np.abs(
+                    self.records["secure"]["raw_force_n"]
+                ))),
+            },
+            "events": [{"step": step, "force_n": force, "duration_steps": 1,
+                        "phase": "after_controller_commit_before_plant_step"}
+                       for step, force in self.disturbances],
+            "branches": self.records,
         }

@@ -35,6 +35,17 @@
 结果/非饱和契约/理想监督限制见[观测器指南](../docs/cart_pole_observer.md)。
 这条入口不会启动P1/P2或GUI。
 
+## 倒立摆两测量有限三方实验
+
+`cart_pole_observer_lan.example.yaml` 是单独的 Client schema 2 profile，引用上述
+`cart_pole_observer.yaml` 与共享素数证明；P1/P2 仍使用原三角色脚本及配置。
+将 `lab-client-continuous.example.yaml` 的 `experiment` 指向此文件后，Client
+在拨号前从仿真首测量派生四维动态 spec、定点范围与逐步资源计划。
+可选 `disturbances: [[200, 1]]` 声明有限单步外力；它不进入控制器输入。
+正式产物保留原八字段及新增的版本化倒立摆侧证据，详情和命令见
+[连续 LAN 实验](../docs/lan_continuous.md)。该配置仅供有限近直立仿真，
+不启用跨段持续、动态起摆或真实硬件。
+
 ## Fig3 四精度批量图
 
 在项目根目录用 PowerShell 或命令提示符运行。先只查看已经发布的四点结果，**不重新计算**：

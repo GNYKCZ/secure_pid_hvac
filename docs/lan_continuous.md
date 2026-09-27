@@ -204,6 +204,29 @@ Fig. 4 逐点数据，故图是论文参数衍生的线性数值/协议对照，
 
 ## 接入下一个离散状态空间场景
 
+### 倒立摆两测量动态有限 profile（#108）
+
+Client 将 `configs/lab-client-continuous.example.yaml` 的 `experiment` 指向
+`configs/cart_pole_observer_lan.example.yaml`；P1/P2 仍分别运行原脚本与角色配置：
+
+```powershell
+uv run python scripts/run_continuous_p1.py configs/lab-p1.example.yaml
+uv run python scripts/run_continuous_p2.py configs/lab-p2.example.yaml
+uv run python scripts/run_continuous_client.py configs/lab-client-continuous.example.yaml
+```
+
+三条命令需在不同终端启动，P1/P2 先监听。动态示例的 `numeric` 值是须由预检
+接受的候选，不是算法常量；初始状态、首样本、编码位宽和范围证据在 Client 拨号前
+统一生成。可选 `disturbances: [[200, 1]]` 表示第200区间的+1N单步外扰；它不进入
+控制器输入。理想/安全各有独立 plant，终点仅观测。成功 JSON 的 `run_dir` 可用
+`load_verified_cart_pole_run` 独立复核动态侧证据与图。失败时 CLI 只给受限故障类别、
+已双提交数、已完成物理数和材料消耗；一次双提交不能当作施力完成。
+
+本机三个 PID 可证明三独立进程，不证明真三机。`insecure_tcp` 无身份认证或传输加密；
+需要该属性时选择现有 mTLS 配置。此有限 profile 不接入分段 runtime，跨段秘密状态
+与材料延续由 #109 另行设计。数值、reader 和 `x̄_N` 交接详见
+[观测器指南](cart_pole_observer.md)。
+
 新场景须在自身 `scenarios/<name>/` 中提供 `ControllerSpec` 来源、数值/测量界
 证明、独立 ideal/secure 的 `SimulationPlan` 与明文基线核对；在 `experiments/`
 中提供严格的 Client profile loader（含来源摘要、素数和绘图通道），并在

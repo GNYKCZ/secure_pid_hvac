@@ -12,6 +12,7 @@ from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from threading import Event
+from time import perf_counter
 
 from secure_control.execution.lan_config import LanConfig, load_lan_config
 from secure_control.execution.lan_runtime import (
@@ -60,15 +61,18 @@ def _enable_terminal_progress() -> None:
 
 def _failure(role: str, code: int, category: str, error: Exception) -> int:
     _LAN_LOG.error("%s 运行失败：%s（%s）。", role, category, type(error).__name__)
+    progress = getattr(error, "_public_lan_progress", None)
+    report = {
+        "status": "uncertain" if isinstance(progress, dict) and progress.get("uncertain")
+                  else "failed",
+        "role": role, "pid": os.getpid(), "category": category,
+        "error_type": type(error).__name__,
+    }
+    if isinstance(progress, dict):
+        report["progress"] = progress
     print(
         json.dumps(
-            {
-                "status": "failed",
-                "role": role,
-                "pid": os.getpid(),
-                "category": category,
-                "error_type": type(error).__name__,
-            },
+            report,
             ensure_ascii=False,
             sort_keys=True,
         )
@@ -234,6 +238,7 @@ def _run_prepared_client(config: LanConfig, experiment: PreparedLanExperiment,
     check_cancelled()
     if phase is not None:
         phase("connecting")
+    wall_started = perf_counter()
     runtime = LanContinuousRuntime(
         config, experiment.spec, experiment.context, experiment.contract,
         experiment.security_parameter, experiment.evidence,
@@ -273,6 +278,21 @@ def _run_prepared_client(config: LanConfig, experiment: PreparedLanExperiment,
         experiment.recheck_sources()
         check_cancelled()
         runtime.finish()
+        wall_elapsed_ms = (perf_counter() - wall_started) * 1000
+    except Exception as error:
+        if experiment.physical_completed_count is not None:
+            attempted = len(runtime.confirmed_steps)
+            physical = experiment.physical_completed_count()
+            error._public_lan_progress = {
+                "protocol_double_committed_count": attempted,
+                "physically_confirmed_count": physical,
+                "resource_counts": runtime.resource_counts,
+                "uncertain": isinstance(error, (
+                    LanTimeoutError, LocalhostTransportTimeout,
+                    LocalhostTransportDisconnected, TimeoutError, ConnectionError, OSError,
+                )),
+            }
+        raise
     finally:
         runtime.close()
     provenance = collect_provenance(
@@ -297,6 +317,9 @@ def _run_prepared_client(config: LanConfig, experiment: PreparedLanExperiment,
             "unauthenticated plaintext TCP lab simulation; no authenticated LAN claim"
         ),
     })
+    if experiment.include_round_ledger:
+        provenance["round_ledger"] = runtime.confirmed_plans
+        provenance["wall_elapsed_ms"] = wall_elapsed_ms
     def derived_writer(record, stage):
         """一份正式 staging 同时收纳通用 applied 图和可选场景证据。"""
         names = write_control_triptych(record, stage, experiment.control_channel)
@@ -318,7 +341,7 @@ def _run_prepared_client(config: LanConfig, experiment: PreparedLanExperiment,
         experiment.verify_scenario_run(artifact.run_dir)
     if record.run_id != artifact.run_id or record.result.time.size != experiment.sample_count:
         raise ValueError("发布后的 run 身份或行数不符。")
-    return {
+    completed = {
         "status": "complete", "role": "Client", "pid": os.getpid(),
         "topology_sha256": config.topology.digest,
         "session_id": runtime.session_id, "run_id": artifact.run_id,
@@ -329,6 +352,9 @@ def _run_prepared_client(config: LanConfig, experiment: PreparedLanExperiment,
         "resource_counts": counts, "transport": config.transport,
         "tls_version": "TLSv1.3" if config.transport == "mutual_tls" else None,
     }
+    if experiment.include_round_ledger:
+        completed["wall_elapsed_ms"] = wall_elapsed_ms
+    return completed
 
 
 def _run() -> int:

@@ -6,6 +6,7 @@ import hashlib
 import math
 import random
 import secrets
+from collections.abc import Iterator
 from dataclasses import dataclass
 from fractions import Fraction
 from numbers import Integral
@@ -63,6 +64,62 @@ def _require_step(step: int) -> int:
     if isinstance(step, bool) or not isinstance(step, Integral) or step < 0:
         raise ValueError("step 必须是非负整数。")
     return int(step)
+
+
+def _row_bounds_integer(first: np.ndarray, first_bounds: tuple[int, ...],
+                        second: np.ndarray, second_bounds: tuple[int, ...]) -> list[int]:
+    """以任意精度整数界定一个编码累加器的各行。"""
+    return [
+        sum(abs(int(first[row, col])) * first_bounds[col] for col in range(first.shape[1]))
+        + sum(abs(int(second[row, col])) * second_bounds[col]
+              for col in range(second.shape[1]))
+        for row in range(first.shape[0])
+    ]
+
+
+def _finite_horizon_encoded_trace(payloads: dict[str, np.ndarray],
+                                  input_bounds: tuple[int, ...], scale_bits: int,
+                                  horizon_steps: int) -> Iterator[dict[str, object]]:
+    """编码矩阵的精确有理数幂迹；协议和场景证据使用同一计算。"""
+    dimension = payloads["A"].shape[0]
+    scale = 1 << scale_bits
+    power = [[Fraction(int(row == col)) for col in range(dimension)]
+             for row in range(dimension)]
+    transition = [[Fraction(int(payloads["A"][row, col]), scale)
+                   for col in range(dimension)] for row in range(dimension)]
+    initial = [abs(int(value)) for value in payloads["x0"]]
+    drift = []
+    for row in range(dimension):
+        encoded_input = sum(Fraction(abs(int(payloads["B"][row, col])) * bound, scale)
+                            for col, bound in enumerate(input_bounds))
+        # 系数可被 S 整除时 m/S 本身为整数；其余行保留 1/2 舍入和 ±1 Trunc。
+        exact_division = all(int(item) % scale == 0 for item in (
+            *payloads["A"][row], *payloads["B"][row]
+        ))
+        rounding = (1 if exact_division else Fraction(3, 2)) if scale_bits else 0
+        drift.append(encoded_input + rounding)
+    accumulated = [Fraction(0) for _ in range(dimension)]
+    for step in range(horizon_steps + 1):
+        envelope = [sum(abs(power[row][col]) * initial[col]
+                        for col in range(dimension)) + accumulated[row]
+                    for row in range(dimension)]
+        state = tuple((value.numerator + value.denominator - 1) // value.denominator
+                      for value in envelope)
+        state_raw = (_row_bounds_integer(payloads["A"], state, payloads["B"], input_bounds)
+                     if step < horizon_steps else [])
+        output_raw = (_row_bounds_integer(payloads["C"], state, payloads["D"], input_bounds)
+                      if step < horizon_steps else [])
+        yield {"step": step, "state_payload_bounds": list(state),
+               "state_accumulator_bounds": state_raw,
+               "output_accumulator_bounds": output_raw}
+        if step == horizon_steps:
+            return
+        accumulated = [accumulated[row] + sum(abs(power[row][col]) * drift[col]
+                                               for col in range(dimension))
+                       for row in range(dimension)]
+        power = [[sum(power[row][mid] * transition[mid][col]
+                      for mid in range(dimension)) for col in range(dimension)]
+                 for row in range(dimension)]
 
 
 def _scalar_from_array(share: AdditiveShare, index: tuple[int, ...]) -> AdditiveShare:
@@ -587,60 +644,52 @@ class Client:
         layout: ControllerLayout,
         contract: ControllerRangeContract,
     ) -> tuple[list[int], list[int]]:
-        """以 Python 精确整数从编码 x0 逐步证明有限 horizon 的范围前提。
+        """用编码矩阵的精确有理数幂包络证明每个有限步骤。
 
-        ``s_k`` 是各 state payload 的公开绝对上界。每个可执行 k 先用 ``s_k``
-        检查更新前输出，再检查 state accumulator 与 Trunc 前提，推得 ``s_(k+1)``；
-        终点 state 也须在声明界内，但不虚构终点的额外 controller step。
+        展开线性递推后才取绝对值，保留矩阵乘积中的符号抵消；每步
+        ``3/2`` 同时覆盖最近整数舍入与 Protocol 2 的一单位偏差。
         """
-        current = [abs(int(value)) for value in payloads["x0"]]
-        input_bounds = contract.input_payload_bounds
+        dimension = layout.state_dimension
         state_bounds = contract.state_payload_bounds
         ledger = layout.scale_ledger
         centered_limit = (self.sharing.modulus - 1) // 2
         maximum_truncation_message = self.truncation.maximum_message
         assert contract.horizon_steps is not None
-        maximum_state_raw = [0] * layout.state_dimension
+        maximum_state_raw = [0] * dimension
         maximum_output_raw = [0] * layout.output_dimension
-
-        for step in range(contract.horizon_steps):
-            output_raw_bounds = self._row_bounds(
-                payloads["C"], tuple(current), payloads["D"], input_bounds
-            )
+        for entry in _finite_horizon_encoded_trace(
+            payloads, contract.input_payload_bounds, ledger.state_truncation_bits,
+            contract.horizon_steps,
+        ):
+            step = entry["step"]
+            current = entry["state_payload_bounds"]
+            if any(value > bound for value, bound in zip(current, state_bounds)):
+                raise ValueError(
+                    f"finite horizon 第 {step} 步 state 超出 state_payload_bounds。"
+                )
+            if step == contract.horizon_steps:
+                break  # 终点只检查后继 state，不虚构额外控制轮次。
+            output_raw_bounds = entry["output_accumulator_bounds"]
             maximum_output_raw = [
                 max(old, new) for old, new in zip(maximum_output_raw, output_raw_bounds)
             ]
             if any(value > centered_limit for value in output_raw_bounds):
                 raise ValueError(f"finite horizon 第 {step} 步 output 超出 centered Z_q 范围。")
-
-            state_raw_bounds = self._row_bounds(
-                payloads["A"], tuple(current), payloads["B"], input_bounds
-            )
+            state_raw_bounds = entry["state_accumulator_bounds"]
             maximum_state_raw = [
                 max(old, new) for old, new in zip(maximum_state_raw, state_raw_bounds)
             ]
-            next_bounds: list[int] = []
             for raw_bound in state_raw_bounds:
                 if ledger.state_truncation_bits:
                     if raw_bound > maximum_truncation_message:
                         raise ValueError(
                             f"finite horizon 第 {step} 步 state 超出 Protocol 2 的 Z<kappa> 范围。"
                         )
-                    truncation_scale = 1 << ledger.state_truncation_bits
-                    # Protocol 2 的 rounding 与 w∈{-1,0,1} 需要额外保留 1 payload。
-                    next_bound = (raw_bound + truncation_scale - 1) // truncation_scale + 1
                 else:
                     if raw_bound > centered_limit:
                         raise ValueError(
                             f"finite horizon 第 {step} 步 state 超出 centered Z_q 范围。"
                         )
-                    next_bound = raw_bound
-                next_bounds.append(next_bound)
-            if any(value > bound for value, bound in zip(next_bounds, state_bounds)):
-                raise ValueError(
-                    f"finite horizon 第 {step + 1} 步 state 超出 state_payload_bounds。"
-                )
-            current = next_bounds
         return maximum_state_raw, maximum_output_raw
 
     def _validate_closed_loop_evidence(
@@ -951,18 +1000,7 @@ class Client:
         second_bounds: tuple[int, ...],
     ) -> list[int]:
         """以三角不等式计算每行 ledger accumulator 的公开绝对上界，不读取 shares。"""
-        bounds: list[int] = []
-        for row in range(first.shape[0]):
-            bound = sum(
-                abs(int(first[row, column])) * first_bounds[column]
-                for column in range(first.shape[1])
-            )
-            bound += sum(
-                abs(int(second[row, column])) * second_bounds[column]
-                for column in range(second.shape[1])
-            )
-            bounds.append(bound)
-        return bounds
+        return _row_bounds_integer(first, first_bounds, second, second_bounds)
 
     def _resource_plan(
         self, layout: ControllerLayout, session_id: str, round_id: str, step: int
