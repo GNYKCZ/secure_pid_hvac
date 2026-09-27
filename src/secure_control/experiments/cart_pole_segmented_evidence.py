@@ -823,13 +823,20 @@ def write_segmented_overview(source, stage: Path, *, check=lambda: None, staging
 def redraw_segmented_control(run_dir, output_path):
     """通过完整新 reader 重绘概要；不恢复协议或更改已发布源。"""
     source = open_verified_cart_pole_segmented_run(run_dir)
+    target = Path(output_path)
+    if os.path.lexists(target):
+        raise FileExistsError("重绘目标已存在。")
+    # 必须在 mkdir/savefig 前核对真实路径；目录别名及 .. 也不能添加源内成员。
+    if target.resolve().is_relative_to(source.path.resolve()):
+        raise ValueError("重绘目标必须位于正式源目录之外。")
+    target.parent.mkdir(parents=True, exist_ok=True)
     series, _events, _stable = _segment_overview(source, lambda: None, False)
     figure = _overview_control(series, f"{source.metadata['artifact_run_id']} · verified overview",
                                source.metadata["N"])
-    target = Path(output_path)
-    target.parent.mkdir(parents=True, exist_ok=True)
     try:
-        figure.savefig(target, dpi=160, format="png")
+        # 排他创建保留已有输出；即使绘图期间目标被创建，也不截断其字节。
+        with target.open("xb") as output:
+            figure.savefig(output, dpi=160, format="png")
     finally:
         figure.clear()
     return target

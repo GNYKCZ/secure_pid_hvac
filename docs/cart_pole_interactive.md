@@ -60,6 +60,8 @@ for entry, record, evidence, protocol in run.iter_segments():
 `cart_pole_evidence.json` 回放 0…400。通用重绘命令也识别新的完整聚合根：
 `uv run secure-control redraw --run-dir <run-dir> --output <new-control.png>`。
 它先完整验证，再流式绘制概要，不启动安全协议。
+重绘目标必须是正式源目录之外的新文件；已有目标以及通过目录别名指向源内的目标
+均在写入前拒绝，原结果的图摘要、目录成员及回放能力保持不变。
 
 ## 三电脑配置
 

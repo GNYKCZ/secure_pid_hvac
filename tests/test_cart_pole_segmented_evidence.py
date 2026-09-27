@@ -406,8 +406,83 @@ def test_disk_identity_index_and_reducer_have_fixed_capacity():
 
 def test_redraw_dispatches_verified_segmented_source_without_protocol(published, tmp_path):
     output = tmp_path / "overview.png"
+    before = _redraw_source_fingerprint(published[0])
     result = subprocess.run([sys.executable,"-m","secure_control.experiments.lan_runner",
                              "redraw","--run-dir",str(published[0]),"--output",str(output)],
                             cwd=ROOT, capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["status"] == "complete" and output.stat().st_size > 1000
+    _assert_redraw_source_preserved(published[0], before)
+
+
+def _redraw_source_fingerprint(path):
+    """RV-001：测试的小型真实产物同时比较目录成员及全部文件字节摘要。"""
+    return {str(item.relative_to(path)): evidence._hash(item) if item.is_file() else None
+            for item in path.rglob("*")}
+
+
+def _assert_redraw_source_preserved(path, before):
+    assert _redraw_source_fingerprint(path) == before
+    run = evidence.open_verified_cart_pole_segmented_run(path)
+    assert run.observation_at(0)["step"] == 0
+    assert run.observation_at(run.metadata["N"])["step"] == run.metadata["N"]
+
+
+@pytest.mark.parametrize("entrypoint", ["api", "cli"])
+@pytest.mark.parametrize("target_kind", ["existing_external", "source_control", "source_new",
+                                         "source_nested", "parent_alias"])
+def test_redraw_rejects_existing_or_source_targets_without_mutation(
+    published, tmp_path, entrypoint, target_kind
+):
+    """RV-001：公开入口拒绝已有目标和源内新文件，不能靠 reader 放松成员校验。"""
+    path = _copy(published, tmp_path)
+    target = tmp_path / "existing.png"
+    if target_kind == "existing_external":
+        target.write_bytes(b"user-owned existing output")
+    elif target_kind == "source_control":
+        target = path / "control.png"
+    elif target_kind == "source_new":
+        target = path / "overview.png"
+    elif target_kind == "source_nested":
+        target = path / "new-directory" / "overview.png"
+    else:
+        target = path / "segments" / ".." / "overview.png"
+    before = _redraw_source_fingerprint(path)
+    original = target.read_bytes() if target.is_file() else None
+    if entrypoint == "api":
+        with pytest.raises((FileExistsError, ValueError)):
+            evidence.redraw_segmented_control(path, target)
+    else:
+        result = subprocess.run(
+            [sys.executable, "-m", "secure_control.experiments.lan_runner", "redraw",
+             "--run-dir", str(path), "--output", str(target)],
+            cwd=ROOT, capture_output=True, text=True, check=False,
+        )
+        assert result.returncode != 0
+        assert json.loads(result.stdout)["status"] != "complete"
+    if original is not None:
+        assert target.read_bytes() == original
+    else:
+        assert not target.exists()
+    _assert_redraw_source_preserved(path, before)
+
+
+def test_redraw_rejects_directory_symlink_alias_into_source(published, tmp_path):
+    """RV-001：词法上位于外部的目录别名不能绕过源只读边界。"""
+    path = _copy(published, tmp_path)
+    alias = tmp_path / "source-alias"
+    alias.symlink_to(path, target_is_directory=True)
+    before = _redraw_source_fingerprint(path)
+    with pytest.raises(ValueError):
+        evidence.redraw_segmented_control(path, alias / "overview.png")
+    _assert_redraw_source_preserved(path, before)
+
+
+def test_redraw_api_creates_external_new_output_and_preserves_source(published, tmp_path):
+    """RV-001：合法外部目录可创建，成功后完整 reader 与首末 seek 仍成立。"""
+    path = _copy(published, tmp_path)
+    before = _redraw_source_fingerprint(path)
+    output = tmp_path / "new-figures" / "overview.png"
+    assert evidence.redraw_segmented_control(path, output) == output
+    assert output.stat().st_size > 1000
+    _assert_redraw_source_preserved(path, before)
