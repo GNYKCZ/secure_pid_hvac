@@ -434,6 +434,15 @@ def run_observer_balance_experiment(
         episode.end(reason or status)
     time_rows = np.array(times, dtype=float)
     time_rows.setflags(write=False)
+    # 外部设备不由effective构造；仅已记录的首个独立诊断真值可作实际初态来源。
+    # 首样本失败且没有可信诊断行时明确标未知，不借用设计配置的默认plant初态。
+    initial_state = effective.initial_state if is_simulation else (
+        rows["truth"][0].tolist() if rows["truth"] else None
+    )
+    initial_state_source = (
+        "canonical_simulation_contract" if is_simulation else
+        "injected_diagnostic_truth" if rows["truth"] else "unavailable"
+    )
     return ObserverBalanceResult(
         time_rows, tuple(sample_ids), *(_rows(rows[name], width) for name, width in (
             ("measurement", 2), ("local_measurement", 2), ("estimate", 4), ("truth", 4), ("local_truth", 4),
@@ -442,7 +451,8 @@ def run_observer_balance_experiment(
         )), tuple(statuses), tuple(counts), tuple(receipts), tuple(recorded_events), status,
         failure_step, reason, detail, json.dumps(attempted, allow_nan=False),
         json.dumps(design.to_snapshot(), allow_nan=False), initialization_json,
-        json.dumps({"initial_state": effective.initial_state, "disturbances": events,
+        json.dumps({"initial_state": initial_state, "initial_state_source": initial_state_source,
+                    "disturbances": events,
                     "velocity_seed_override": velocity_seed}, allow_nan=False),
     )
 

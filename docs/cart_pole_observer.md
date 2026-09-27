@@ -133,6 +133,10 @@ Client未来需要速度监督时须独立因果估计或保留明确理想监�
 源字节SHA/有效配置、派生模型/矩阵/谱、spec/x0/误差前提/范围、样本身份/两测量、
 xhat、连续真值/局部监督量、计数及raw/command/applied/disturbance/total分列。
 run保存前后核对源字节，allow_nan=False，结果只读，摘要由原始行复算。
+`effective_options.initial_state` 对内建仿真取确实构造plant的配置/覆盖初态；
+替换设备时只取已记录的首个注入诊断真值，并标记
+`initial_state_source=injected_diagnostic_truth`；无可信首行时为null/unavailable，
+不会把设计配置默认初态冒充外部运行初态。此诊断来源不进入控制输入或x0。
 此明文研究结果不是三方writer/reader认证，也没有虚构secure分支。
 
 正常N区间有N+1观测/N力；坏首样本可零行，后继样本失效只保留可确认区间和可用观测，

@@ -233,6 +233,9 @@ def test_provider_replacement_never_reads_truth_to_seed_or_control(design):
     assert result.goal_met
     np.testing.assert_array_equal(result.estimate[0], [.02,0,.05,0])
     np.testing.assert_array_equal(result.truth[0], [.02,.1,.05,-.15])
+    report = result.to_report()
+    assert report["effective_options"]["initial_state"] == result.truth[0].tolist()
+    assert report["effective_options"]["initial_state_source"] == "injected_diagnostic_truth"
     with pytest.raises(ValueError, match="另外注入"):
         run_observer_balance_experiment(design, device=device)
 
@@ -356,6 +359,8 @@ def test_invalid_initial_measurement_has_no_fabricated_rows(design, sample):
     assert not result.goal_met and len(result.time_s) == 0 and result.completed_steps == 0
     assert result.failure_reason == "measurement"
     json.dumps(result.to_report(), allow_nan=False)
+    assert result.to_report()["effective_options"]["initial_state"] is None
+    assert result.to_report()["effective_options"]["initial_state_source"] == "unavailable"
 
 
 @pytest.mark.parametrize("disposition", ["accepted", "unknown", "rejected"])
@@ -449,6 +454,12 @@ def test_report_freezing_repeatability_and_io(design, tmp_path):
     path = write_observer_balance_report(result, tmp_path/"result.json")
     report = json.loads(path.read_text(encoding="utf-8"))
     assert report["kind"] == "cart_pole_observer_plaintext" and report["version"] == 1
+    assert report["effective_options"]["initial_state"] == list(design.plant.initial_state)
+    assert report["effective_options"]["initial_state_source"] == "canonical_simulation_contract"
+    override = (.02,.1,.05,-.15)
+    overridden = run_observer_balance_experiment(design, initial_state=override).to_report()
+    assert overridden["effective_options"]["initial_state"] == list(override)
+    assert overridden["effective_options"]["initial_state_source"] == "canonical_simulation_contract"
     assert not report["provenance"]["available"]
     assert report["summary"]["completed_steps"] == 400
     report["truth"][0][0] = 99
