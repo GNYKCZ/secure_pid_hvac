@@ -35,6 +35,7 @@ from secure_control.experiments.cart_pole_full_evidence import (
 from secure_control.experiments.cart_pole_segmented_evidence import _bytes
 from secure_control.experiments.lan_profile import _load_prime
 from secure_control.protocol.arithmetic import ScalarProgram, certify_scalar_program
+from secure_control.scenarios.cart_pole import secure_full_experiment as secure_full_module
 from secure_control.scenarios.cart_pole.adapter import MeasurementSample
 from secure_control.scenarios.cart_pole.gui import FullRouteWindow
 from secure_control.scenarios.cart_pole.observer import load_cart_pole_observer_design
@@ -397,15 +398,127 @@ def test_secure_full_real_process_kick_to_energy(tmp_path):
             result, physical=failed_physical, epoch_events=tuple(unsealed_epochs),
             unconfirmed_protocol_step=16,
         )
-        prefix = open_verified_cart_pole_full_run(
-            write_cart_pole_full_run(failed, tmp_path / "sealed-prefix")
-        )
-        assert prefix.manifest["N"] == 10
-        assert prefix.manifest["status"] == "failed_prefix"
-        assert prefix.report["unsealed_failure"]["physical_steps_before_failure"] == 16
+        # 此合成记录同时声称 k=16 的观测失败和区间失败，且 k=16 已是 horizon。
+        with pytest.raises(ValueError, match="同时声明"):
+            write_cart_pole_full_run(failed, tmp_path / "impossible-prefix")
+        assert not (tmp_path / "impossible-prefix").exists()
         for process in parties:
             out, err = process.communicate(timeout=20)
             assert process.returncode == 0, (out, err)
+    finally:
+        for process in parties:
+            if process.poll() is None:
+                process.terminate()
+                process.communicate(timeout=10)
+
+
+def test_secure_full_real_unsealed_interval_keeps_only_receipted_prefix(tmp_path, monkeypatch):
+    paths = _plain_deployment(tmp_path)
+    source = paths["Client"].read_text(encoding="utf-8")
+    paths["Client"].write_text(source.replace(
+        "experiment: paper_pid_lan.example.yaml",
+        f"experiment: {ROOT / 'configs/paper_pid_lan.example.yaml'}",
+    ), encoding="utf-8")
+    design, swing, modulus, evidence, _, _ = _inputs()
+    original_step = LanScalarRuntime.step
+
+    def disconnect_before_round(runtime, values, physical_step):
+        if physical_step == 16:
+            raise OSError("injected unsealed round failure")
+        return original_step(runtime, values, physical_step)
+
+    monkeypatch.setattr(LanScalarRuntime, "step", disconnect_before_round)
+    parties = [subprocess.Popen(
+        [sys.executable, "-c", _PARTY, role, str(paths[role])],
+        cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    ) for role in ("P1", "P2")]
+    try:
+        result = run_secure_full_experiment(
+            design.plant, design.balance,
+            replace(swing, horizon_steps=20, acquisition_deadline_steps=20),
+            design, load_lan_config(paths["Client"], "Client"),
+            modulus=modulus, modulus_evidence=evidence,
+        )
+        assert result.physical.completed_steps == 16
+        assert result.physical.failure_observation_step is None
+        assert result.physical.failure_interval_step == 16
+        assert result.unconfirmed_protocol_step == 16
+        assert [row["phase"] for row in result.epoch_events] == ["kick", "energy"]
+        assert result.epoch_events[0]["closed_segments"][-1]["action"] == "switch"
+        assert not result.epoch_events[1]["closed_segments"]
+        verified = open_verified_cart_pole_full_run(
+            write_cart_pole_full_run(result, tmp_path / "real-sealed-prefix")
+        )
+        assert verified.manifest["N"] == 10
+        assert verified.manifest["status"] == "failed_prefix"
+        assert verified.report["unsealed_failure"]["physical_steps_before_failure"] == 16
+    finally:
+        for process in parties:
+            if process.poll() is None:
+                process.terminate()
+                process.communicate(timeout=10)
+
+
+@pytest.mark.parametrize("next_phase, sealed_steps", [("energy", 10), ("dynamic", 309)])
+def test_secure_full_switch_setup_failure_publishes_receipted_prefix(
+    tmp_path, monkeypatch, next_phase, sealed_steps,
+):
+    paths = _plain_deployment(tmp_path)
+    source = paths["Client"].read_text(encoding="utf-8")
+    paths["Client"].write_text(source.replace(
+        "experiment: paper_pid_lan.example.yaml",
+        f"experiment: {ROOT / 'configs/paper_pid_lan.example.yaml'}",
+    ), encoding="utf-8")
+    design, swing, modulus, evidence, _, _ = _inputs()
+    parties = [subprocess.Popen(
+        [sys.executable, "-c", _PARTY, role, str(paths[role])],
+        cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    ) for role in ("P1", "P2")]
+    if next_phase == "energy":
+        original = secure_full_module.LanScalarRuntime
+
+        def fail_energy(*args, **kwargs):
+            if kwargs["epoch_id"].startswith("energy-"):
+                raise OSError("injected energy setup failure")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(secure_full_module, "LanScalarRuntime", fail_energy)
+    else:
+        def fail_dynamic(*_args, **_kwargs):
+            raise OSError("injected dynamic setup failure")
+
+        monkeypatch.setattr(secure_full_module, "LanSegmentedRuntime", fail_dynamic)
+    try:
+        result = run_secure_full_experiment(
+            design.plant, design.balance, swing, design,
+            load_lan_config(paths["Client"], "Client"),
+            modulus=modulus, modulus_evidence=evidence,
+        )
+        assert result.physical.completed_steps == sealed_steps
+        assert result.physical.termination == "failed"
+        assert result.physical.failure_reason == "setup_or_switch"
+        assert result.physical.failure_observation_step is None
+        assert result.physical.failure_interval_step is None
+        assert result.physical.attempted_step is None
+        assert result.unconfirmed_protocol_step is None
+        closure = result.epoch_events[-1]["closed_segments"][-1]
+        assert closure["action"] == "switch" and closure["physical_end"] == sealed_steps
+        assert [item["role"] for item in closure["receipts"]] == ["P1", "P2"]
+        verified = open_verified_cart_pole_full_run(
+            write_cart_pole_full_run(result, tmp_path / "sealed-switch-failure")
+        )
+        assert verified.manifest["N"] == sealed_steps
+        assert verified.manifest["status"] == "failed_prefix"
+        assert verified.report["failure"]["reason"] == "setup_or_switch"
+
+        missing_receipt = copy.deepcopy(result.epoch_events)
+        missing_receipt[-1]["closed_segments"][-1]["receipts"].pop()
+        with pytest.raises(ValueError, match="回执"):
+            write_cart_pole_full_run(
+                replace(result, epoch_events=tuple(missing_receipt)),
+                tmp_path / "missing-switch-receipt",
+            )
+        assert not (tmp_path / "missing-switch-receipt").exists()
     finally:
         for process in parties:
             if process.poll() is None:
@@ -486,6 +599,21 @@ def test_secure_full_real_process_nominal_stable_horizon(tmp_path):
         )
         assert verified.manifest["status"] == "complete"
         assert verified.manifest["N"] == 1500
+        physical = copy.deepcopy(verified.report)
+        physical["termination"] = "failed"
+        physical["goal_met"] = False
+        physical["failure"] = {
+            "observation_step": None, "interval_step": 1500,
+            "reason": "protocol_or_control", "detail": "invented terminal round",
+        }
+        raw = _bytes(physical)
+        (verified.path / "physical.json").write_bytes(raw)
+        manifest = copy.deepcopy(verified.manifest)
+        manifest["status"] = "failed_prefix"
+        manifest["physical_sha256"] = hashlib.sha256(raw).hexdigest()
+        (verified.path / "run.json").write_bytes(_bytes(manifest))
+        with pytest.raises(ValueError, match="v3"):
+            open_verified_cart_pole_full_run(verified.path)
         for process in parties:
             out, err = process.communicate(timeout=20)
             assert process.returncode == 0, (out, err)

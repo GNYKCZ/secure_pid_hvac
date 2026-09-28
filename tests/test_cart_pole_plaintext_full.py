@@ -80,6 +80,19 @@ def test_plaintext_full_v3_verified_reader(tmp_path):
     (verified.path / "run.json").write_bytes(_bytes(updated_manifest))
     with pytest.raises(ValueError, match="v3"):
         open_verified_cart_pole_full_run(verified.path)
+    impossible_interval = copy.deepcopy(physical)
+    impossible_interval["termination"] = "failed"
+    impossible_interval["goal_met"] = False
+    impossible_interval["failure"] = {
+        "observation_step": None, "interval_step": 1500,
+        "reason": "numeric_control", "detail": "invented terminal control",
+    }
+    raw = _bytes(impossible_interval)
+    (verified.path / "physical.json").write_bytes(raw)
+    updated_manifest["physical_sha256"] = hashlib.sha256(raw).hexdigest()
+    (verified.path / "run.json").write_bytes(_bytes(updated_manifest))
+    with pytest.raises(ValueError, match="v3"):
+        open_verified_cart_pole_full_run(verified.path)
 
 
 def test_plaintext_v3_reader_accepts_confirmed_stop_prefix(tmp_path):
@@ -101,6 +114,21 @@ def test_plaintext_v3_reader_accepts_confirmed_stop_prefix(tmp_path):
     )
     assert verified.manifest["N"] == 5
     assert verified.report["termination"] == "stopped"
+    physical = copy.deepcopy(verified.report)
+    physical["termination"] = "failed"
+    physical["goal_met"] = False
+    physical["failure"] = {
+        "observation_step": None, "interval_step": 5,
+        "reason": "numeric_control", "detail": "invented unobserved control",
+    }
+    raw = _bytes(physical)
+    (verified.path / "physical.json").write_bytes(raw)
+    manifest = copy.deepcopy(verified.manifest)
+    manifest["status"] = "failed_prefix"
+    manifest["physical_sha256"] = hashlib.sha256(raw).hexdigest()
+    (verified.path / "run.json").write_bytes(_bytes(manifest))
+    with pytest.raises(ValueError, match="v3"):
+        open_verified_cart_pole_full_run(verified.path)
 
 
 def test_plaintext_v3_reader_accepts_time_limit_and_failed_interval(tmp_path):

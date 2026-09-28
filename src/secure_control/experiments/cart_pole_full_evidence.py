@@ -238,6 +238,9 @@ def _verified_outcome(report: dict, manifest: dict, horizon: int) -> None:
     if termination == "failed":
         if not isinstance(failure["reason"], str) or not failure["reason"]:
             raise ValueError("v3 失败状态缺少原因")
+        if (failure["observation_step"] is not None
+                and failure["interval_step"] is not None):
+            raise ValueError("v3 观测失败与区间失败不能同时声明")
         if terminal is not None and terminal["phase"] == "failed":
             if (failure["observation_step"] != n
                     or failure["interval_step"] is not None
@@ -254,13 +257,33 @@ def _verified_outcome(report: dict, manifest: dict, horizon: int) -> None:
                                       or failure["reason"] != "measurement_invalid"):
                 raise ValueError("v3 失败观测步与前缀不一致")
         elif failure["interval_step"] is not None:
-            if (type(failure["interval_step"]) is not int
-                    or failure["interval_step"] < n
-                    or (failure["interval_step"] > n
-                        and report.get("unsealed_failure") is None)):
+            interval = failure["interval_step"]
+            attempted = report["attempted_step"]
+            unsealed = report.get("unsealed_failure")
+            if (type(interval) is not int or not n <= interval < horizon
+                    or terminal is None or terminal["phase"] == "failed"
+                    or not isinstance(attempted, dict)
+                    or attempted.get("interval_step") != interval
+                    or (interval > n and (
+                        not isinstance(unsealed, dict)
+                        or unsealed["first_unsealed_step"] != n
+                        or unsealed["physical_steps_before_failure"] != interval
+                    ))):
                 raise ValueError("v3 失败区间与确认前缀不一致")
-        elif report.get("unsealed_failure") is None:
-            raise ValueError("v3 失败结论没有观测、区间或未密封证据")
+        else:
+            closure = (manifest["epochs"][-1]["closed_segments"][-1]
+                       if manifest["route"] == "secure_full" else None)
+            sealed_switch_failure = (
+                failure["reason"] == "setup_or_switch"
+                and terminal is not None and terminal["phase"] != "failed"
+                and n < horizon and report["attempted_step"] is None
+                and report["unconfirmed_protocol_step"] is None
+                and report.get("unsealed_failure") is None
+                and closure is not None and closure["action"] == "switch"
+                and closure["physical_end"] == n
+            )
+            if not sealed_switch_failure and report.get("unsealed_failure") is None:
+                raise ValueError("v3 失败结论没有观测、区间或已密封切换证据")
     else:
         if any(value is not None for value in failure.values()) or report["attempted_step"] is not None:
             raise ValueError("v3 非失败终止不得带失败结论")
