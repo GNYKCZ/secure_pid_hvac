@@ -23,7 +23,7 @@ from .controller import (
 from .experiment import BalanceMonitor
 
 if TYPE_CHECKING:
-    from .observer import CartPoleObserverDesign
+    from .observer import CartPoleObserverDesign, ObserverInitialization
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,7 +254,8 @@ class SwingUpSupervisor:
 
     def __init__(self, plant: CartPoleContract, balance: CartPoleBalanceConfig,
                  config: CartPoleSwingUpConfig,
-                 *, observer_design: CartPoleObserverDesign | None = None) -> None:
+                 *, observer_design: CartPoleObserverDesign | None = None,
+                 external_dynamic: bool = False) -> None:
         """每次实验新建独立状态；不虚构能量法的线性控制器状态。"""
         config.validate(plant, balance)
         if observer_design is not None and (
@@ -262,11 +263,15 @@ class SwingUpSupervisor:
             or observer_design.balance != balance
         ):
             raise ValueError("observer设计与起摆物理/平衡来源不一致")
+        if external_dynamic and observer_design is None:
+            raise ValueError("外部动态控制需要已验证的 observer 设计")
         self.plant, self.balance, self.config = plant, balance, config
         self.observer_design = observer_design
+        self.external_dynamic = external_dynamic
         self.runtime = (PlaintextStateSpaceRuntime(build_cart_pole_controller_spec(plant, balance))
                         if observer_design is None else None)
         self.episode: ObserverBalanceEpisode | None = None
+        self.latest_initialization: ObserverInitialization | None = None
         self.initializations: list[tuple[int, int, float, tuple[float, ...]]] = []
         self.phase = "swing_up"
         self.next_observation_step = 0
@@ -294,6 +299,7 @@ class SwingUpSupervisor:
             self.episode.end(reason)
             self.episode = None
             self.runtime = None
+        self.latest_initialization = None
 
     def _return_to_swing(self, reason: str, step: int, local: np.ndarray) -> None:
         was_balanced = self.phase == "balance"
@@ -313,9 +319,11 @@ class SwingUpSupervisor:
                                    float(output[0]), float(output[2]))
         initialization = self.observer_design.initialize(
             sample, velocity_seed=(float(output[1]), float(output[3])))
-        self.runtime = PlaintextStateSpaceRuntime(initialization.spec)
-        self.episode = ObserverBalanceEpisode(
-            initialization, self.runtime, episode_id=f"plaintext-capture-{step}")
+        self.latest_initialization = initialization
+        if not self.external_dynamic:
+            self.runtime = PlaintextStateSpaceRuntime(initialization.spec)
+            self.episode = ObserverBalanceEpisode(
+                initialization, self.runtime, episode_id=f"plaintext-capture-{step}")
         self.initializations.append((
             step, initialization.branch, initialization.theta_star,
             tuple(float(value) for value in initialization.spec.x0),
@@ -403,6 +411,8 @@ class SwingUpSupervisor:
         if tuple(local) != self.last.local_state:
             raise ValueError("力计算必须使用本次观测")
         if self.phase in ("capture", "balance"):
+            if self.external_dynamic:
+                raise RuntimeError("外部动态控制力必须由安全 runtime 提供")
             if self.episode is not None:
                 sample = MeasurementSample(step, step * self.plant.sample_period_s,
                                            float(output[0]), float(output[2]))

@@ -15,6 +15,10 @@ from scipy.integrate import solve_ivp
 from test_cart_pole_balance import ORACLE_K, _oracle_rhs
 from test_cart_pole_observer import ORACLE_L, independent_model
 
+from secure_control.experiments.cart_pole_full_evidence import (
+    open_verified_cart_pole_full_run,
+    write_cart_pole_plaintext_full_run,
+)
 from secure_control.scenarios.cart_pole.adapter import MeasurementSample
 from secure_control.scenarios.cart_pole.observer import (
     build_cart_pole_observer_design,
@@ -29,6 +33,20 @@ from secure_control.scenarios.cart_pole.swing_up_experiment import run_plaintext
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "configs/cart_pole_swing_up.yaml"
+
+
+def test_plaintext_full_v3_verified_reader(tmp_path):
+    design = load_cart_pole_observer_design(ROOT / "configs/cart_pole_observer.yaml")
+    swing = load_cart_pole_swing_up_config(CONFIG, design.plant, design.balance)
+    result = run_plaintext_full_experiment(design.plant, design.balance, swing, design)
+    verified = open_verified_cart_pole_full_run(
+        write_cart_pole_plaintext_full_run(result, tmp_path / "plain-v3")
+    )
+    assert verified.manifest["N"] == 1500
+    assert verified.manifest["resource_counts"] == {
+        "beaver_triples": 0, "truncations": 0,
+    }
+    assert verified.observation(309)["phase"] == "capture"
 
 
 @pytest.fixture(scope="module")

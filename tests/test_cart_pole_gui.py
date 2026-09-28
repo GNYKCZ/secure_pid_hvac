@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 from test_cart_pole_segmented_evidence import _run
 
-from secure_control.scenarios.cart_pole.gui import CartPoleWindow
+from secure_control.scenarios.cart_pole.gui import CartPoleWindow, FullRouteWindow
 
 _GUI = r'''
 import json, os, sys, threading, time, tkinter as tk, tracemalloc, ctypes
@@ -179,6 +179,37 @@ def test_mailbox_bounds_notifications_and_preserves_terminal_latest_frame():
     assert window._latest_frame == {"step":9999}
     assert len(window.messages) == 64
     assert window._terminal == ("complete", "verified")
+
+
+def test_actual_tk_plaintext_full_route_replays_verified_capture(tmp_path):
+    root = tk.Tk()
+    window = FullRouteWindow(
+        root, route="plaintext", client_path=Path("unused"),
+        observer_path=Path(__file__).resolve().parents[1] / "configs/cart_pole_observer.yaml",
+        swing_path=Path(__file__).resolve().parents[1] / "configs/cart_pole_swing_up.yaml",
+        prime_path=Path("unused"), output=tmp_path / "gui-plain-v3", segment_steps=100,
+    )
+    observed = []
+    deadline = time.monotonic() + 30
+
+    def check():
+        if window.verified is not None:
+            window.replay.set(309)
+            window._seek("309")
+            observed.append((window.verified.manifest["N"], window.detail.get()))
+            window._close()
+        elif time.monotonic() >= deadline:
+            observed.append(("timeout", window.status.get()))
+            window._close()
+        else:
+            root.after(50, check)
+
+    window.start()
+    root.after(50, check)
+    root.mainloop()
+    window.worker.join(timeout=5)
+    assert observed and observed[0][0] == 1500, observed
+    assert "phase=capture" in observed[0][1]
 
 
 def test_async_seek_coalesces_requests_and_old_generation_cannot_override(tmp_path):

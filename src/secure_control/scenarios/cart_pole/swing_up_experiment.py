@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from threading import Event
 
 import numpy as np
 
@@ -111,13 +113,18 @@ class SwingUpResult:
                         "final_stable_count": self.observations[-1].stable_count
                         if self.observations else 0},
         }
-        if self.route == "plaintext_full":
+        if self.route in {"plaintext_full", "secure_full"}:
             report.update({
-                "kind": "cart_pole_plaintext_full", "route": self.route,
+                "kind": ("cart_pole_plaintext_full" if self.route == "plaintext_full"
+                         else "cart_pole_secure_full"), "route": self.route,
+                "computation_mode": ("plaintext" if self.route == "plaintext_full"
+                                     else "three_party_secret_shared"),
                 "assumptions": ["only p and continuous theta enter the controller",
                                 "causal finite differences; k0 zero velocity seed",
                                 "state/output are diagnostic plant truth, not controller input",
-                                "finite simulation, not secure computation or global stability"],
+                                ("finite simulation, not secure computation or global stability"
+                                 if self.route == "plaintext_full" else
+                                 "finite three-process simulation; no global stability claim")],
                 "measurement": self.measurement.tolist(),
                 "estimated_state": self.estimated_state.tolist(),
                 "controller_source": list(self.controller_source),
@@ -128,7 +135,8 @@ class SwingUpResult:
                      "x0": list(x0)}
                     for step, branch, theta_star, x0 in self.observer_initializations
                 ],
-                "resource_counts": {"beaver_triples": 0, "truncations": 0},
+                "resource_counts": ({"beaver_triples": 0, "truncations": 0}
+                                    if self.route == "plaintext_full" else None),
             })
         return report
 
@@ -241,6 +249,8 @@ def run_swing_up_experiment(
 def run_plaintext_full_experiment(
     plant_contract: CartPoleContract, balance: CartPoleBalanceConfig, config: CartPoleSwingUpConfig,
     observer_design: CartPoleObserverDesign,
+    *, on_step: Callable[[int, tuple[float, ...], str, str, float, float], None] | None = None,
+    stop_event: Event | None = None,
 ) -> SwingUpResult:
     """同一非线性 plant 上用两测量起摆、动态捕获与恢复；真值只进诊断行。"""
     if not isinstance(config, CartPoleSwingUpConfig):
@@ -275,6 +285,9 @@ def run_plaintext_full_experiment(
         failure_observation, detail = 0, str(error)
     else:
         for step in range(config.horizon_steps + 1):
+            if stop_event is not None and stop_event.is_set():
+                termination = "stopped"
+                break
             try:
                 estimated = estimator.observe(sample)
             except (TypeError, ValueError, FloatingPointError, OverflowError) as error:
@@ -328,6 +341,9 @@ def run_plaintext_full_experiment(
             sample, state, output = next_sample, next_state, next_output
             states.append(state)
             outputs.append(output)
+            if on_step is not None:
+                on_step(step + 1, tuple(float(value) for value in state), observed.phase,
+                        source, applied, disturbance)
     state_rows, output_rows = _rows(states, 4), _rows(outputs, 4)
     time = np.arange(len(states), dtype=np.float64) * effective.sample_period_s
     time.setflags(write=False)

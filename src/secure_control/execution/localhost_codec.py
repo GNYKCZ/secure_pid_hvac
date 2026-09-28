@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import asdict, dataclass
+from fractions import Fraction
 from math import isfinite, prod
 from numbers import Integral
 from typing import Any, Literal
@@ -19,6 +20,12 @@ from secure_control.crypto import (
     PrimeModulusVerification,
 )
 from secure_control.protocol import ControllerRangeVerification, ControllerScaleLedger
+from secure_control.protocol.arithmetic import (
+    ScalarGate,
+    ScalarGateMaterial,
+    ScalarPartyMaterial,
+    ScalarProgram,
+)
 from secure_control.protocol.messages import (
     ControllerLayout,
     ControllerShare,
@@ -111,7 +118,7 @@ class LanHelloPayload:
 
     profile_sha256: str
     nonce: str
-    mode: Literal["lan-single-step-v1", "lan-continuous-v1"] = "lan-single-step-v1"
+    mode: Literal["lan-single-step-v1", "lan-continuous-v1", "lan-scalar-v3"] = "lan-single-step-v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,7 +144,7 @@ class LanSegmentedHelloPayload:
     segment_index: int
     global_start: int
     previous_session_id: str | None
-    mode: Literal["lan-segmented-v1", "lan-segmented-v2"] = "lan-segmented-v1"
+    mode: Literal["lan-segmented-v1", "lan-segmented-v2", "lan-full-v3"] = "lan-segmented-v1"
 
     def __post_init__(self) -> None:
         _required_sha256(self.profile_sha256, "profile_sha256")
@@ -146,7 +153,7 @@ class LanSegmentedHelloPayload:
         _require_nonnegative_integer(self.segment_index, "segment_index")
         _require_nonnegative_integer(self.global_start, "global_start")
         _require_optional_identity(self.previous_session_id, "previous_session_id")
-        if self.mode not in {"lan-segmented-v1", "lan-segmented-v2"}:
+        if self.mode not in {"lan-segmented-v1", "lan-segmented-v2", "lan-full-v3"}:
             raise LocalhostCodecError("分段 hello 模式错误。")
 
 
@@ -160,14 +167,14 @@ class SegmentEndPayload:
     confirmed_count: int
     global_end_exclusive: int
     last_round_id: str | None
-    action: Literal["continue", "stop"]
+    action: Literal["continue", "stop", "switch"]
 
     def __post_init__(self) -> None:
         _text(self.run_id, "run_id")
         for name in ("segment_index", "global_start", "confirmed_count", "global_end_exclusive"):
             _require_nonnegative_integer(getattr(self, name), name)
         _require_optional_identity(self.last_round_id, "last_round_id")
-        if (self.action not in {"continue", "stop"}
+        if (self.action not in {"continue", "stop", "switch"}
                 or self.global_end_exclusive != self.global_start + self.confirmed_count
                 or (self.last_round_id is None) != (self.confirmed_count == 0)):
             raise LocalhostCodecError("段结束前缀或末轮无效。")
@@ -792,7 +799,7 @@ def _decode_value(value: object) -> object:
     if kind == "lan_hello":
         _exact_fields(mapping, {"type", "profile_sha256", "nonce", "mode"}, kind)
         mode = _text(mapping["mode"], "mode")
-        if mode not in {"lan-single-step-v1", "lan-continuous-v1"}:
+        if mode not in {"lan-single-step-v1", "lan-continuous-v1", "lan-scalar-v3"}:
             raise LocalhostCodecError("不支持的 LAN 模式。")
         return LanHelloPayload(
             _required_sha256(mapping["profile_sha256"], "profile_sha256"),
@@ -1519,3 +1526,246 @@ def _require_nonnegative_integer(value: object, name: str) -> None:
 def _require_optional_identity(value: object, name: str) -> None:
     if value is not None:
         _text(value, name)
+
+
+@dataclass(frozen=True, slots=True)
+class ScalarSetupV3:
+    """固定算术拓扑及已认证素数的公开配置；常量数值从不出现于 setup。"""
+
+    program: ScalarProgram
+    modulus: int
+    fractional_bits: int
+    security_parameter: int
+    modulus_evidence: PrimeModulusEvidence | None
+
+
+@dataclass(frozen=True, slots=True)
+class ScalarStageV3:
+    """单方已算完一轮的输出份额与实际消费数。"""
+
+    output_share: int
+    products: int
+    truncations: int
+
+
+@dataclass(frozen=True, slots=True)
+class ScalarFrameV3:
+    """v3 算术消息统一绑定角色、run、epoch、session 与物理/局部步。"""
+
+    sender: Literal["Client", "P1", "P2"]
+    recipient: Literal["Client", "P1", "P2"]
+    run_id: str
+    epoch_id: str
+    session_id: str
+    physical_step: int
+    local_step: int
+    round_id: str | None
+    resource_id: str | None
+    operation: str
+    payload: object
+
+
+_SCALAR_OPERATIONS = {
+    "setup", "ready", "material", "compute", "result", "commit", "committed",
+    "end", "ended", "peer_product", "peer_truncation", "peer_complete",
+}
+
+
+def encode_scalar_frame_v3(frame: ScalarFrameV3) -> bytes:
+    """严格编码 v3 消息；大整数一律十进制字符串，绝不使用 pickle。"""
+    if not isinstance(frame, ScalarFrameV3):
+        raise TypeError("v3 frame 类型无效")
+    _validate_scalar_frame_v3(frame)
+    payload = frame.payload
+    if isinstance(payload, ScalarSetupV3):
+        body: object = {
+            "program": {
+                "inputs": list(payload.program.inputs),
+                "constants": [name for name, _ in payload.program.constants],
+                "gates": [[g.name, g.operation, g.left, g.right] for g in payload.program.gates],
+                "output": payload.program.output,
+            },
+            "modulus": _decimal(payload.modulus),
+            "fractional_bits": payload.fractional_bits,
+            "security_parameter": payload.security_parameter,
+            "modulus_evidence": _encode_prime_evidence(payload.modulus_evidence),
+        }
+    elif isinstance(payload, ScalarPartyMaterial):
+        body = {
+            "party": payload.party,
+            "round_id": payload.round_id,
+            "step": payload.step,
+            "program_sha256": payload.program_sha256,
+            "values": [[name, _decimal(value)] for name, value in payload.values],
+            "gates": [
+                [gate.gate, gate.resource_id, *(_decimal(value) for value in
+                 (gate.a, gate.b, gate.c, gate.r, gate.r_prime))]
+                for gate in payload.gates
+            ],
+        }
+    elif isinstance(payload, ScalarStageV3):
+        body = {"output_share": _decimal(payload.output_share),
+                "products": payload.products, "truncations": payload.truncations}
+    elif isinstance(payload, tuple):
+        body = [_decimal(value) for value in payload]
+    elif isinstance(payload, int):
+        body = _decimal(payload)
+    else:
+        body = payload
+    content = {
+        "schema": "scalar-v3",
+        "sender": frame.sender,
+        "recipient": frame.recipient,
+        "run_id": frame.run_id,
+        "epoch_id": frame.epoch_id,
+        "session_id": frame.session_id,
+        "physical_step": frame.physical_step,
+        "local_step": frame.local_step,
+        "round_id": frame.round_id,
+        "resource_id": frame.resource_id,
+        "operation": frame.operation,
+        "payload": body,
+    }
+    return json.dumps(content, separators=(",", ":"), ensure_ascii=False,
+                      allow_nan=False).encode("utf-8")
+
+
+def decode_scalar_frame_v3(encoded: bytes) -> ScalarFrameV3:
+    """白名单解析 v3，拒绝多余字段、非规范整数和伪造角色方向。"""
+    mapping = _mapping(_load_json(encoded), "scalar-v3 frame")
+    _exact_fields(mapping, {"schema", "sender", "recipient", "run_id", "epoch_id",
+                            "session_id", "physical_step", "local_step", "round_id",
+                            "resource_id", "operation", "payload"}, "scalar-v3 frame")
+    if mapping["schema"] != "scalar-v3":
+        raise LocalhostCodecError("v3 schema 错误")
+    operation = _text(mapping["operation"], "operation")
+    raw = mapping["payload"]
+    if operation == "setup":
+        setup = _mapping(raw, "setup")
+        _exact_fields(setup, {"program", "modulus", "fractional_bits",
+                              "security_parameter", "modulus_evidence"}, "scalar setup")
+        public = _mapping(setup["program"], "program")
+        _exact_fields(public, {"inputs", "constants", "gates", "output"}, "scalar program")
+        if not isinstance(public["inputs"], list) or not isinstance(public["constants"], list):
+            raise LocalhostCodecError("v3 程序输入/常量列表无效")
+        if not isinstance(public["gates"], list) or len(public["gates"]) > 256:
+            raise LocalhostCodecError("v3 门列表无效")
+        gates = []
+        for item in public["gates"]:
+            if not isinstance(item, list) or len(item) != 4:
+                raise LocalhostCodecError("v3 门字段无效")
+            gates.append(ScalarGate(*(_text(value, "gate") for value in item)))
+        program = ScalarProgram(
+            tuple(_text(value, "input") for value in public["inputs"]),
+            tuple((_text(value, "constant"), Fraction(0)) for value in public["constants"]),
+            tuple(gates), _text(public["output"], "output"),
+        )
+        payload: object = ScalarSetupV3(
+            program, _parse_decimal(setup["modulus"]),
+            _positive(setup["fractional_bits"], "fractional_bits"),
+            _positive(setup["security_parameter"], "security_parameter"),
+            _decode_prime_evidence(setup["modulus_evidence"]),
+        )
+    elif operation == "material":
+        material = _mapping(raw, "material")
+        _exact_fields(material, {"party", "round_id", "step", "program_sha256",
+                                 "values", "gates"}, "scalar material")
+        if (not isinstance(material["values"], list) or len(material["values"]) > 256
+                or not isinstance(material["gates"], list) or len(material["gates"]) > 256):
+            raise LocalhostCodecError("v3 材料列表无效")
+        values = []
+        for item in material["values"]:
+            if not isinstance(item, list) or len(item) != 2:
+                raise LocalhostCodecError("v3 数值份额字段无效")
+            values.append((_text(item[0], "value name"), _parse_decimal(item[1])))
+        resources = []
+        for item in material["gates"]:
+            if not isinstance(item, list) or len(item) != 7:
+                raise LocalhostCodecError("v3 门材料字段无效")
+            resources.append(ScalarGateMaterial(
+                _text(item[0], "gate"), _text(item[1], "resource_id"),
+                *(_parse_decimal(value) for value in item[2:]),
+            ))
+        payload = ScalarPartyMaterial(
+            _party(material["party"]), _text(material["round_id"], "round_id"),
+            _nonnegative(material["step"], "step"),
+            _required_sha256(material["program_sha256"], "program_sha256"),
+            tuple(values), tuple(resources),
+        )
+    elif operation == "result":
+        result = _mapping(raw, "result")
+        _exact_fields(result, {"output_share", "products", "truncations"}, "scalar result")
+        payload = ScalarStageV3(
+            _parse_decimal(result["output_share"]),
+            _nonnegative(result["products"], "products"),
+            _nonnegative(result["truncations"], "truncations"),
+        )
+    elif operation == "peer_product":
+        if not isinstance(raw, list) or len(raw) != 2:
+            raise LocalhostCodecError("v3 peer_product 需两个份额")
+        payload = tuple(_parse_decimal(value) for value in raw)
+    elif operation == "peer_truncation":
+        payload = _parse_decimal(raw)
+    elif operation in {"committed", "ended"}:
+        payload = _nonnegative(_parse_decimal(raw), operation)
+    elif operation == "end":
+        if raw not in {"stop", "switch"}:
+            raise LocalhostCodecError("v3 end action 无效")
+        payload = raw
+    elif operation in {"ready", "compute", "commit", "peer_complete"}:
+        if raw is not None:
+            raise LocalhostCodecError("v3 空消息不得带 payload")
+        payload = None
+    else:
+        raise LocalhostCodecError("未知 v3 operation")
+    frame = ScalarFrameV3(
+        _text(mapping["sender"], "sender"), _text(mapping["recipient"], "recipient"),
+        _text(mapping["run_id"], "run_id"), _text(mapping["epoch_id"], "epoch_id"),
+        _text(mapping["session_id"], "session_id"),
+        _nonnegative(mapping["physical_step"], "physical_step"),
+        _nonnegative(mapping["local_step"], "local_step"),
+        _optional_text(mapping["round_id"], "round_id"),
+        _optional_text(mapping["resource_id"], "resource_id"),
+        operation, payload,
+    )
+    _validate_scalar_frame_v3(frame)
+    return frame
+
+
+def _validate_scalar_frame_v3(frame: ScalarFrameV3) -> None:
+    """统一检查角色方向、身份字段和操作所需的 payload。"""
+    if frame.operation not in _SCALAR_OPERATIONS:
+        raise LocalhostCodecError("未知 v3 operation")
+    for name in ("run_id", "epoch_id", "session_id"):
+        _text(getattr(frame, name), name)
+    if (type(frame.physical_step) is not int or frame.physical_step < 0
+            or type(frame.local_step) is not int or frame.local_step < 0):
+        raise LocalhostCodecError("v3 步号无效")
+    party = {"P1", "P2"}
+    client_to_party = {"setup", "material", "compute", "commit", "end"}
+    party_to_client = {"ready", "result", "committed", "ended"}
+    peer = {"peer_product", "peer_complete"}
+    if not (
+        (frame.operation in client_to_party and frame.sender == "Client"
+         and frame.recipient in party)
+        or (frame.operation in party_to_client and frame.sender in party
+            and frame.recipient == "Client")
+        or (frame.operation in peer and frame.sender in party
+            and frame.recipient in party and frame.sender != frame.recipient)
+        or (frame.operation == "peer_truncation" and
+            (frame.sender, frame.recipient) == ("P2", "P1"))
+    ):
+        raise LocalhostCodecError("v3 操作与角色方向不符")
+    need_round = frame.operation not in {"setup", "end", "ended"}
+    need_resource = frame.operation.startswith("peer_")
+    if (need_round != (frame.round_id is not None)
+            or need_resource != (frame.resource_id is not None)):
+        raise LocalhostCodecError("v3 round/resource 身份不符")
+    expected = {
+        "setup": ScalarSetupV3, "material": ScalarPartyMaterial,
+        "result": ScalarStageV3, "peer_product": tuple,
+        "peer_truncation": int, "committed": int, "ended": int, "end": str,
+    }
+    required = expected.get(frame.operation, type(None))
+    if not isinstance(frame.payload, required):
+        raise LocalhostCodecError("v3 payload 类型与操作不符")
