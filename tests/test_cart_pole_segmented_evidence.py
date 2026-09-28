@@ -89,8 +89,13 @@ from secure_control.protocol import Client
 from secure_control.scenarios.cart_pole.interactive import InteractiveSession
 config = load_lan_config(Path(sys.argv[1]), 'Client')
 count, capacity = int(sys.argv[3]), int(sys.argv[4])
-control, session = RunControl(), InteractiveSession()
 mode = sys.argv[2]
+scheduled = {step: 1. if step % 2 else -1. for step in range(count)} if mode == 'pulses' else {}
+control, session = RunControl(), InteractiveSession(scheduled=scheduled)
+prepared = None
+if mode == 'pulses':
+    from secure_control.experiments.lan_continuous_profile import load_segmented_experiment
+    prepared = load_segmented_experiment(config.experiment_config, capacity, session)
 replacement = None
 if mode == 'prepare_fail':
     original_prepare = Client.prepare_online
@@ -138,7 +143,8 @@ def step(record):
         control.request_stop()
 try:
     result = run_cart_pole_segmented(config, control=control, session=session,
-                                     segment_steps=capacity, on_step=step, phase=phase)
+                                     segment_steps=capacity, on_step=step, phase=phase,
+                                     prepared=prepared)
 except Exception as error:
     import traceback
     result = {'status':'failed', 'category':type(error).__name__, 'traceback':traceback.format_exc()}
@@ -147,7 +153,8 @@ finally:
         replacement.terminate()
         replacement.wait(timeout=10)
 print(json.dumps({'result':result,'boundaries':boundaries,
-                  'wall_s':time.monotonic()-started,'peak_bytes':tracemalloc.get_traced_memory()[1]}))
+                  'wall_s':time.monotonic()-started,'peak_bytes':tracemalloc.get_traced_memory()[1],
+                  'device_pending':len(prepared.scene.device._scheduled) if prepared else None}))
 '''
 
 
@@ -224,6 +231,45 @@ def test_real_segments_publish_and_observation_seek_matches_confirmed_frames(pub
             run.observation_at(value)
 
 
+def test_v1_reader_accepts_historical_contract_shape_without_weakening_checks(published, tmp_path):
+    path = _copy(published, tmp_path)
+    config_file = path / "config.json"
+    plot_file = path / "plots.json"
+    manifest_file = path / "run.json"
+    config = json.loads(config_file.read_text(encoding="utf-8"))
+    contract = config["definition"]["segment_range"]["contract"]
+    assert contract.pop("reachability_block_steps") is None
+    for entry in map(json.loads, (path / "segments.jsonl").read_text(encoding="utf-8").splitlines()):
+        if entry["chunk"] is None:
+            continue
+        block_config_file = path / "segments" / str(entry["index"]) / entry["chunk"]["name"] / "config.json"
+        block_config = json.loads(block_config_file.read_text(encoding="utf-8"))
+        assert block_config["segment_range"]["contract"].pop("reachability_block_steps") is None
+        block_config_file.write_bytes(evidence._bytes(block_config))
+    _rehash(path)
+
+    def write_and_rehash():
+        config_file.write_bytes(evidence._bytes(config))
+        plots = json.loads(plot_file.read_text(encoding="utf-8"))
+        plots["config_sha256"] = evidence._hash(config_file)
+        plot_file.write_bytes(evidence._bytes(plots))
+        manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+        manifest["config_sha256"] = plots["config_sha256"]
+        manifest["plots_sha256"] = evidence._hash(plot_file)
+        manifest_file.write_bytes(evidence._bytes(manifest))
+
+    write_and_rehash()
+    run = evidence.open_verified_cart_pole_segmented_run(path)
+    assert run.metadata["format_version"] == 1
+    assert run.observation_at(4)["step"] == 4
+    evidence.redraw_segmented_control(path, tmp_path / "historical-redraw")
+
+    contract["input_payload_bounds"][0] += 1
+    write_and_rehash()
+    with pytest.raises(ValueError):
+        evidence.open_verified_cart_pole_segmented_run(path)
+
+
 def test_dynamic_v2_publishes_verified_continuous_state(tmp_path_factory):
     root = tmp_path_factory.mktemp("dv2")
     report = _run(root, count=7, capacity=3, client_code=_DYNAMIC_CLIENT, dynamic=True)
@@ -235,6 +281,22 @@ def test_dynamic_v2_publishes_verified_continuous_state(tmp_path_factory):
         "products_consumed": 210, "truncations_consumed": 28,
     }
     assert len({item["session"] for item in report["boundaries"]}) == 1
+
+
+def test_dynamic_v2_continuous_pulses_keep_device_memory_bounded(tmp_path_factory):
+    report = _run(tmp_path_factory.mktemp("dv2pulses"), count=41, capacity=20,
+                  mode="pulses", client_code=_DYNAMIC_CLIENT, dynamic=True)
+    assert report["result"]["status"] == "complete", report["result"]
+    assert report["device_pending"] == 0
+    run = evidence.open_verified_cart_pole_segmented_run(report["result"]["run_dir"])
+    assert run.metadata["segment_count"] == 3
+    snapshots = [item["snapshot"] for _, _, _, segment in run.iter_segments()
+                 for item in segment["steps"]]
+    assert [item["requested_disturbance_n"] for item in snapshots] == [
+        1. if step % 2 else -1. for step in range(41)
+    ]
+    assert all(item["force_disposition"] in ("accepted", "rejected_total_force_limit")
+               for item in snapshots)
 
 
 def test_dynamic_v2_failed_run_exposes_verified_unsealed_prefix(tmp_path_factory):

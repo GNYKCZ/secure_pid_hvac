@@ -296,6 +296,7 @@ class CartPoleObserverSimulation:
         except Exception:
             self._ended = True
             raise
+        self._scheduled.pop(self._step, None)
         self._last_forces = (requested, actual, applied + actual, disposition)
         self._step += 1
         return ActuationReceipt(command.command_id, command.episode_id, command.sample_id,

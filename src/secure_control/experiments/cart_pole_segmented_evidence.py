@@ -313,7 +313,13 @@ class _Definition:
             parameter_bits=effective["paper_parameter_bits"],
             runtime_payload_bits=effective["runtime_payload_bits"], modulus=effective["q"],
         )
-        _same(effective["segment_range"], {"contract": asdict(self.contract), "proof": proof})
+        expected_contract = asdict(self.contract)
+        saved_range = effective["segment_range"]
+        if (isinstance(saved_range, dict) and isinstance(saved_range.get("contract"), dict)
+                and "reachability_block_steps" not in saved_range["contract"]):
+            # Published v1 results predate the v2-only contract field.
+            expected_contract.pop("reachability_block_steps")
+        _same(saved_range, {"contract": expected_contract, "proof": proof})
         _, _, finite_proof = cart_pole_numeric_contract(
             self.spec, self.balance, fractional_bits=effective["fractional_bits"],
             parameter_bits=effective["paper_parameter_bits"],

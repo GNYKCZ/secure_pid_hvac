@@ -584,6 +584,40 @@ def test_actual_simulation_atomic_track_failure_and_no_resend(design):
         sim.read_interval_forces()
 
 
+def test_simulation_consumes_live_interval_requests_but_keeps_future_events(design):
+    class ConstantPlant:
+        def __init__(self):
+            self.completed = 0
+            self.last_force = None
+
+        def output(self):
+            return np.zeros(4)
+
+        def step(self, force):
+            self.completed += 1
+            self.last_force = float(force[0])
+            return self.output()
+
+    plant = ConstantPlant()
+    sim = CartPoleObserverSimulation(plant, design.plant, ((2003, 1.),))
+    for step in range(2001):
+        force = 1. if step % 2 else -1.
+        sim.request_disturbance(step, force)
+        receipt = sim.send_control(ControlCommand(step, "live", step, 0.))
+        assert receipt.disposition == "simulated_interval_completed"
+        assert sim.read_interval_forces() == (force, force, force, "accepted")
+        assert sim._scheduled == {2003: 1.}
+    sim.request_disturbance(2001, 1.)
+    sim.send_control(ControlCommand(2001, "live", 2001,
+                                    design.plant.max_applied_force_n))
+    requested, actual, total, disposition = sim.read_interval_forces()
+    assert requested == 1. and actual == 0.
+    assert total == design.plant.max_applied_force_n
+    assert disposition == "rejected_total_force_limit"
+    assert sim._scheduled == {2003: 1.}
+    assert plant.completed == 2002 and plant.last_force == total
+
+
 @pytest.mark.parametrize("output", [np.array([np.inf]), np.array([np.nan]), np.array([1,2]), np.array([True])])
 def test_runtime_failure_ends_episode_and_does_not_reinitialize(design, output):
     """数值/shape失败不重复step或读取秘密state，后续必须显式新episode。"""
