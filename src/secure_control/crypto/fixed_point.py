@@ -191,14 +191,15 @@ class FixedPointContext:
 
         try:
             real_value = float(item)
-            scaled = real_value * self.scale
         except OverflowError as error:
             raise ValueError("待编码值过大，无法安全缩放。") from error
-        if not math.isfinite(real_value) or not math.isfinite(scaled):
+        if not math.isfinite(real_value):
             raise ValueError("待编码值及其缩放结果必须是有限数。")
 
-        # 论文规定 floor(x + 1/2)，故不能使用 Python/NumPy 的 round。
-        payload = math.floor(scaled + 0.5)
+        # binary float 本身是精确有理数；先取其整数比，避免 ell 很大时
+        # scaled + 0.5 把半量化单位附近的值错误舍入到另一侧。
+        numerator, denominator = real_value.as_integer_ratio()
+        payload = (2 * numerator * self.scale + denominator) // (2 * denominator)
         self._validate_payload(payload)
         return payload
 

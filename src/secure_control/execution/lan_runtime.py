@@ -227,7 +227,9 @@ class LanContinuousRuntime:
     ) -> None:
         if config.role != "Client" or config.experiment_config is None:
             raise ValueError("连续运行必须使用 Client experiment 配置。")
-        v2 = _segment_hello is not None and _segment_hello.mode == "lan-segmented-v2"
+        v2 = _segment_hello is not None and _segment_hello.mode in {
+            "lan-segmented-v2", "lan-full-v3",
+        }
         if v2:
             if (range_contract.reachability_block_steps is None
                     or range_contract.horizon_steps is not None
@@ -510,8 +512,17 @@ class LanSegmentedRuntime:
     def __init__(self, config: LanConfig, spec: ControllerSpec,
                  fixed_point: FixedPointContext, range_contract: ControllerRangeContract,
                  security_parameter: int, modulus_evidence: PrimeModulusEvidence | None,
-                 *, control: RunControl, segment_capacity: int | None = None) -> None:
+                 *, control: RunControl, segment_capacity: int | None = None,
+                 full_run_id: str | None = None,
+                 previous_epoch_session: str | None = None) -> None:
         self._v2 = spec.state_dimension != 0
+        self._full_v3 = full_run_id is not None
+        if self._full_v3 and (
+            not self._v2 or not previous_epoch_session or not full_run_id
+        ):
+            raise ValueError("v3 动态 epoch 需要原物理 run 与上一安全 session")
+        if not self._full_v3 and previous_epoch_session is not None:
+            raise ValueError("旧持续模式不得引用 v3 epoch session")
         if self._v2 and segment_capacity is None:
             raise ValueError("非零秘密状态持续模式必须显式声明 segment_capacity")
         capacity = segment_capacity if self._v2 else range_contract.horizon_steps
@@ -527,10 +538,10 @@ class LanSegmentedRuntime:
         self.contract, self.security_parameter = range_contract, security_parameter
         self.segment_capacity = capacity
         self.evidence, self.control = modulus_evidence, control
-        self.run_id = secrets.token_hex(32)
+        self.run_id = full_run_id if self._full_v3 else secrets.token_hex(32)
         self.controller_epoch = secrets.token_hex(32) if self._v2 else None
         self.segment_index = self.global_start = self.confirmed_step_count = 0
-        self._previous_session = None
+        self._previous_session = previous_epoch_session
         self._segment: LanContinuousRuntime | None = None
         self._pending: SegmentedStep | None = None
         self._records: list[SegmentedStep] = []
@@ -546,6 +557,7 @@ class LanSegmentedRuntime:
         self.hello = LanSegmentedHelloPayload(
             self.config.topology.digest, secrets.token_hex(32), self.run_id,
             self.segment_index, self.global_start, self._previous_session,
+            "lan-full-v3" if self._full_v3 else
             "lan-segmented-v2" if self._v2 else "lan-segmented-v1",
         )
         started = time.monotonic()
@@ -638,14 +650,16 @@ class LanSegmentedRuntime:
         self._attempted_round = None
         self.phase = "RUNNING"
 
-    def end_segment(self) -> SegmentRecord:
+    def end_segment(self, *, switch_epoch: bool = False) -> SegmentRecord:
         """向双方先发送同一个 action，再于共享 deadline 验证独立计数回执。"""
         if self.phase != "RUNNING" or self._pending is not None:
             raise RuntimeError("未确认物理推进或失败状态不得正常结束。")
         assert self._segment is not None
         segment = self._segment
         with self.control._lock:
-            action = "stop" if self.control._stop else "continue"
+            if switch_epoch and not self._full_v3:
+                raise ValueError("只有 v3 动态 epoch 可以显式切换")
+            action = "switch" if switch_epoch else "stop" if self.control._stop else "continue"
             if action == "continue" and not self.segment_full:
                 raise RuntimeError("只有满段才能继续。")
             self.phase = "STOPPING" if action == "stop" else "ENDING_SEGMENT"
@@ -688,14 +702,15 @@ class LanSegmentedRuntime:
             self._records.clear()
             self._last_end_round_id = end.last_round_id
             self._last_closed_segment_count = self.confirmed_step_count
-            self.phase = "STOPPED" if action == "stop" else "CONNECTING_NEXT"
+            self.phase = ("SWITCHED" if action == "switch" else
+                          "STOPPED" if action == "stop" else "CONNECTING_NEXT")
             completed = True
             return record
         except Exception:
             self.phase = "UNCERTAIN"
             raise
         finally:
-            if not self._v2 or action == "stop" or not completed:
+            if not self._v2 or action in {"stop", "switch"} or not completed:
                 segment.close()
 
     def next_segment(self) -> None:
@@ -715,7 +730,7 @@ class LanSegmentedRuntime:
                 self.hello = LanSegmentedHelloPayload(
                     self.hello.profile_sha256, self.hello.nonce, self.run_id,
                     self.segment_index, self.global_start, self._segment.session_id,
-                    "lan-segmented-v2",
+                    "lan-full-v3" if self._full_v3 else "lan-segmented-v2",
                 )
                 self.phase = "RUNNING"
             except Exception:
@@ -736,7 +751,7 @@ class LanSegmentedRuntime:
 
     def close(self) -> None:
         """故障清理只关闭连接，不能产生正常停止结果。"""
-        if self.phase not in {"STOPPED", "FAILED", "UNCERTAIN", "CANCELLED"}:
+        if self.phase not in {"STOPPED", "SWITCHED", "FAILED", "UNCERTAIN", "CANCELLED"}:
             self.phase = "FAILED"
         if self._segment is not None:
             self._segment.close()
@@ -777,6 +792,16 @@ class _PartyRunTail:
     layout: object
 
 
+@dataclass(frozen=True, slots=True)
+class _ScalarRunTail:
+    """v3 安全结束屏障后的物理前缀；下一 epoch 必须显式 rearm。"""
+
+    run_id: str
+    physical_end: int
+    session_id: str
+    epoch_id: str
+
+
 def _validate_segment_chain(hello: LanSegmentedHelloPayload, session: str,
                             tail: _PartyRunTail | None) -> None:
     if tail is None:
@@ -790,7 +815,8 @@ def _validate_segment_chain(hello: LanSegmentedHelloPayload, session: str,
 
 def _run_party_session(config: LanConfig, client_listener: socket.socket,
                        peer_listener: socket.socket | None,
-                       tail: _PartyRunTail | None) -> tuple[dict[str, object], _PartyRunTail | None]:
+                       tail: _PartyRunTail | _ScalarRunTail | None
+                       ) -> tuple[dict[str, object], _PartyRunTail | _ScalarRunTail | None]:
     """旧模式与新模式共享唯一的握手、离线装配和 Protocol 3 单段计算。"""
     role = config.role
     party = 0 if role == "P1" else 1
@@ -808,8 +834,24 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
             startup_deadline,
         )
         if isinstance(hello, LanSegmentedHelloPayload):
-            _validate_segment_chain(hello, session, tail)
-        elif tail is not None:
+            if isinstance(tail, _ScalarRunTail):
+                if (
+                    hello.mode != "lan-full-v3"
+                    or hello.run_id != tail.run_id
+                    or hello.segment_index != 0 or hello.global_start != 0
+                    or hello.previous_session_id != tail.session_id
+                    or session == tail.session_id
+                ):
+                    raise RuntimeError("v3 动态捕获没有绑定已结束的安全 epoch")
+            else:
+                if hello.mode == "lan-full-v3":
+                    raise RuntimeError("v3 动态捕获缺少上一 epoch 的结束屏障")
+                _validate_segment_chain(hello, session, tail)
+        elif tail is not None and not (
+            isinstance(tail, _ScalarRunTail)
+            and isinstance(hello, LanHelloPayload) and hello.mode == "lan-scalar-v3"
+            and session != tail.session_id
+        ):
             raise ValueError("持续 run 不允许切回旧模式。")
         _LAN_LOG.info("%s 与 Client 的协议连接已建立。", role)
         if party == 0:
@@ -829,6 +871,25 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
             None,
             config.startup_timeout,
         )
+        if isinstance(hello, LanHelloPayload) and hello.mode == "lan-scalar-v3":
+            from .lan_scalar_runtime import run_party_scalar_session
+
+            summary = run_party_scalar_session(
+                config, client_socket, peer_socket, role=role, session_id=session,
+                expected_run_id=tail.run_id if isinstance(tail, _ScalarRunTail) else None,
+                expected_physical_step=(
+                    tail.physical_end if isinstance(tail, _ScalarRunTail) else None
+                ),
+                previous_epoch_id=tail.epoch_id if isinstance(tail, _ScalarRunTail) else None,
+            )
+            next_tail = (
+                _ScalarRunTail(
+                    summary["run_id"], summary["physical_end"],
+                    summary["session_id"], summary["epoch_id"],
+                )
+                if summary["action"] == "switch" else None
+            )
+            return summary, next_tail
         setup_request = _party_receive(
             client_socket, role, 2, "lan_setup", session, config.startup_timeout
         )
@@ -838,9 +899,12 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
         if (hello.mode in {"lan-continuous-v1", "lan-segmented-v1"}
                 and not isinstance(setup, LanContinuousSetupPayload)):
             raise TypeError("连续模式的公开 setup 类型不合法。")
-        v2 = hello.mode == "lan-segmented-v2"
+        v2 = hello.mode in {"lan-segmented-v2", "lan-full-v3"}
         if v2 and not isinstance(setup, LanSegmentedSetupV2Payload):
             raise TypeError("v2 持续模式的公开 setup 类型不合法。")
+        if (hello.mode == "lan-full-v3" and isinstance(tail, _ScalarRunTail)
+                and setup.controller_epoch == tail.epoch_id):
+            raise ValueError("v3 新动态捕获必须使用新 epoch")
         if not isinstance(setup, (LanSetupPayload, LanContinuousSetupPayload,
                                   LanSegmentedSetupV2Payload)):
             raise TypeError("公开 LAN setup 类型不合法。")
@@ -879,7 +943,12 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
             or (tail is not None and material.layout != tail.layout)
         ):
             raise ValueError("持续模式只支持冻结的零维 controller layout。")
-        if v2 and (tail is not None or material.layout.state_dimension == 0):
+        if v2 and (
+            (tail is not None and not (
+                hello.mode == "lan-full-v3" and isinstance(tail, _ScalarRunTail)
+            ))
+            or material.layout.state_dimension == 0
+        ):
             raise ValueError("v2 仅允许首段建立非零秘密状态 session")
         offline = rehydrate_offline_material(material, range_contract)
         role_object = P1(offline) if party == 0 else P2(offline)
@@ -916,7 +985,8 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                 sequence += 1
                 hello = LanSegmentedHelloPayload(
                     hello.profile_sha256, hello.nonce, hello.run_id,
-                    begin.segment_index, begin.global_start, session, "lan-segmented-v2",
+                    begin.segment_index, begin.global_start, session,
+                    "lan-full-v3" if hello.mode == "lan-full-v3" else "lan-segmented-v2",
                 )
                 committed = 0
                 last_round = None
@@ -927,6 +997,8 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                 end = online_request.payload
                 if not isinstance(end, SegmentEndPayload):
                     raise TypeError("段结束请求类型错误。")
+                if end.action == "switch" and hello.mode != "lan-full-v3":
+                    raise ValueError("旧分段模式不得执行 v3 epoch switch")
                 actual = SegmentEndPayload(
                     hello.run_id, hello.segment_index, hello.global_start, committed,
                     hello.global_start + committed, last_round, end.action,
@@ -940,13 +1012,23 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                     sequence += 1
                     awaiting_begin = True
                     continue
-                tail = (_PartyRunTail(hello.run_id, hello.segment_index + 1,
-                                      hello.global_start + committed, session, setup, material.layout)
-                        if not v2 else None)
+                if hello.mode == "lan-full-v3" and end.action == "switch":
+                    assert isinstance(tail, _ScalarRunTail)
+                    tail = _ScalarRunTail(
+                        tail.run_id, tail.physical_end + global_committed,
+                        session, setup.controller_epoch,
+                    )
+                else:
+                    tail = (
+                        _PartyRunTail(
+                            hello.run_id, hello.segment_index + 1,
+                            hello.global_start + committed, session, setup, material.layout,
+                        ) if not v2 and end.action == "continue" else None
+                    )
                 summary = {"status": "closed", "role": role, "pid": os.getpid(),
                            "steps_committed": receipt.cumulative_committed_count,
                            "final_receipt": asdict(receipt), "transport": config.transport}
-                return summary, tail if end.action == "continue" else None
+                return summary, tail
             _check_request(online_request, role, sequence, "online", session)
             expected_step = global_committed if v2 else committed
             if committed >= steps:

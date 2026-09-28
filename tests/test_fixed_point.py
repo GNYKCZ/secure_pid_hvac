@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 from fractions import Fraction
+from math import nextafter
 
 import numpy as np
 import pytest
@@ -54,6 +55,19 @@ def test_exact_rational_encoding_avoids_large_float_intermediate() -> None:
     value = Fraction((1 << 60) + 1, 2)
 
     assert context.encode(value) == (1 << 60) + 1
+
+
+def test_high_precision_float_encoding_respects_half_quantization_boundary() -> None:
+    """ell=80 时二进制浮点输入也必须执行精确 floor(x·2^ell+1/2)。"""
+    context = FixedPointContext(modulus=(1 << 256) - 189, integer_bits=174,
+                                fractional_bits=80)
+    below_half = nextafter(2.0**-81, 0.0)
+    half = 2.0**-81
+
+    assert context.encode(below_half) == 0
+    assert context.encode(half) == 1
+    assert context.encode(-half) == 0
+    assert context.encode(-nextafter(half, 1.0)) == -1
 
 
 def test_multiplication_rejects_detectable_mathematical_modular_wraparound() -> None:

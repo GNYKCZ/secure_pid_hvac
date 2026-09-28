@@ -1,4 +1,5 @@
 configs/hvac_2r2c_sweep_prime.yaml text eol=crlf
+configs/paper_pid_cascade_zoh.yaml text eol=lf
 configs/shared_prime_256_pocklington.yaml text eol=crlf
 configs/paper_pid_fig3_sweep.yaml text eol=crlf
 configs/quadruple_tank_plant.yaml text eol=crlf

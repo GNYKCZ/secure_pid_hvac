@@ -98,6 +98,8 @@ uv run python -c "import secure_control; print(secure_control.__version__)"
 [下垂起摆明文可行性实验](docs/cart_pole_swing_up.md) 使用
 `uv run python scripts/run_cart_pole_swing_up.py configs/cart_pole_swing_up.yaml`，
 无需启动 P1/P2；其明文报告不代表已实现安全起摆。
+从下垂起点分别完成两测量动态捕获的明文与三进程安全路线、v3 验证结果和 GUI 入口见
+[完整路线指南](docs/cart_pole_full_route.md)。
 旧 HVAC 命令不再作为用户入口展示，示例输入移入测试夹具；底层实现和相应回归仍供内部验证。
 
 ## 安全算术基线

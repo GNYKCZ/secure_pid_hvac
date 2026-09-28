@@ -14,7 +14,20 @@ from pathlib import Path
 import pytest
 from test_cart_pole_segmented_evidence import _run
 
-from secure_control.scenarios.cart_pole.gui import CartPoleWindow
+from secure_control.scenarios.cart_pole.gui import CartPoleWindow, FullRouteWindow
+
+
+def _test_tk_root():
+    """Retry only transient Windows access to uv's bundled Tk theme file."""
+    for attempt in range(3):
+        try:
+            return tk.Tk()
+        except tk.TclError as error:
+            if "xpTheme.tcl" not in str(error) or attempt == 2:
+                raise
+            gc.collect()
+            time.sleep(.1)
+
 
 _GUI = r'''
 import json, os, sys, threading, time, tkinter as tk, tracemalloc, ctypes
@@ -30,6 +43,10 @@ disk_peak = 0
 phase_memory = {}
 original_notify = window._notify
 def memory_notify(kind,value):
+    if kind == 'phase' and value == 'PUBLISHING':
+        # Release scandir handles before the Windows directory rename.
+        disk_stop.set()
+        disk_thread.join()
     original_notify(kind,value)
     if kind == 'phase' and value in ('BACKEND_STOPPED','REPLAYING','VERIFYING','PLOTTING','COMPLETE'):
         phase_memory[value] = tracemalloc.get_traced_memory()
@@ -181,13 +198,44 @@ def test_mailbox_bounds_notifications_and_preserves_terminal_latest_frame():
     assert window._terminal == ("complete", "verified")
 
 
+def test_actual_tk_plaintext_full_route_replays_verified_capture(tmp_path):
+    root = _test_tk_root()
+    window = FullRouteWindow(
+        root, route="plaintext", client_path=Path("unused"),
+        observer_path=Path(__file__).resolve().parents[1] / "configs/cart_pole_observer.yaml",
+        swing_path=Path(__file__).resolve().parents[1] / "configs/cart_pole_swing_up.yaml",
+        prime_path=Path("unused"), output=tmp_path / "gui-plain-v3", segment_steps=100,
+    )
+    observed = []
+    deadline = time.monotonic() + 30
+
+    def check():
+        if window.verified is not None:
+            window.replay.set(309)
+            window._seek("309")
+            observed.append((window.verified.manifest["N"], window.detail.get()))
+            window._close()
+        elif time.monotonic() >= deadline:
+            observed.append(("timeout", window.status.get()))
+            window._close()
+        else:
+            root.after(50, check)
+
+    window.start()
+    root.after(50, check)
+    root.mainloop()
+    window.worker.join(timeout=5)
+    assert observed and observed[0][0] == 1500, observed
+    assert "phase=capture" in observed[0][1]
+
+
 def test_async_seek_coalesces_requests_and_old_generation_cannot_override(tmp_path):
     """可控后台屏障，不依赖拖动时序；Tk 线程不执行 reader。"""
     from test_cart_pole_lan import _profile_for
     from test_lan_continuous import _plain_deployment
     paths = _plain_deployment(tmp_path)
     _profile_for(paths)
-    root = tk.Tk()
+    root = _test_tk_root()
     window = CartPoleWindow(root, paths["Client"])
     started, release = threading.Event(), threading.Event()
     reader_threads = []
@@ -260,7 +308,7 @@ def test_finite_window_initial_replay_remains_finite_and_stop_disabled(tmp_path)
     from test_lan_continuous import _plain_deployment
     paths = _plain_deployment(tmp_path)
     _profile_for(paths)
-    root = tk.Tk()
+    root = _test_tk_root()
     try:
         window = CartPoleWindow(root, paths["Client"], mode="finite")
         assert window.prepared.sample_count == 400

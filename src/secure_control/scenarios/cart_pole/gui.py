@@ -402,3 +402,173 @@ def run_window(config_path: Path, *, segment_steps=400, mode="segmented") -> Non
         raise
     window.start()
     root.mainloop()
+
+
+class FullRouteWindow:
+    """#103 两条完整路线的物理确认帧和 v3 验证结果回放。"""
+
+    def __init__(self, root: tk.Tk, *, route: str, client_path: Path,
+                 observer_path: Path, swing_path: Path, prime_path: Path,
+                 output: Path, segment_steps: int) -> None:
+        if route not in {"plaintext", "secure"}:
+            raise ValueError("完整路线模式无效")
+        self.root, self.route = root, route
+        self.client_path, self.observer_path = client_path, observer_path
+        self.swing_path, self.prime_path = swing_path, prime_path
+        self.output, self.segment_steps = output, segment_steps
+        self.stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._frame = self._terminal = None
+        self.verified = None
+        root.title(f"Cart-pole full route · {route}")
+        root.geometry("860x610")
+        self.status = tk.StringVar(value="准备从下垂起点运行")
+        self.detail = tk.StringVar(value="物理 step=0 · 起摆")
+        tk.Label(root, textvariable=self.status, font=("Arial", 14, "bold")).pack(pady=10)
+        self.canvas = tk.Canvas(root, width=820, height=340, bg="white")
+        self.canvas.pack()
+        tk.Label(root, textvariable=self.detail, wraplength=800).pack(pady=5)
+        self.stop = tk.Button(root, text="停止并验证已确认前缀", command=self._request_stop)
+        self.stop.pack(pady=6)
+        self.replay = tk.Scale(root, from_=0, to=0, orient="horizontal",
+                               state="disabled", length=760, label="验证结果回放",
+                               command=self._seek)
+        self.replay.pack()
+        self.location = tk.StringVar(value=f"目标结果目录：{output}")
+        tk.Label(root, textvariable=self.location, wraplength=800).pack(pady=5)
+        self._draw((0., 0., math.pi, 0.))
+        root.protocol("WM_DELETE_WINDOW", self._close)
+
+    def _draw(self, state) -> None:
+        p, _, theta, _ = state
+        self.canvas.delete("all")
+        center, track_y = 410, 260
+        cart_x = center + 660 * p
+        self.canvas.create_line(80, track_y + 30, 740, track_y + 30, width=4)
+        self.canvas.create_line(center, 80, center, track_y + 50, fill="#888", dash=(4, 4))
+        self.canvas.create_rectangle(cart_x - 40, track_y - 18, cart_x + 40, track_y + 20,
+                                     fill="#2b75b8")
+        self.canvas.create_line(cart_x, track_y - 18, cart_x - 155 * math.sin(theta),
+                                track_y - 18 - 155 * math.cos(theta), fill="#c55a28", width=8)
+
+    def _request_stop(self) -> None:
+        self.stop_event.set()
+        self.stop.configure(state="disabled")
+        self.status.set("等待当前安全/物理确认边界，然后验证前缀")
+
+    def _confirmed(self, step, state, phase, source, applied, disturbance) -> None:
+        with self._lock:
+            self._frame = (step, state, phase, source, applied, disturbance)
+
+    def _work(self) -> None:
+        try:
+            from secure_control.experiments.cart_pole_full_evidence import (
+                open_verified_cart_pole_full_run,
+                write_cart_pole_full_run,
+                write_cart_pole_plaintext_full_run,
+            )
+            from secure_control.scenarios.cart_pole.observer import load_cart_pole_observer_design
+            from secure_control.scenarios.cart_pole.secure_full_experiment import (
+                run_secure_full_experiment,
+            )
+            from secure_control.scenarios.cart_pole.swing_up import load_cart_pole_swing_up_config
+            from secure_control.scenarios.cart_pole.swing_up_experiment import (
+                run_plaintext_full_experiment,
+            )
+
+            design = load_cart_pole_observer_design(self.observer_path)
+            swing = load_cart_pole_swing_up_config(
+                self.swing_path, design.plant, design.balance,
+            )
+            if self.route == "plaintext":
+                result = run_plaintext_full_experiment(
+                    design.plant, design.balance, swing, design,
+                    on_step=self._confirmed, stop_event=self.stop_event,
+                )
+                path = write_cart_pole_plaintext_full_run(result, self.output)
+            else:
+                from secure_control.experiments.lan_profile import _load_prime
+
+                modulus, evidence, _ = _load_prime(self.prime_path)
+                result = run_secure_full_experiment(
+                    design.plant, design.balance, swing, design,
+                    load_lan_config(self.client_path, "Client"), modulus=modulus,
+                    modulus_evidence=evidence, segment_capacity=self.segment_steps,
+                    on_step=self._confirmed, stop_event=self.stop_event,
+                )
+                path = write_cart_pole_full_run(result, self.output)
+            verified = open_verified_cart_pole_full_run(path)
+            with self._lock:
+                self._terminal = ("complete", verified)
+        except Exception as error:  # noqa: BLE001 - UI 不显示网络和证书载荷
+            with self._lock:
+                self._terminal = ("failed", type(error).__name__)
+
+    def start(self) -> None:
+        self.worker = threading.Thread(target=self._work, name="cart-pole-full-client")
+        self.worker.start()
+        self.root.after(40, self._poll)
+
+    def _poll(self) -> None:
+        with self._lock:
+            frame, self._frame = self._frame, None
+            terminal, self._terminal = self._terminal, None
+        if frame is not None and self.verified is None:
+            step, state, phase, source, applied, disturbance = frame
+            self._draw(state)
+            self.status.set(f"已确认物理 step={step} · {phase} · {source}")
+            self.detail.set(
+                f"p={state[0]:+.4f} m · θ={state[2]:+.4f} rad · "
+                f"applied={applied:+.3f} N · 外力={disturbance:+.1f} N"
+            )
+        if terminal is not None:
+            kind, value = terminal
+            self.stop.configure(state="disabled")
+            if kind == "complete":
+                self.verified = value
+                self.replay.configure(state="normal", to=value.manifest["N"])
+                self.location.set(f"已验证结果目录：{value.path}")
+                self.replay.set(value.manifest["N"])
+                self.status.set(
+                    f"{self.route} · v3 已验证 · N={value.manifest['N']} · "
+                    f"{value.report['termination']} · goal={value.report['goal_met']}"
+                )
+            else:
+                self.status.set(f"运行/发布失败：{value}")
+        if self.root.winfo_exists():
+            self.root.after(40, self._poll)
+
+    def _seek(self, value: str) -> None:
+        if self.verified is None:
+            return
+        observation = self.verified.observation(int(float(value)))
+        step = observation["step"]
+        self._draw(observation["state"])
+        row = self.verified.steps[step - 1] if step else None
+        self.detail.set(
+            f"step={step} · phase={observation['phase']} · "
+            f"source={row['source'] if row else 'initial'} · "
+            f"epoch={row['epoch_id'] if row else '-'} · "
+            f"resources={len(row['resource_ids']) if row else 0}"
+        )
+
+    def _close(self) -> None:
+        self.stop_event.set()
+        self.root.destroy()
+
+
+def run_full_window(config_path: Path, *, route: str, observer_path: Path,
+                    swing_path: Path, prime_path: Path, output: Path,
+                    segment_steps: int = 400) -> None:
+    root = tk.Tk()
+    try:
+        window = FullRouteWindow(
+            root, route=route, client_path=config_path, observer_path=observer_path,
+            swing_path=swing_path, prime_path=prime_path, output=output,
+            segment_steps=segment_steps,
+        )
+    except Exception:
+        root.destroy()
+        raise
+    window.start()
+    root.mainloop()
