@@ -6,7 +6,9 @@ import json
 import shutil
 import subprocess
 import sys
+from hashlib import sha256
 from itertools import pairwise
+from math import pi
 from pathlib import Path
 
 import numpy as np
@@ -14,7 +16,7 @@ import pytest
 import yaml
 from scipy.integrate import solve_ivp
 from test_cart_pole_balance import ORACLE_K, _oracle_rhs
-from test_cart_pole_lan import ROOT, _profile_for
+from test_cart_pole_lan import ROOT, _observer_profile_for, _profile_for
 from test_lan_continuous import _plain_deployment
 from test_lan_segmented import _PARTY
 from test_lan_single_step import _finish, deployment
@@ -75,11 +77,92 @@ except Exception as error:
 print(json.dumps({'result':result,'frames':frames,'phases':phases}))
 '''
 
+_DYNAMIC_CLIENT = r'''
+import json, os, signal, subprocess, sys, time, tracemalloc
+from dataclasses import replace
+from pathlib import Path
+from secure_control.execution.lan_config import load_lan_config
+from secure_control.execution.lan_runtime import RunControl
+from secure_control.execution import lan_runtime as lan
+from secure_control.experiments.cart_pole_segmented_evidence import run_cart_pole_segmented
+from secure_control.protocol import Client
+from secure_control.scenarios.cart_pole.interactive import InteractiveSession
+config = load_lan_config(Path(sys.argv[1]), 'Client')
+count, capacity = int(sys.argv[3]), int(sys.argv[4])
+mode = sys.argv[2]
+scheduled = {step: 1. if step % 2 else -1. for step in range(count)} if mode == 'pulses' else {}
+control, session = RunControl(), InteractiveSession(scheduled=scheduled)
+prepared = None
+if mode == 'pulses':
+    from secure_control.experiments.lan_continuous_profile import load_segmented_experiment
+    prepared = load_segmented_experiment(config.experiment_config, capacity, session)
+replacement = None
+if mode == 'prepare_fail':
+    original_prepare = Client.prepare_online
+    def prepare(self, distribution, value, *, step):
+        if step == 2:
+            raise RuntimeError('injected material supply failure')
+        return original_prepare(self, distribution, value, step=step)
+    Client.prepare_online = prepare
+if mode == 'stop_inflight':
+    original_reconstruct = Client.reconstruct_control
+    def reconstruct(self, *args, **kwargs):
+        value = original_reconstruct(self, *args, **kwargs)
+        control.request_stop()
+        return value
+    Client.reconstruct_control = reconstruct
+if mode == 'bad_begin':
+    original_begin = lan.LanContinuousRuntime.begin_segment
+    def begin(self, payload):
+        return original_begin(self, replace(payload, segment_index=payload.segment_index+1))
+    lan.LanContinuousRuntime.begin_segment = begin
+boundaries = []
+tracemalloc.start()
+started = time.monotonic()
+def phase(value):
+    global replacement
+    if mode in ('p1_restart', 'p2_restart') and value == 'CONNECTING_NEXT' and replacement is None:
+        index = 5 if mode == 'p1_restart' else 7
+        os.kill(int(sys.argv[index]), signal.SIGTERM)
+        replacement = subprocess.Popen([sys.executable,
+            'scripts/run_continuous_p1.py' if mode == 'p1_restart' else 'scripts/run_continuous_p2.py',
+            sys.argv[index+1]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(.3)
+def step(record):
+    g = record.protocol.global_step
+    if mode == 'fail_after_confirmed' and g == 2:
+        raise RuntimeError('injected record sink failure')
+    if mode == 'cancel_after_confirmed' and g == 2:
+        session.close()
+    if g in (0, capacity-1, capacity, count-1):
+        boundaries.append({'step': g, 'raw': record.protocol.raw_control,
+                           'session': record.protocol.session_id,
+                           'snapshot': record.snapshot.__dict__ if hasattr(record.snapshot, '__dict__')
+                           else {key:getattr(record.snapshot,key) for key in record.snapshot.__dataclass_fields__}})
+    if g + 1 == count:
+        control.request_stop()
+try:
+    result = run_cart_pole_segmented(config, control=control, session=session,
+                                     segment_steps=capacity, on_step=step, phase=phase,
+                                     prepared=prepared)
+except Exception as error:
+    import traceback
+    result = {'status':'failed', 'category':type(error).__name__, 'traceback':traceback.format_exc()}
+finally:
+    if replacement is not None:
+        replacement.terminate()
+        replacement.wait(timeout=10)
+print(json.dumps({'result':result,'boundaries':boundaries,
+                  'wall_s':time.monotonic()-started,'peak_bytes':tracemalloc.get_traced_memory()[1],
+                  'device_pending':len(prepared.scene.device._scheduled) if prepared else None}))
+'''
+
 
 def _run(tmp_path, *, count=7, capacity=3, mode="normal", tls=False, client_code=_CLIENT,
-         party_fault="none"):
+         party_fault="none", dynamic=False, dynamic_initial=(0, 0, .005, 0)):
     paths = deployment.__wrapped__(tmp_path) if tls else _plain_deployment(tmp_path)
-    profile = _profile_for(paths)
+    profile = (_observer_profile_for(paths, initial_state=dynamic_initial)
+               if dynamic else _profile_for(paths))
     if tls:
         value = yaml.safe_load(paths["Client"].read_text())
         value.pop("controller")
@@ -93,7 +176,9 @@ def _run(tmp_path, *, count=7, capacity=3, mode="normal", tls=False, client_code
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             ))
         client = subprocess.Popen(
-            [sys.executable, "-c", client_code, str(paths["Client"]), mode, str(count), str(capacity)],
+            [sys.executable, "-c", client_code, str(paths["Client"]), mode, str(count),
+             str(capacity), str(processes[0].pid), str(paths["P1"]),
+             str(processes[1].pid), str(paths["P2"])],
             cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         processes.append(client)
@@ -109,7 +194,8 @@ def _run(tmp_path, *, count=7, capacity=3, mode="normal", tls=False, client_code
             outcomes = [_finish(p, 20) for p in processes[:2]]
             assert all(row[0] == 0 for row in outcomes), outcomes
             assert len({report["result"]["backend"]["pid"], *(row[1]["pid"] for row in outcomes)}) == 3
-            assert all(row[1]["steps_committed"] == count for row in outcomes)
+            expected = 1 if dynamic and mode == "stop_inflight" else count
+            assert all(row[1]["steps_committed"] == expected for row in outcomes)
         return report
     finally:
         for process in processes:
@@ -143,6 +229,216 @@ def test_real_segments_publish_and_observation_seek_matches_confirmed_frames(pub
     for value in (-1, 8, True):
         with pytest.raises(ValueError):
             run.observation_at(value)
+
+
+def test_v1_reader_accepts_historical_contract_shape_without_weakening_checks(published, tmp_path):
+    path = _copy(published, tmp_path)
+    config_file = path / "config.json"
+    plot_file = path / "plots.json"
+    manifest_file = path / "run.json"
+    config = json.loads(config_file.read_text(encoding="utf-8"))
+    contract = config["definition"]["segment_range"]["contract"]
+    assert contract.pop("reachability_block_steps") is None
+    for entry in map(json.loads, (path / "segments.jsonl").read_text(encoding="utf-8").splitlines()):
+        if entry["chunk"] is None:
+            continue
+        block_config_file = path / "segments" / str(entry["index"]) / entry["chunk"]["name"] / "config.json"
+        block_config = json.loads(block_config_file.read_text(encoding="utf-8"))
+        assert block_config["segment_range"]["contract"].pop("reachability_block_steps") is None
+        block_config_file.write_bytes(evidence._bytes(block_config))
+    _rehash(path)
+
+    def write_and_rehash():
+        config_file.write_bytes(evidence._bytes(config))
+        plots = json.loads(plot_file.read_text(encoding="utf-8"))
+        plots["config_sha256"] = evidence._hash(config_file)
+        plot_file.write_bytes(evidence._bytes(plots))
+        manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+        manifest["config_sha256"] = plots["config_sha256"]
+        manifest["plots_sha256"] = evidence._hash(plot_file)
+        manifest_file.write_bytes(evidence._bytes(manifest))
+
+    write_and_rehash()
+    run = evidence.open_verified_cart_pole_segmented_run(path)
+    assert run.metadata["format_version"] == 1
+    assert run.observation_at(4)["step"] == 4
+    evidence.redraw_segmented_control(path, tmp_path / "historical-redraw")
+
+    contract["input_payload_bounds"][0] += 1
+    write_and_rehash()
+    with pytest.raises(ValueError):
+        evidence.open_verified_cart_pole_segmented_run(path)
+
+
+def test_dynamic_v2_publishes_verified_continuous_state(tmp_path_factory):
+    root = tmp_path_factory.mktemp("dv2")
+    report = _run(root, count=7, capacity=3, client_code=_DYNAMIC_CLIENT, dynamic=True)
+    assert report["result"]["status"] == "complete", report["result"].get("traceback", report)
+    run = evidence.open_verified_cart_pole_segmented_run(report["result"]["run_dir"])
+    assert run.metadata["format_version"] == 2
+    assert run.metadata["N"] == 7
+    assert run.metadata["termination"]["resource_counts"] == {
+        "products_consumed": 210, "truncations_consumed": 28,
+    }
+    assert len({item["session"] for item in report["boundaries"]}) == 1
+
+
+def test_dynamic_v2_continuous_pulses_keep_device_memory_bounded(tmp_path_factory):
+    report = _run(tmp_path_factory.mktemp("dv2pulses"), count=41, capacity=20,
+                  mode="pulses", client_code=_DYNAMIC_CLIENT, dynamic=True)
+    assert report["result"]["status"] == "complete", report["result"]
+    assert report["device_pending"] == 0
+    run = evidence.open_verified_cart_pole_segmented_run(report["result"]["run_dir"])
+    assert run.metadata["segment_count"] == 3
+    snapshots = [item["snapshot"] for _, _, _, segment in run.iter_segments()
+                 for item in segment["steps"]]
+    assert [item["requested_disturbance_n"] for item in snapshots] == [
+        1. if step % 2 else -1. for step in range(41)
+    ]
+    assert all(item["force_disposition"] in ("accepted", "rejected_total_force_limit")
+               for item in snapshots)
+
+
+def test_dynamic_v2_failed_run_exposes_verified_unsealed_prefix(tmp_path_factory):
+    root = tmp_path_factory.mktemp("dv2fail")
+    report = _run(root, count=7, capacity=5,
+                  mode="fail_after_confirmed", client_code=_DYNAMIC_CLIENT, dynamic=True)
+    assert report["result"]["status"] == "failed"
+    prefix = evidence.open_verified_cart_pole_segmented_prefix(
+        report["result"]["prefix_dir"])
+    assert prefix["status"] == "failed"
+    assert prefix["confirmed_step_count"] == prefix["unsealed_step_count"] == 3
+    assert prefix["sealed_step_count"] == 0
+    assert prefix["unsealed_tail_is_complete"] is False
+    with pytest.raises(ValueError):
+        evidence.open_verified_cart_pole_segmented_run(report["result"]["prefix_dir"])
+    forged = root / "forged" / Path(report["result"]["prefix_dir"]).name
+    forged.parent.mkdir()
+    shutil.copytree(report["result"]["prefix_dir"], forged)
+    journal = forged / "journal" / "0.jsonl"
+    entries = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]
+    entries[0]["step"]["protocol"]["raw_control"] = [9.]
+    entries[0]["step"]["snapshot"]["raw_force_n"] = 9.
+    entries[0]["step"]["snapshot"]["applied_force_n"] = 9.
+    previous = None
+    raw = b""
+    for entry in entries:
+        entry["prev_sha256"] = previous
+        previous = sha256(evidence._bytes({"step": entry["step"],
+                                           "prev_sha256": previous})).hexdigest()
+        entry["sha256"] = previous
+        raw += evidence._bytes(entry)
+    journal.write_bytes(raw)
+    checkpoint_file = forged / "checkpoint.json"
+    checkpoint = json.loads(checkpoint_file.read_text(encoding="utf-8"))
+    checkpoint["active_sha256"] = previous
+    checkpoint["active_bytes"] = len(raw)
+    checkpoint_file.write_bytes(evidence._bytes(checkpoint))
+    with pytest.raises(ValueError):
+        evidence.open_verified_cart_pole_segmented_prefix(forged)
+
+    crashed = root / "crashed" / Path(report["result"]["prefix_dir"]).name
+    crashed.parent.mkdir()
+    shutil.copytree(report["result"]["prefix_dir"], crashed)
+    checkpoint_file = crashed / "checkpoint.json"
+    checkpoint = json.loads(checkpoint_file.read_text(encoding="utf-8"))
+    checkpoint["status"] = "running"
+    checkpoint["failure"] = None
+    checkpoint_file.write_bytes(evidence._bytes(checkpoint))
+    with (crashed / "journal" / "0.jsonl").open("ab") as stream:
+        stream.write(b'{"partial":')  # a crash after append, before atomic checkpoint
+    prefix = evidence.open_verified_cart_pole_segmented_prefix(crashed)
+    assert prefix["status"] == "in_progress_or_crashed"
+    assert prefix["confirmed_step_count"] == 3
+    assert prefix["unsealed_tail_is_complete"] is False
+
+
+@pytest.mark.parametrize(("mode", "party_fault", "status", "sealed", "active"), [
+    ("prepare_fail", "none", "failed", 0, 2),
+    ("cancel_after_confirmed", "none", "cancelled", 0, 3),
+    ("normal", "end_lost", "uncertain", 0, 3),
+    ("bad_begin", "none", "uncertain", 1, 0),
+    ("p1_restart", "none", "uncertain", 1, 0),
+    ("p2_restart", "none", "uncertain", 1, 0),
+    ("normal", "commit_lost", "uncertain", 0, 0),
+    ("normal", "peer_disconnect", "uncertain", 0, 0),
+])
+def test_dynamic_v2_faults_keep_only_verified_prefix(tmp_path_factory, mode, party_fault,
+                                                      status, sealed, active):
+    report = _run(tmp_path_factory.mktemp("dv2fault"), count=7, capacity=3, mode=mode,
+                  party_fault=party_fault, client_code=_DYNAMIC_CLIENT, dynamic=True)
+    assert report["result"]["status"] == status, report["result"]
+    prefix = evidence.open_verified_cart_pole_segmented_prefix(
+        report["result"]["prefix_dir"])
+    assert prefix["status"] == status
+    assert prefix["sealed_segment_count"] == sealed
+    assert prefix["unsealed_step_count"] == active
+    assert prefix["unsealed_tail_is_complete"] is False
+
+
+def test_dynamic_v2_inflight_stop_confirms_one_round(tmp_path_factory):
+    report = _run(tmp_path_factory.mktemp("dv2stop"), count=7, capacity=3,
+                  mode="stop_inflight", client_code=_DYNAMIC_CLIENT, dynamic=True)
+    assert report["result"]["status"] == "complete", report["result"]
+    assert report["result"]["confirmed_step_count"] == 1
+
+
+def test_dynamic_v2_reader_rejects_journal_and_rehashed_spec_tamper(tmp_path_factory):
+    root = tmp_path_factory.mktemp("dv2tamper")
+    report = _run(root, count=4, capacity=2, client_code=_DYNAMIC_CLIENT, dynamic=True)
+    assert report["result"]["status"] == "complete", report["result"]
+    source = Path(report["result"]["run_dir"])
+    journal_copy = root / "journal-copy" / source.name
+    journal_copy.parent.mkdir()
+    shutil.copytree(source, journal_copy)
+    journal = journal_copy / "journal" / "0.jsonl"
+    journal.write_bytes(journal.read_bytes().replace(b'"raw_control"', b'"raw_controls"', 1))
+    with pytest.raises(ValueError):
+        evidence.open_verified_cart_pole_segmented_run(journal_copy)
+
+    spec_copy = root / "spec-copy" / source.name
+    spec_copy.parent.mkdir()
+    shutil.copytree(source, spec_copy)
+    config_file = spec_copy / "config.json"
+    config = json.loads(config_file.read_text(encoding="utf-8"))
+    config["definition"]["controller_spec"]["A"][0][0] += 0.01
+    config_file.write_bytes(evidence._bytes(config))
+    plot_file = spec_copy / "plots.json"
+    plot = json.loads(plot_file.read_text(encoding="utf-8"))
+    plot["config_sha256"] = sha256(config_file.read_bytes()).hexdigest()
+    plot_file.write_bytes(evidence._bytes(plot))
+    manifest_file = spec_copy / "run.json"
+    manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+    manifest["config_sha256"] = plot["config_sha256"]
+    manifest["plots_sha256"] = sha256(plot_file.read_bytes()).hexdigest()
+    manifest_file.write_bytes(evidence._bytes(manifest))
+    with pytest.raises(ValueError):
+        evidence.open_verified_cart_pole_segmented_run(spec_copy)
+
+
+def test_dynamic_v2_three_processes_continue_past_400(tmp_path_factory):
+    shorter = _run(tmp_path_factory.mktemp("dv2bounded"), count=201, capacity=200,
+                   client_code=_DYNAMIC_CLIENT, dynamic=True,
+                   dynamic_initial=(0, 0, 2*pi+.005, 0))
+    assert shorter["result"]["status"] == "complete", shorter["result"]
+    report = _run(tmp_path_factory.mktemp("dv2long"), count=401, capacity=200,
+                  client_code=_DYNAMIC_CLIENT, dynamic=True,
+                  dynamic_initial=(0, 0, 2*pi+.005, 0))
+    assert report["result"]["status"] == "complete", report["result"].get("traceback", report)
+    run = evidence.open_verified_cart_pole_segmented_run(report["result"]["run_dir"])
+    assert run.metadata["N"] == 401 and run.metadata["segment_count"] == 3
+    assert run.metadata["termination"]["terminal_time_s"] == 401*.02
+    assert run.metadata["termination"]["resource_counts"] == {
+        "products_consumed": 401*30, "truncations_consumed": 401*4,
+    }
+    assert len({item["session"] for item in report["boundaries"]}) == 1
+    assert report["peak_bytes"] <= shorter["peak_bytes"] + 8 * 1024 * 1024
+    print(json.dumps({"N": 401, "sample_period_s": .02, "wall_s": report["wall_s"],
+                      "peak_python_bytes": report["peak_bytes"],
+                      "peak_python_bytes_at_201": shorter["peak_bytes"]}))
+    for item in report["boundaries"]:
+        np.testing.assert_allclose(run.observation_at(item["step"]+1)["state"],
+                                   item["snapshot"]["observation_after"], atol=1e-12, rtol=0)
 
 
 @pytest.mark.parametrize("count", [0, 1, 3])

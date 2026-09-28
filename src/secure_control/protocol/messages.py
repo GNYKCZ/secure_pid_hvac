@@ -32,6 +32,7 @@ RangeProofMode = Literal[
     "finite_horizon",
     "independent_input_invariant",
     "closed_loop_invariant",
+    "bounded_input_reachability",
 ]
 
 
@@ -245,6 +246,7 @@ class ControllerRangeContract:
     input_payload_bounds: tuple[int, ...]
     horizon_steps: int | None = None
     closed_loop_evidence: ClosedLoopRangeEvidence | None = None
+    reachability_block_steps: int | None = None
 
     def __post_init__(self) -> None:
         """拒绝负数、布尔值和非整数范围，避免将实数界误作编码 payload。"""
@@ -272,6 +274,12 @@ class ControllerRangeContract:
             raise TypeError("closed_loop_evidence 必须是 ClosedLoopRangeEvidence 或 None")
         if self.horizon_steps is not None and self.closed_loop_evidence is not None:
             raise ValueError("finite horizon 与 closed-loop invariant 证据不得同时声明")
+        if self.reachability_block_steps is not None:
+            if (type(self.reachability_block_steps) is not int
+                    or not 1 <= self.reachability_block_steps <= 128):
+                raise ValueError("reachability_block_steps 必须是 1…128 的整数")
+            if self.horizon_steps is not None or self.closed_loop_evidence is not None:
+                raise ValueError("bounded-input reachability 不得与其他范围证明模式混用")
 
     def validate_layout(self, layout: ControllerLayout) -> None:
         """确认公开范围长度覆盖已安装控制器的 state 与 input channel。"""
@@ -282,7 +290,9 @@ class ControllerRangeContract:
 
     @property
     def proof_mode(self) -> RangeProofMode:
-        """返回当前契约明确选择的三种证明模式之一。"""
+        """返回当前契约明确选择的范围证明模式。"""
+        if self.reachability_block_steps is not None:
+            return "bounded_input_reachability"
         if self.horizon_steps is not None:
             return "finite_horizon"
         if self.closed_loop_evidence is not None:

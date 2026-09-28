@@ -22,7 +22,9 @@ from secure_control.scenarios.cart_pole.secure_experiment import (
     CartPoleObserverSecureExperiment,
     CartPoleSecureExperiment,
     SustainedCartPoleExperiment,
+    SustainedCartPoleObserverExperiment,
     cart_pole_numeric_contract,
+    sustained_observer_numeric_contract,
 )
 from secure_control.scenarios.paper_pid.secure_experiment import (
     SCENARIO_VERSION as PAPER_VERSION,
@@ -315,23 +317,49 @@ class PreparedSegmentedExperiment:
     contract: ControllerRangeContract
     security_parameter: int
     evidence: PrimeModulusEvidence | None
-    scene: SustainedCartPoleExperiment
+    scene: SustainedCartPoleExperiment | SustainedCartPoleObserverExperiment
     recheck_sources: Callable[[], None]
     metadata: ScenarioMetadata
     effective_config: dict
     output_root: Path
+    segment_capacity: int
 
 
 def load_segmented_experiment(path: str | Path, segment_steps: int,
                               session: InteractiveSession) -> PreparedSegmentedExperiment:
-    """唯一场景选择点仅启用已设计的倒立摆静态反馈持续装配。"""
+    """唯一场景选择点装配静态 v1 或两测量动态 v2。"""
     if type(segment_steps) is not int or not 1 <= segment_steps <= 1000:
         raise ValueError("segment_steps 必须是 1…1000 的整数。")
     if _load_yaml(Path(path).resolve()).get("scenario") != "cart_pole":
         raise ValueError("当前 profile 尚不支持持续模式。")
     profile = load_cart_pole_lan_profile(path)
     if profile.observer_design is not None:
-        raise ValueError("observer 动态控制器的跨段续算归 #109；此处仅静态持续模式。")
+        initialization = profile.observer_initialization
+        assert initialization is not None
+        context, contract, proof = sustained_observer_numeric_contract(
+            initialization, fractional_bits=profile.ell,
+            parameter_bits=profile.parameter_bits,
+            runtime_payload_bits=profile.runtime_payload_bits, modulus=profile.q,
+        )
+        scene = SustainedCartPoleObserverExperiment(
+            profile.observer_design, initialization, session, profile.disturbances,
+        )
+        effective = _cart_pole_observer(profile).effective_config
+        effective["profile_horizon_steps"] = effective.pop("sample_count")
+        effective.update({"scenario": {"name": "cart_pole", "version": "5"},
+                          "mode": "segmented_dynamic",
+                          "claim_level": "cart-pole-observer-sustained-simulation",
+                          "segment_capacity": segment_steps,
+                          "range": {"mode": "bounded_input_reachability", "proof": proof},
+                          "segment_range": {"contract": asdict(contract), "proof": proof},
+                          "disturbance_policy": dict(DISTURBANCE_POLICY),
+                          "modulus_evidence": asdict(profile.evidence)
+                          if profile.evidence else None})
+        return PreparedSegmentedExperiment(
+            profile.spec, context, contract, profile.security_parameter, profile.evidence,
+            scene, profile.recheck_sources, scene.metadata, effective, profile.output_root,
+            segment_steps,
+        )
     context, contract, _proof = cart_pole_numeric_contract(
         profile.spec, replace(profile.balance, horizon_steps=segment_steps),
         fractional_bits=profile.ell, parameter_bits=profile.parameter_bits,
@@ -345,5 +373,6 @@ def load_segmented_experiment(path: str | Path, segment_steps: int,
                       "modulus_evidence": asdict(profile.evidence) if profile.evidence else None})
     return PreparedSegmentedExperiment(
         profile.spec, context, contract, profile.security_parameter, profile.evidence,
-        scene, profile.recheck_sources, scene.adapter.metadata, effective, profile.output_root,
+        scene, profile.recheck_sources, scene.metadata, effective, profile.output_root,
+        segment_steps,
     )

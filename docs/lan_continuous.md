@@ -223,9 +223,31 @@ uv run python scripts/run_continuous_client.py configs/lab-client-continuous.exa
 已双提交数、已完成物理数和材料消耗；一次双提交不能当作施力完成。
 
 本机三个 PID 可证明三独立进程，不证明真三机。`insecure_tcp` 无身份认证或传输加密；
-需要该属性时选择现有 mTLS 配置。此有限 profile 不接入分段 runtime，跨段秘密状态
-与材料延续由 #109 另行设计。数值、reader 和 `x̄_N` 交接详见
+需要该属性时选择现有 mTLS 配置。此有限入口仍按精确 N 步运行；同一 profile 的
+动态持续入口见下节。数值、reader 和 `x̄_N` 交接详见
 [观测器指南](cart_pole_observer.md)。
+
+### 两测量动态持续运行（#109）
+
+将 Client 的 `experiment` 指向 `configs/cart_pole_observer_lan.example.yaml`，
+分别启动原 P1/P2，再运行
+`uv run python scripts/run_cart_pole_client.py <Client 配置> --headless-continuous --segment-steps 400`。
+Ctrl+C 请求正常停止；真实总步数可超过 profile 中用于有限实验的 horizon。
+动态持续入口将同一 profile 重新预检为精确有理数的有界输入可达界，使用
+`lan-segmented-v2`：一次离线分享、同一 session 和 controller epoch，段界仅用
+双回执与 `segment_begin` 屏障，控制器秘密 state 不离开 P1/P2，材料和 round ID
+逐全局步更新。现有静态持续 v1 与有限动态入口保留原行为。
+
+正常停止且 reader、概要图和发布门禁全部通过后，headless 结果为 `complete`，
+根目录的 format version 为 2。可用
+`open_verified_cart_pole_segmented_run(run_dir)` 流式核对每段、全局控制器递推的
+公开 nominal/Trunc 包络、独立理想 plant 和物理前缀。失败、取消、不确定提交或
+进程崩溃留下 `.incomplete-<run-id>` 时，用
+`open_verified_cart_pole_segmented_prefix(prefix_dir)` 核验 checkpoint、已封段和
+未封段逐步日志；未封段没有双方结束回执，不是完整运行或可恢复控制状态。
+任何方断连或重启都需要新的 run/session，不能从前缀自动续控。哈希链检测文件
+不一致，不提供针对整体重写的密码学真实性。该证书证明控制器编码数值安全，
+不保证非线性 plant 永久稳定、20 ms 墙钟或真实硬件。
 
 新场景须在自身 `scenarios/<name>/` 中提供 `ControllerSpec` 来源、数值/测量界
 证明、独立 ideal/secure 的 `SimulationPlan` 与明文基线核对；在 `experiments/`

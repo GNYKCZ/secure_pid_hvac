@@ -12,14 +12,19 @@ from secure_control.core import ControllerSpec
 from secure_control.crypto import FixedPointContext
 from secure_control.execution import PlaintextStateSpaceRuntime
 from secure_control.protocol import ControllerRangeContract
-from secure_control.protocol.roles import _finite_horizon_encoded_trace
+from secure_control.protocol.roles import (
+    _bounded_input_reachability,
+    _finite_horizon_encoded_trace,
+)
 from secure_control.simulation import SimulationBranch, SimulationPlan, SimulationResult
 
 from .adapter import (
     CartPoleAdapter,
     CartPoleObserverSimulation,
     ControlCommand,
+    MeasurementSample,
     ObserverBalanceEpisode,
+    _checked_sample,
     _disturbance_plan,
     _finite_vector,
 )
@@ -33,6 +38,43 @@ if TYPE_CHECKING:
     from .interactive import InteractiveSession
 
 SCENARIO_VERSION = "1"
+
+
+def sustained_observer_numeric_contract(
+    initialization: ObserverInitialization, *, fractional_bits: int,
+    parameter_bits: int, runtime_payload_bits: int, modulus: int,
+) -> tuple[FixedPointContext, ControllerRangeContract, dict[str, object]]:
+    """Choose an exact encoded block certificate for an unbounded number of rounds."""
+    spec = initialization.spec
+    if (spec.state_dimension != 4 or spec.input_dimension != 2 or spec.output_dimension != 1
+            or not runtime_payload_bits >= parameter_bits > fractional_bits >= 1):
+        raise ValueError("observer 持续数值位宽或维度无效。")
+    parameter_context = FixedPointContext(modulus, parameter_bits, fractional_bits)
+    for name in ("A", "B", "C", "D", "x0"):
+        parameter_context.encode(getattr(spec, name))
+    context = FixedPointContext(modulus, runtime_payload_bits, fractional_bits)
+    inputs = tuple(max(abs(int(context.encode(-nextafter(limit, inf)))),
+                       abs(int(context.encode(nextafter(limit, inf)))))
+                   for limit in initialization.y_abs)
+    if any(bound > context.maximum_payload for bound in inputs):
+        raise ValueError("observer 测量超过 runtime payload。")
+    payloads = {name: np.asarray(context.encode(getattr(spec, name)), dtype=object)
+                for name in ("A", "B", "C", "D", "x0")}
+    for block in range(1, 129):
+        try:
+            bounds = _bounded_input_reachability(payloads, inputs, fractional_bits, block)
+        except ValueError:
+            continue
+        if all(bound <= context.maximum_payload for bound in bounds):
+            break
+    else:
+        raise ValueError("observer 编码矩阵无可表示的有界输入可达证书。")
+    contract = ControllerRangeContract(bounds, inputs, reachability_block_steps=block)
+    proof = {"algorithm": "encoded-block-power-rational-v1", "block_steps": block,
+             "state_payload_bounds": list(bounds), "input_payload_bounds": list(inputs),
+             "initial_payload": [int(x) for x in payloads["x0"].flat],
+             "output_fractional_bits": 2 * fractional_bits}
+    return context, contract, proof
 
 
 def cart_pole_observer_numeric_contract(
@@ -138,6 +180,7 @@ class SustainedCartPoleExperiment:
                  session: InteractiveSession) -> None:
         self.plant = CartPolePlant(plant)
         self.adapter = CartPoleAdapter(plant, balance)
+        self.metadata = self.adapter.metadata
         self.monitor = BalanceMonitor(balance)
         self.session = session
         self.period = plant.sample_period_s
@@ -176,6 +219,11 @@ class SustainedCartPoleExperiment:
         self.output = following
         self.next_step += 1
         return snapshot
+
+    def terminal_summary(self) -> dict[str, object]:
+        return {"terminal_time_s": self.next_step * self.period,
+                "observed_status": self.monitor.status,
+                "stable_count": self.monitor.stable_count}
 
 
 class MonitoredCartPoleAdapter(CartPoleAdapter):
@@ -283,6 +331,113 @@ class CartPoleSecureExperiment:
             "terminal_time_s": self.balance.horizon_steps * self.plant_contract.sample_period_s,
             "branches": branches,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class SustainedObserverStepSnapshot:
+    """Public interval facts; no observer estimate or protocol share is exposed."""
+
+    t_before_s: float
+    t_after_s: float
+    measurement: tuple[float, float]
+    local_measurement: tuple[float, float]
+    observation_before: tuple[float, ...]
+    observation_after: tuple[float, ...]
+    raw_force_n: float
+    applied_force_n: float
+    requested_disturbance_n: float
+    disturbance_force_n: float
+    total_force_n: float
+    force_disposition: str
+    observed_status: str
+    stable_count: int
+
+
+class SustainedCartPoleObserverExperiment:
+    """One physical plant, chart and global measurement stream across logical segments."""
+
+    def __init__(self, design: CartPoleObserverDesign,
+                 initialization: ObserverInitialization, session: InteractiveSession,
+                 disturbances: tuple[tuple[int, float], ...] = ()) -> None:
+        from .interactive import InteractiveSession
+
+        if not isinstance(session, InteractiveSession):
+            raise TypeError("需要交互会话。")
+        self.design, self.initialization, self.session = design, initialization, session
+        self._scheduled = dict(_disturbance_plan(disturbances, None))
+        self.plant = CartPolePlant(design.plant)
+        self.device = CartPoleObserverSimulation(self.plant, design.plant)
+        self.monitor = BalanceMonitor(design.balance)
+        self.metadata = CartPoleAdapter(design.plant, design.balance).metadata
+        self.period = design.plant.sample_period_s
+        self._step = initialization.first_sample_id
+        self._sample: MeasurementSample | None = None
+        self._before: np.ndarray | None = None
+        self._local: np.ndarray | None = None
+        self._episode_id = "sustained-observer"
+        self._observe()
+
+    def _observe(self) -> np.ndarray:
+        truth = self.device.read_diagnostic_truth()
+        local = truth.copy()
+        local[2] -= self.initialization.theta_star
+        if self.monitor.observe(local) == "failed":
+            raise ValueError("倒立摆超出 observer 监督工作域。")
+        return truth
+
+    def controller_input(self) -> np.ndarray:
+        if self._sample is not None:
+            raise RuntimeError("上一测量尚未完成物理区间。")
+        sample = self.device.read_measurement()
+        _checked_sample(sample, self._step, self.period)
+        local = _finite_vector(
+            [sample.p_m, sample.theta_rad - self.initialization.theta_star],
+            2, "measurement",
+        )
+        if np.any(np.abs(local) > self.initialization.y_abs):
+            raise ValueError("measurement_outside_local_domain")
+        self._sample, self._local = sample, local
+        self._before = self.device.read_diagnostic_truth()
+        return local.copy()
+
+    def advance(self, step: int, raw_control: np.ndarray) -> SustainedObserverStepSnapshot:
+        if (step != self._step or self._sample is None or self._local is None
+                or self._before is None):
+            raise ValueError("物理推进与全局样本不一致。")
+        raw = float(_finite_vector(raw_control, 1, "raw_control")[0])
+        if abs(raw) > self.design.plant.max_applied_force_n:
+            raise ValueError("saturation_outside_contract")
+        requested = self.session.take(step)
+        if not requested:
+            requested = self._scheduled.pop(step, 0.)
+        self.device.request_disturbance(step, requested)
+        receipt = self.device.send_control(ControlCommand(
+            step, self._episode_id, self._sample.sample_id, raw,
+        ))
+        if (receipt.disposition != "simulated_interval_completed"
+                or receipt.applied_force_n != raw
+                or receipt.applied_source != "canonical_simulation"):
+            raise ValueError("物理区间未确认。")
+        requested, actual, total, disposition = self.device.read_interval_forces()
+        after = self._observe()
+        snapshot = SustainedObserverStepSnapshot(
+            step * self.period, (step + 1) * self.period,
+            (self._sample.p_m, self._sample.theta_rad), tuple(self._local),
+            tuple(self._before), tuple(after), raw, raw, requested, actual, total,
+            disposition, self.monitor.status, self.monitor.stable_count,
+        )
+        self._sample = self._local = self._before = None
+        self._step += 1
+        self.session.emit("frame", {"step": self._step, "time_s": self._step * self.period,
+                                    "state": tuple(after), "status": self.monitor.status,
+                                    "applied_force_n": raw,
+                                    "disturbance_force_n": actual})
+        return snapshot
+
+    def terminal_summary(self) -> dict[str, object]:
+        return {"terminal_time_s": self._step * self.period,
+                "observed_status": self.monitor.status,
+                "stable_count": self.monitor.stable_count}
 
 
 class CartPoleObserverSecureExperiment:
