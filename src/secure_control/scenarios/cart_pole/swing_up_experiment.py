@@ -8,13 +8,20 @@ from pathlib import Path
 
 import numpy as np
 
-from .adapter import CartPoleAdapter, _finite_vector
+from .adapter import (
+    CartPoleAdapter,
+    CartPoleObserverSimulation,
+    ControlCommand,
+    _finite_vector,
+)
 from .contract import CartPoleContract, _number
 from .controller import CartPoleBalanceConfig
 from .experiment import _rows
+from .observer import CartPoleObserverDesign
 from .plant import STATE_NAMES, STATE_UNITS, CartPolePlant
 from .swing_up import (
     CartPoleSwingUpConfig,
+    CausalVelocityEstimator,
     SwingUpObservation,
     SwingUpSupervisor,
     SwingUpTransition,
@@ -48,6 +55,12 @@ class SwingUpResult:
     failure_detail: str | None
     attempted_step: tuple[int, float | None, float | None, float | None, float | None] | None
     configurations_json: str
+    route: str = "plaintext_static"
+    measurement: np.ndarray | None = None
+    estimated_state: np.ndarray | None = None
+    controller_source: tuple[str, ...] = ()
+    observer_state_before: tuple[tuple[float, ...] | None, ...] = ()
+    observer_initializations: tuple[tuple[int, int, float, tuple[float, ...]], ...] = ()
 
     @property
     def completed_steps(self) -> int:
@@ -59,7 +72,7 @@ class SwingUpResult:
         entries = [row.step for i, row in enumerate(self.observations)
                    if row.status == "stable" and (i == 0 or self.observations[i - 1].status != "stable")]
         peak = lambda rows: np.max(np.abs(rows), axis=0).tolist() if len(rows) else None
-        return {
+        report = {
             "kind": "cart_pole_swing_up_plaintext", "version": 1, "computation_mode": "plaintext",
             "configurations": json.loads(self.configurations_json),
             "provenance": json.loads(json.dumps(provenance, allow_nan=False)) if provenance else {
@@ -98,6 +111,26 @@ class SwingUpResult:
                         "final_stable_count": self.observations[-1].stable_count
                         if self.observations else 0},
         }
+        if self.route == "plaintext_full":
+            report.update({
+                "kind": "cart_pole_plaintext_full", "route": self.route,
+                "assumptions": ["only p and continuous theta enter the controller",
+                                "causal finite differences; k0 zero velocity seed",
+                                "state/output are diagnostic plant truth, not controller input",
+                                "finite simulation, not secure computation or global stability"],
+                "measurement": self.measurement.tolist(),
+                "estimated_state": self.estimated_state.tolist(),
+                "controller_source": list(self.controller_source),
+                "observer_state_before": [None if row is None else list(row)
+                                          for row in self.observer_state_before],
+                "observer_initializations": [
+                    {"observation_step": step, "branch": branch, "theta_star_rad": theta_star,
+                     "x0": list(x0)}
+                    for step, branch, theta_star, x0 in self.observer_initializations
+                ],
+                "resource_counts": {"beaver_triples": 0, "truncations": 0},
+            })
+        return report
 
 
 def run_swing_up_experiment(
@@ -202,6 +235,113 @@ def run_swing_up_experiment(
         _rows(disturbances, 1), _rows(totals, 1), tuple(modes), tuple(observations),
         tuple(supervisor.transitions), tuple(events), termination, termination == "observed_success",
         first_stable, failure_observation, failure_interval, reason, detail, attempted, snapshots,
+    )
+
+
+def run_plaintext_full_experiment(
+    plant_contract: CartPoleContract, balance: CartPoleBalanceConfig, config: CartPoleSwingUpConfig,
+    observer_design: CartPoleObserverDesign,
+) -> SwingUpResult:
+    """同一非线性 plant 上用两测量起摆、动态捕获与恢复；真值只进诊断行。"""
+    if not isinstance(config, CartPoleSwingUpConfig):
+        raise TypeError("config 必须是 CartPoleSwingUpConfig")
+    if not isinstance(observer_design, CartPoleObserverDesign):
+        raise TypeError("observer_design 必须是 CartPoleObserverDesign")
+    config.validate(plant_contract, balance)
+    effective = replace(plant_contract, initial_state=config.initial_state)
+    plant = CartPolePlant(effective)
+    device = CartPoleObserverSimulation(plant, effective, config.disturbances)
+    adapter = CartPoleAdapter(effective, balance)
+    supervisor = SwingUpSupervisor(effective, balance, config, observer_design=observer_design)
+    estimator = CausalVelocityEstimator(effective.sample_period_s)
+    states, outputs, measurements, estimates, observations = [], [], [], [], []
+    raw_forces, applied_forces, disturbances, totals, modes, events = [], [], [], [], [], []
+    sources, controller_states = [], []
+    termination = "failed"
+    failure_observation = failure_interval = reason = detail = attempted = first_stable = None
+    snapshots = json.dumps({
+        "plant_source_contract": asdict(plant_contract), "balance": asdict(balance),
+        "swing_up": asdict(config), "observer": observer_design.to_snapshot(),
+        "effective_initial_state": list(effective.initial_state),
+    }, allow_nan=False)
+    try:
+        sample = device.read_measurement()
+        state = _finite_vector(plant.state, 4, "initial_state")
+        output = _observation(device.read_diagnostic_truth())
+        states.append(state)
+        outputs.append(output)
+    except (TypeError, ValueError, FloatingPointError, OverflowError) as error:
+        reason = "nonfinite" if isinstance(error, (FloatingPointError, OverflowError)) else "observation_invalid"
+        failure_observation, detail = 0, str(error)
+    else:
+        for step in range(config.horizon_steps + 1):
+            try:
+                estimated = estimator.observe(sample)
+            except (TypeError, ValueError, FloatingPointError, OverflowError) as error:
+                failure_observation, reason, detail = step, "measurement_invalid", str(error)
+                break
+            measurements.append(np.array([sample.p_m, sample.theta_rad]))
+            estimates.append(estimated)
+            observed = supervisor.observe(step, estimated)
+            observations.append(observed)
+            if observed.status == "stable" and first_stable is None:
+                first_stable = step
+            if observed.phase == "failed":
+                failure_observation, reason = step, observed.failure_reason
+                break
+            if step == config.horizon_steps:
+                termination = ("observed_success" if observed.phase == "balance"
+                               and observed.status == "stable" else "time_limit")
+                break
+            source = ("plaintext_dynamic_observer" if observed.phase in ("capture", "balance")
+                      else "plaintext_kick" if step < config.kick_steps else "plaintext_energy")
+            controller_before = (tuple(float(value) for value in supervisor.runtime.state)
+                                 if source == "plaintext_dynamic_observer" else None)
+            raw = applied = disturbance = total = None
+            stage = "control"
+            try:
+                raw = _number(supervisor.raw_force(step, estimated), "raw_force")
+                applied = float(adapter.apply_control(np.array([raw]))[0])
+                stage = "plant"
+                receipt = device.send_control(ControlCommand(step, "plaintext-full", step, applied))
+                if receipt.disposition != "simulated_interval_completed":
+                    raise ValueError("区间未物理确认")
+                requested, disturbance, total, disposition = device.read_interval_forces()
+                next_sample = device.read_measurement()
+                next_state = _finite_vector(plant.state, 4, "next_state")
+                next_output = _observation(device.read_diagnostic_truth())
+            except (TypeError, ValueError, FloatingPointError, OverflowError) as error:
+                failure_interval, detail = step, str(error)
+                reason = ("track_limit" if stage == "plant" and "track_center_limit_m" in str(error)
+                          else "numeric_step" if stage == "plant" else "numeric_control")
+                attempted = (step, raw, applied, disturbance, total)
+                break
+            raw_forces.append(np.array([raw]))
+            applied_forces.append(np.array([applied]))
+            disturbances.append(np.array([disturbance]))
+            totals.append(np.array([total]))
+            modes.append(observed.phase)
+            sources.append(source)
+            controller_states.append(controller_before)
+            if requested:
+                events.append((step, requested, disturbance, disposition))
+            sample, state, output = next_sample, next_state, next_output
+            states.append(state)
+            outputs.append(output)
+    state_rows, output_rows = _rows(states, 4), _rows(outputs, 4)
+    time = np.arange(len(states), dtype=np.float64) * effective.sample_period_s
+    time.setflags(write=False)
+    angles = np.array([upright_coordinates(row)[2] for row in output_rows], dtype=np.float64)
+    angles.setflags(write=False)
+    return SwingUpResult(
+        time, state_rows, output_rows, angles, _rows(raw_forces, 1), _rows(applied_forces, 1),
+        _rows(disturbances, 1), _rows(totals, 1), tuple(modes), tuple(observations),
+        tuple(supervisor.transitions), tuple(events), termination, termination == "observed_success",
+        first_stable, failure_observation, failure_interval, reason, detail, attempted, snapshots,
+        route="plaintext_full", measurement=_rows(measurements, 2),
+        estimated_state=_rows(estimates, 4), controller_source=tuple(sources),
+        observer_state_before=tuple(controller_states),
+        observer_initializations=tuple(supervisor.initializations),
     )
 
 

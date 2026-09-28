@@ -148,3 +148,32 @@ raw峰值约17.2733589210N、applied峰值10N、7个饱和区间。
 
 有限轨道内的控制可行性与安全算术可行性分别验证。这里不改变LAN profile、
 P1/P2、core、generic engine、旧物理或stable/safe阈值，也不实现#103或#76。
+
+## #103 独立明文完整路线（部分交付）
+
+新版 [Issue #103](https://github.com/GNYKCZ/secure_pid_hvac/issues/103) 要求明文与安全两条各自完整的路线。
+当前 `plaintext_full` 只交付明文起摆→明文动态捕获/平衡/恢复；上文的旧静态研究入口仍为默认，
+其历史 JSON 和回归不改。运行示例：
+
+```powershell
+uv run python scripts/run_cart_pole_swing_up.py configs/cart_pole_swing_up.yaml --route plaintext_full
+uv run python scripts/run_cart_pole_swing_up.py configs/cart_pole_swing_up.yaml --route plaintext_full --direction -1 --disturbance 600:-1
+```
+
+`--observer` 可指定 #107 三源 observer YAML，默认 `configs/cart_pole_observer.yaml`。
+其 plant/balance 必须与起摆来源相同；合法物理参数变化须重新派生 observer 设计。
+每个 route 自己新建 canonical `CartPolePlant`、测量/阶段历史和控制状态。新路线的控制输入仅为
+`MeasurementSample` 的 p 与连续 θ：k=0 明示零速度种子，k=1 用一阶后差，k≥2 用三点因果后差；
+先差分连续 θ，再为监督映射局部 α。仿真四维真值只供诊断报告，不进入控制力或阶段判定。
+
+进入捕获的同一观测，以两测量和该步因果速度初始化 #107 四维明文 observer；
+随后先用旧控制器状态计算力、再更新 observer 状态。`balance` 的稳定盒外恢复继续同一 observer。
+若退出局部 safe 域但仍满足轨道和速度全局门禁，则在该已确认观测转回起摆，废弃本次 observer，
+按冷却/捕获尝试与重新计时规则再捕获；轨道、超速、数值或采样失效则停止。
+raw 控制力由原执行器限幅，外力由原设备按合力限值接受或拒绝，失败只保留可确认前缀。
+
+新报告 `kind=cart_pole_plaintext_full`，除原物理/力/阶段行外，含 N+1 两测量、因果估计、
+每区间明文控制来源、动态 observer 更新前状态及每次捕获初始化。`state/output` 明确是仿真诊断真值；
+Beaver/Trunc 资源计数恒为 0。它仍是明文研究 JSON，不是三方正式 verified 产物；
+没有安全起摆、v3 安全 reader 或 GUI 安全路线通过的声明。上述安全部分等待 #103 新版设计的公开阶段、
+非线性数值/协议和 epoch 契约获用户决定后再实施。
