@@ -80,6 +80,23 @@ def test_plaintext_full_v3_verified_reader(tmp_path):
     (verified.path / "run.json").write_bytes(_bytes(updated_manifest))
     with pytest.raises(ValueError, match="v3"):
         open_verified_cart_pole_full_run(verified.path)
+    invented_unsealed = copy.deepcopy(physical)
+    invented_unsealed["termination"] = "failed"
+    invented_unsealed["goal_met"] = False
+    invented_unsealed["failure"] = {
+        "observation_step": None, "interval_step": None,
+        "reason": "protocol_or_control", "detail": "invented unsealed tail",
+    }
+    invented_unsealed["unsealed_failure"] = {
+        "physical_steps_before_failure": 1500, "first_unsealed_step": 1500,
+        "attempted_step": None, "unconfirmed_protocol_step": None,
+    }
+    raw = _bytes(invented_unsealed)
+    (verified.path / "physical.json").write_bytes(raw)
+    updated_manifest["physical_sha256"] = hashlib.sha256(raw).hexdigest()
+    (verified.path / "run.json").write_bytes(_bytes(updated_manifest))
+    with pytest.raises(ValueError, match="v3"):
+        open_verified_cart_pole_full_run(verified.path)
     impossible_interval = copy.deepcopy(physical)
     impossible_interval["termination"] = "failed"
     impossible_interval["goal_met"] = False

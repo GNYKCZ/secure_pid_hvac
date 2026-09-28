@@ -235,6 +235,24 @@ def _verified_outcome(report: dict, manifest: dict, horizon: int) -> None:
         raise ValueError("v3 manifest 状态与终止状态不一致")
 
     terminal = observations[-1] if len(observations) == n + 1 else None
+    unsealed = report.get("unsealed_failure")
+    if unsealed is not None:
+        closure = (manifest["epochs"][-1]["closed_segments"][-1]
+                   if manifest["route"] == "secure_full" else None)
+        if (termination != "failed" or not isinstance(unsealed, dict)
+                or set(unsealed) != {
+                    "physical_steps_before_failure", "first_unsealed_step",
+                    "attempted_step", "unconfirmed_protocol_step",
+                }
+                or type(unsealed["physical_steps_before_failure"]) is not int
+                or not n <= unsealed["physical_steps_before_failure"] <= horizon
+                or unsealed["first_unsealed_step"] != n or n >= horizon
+                or unsealed["attempted_step"] != failure["interval_step"]
+                or unsealed["unconfirmed_protocol_step"]
+                != report["unconfirmed_protocol_step"]
+                or closure is None or closure["action"] not in {"switch", "continue"}
+                or closure["physical_end"] != n):
+            raise ValueError("v3 未密封失败与安全确认前缀不一致")
     if termination == "failed":
         if not isinstance(failure["reason"], str) or not failure["reason"]:
             raise ValueError("v3 失败状态缺少原因")
@@ -244,14 +262,14 @@ def _verified_outcome(report: dict, manifest: dict, horizon: int) -> None:
         if terminal is not None and terminal["phase"] == "failed":
             if (failure["observation_step"] != n
                     or failure["interval_step"] is not None
-                    or failure["reason"] != terminal["failure_reason"]):
+                    or failure["reason"] != terminal["failure_reason"]
+                    or unsealed is not None):
                 raise ValueError("v3 失败观测与结论不一致")
         elif failure["observation_step"] is not None:
-            unsealed = report.get("unsealed_failure")
             later_failure = (isinstance(unsealed, dict)
                              and type(failure["observation_step"]) is int
                              and n < failure["observation_step"]
-                             <= unsealed["physical_steps_before_failure"])
+                             == unsealed["physical_steps_before_failure"])
             if not later_failure and (terminal is not None
                                       or failure["observation_step"] != n
                                       or failure["reason"] != "measurement_invalid"):
@@ -259,11 +277,12 @@ def _verified_outcome(report: dict, manifest: dict, horizon: int) -> None:
         elif failure["interval_step"] is not None:
             interval = failure["interval_step"]
             attempted = report["attempted_step"]
-            unsealed = report.get("unsealed_failure")
             if (type(interval) is not int or not n <= interval < horizon
                     or terminal is None or terminal["phase"] == "failed"
                     or not isinstance(attempted, dict)
                     or attempted.get("interval_step") != interval
+                    or (unsealed is not None
+                        and unsealed["physical_steps_before_failure"] != interval)
                     or (interval > n and (
                         not isinstance(unsealed, dict)
                         or unsealed["first_unsealed_step"] != n
@@ -282,7 +301,13 @@ def _verified_outcome(report: dict, manifest: dict, horizon: int) -> None:
                 and closure is not None and closure["action"] == "switch"
                 and closure["physical_end"] == n
             )
-            if not sealed_switch_failure and report.get("unsealed_failure") is None:
+            unsealed_setup_failure = (
+                unsealed is not None and failure["reason"] == "setup_or_switch"
+                and terminal is not None and terminal["phase"] != "failed"
+                and unsealed["physical_steps_before_failure"] > n
+                and report["attempted_step"] is None
+            )
+            if not sealed_switch_failure and not unsealed_setup_failure:
                 raise ValueError("v3 失败结论没有观测、区间或已密封切换证据")
     else:
         if any(value is not None for value in failure.values()) or report["attempted_step"] is not None:

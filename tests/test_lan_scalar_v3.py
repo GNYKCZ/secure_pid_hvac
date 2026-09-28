@@ -459,6 +459,53 @@ def test_secure_full_real_unsealed_interval_keeps_only_receipted_prefix(tmp_path
                 process.communicate(timeout=10)
 
 
+def test_secure_full_real_unsealed_switch_failure_keeps_receipted_prefix(
+    tmp_path, monkeypatch,
+):
+    paths = _plain_deployment(tmp_path)
+    source = paths["Client"].read_text(encoding="utf-8")
+    paths["Client"].write_text(source.replace(
+        "experiment: paper_pid_lan.example.yaml",
+        f"experiment: {ROOT / 'configs/paper_pid_lan.example.yaml'}",
+    ), encoding="utf-8")
+    design, swing, modulus, evidence, _, _ = _inputs()
+    original_end = LanScalarRuntime.end
+
+    def fail_energy_switch(runtime, action="stop"):
+        if runtime.epoch_id.startswith("energy-") and action == "switch":
+            raise OSError("injected unsealed energy switch failure")
+        return original_end(runtime, action)
+
+    monkeypatch.setattr(LanScalarRuntime, "end", fail_energy_switch)
+    parties = [subprocess.Popen(
+        [sys.executable, "-c", _PARTY, role, str(paths[role])],
+        cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    ) for role in ("P1", "P2")]
+    try:
+        result = run_secure_full_experiment(
+            design.plant, design.balance, swing, design,
+            load_lan_config(paths["Client"], "Client"),
+            modulus=modulus, modulus_evidence=evidence,
+        )
+        assert result.physical.completed_steps == 309
+        assert result.physical.failure_reason == "setup_or_switch"
+        assert result.physical.failure_observation_step is None
+        assert result.physical.failure_interval_step is None
+        assert result.epoch_events[0]["closed_segments"][-1]["action"] == "switch"
+        assert not result.epoch_events[1]["closed_segments"]
+        verified = open_verified_cart_pole_full_run(
+            write_cart_pole_full_run(result, tmp_path / "unsealed-switch-failure")
+        )
+        assert verified.manifest["N"] == 10
+        assert verified.manifest["status"] == "failed_prefix"
+        assert verified.report["unsealed_failure"]["physical_steps_before_failure"] == 309
+    finally:
+        for process in parties:
+            if process.poll() is None:
+                process.terminate()
+                process.communicate(timeout=10)
+
+
 @pytest.mark.parametrize("next_phase, sealed_steps", [("energy", 10), ("dynamic", 309)])
 def test_secure_full_switch_setup_failure_publishes_receipted_prefix(
     tmp_path, monkeypatch, next_phase, sealed_steps,
@@ -610,6 +657,23 @@ def test_secure_full_real_process_nominal_stable_horizon(tmp_path):
         (verified.path / "physical.json").write_bytes(raw)
         manifest = copy.deepcopy(verified.manifest)
         manifest["status"] = "failed_prefix"
+        manifest["physical_sha256"] = hashlib.sha256(raw).hexdigest()
+        (verified.path / "run.json").write_bytes(_bytes(manifest))
+        with pytest.raises(ValueError, match="v3"):
+            open_verified_cart_pole_full_run(verified.path)
+        invented_unsealed = copy.deepcopy(verified.report)
+        invented_unsealed["termination"] = "failed"
+        invented_unsealed["goal_met"] = False
+        invented_unsealed["failure"] = {
+            "observation_step": None, "interval_step": None,
+            "reason": "setup_or_switch", "detail": "invented unsealed tail",
+        }
+        invented_unsealed["unsealed_failure"] = {
+            "physical_steps_before_failure": 1500, "first_unsealed_step": 1500,
+            "attempted_step": None, "unconfirmed_protocol_step": None,
+        }
+        raw = _bytes(invented_unsealed)
+        (verified.path / "physical.json").write_bytes(raw)
         manifest["physical_sha256"] = hashlib.sha256(raw).hexdigest()
         (verified.path / "run.json").write_bytes(_bytes(manifest))
         with pytest.raises(ValueError, match="v3"):
