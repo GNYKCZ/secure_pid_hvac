@@ -331,8 +331,35 @@ def test_secure_full_real_process_kick_to_energy(tmp_path):
         assert verified.manifest["N"] == 16
         folder = verified.path
         original_manifest = json.loads((folder / "run.json").read_text(encoding="utf-8"))
+        original_physical = json.loads((folder / "physical.json").read_text(encoding="utf-8"))
         original_steps = [json.loads(line) for line in
                           (folder / "steps.jsonl").read_text(encoding="utf-8").splitlines()]
+        for field, value in (
+            ("goal_met", True),
+            ("termination", "observed_success"),
+            ("failure", {"observation_step": None, "interval_step": None,
+                         "reason": None, "detail": None}),
+            ("summary.first_stable_step", 16),
+            ("summary.stable_entry_steps", [16]),
+            ("summary.final_stable_count", 99),
+            ("manifest.status", "complete"),
+        ):
+            altered_physical = copy.deepcopy(original_physical)
+            altered_manifest = copy.deepcopy(original_manifest)
+            if field == "manifest.status":
+                altered_manifest["status"] = value
+            elif field.startswith("summary."):
+                altered_physical["summary"][field.split(".", 1)[1]] = value
+            else:
+                altered_physical[field] = value
+            raw = _bytes(altered_physical)
+            (folder / "physical.json").write_bytes(raw)
+            altered_manifest["physical_sha256"] = hashlib.sha256(raw).hexdigest()
+            (folder / "run.json").write_bytes(_bytes(altered_manifest))
+            with pytest.raises(ValueError, match="v3"):
+                open_verified_cart_pole_full_run(folder)
+        (folder / "physical.json").write_bytes(_bytes(original_physical))
+        (folder / "run.json").write_bytes(_bytes(original_manifest))
         for field, replacement in (("source", "plaintext_energy"),
                                    ("epoch_id", "old-epoch"),
                                    ("raw_force_n", 100.0)):

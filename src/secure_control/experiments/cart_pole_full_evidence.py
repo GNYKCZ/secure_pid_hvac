@@ -193,6 +193,88 @@ def _finite_close(actual, expected, *, atol=1e-10) -> None:
         raise ValueError("v3 数值或物理重放不一致")
 
 
+def _verified_outcome(report: dict, manifest: dict, horizon: int) -> None:
+    """由已重放的观测和已确认前缀核对终止结论及派生摘要。"""
+    observations = report["observations"]
+    n = manifest["N"]
+    entries = [row["step"] for index, row in enumerate(observations)
+               if row["status"] == "stable"
+               and (index == 0 or observations[index - 1]["status"] != "stable")]
+
+    def peak(rows):
+        return np.max(np.abs(np.asarray(rows, dtype=float)), axis=0).tolist() if rows else None
+
+    expected_summary = {
+        "completed_steps": n,
+        "first_stable_step": entries[0] if entries else None,
+        "stable_entry_steps": entries,
+        "max_abs_state": peak(report["state"]),
+        "max_abs_raw_force": peak(report["raw_force"]),
+        "max_abs_applied_force": peak(report["applied_force"]),
+        "max_abs_total_force": peak(report["total_force"]),
+        "saturated_intervals": sum(raw != applied for raw, applied in zip(
+            report["raw_force"], report["applied_force"], strict=True)),
+        "final_stable_count": observations[-1]["stable_count"],
+    }
+    if _bytes(report["summary"]) != _bytes(expected_summary):
+        raise ValueError("v3 派生摘要与已验证观测不一致")
+
+    failure = report["failure"]
+    if not isinstance(failure, dict) or set(failure) != {
+        "observation_step", "interval_step", "reason", "detail",
+    }:
+        raise ValueError("v3 失败结论字段无效")
+    termination = report["termination"]
+    if termination not in {"observed_success", "time_limit", "stopped", "failed"}:
+        raise ValueError("v3 终止状态无效")
+    if type(report["goal_met"]) is not bool or report["goal_met"] != (
+        termination == "observed_success"
+    ):
+        raise ValueError("v3 目标结论与终止状态不一致")
+    if manifest["status"] != ("failed_prefix" if termination == "failed" else "complete"):
+        raise ValueError("v3 manifest 状态与终止状态不一致")
+
+    terminal = observations[-1] if len(observations) == n + 1 else None
+    if termination == "failed":
+        if not isinstance(failure["reason"], str) or not failure["reason"]:
+            raise ValueError("v3 失败状态缺少原因")
+        if terminal is not None and terminal["phase"] == "failed":
+            if (failure["observation_step"] != n
+                    or failure["interval_step"] is not None
+                    or failure["reason"] != terminal["failure_reason"]):
+                raise ValueError("v3 失败观测与结论不一致")
+        elif failure["observation_step"] is not None:
+            unsealed = report.get("unsealed_failure")
+            later_failure = (isinstance(unsealed, dict)
+                             and type(failure["observation_step"]) is int
+                             and n < failure["observation_step"]
+                             <= unsealed["physical_steps_before_failure"])
+            if not later_failure and (terminal is not None
+                                      or failure["observation_step"] != n
+                                      or failure["reason"] != "measurement_invalid"):
+                raise ValueError("v3 失败观测步与前缀不一致")
+        elif failure["interval_step"] is not None:
+            if (type(failure["interval_step"]) is not int
+                    or failure["interval_step"] < n
+                    or (failure["interval_step"] > n
+                        and report.get("unsealed_failure") is None)):
+                raise ValueError("v3 失败区间与确认前缀不一致")
+        elif report.get("unsealed_failure") is None:
+            raise ValueError("v3 失败结论没有观测、区间或未密封证据")
+    else:
+        if any(value is not None for value in failure.values()) or report["attempted_step"] is not None:
+            raise ValueError("v3 非失败终止不得带失败结论")
+        if termination == "stopped":
+            if terminal is not None or n > horizon:
+                raise ValueError("v3 停止结论与观测前缀不一致")
+        else:
+            expected = ("observed_success" if terminal is not None
+                        and terminal["phase"] == "balance"
+                        and terminal["status"] == "stable" else "time_limit")
+            if terminal is None or n != horizon or termination != expected:
+                raise ValueError("v3 到期结论与终点观测不一致")
+
+
 def _verified_epochs(manifest: dict, steps: list[dict]) -> None:
     epochs = manifest["epochs"]
     if not isinstance(epochs, list) or not epochs or epochs[0]["physical_start"] != 0:
@@ -472,4 +554,5 @@ def open_verified_cart_pole_full_run(directory: str | Path) -> VerifiedFullRun:
             or sum(row["truncations"] for row in steps)
             != manifest["resource_counts"]["truncations"]):
         raise ValueError("v3 累计资源计数不一致")
+    _verified_outcome(report, manifest, swing.horizon_steps)
     return VerifiedFullRun(root, manifest, report, tuple(steps))

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import subprocess
 import sys
 from dataclasses import replace
 from math import pi
 from pathlib import Path
+from threading import Event
 
 import numpy as np
 import pytest
@@ -19,6 +22,7 @@ from secure_control.experiments.cart_pole_full_evidence import (
     open_verified_cart_pole_full_run,
     write_cart_pole_plaintext_full_run,
 )
+from secure_control.experiments.cart_pole_segmented_evidence import _bytes
 from secure_control.scenarios.cart_pole.adapter import MeasurementSample
 from secure_control.scenarios.cart_pole.observer import (
     build_cart_pole_observer_design,
@@ -47,6 +51,110 @@ def test_plaintext_full_v3_verified_reader(tmp_path):
         "beaver_triples": 0, "truncations": 0,
     }
     assert verified.observation(309)["phase"] == "capture"
+    physical = json.loads((verified.path / "physical.json").read_text(encoding="utf-8"))
+    manifest = json.loads((verified.path / "run.json").read_text(encoding="utf-8"))
+    for field, value in (
+        ("goal_met", False),
+        ("termination", "time_limit"),
+        ("failure", {"observation_step": None, "interval_step": None,
+                     "reason": "protocol_or_control", "detail": "invented"}),
+    ):
+        altered = copy.deepcopy(physical)
+        altered[field] = value
+        raw = _bytes(altered)
+        (verified.path / "physical.json").write_bytes(raw)
+        updated_manifest = copy.deepcopy(manifest)
+        updated_manifest["physical_sha256"] = hashlib.sha256(raw).hexdigest()
+        (verified.path / "run.json").write_bytes(_bytes(updated_manifest))
+        with pytest.raises(ValueError, match="v3"):
+            open_verified_cart_pole_full_run(verified.path)
+    invented_failure = copy.deepcopy(physical)
+    invented_failure["termination"] = "failed"
+    invented_failure["goal_met"] = False
+    invented_failure["failure"]["reason"] = "setup_or_switch"
+    raw = _bytes(invented_failure)
+    (verified.path / "physical.json").write_bytes(raw)
+    updated_manifest = copy.deepcopy(manifest)
+    updated_manifest["physical_sha256"] = hashlib.sha256(raw).hexdigest()
+    updated_manifest["status"] = "failed_prefix"
+    (verified.path / "run.json").write_bytes(_bytes(updated_manifest))
+    with pytest.raises(ValueError, match="v3"):
+        open_verified_cart_pole_full_run(verified.path)
+
+
+def test_plaintext_v3_reader_accepts_confirmed_stop_prefix(tmp_path):
+    design = load_cart_pole_observer_design(ROOT / "configs/cart_pole_observer.yaml")
+    swing = load_cart_pole_swing_up_config(CONFIG, design.plant, design.balance)
+    stop = Event()
+
+    def after_step(step, *_args):
+        if step == 5:
+            stop.set()
+
+    result = run_plaintext_full_experiment(
+        design.plant, design.balance, swing, design,
+        on_step=after_step, stop_event=stop,
+    )
+    assert result.completed_steps == 5 and result.termination == "stopped"
+    verified = open_verified_cart_pole_full_run(
+        write_cart_pole_plaintext_full_run(result, tmp_path / "plain-stopped")
+    )
+    assert verified.manifest["N"] == 5
+    assert verified.report["termination"] == "stopped"
+
+
+def test_plaintext_v3_reader_accepts_time_limit_and_failed_interval(tmp_path):
+    design = load_cart_pole_observer_design(ROOT / "configs/cart_pole_observer.yaml")
+    swing = load_cart_pole_swing_up_config(CONFIG, design.plant, design.balance)
+    cases = (
+        (replace(swing, horizon_steps=320, acquisition_deadline_steps=320), "time_limit"),
+        (replace(swing, initial_state=(.49, 0., pi, 0.)), "failed"),
+    )
+    for index, (config, termination) in enumerate(cases):
+        result = run_plaintext_full_experiment(design.plant, design.balance, config, design)
+        assert result.termination == termination
+        verified = open_verified_cart_pole_full_run(
+            write_cart_pole_plaintext_full_run(result, tmp_path / f"plain-prefix-{index}")
+        )
+        assert verified.report["termination"] == termination
+        assert verified.manifest["N"] == result.completed_steps
+
+
+def test_plaintext_v3_reader_rejects_rehashed_false_outcomes(tmp_path):
+    design = load_cart_pole_observer_design(ROOT / "configs/cart_pole_observer.yaml")
+    swing = load_cart_pole_swing_up_config(CONFIG, design.plant, design.balance)
+    short = replace(swing, horizon_steps=16, acquisition_deadline_steps=16)
+    result = run_plaintext_full_experiment(design.plant, design.balance, short, design)
+    assert result.termination == "failed" and not result.goal_met
+    path = write_cart_pole_plaintext_full_run(result, tmp_path / "plain-failed")
+    physical = json.loads((path / "physical.json").read_text(encoding="utf-8"))
+    manifest = json.loads((path / "run.json").read_text(encoding="utf-8"))
+    assert open_verified_cart_pole_full_run(path).report["goal_met"] is False
+
+    for field, value in (
+        ("goal_met", True),
+        ("termination", "observed_success"),
+        ("failure", {"observation_step": None, "interval_step": None,
+                     "reason": None, "detail": None}),
+        ("summary.first_stable_step", 16),
+        ("summary.stable_entry_steps", [16]),
+        ("summary.final_stable_count", 99),
+        ("manifest.status", "complete"),
+    ):
+        altered = copy.deepcopy(physical)
+        altered_manifest = copy.deepcopy(manifest)
+        if field == "manifest.status":
+            altered_manifest["status"] = value
+        elif field.startswith("summary."):
+            altered["summary"][field.split(".", 1)[1]] = value
+        else:
+            altered[field] = value
+        raw = _bytes(altered)
+        (path / "physical.json").write_bytes(raw)
+        altered_manifest["physical_sha256"] = hashlib.sha256(raw).hexdigest()
+        (path / "run.json").write_bytes(_bytes(altered_manifest))
+        with pytest.raises(ValueError, match="v3"):
+            open_verified_cart_pole_full_run(path)
 
 
 @pytest.fixture(scope="module")
