@@ -1,0 +1,538 @@
+"""#116：批量计划只使用公开拓扑与原有资源次序。"""
+
+import random
+import socket
+import time
+from dataclasses import replace
+from fractions import Fraction
+from queue import Queue
+from threading import Thread
+from types import SimpleNamespace
+
+import pytest
+
+from secure_control.crypto import AdditiveShare
+from secure_control.execution._localhost_peer import LocalhostProtocol3PeerPort
+from secure_control.execution.localhost_codec import (
+    SCHEMA_VERSION,
+    LanHelloPayload,
+    LocalhostCodecError,
+    ScalarFrameV3,
+    ScalarLayerPayloadV1,
+    WireEnvelope,
+    decode_envelope,
+    encode_envelope,
+    encode_scalar_frame_v3,
+)
+from secure_control.execution.localhost_transport import (
+    LocalhostTransportProtocolError,
+    send_envelope,
+    send_frame,
+)
+from secure_control.protocol import P1, P2
+from secure_control.protocol.arithmetic import (
+    ScalarGate,
+    ScalarPartyExecutor,
+    ScalarProgram,
+    build_scalar_layer_plan,
+    prepare_scalar_round,
+)
+from secure_control.protocol.coordinator import (
+    LocalProtocol3PartyEndpoint,
+    Protocol3Orchestrator,
+    rehydrate_offline_material,
+    rehydrate_online_material,
+    stage_protocol3_batch,
+)
+from secure_control.protocol.messages import (
+    PartyOfflineMaterial,
+    PartyOnlineMaterial,
+    PartyOnlineRound,
+    ProductMaskPayload,
+    Protocol3BatchPayload,
+    public_step_plan_sha256,
+)
+
+
+def test_public_layer_plan_keeps_independent_gates_and_empty_program():
+    program = ScalarProgram(
+        ("a", "b", "c"), (("secret_constant", Fraction(3, 2)),),
+        (
+            ScalarGate("first", "multiply", "a", "b"),
+            ScalarGate("sum", "add", "first", "c"),
+            ScalarGate("independent", "multiply", "b", "secret_constant"),
+            ScalarGate("second", "multiply", "sum", "independent"),
+        ),
+        "second",
+    )
+    plan = build_scalar_layer_plan(program)
+    assert plan.layers == (("first", "independent"), ("second",))
+    assert plan.program_sha256 == program.topology_sha256()
+    changed_secret = ScalarProgram(
+        program.inputs, (("secret_constant", Fraction(-7, 4)),),
+        program.gates, program.output,
+    )
+    assert build_scalar_layer_plan(changed_secret) == plan
+    assert build_scalar_layer_plan(ScalarProgram(("kick",), (), (), "kick")).layers == ()
+
+
+def test_swing_up_has_38_products_in_16_public_layers():
+    from test_lan_scalar_v3 import _inputs
+
+    _, _, _, _, program, _ = _inputs()
+    plan = build_scalar_layer_plan(program)
+    assert tuple(len(layer) for layer in plan.layers) == (
+        5, 4, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 4, 2, 1, 1,
+    )
+    assert {name for layer in plan.layers for name in layer} == {
+        gate.name for gate in program.gates if gate.operation == "multiply"
+    }
+
+
+def test_dynamic_batch_codec_requires_whole_identity_shape_and_direction():
+    payload = Protocol3BatchPayload(
+        "product", "a" * 64, None, "session", None, 0,
+        ("one", "two"),
+        (ProductMaskPayload(AdditiveShare(1), AdditiveShare(2), 0),
+         ProductMaskPayload(AdditiveShare(3), AdditiveShare(4), 0)),
+    )
+    frame = WireEnvelope(
+        SCHEMA_VERSION, "request", "P1", "P2", 1,
+        "peer_batch", "session", "round", 0, None, payload,
+    )
+    assert decode_envelope(encode_envelope(frame)) == frame
+    with pytest.raises(ValueError, match="shape"):
+        Protocol3BatchPayload("product", "a" * 64, None, "session", None, 0,
+                              ("one", "two"), payload.products[:1])
+    with pytest.raises(LocalhostCodecError, match="方向"):
+        WireEnvelope(
+            SCHEMA_VERSION, "request", "P1", "P2", 2, "peer_batch",
+            "session", "round", 0, None,
+            Protocol3BatchPayload("truncation", "a" * 64, None, "session", None,
+                                  2, (), truncations=()),
+        )
+
+
+def test_default_lan_party_rejects_unnegotiated_legacy_hello(monkeypatch):
+    from secure_control.execution import lan_runtime
+
+    accepted, remote = socket.socketpair()
+    monkeypatch.setattr(lan_runtime, "accept_role", lambda *_args: accepted)
+    monkeypatch.setattr(
+        lan_runtime, "_accept_hello",
+        lambda *_args: ("session", LanHelloPayload("a" * 64, "b" * 64)),
+    )
+    try:
+        with pytest.raises(ValueError, match="批量能力不一致"):
+            lan_runtime._run_party_session(
+                SimpleNamespace(role="P1", startup_timeout=1), None, None, None,
+                expected_batch=True,
+            )
+        assert accepted.fileno() == -1
+    finally:
+        remote.close()
+
+
+@pytest.mark.parametrize("mismatch", ["round", "epoch", "plan", "ids", "phase", "sequence"])
+def test_dynamic_peer_rejects_incomplete_or_cross_round_batch(mismatch):
+    from test_two_party_protocol import make_stack
+
+    client, _, _, _, distribution = make_stack()
+    online = client.prepare_online(distribution, [0.25], step=0, rng=random.Random(21))
+    plan = online.p1_resources.plan
+    ids = tuple(item.resource_id for item in plan.product_resources)
+    products = tuple(ProductMaskPayload(AdditiveShare(0), AdditiveShare(0), 1)
+                     for _ in ids)
+    fields = {
+        "phase": "product", "plan_sha256": public_step_plan_sha256(plan),
+        "run_id": "run", "epoch_id": "epoch", "physical_step": 7,
+        "batch_index": 0, "resource_ids": ids, "products": products,
+    }
+    if mismatch == "epoch":
+        fields["epoch_id"] = "previous-epoch"
+    elif mismatch == "plan":
+        fields["plan_sha256"] = "a" * 64
+    elif mismatch == "ids":
+        fields["resource_ids"] = (*ids[:-1], "wrong-id")
+    elif mismatch == "phase":
+        fields.update(phase="product_complete", batch_index=1, products=())
+    payload = Protocol3BatchPayload(**fields)
+    sockets = socket.socketpair()
+    receiver = LocalhostProtocol3PeerPort(
+        sockets[0], "P1", 8 * 1024 * 1024, 5, batch_enabled=True,
+    )
+    receiver.bind(plan.session_id)
+    receiver.set_batch_round(plan, modulus=client.fixed_point.modulus,
+                             run_id="run", epoch_id="epoch", physical_step=7)
+    frame = WireEnvelope(
+        SCHEMA_VERSION, "request", "P2", "P1", 2 if mismatch == "sequence" else 1,
+        "peer_batch", plan.session_id,
+        "wrong-round" if mismatch == "round" else plan.round_id,
+        plan.step, None, payload,
+    )
+    try:
+        send_envelope(sockets[1], frame, deadline=time.monotonic() + 5,
+                      limit=8 * 1024 * 1024)
+        with pytest.raises(ValueError, match="身份不匹配"):
+            receiver._receive_batch(plan, "product", ids)
+    finally:
+        receiver.close()
+        sockets[1].close()
+
+
+def test_dynamic_peer_rejects_noncanonical_member_and_duplicate_resource_id():
+    from test_two_party_protocol import make_stack
+
+    client, _, _, _, distribution = make_stack()
+    plan = client.prepare_online(distribution, [0.25], step=0).p1_resources.plan
+    ids = tuple(item.resource_id for item in plan.product_resources)
+    with pytest.raises(ValueError, match="身份不合法"):
+        Protocol3BatchPayload("product", "a" * 64, None, "epoch", None, 0,
+                              (ids[0], ids[0]),
+                              (ProductMaskPayload(AdditiveShare(0), AdditiveShare(0), 1),) * 2)
+    sockets = socket.socketpair()
+    peer = LocalhostProtocol3PeerPort(sockets[0], "P1", 8 * 1024 * 1024, 5,
+                                      batch_enabled=True)
+    peer.bind(plan.session_id)
+    peer.set_batch_round(plan, modulus=client.fixed_point.modulus)
+    try:
+        with pytest.raises(ValueError, match="canonical residue"):
+            peer._check_batch_values(
+                tuple(ProductMaskPayload(AdditiveShare(0),
+                                         AdditiveShare(client.fixed_point.modulus), 1)
+                      for _ in ids), len(ids), "product", sender="P2",
+            )
+    finally:
+        peer.close()
+        sockets[1].close()
+
+
+def test_dynamic_batch_frame_budget_rejects_before_any_bytes_are_sent():
+    from test_two_party_protocol import make_stack
+
+    client, _, _, _, distribution = make_stack()
+    plan = client.prepare_online(distribution, [0.25], step=0).p1_resources.plan
+    ids = tuple(item.resource_id for item in plan.product_resources)
+    payload = Protocol3BatchPayload(
+        "product", public_step_plan_sha256(plan), None, plan.session_id, None, 0, ids,
+        tuple(ProductMaskPayload(AdditiveShare(0), AdditiveShare(0), 0) for _ in ids),
+    )
+    frame = WireEnvelope(SCHEMA_VERSION, "request", "P1", "P2", 1, "peer_batch",
+                         plan.session_id, plan.round_id, plan.step, None, payload)
+    sockets = socket.socketpair()
+    try:
+        with pytest.raises(LocalhostTransportProtocolError, match="上限"):
+            send_envelope(sockets[0], frame, deadline=time.monotonic() + 2, limit=128)
+        sockets[1].setblocking(False)
+        with pytest.raises(BlockingIOError):
+            sockets[1].recv(1)
+    finally:
+        for sock in sockets:
+            sock.close()
+
+
+def test_large_legal_peer_batch_with_small_socket_buffers_does_not_deadlock():
+    from test_two_party_protocol import make_stack
+
+    client, _, _, _, distribution = make_stack()
+    original = client.prepare_online(distribution, [0.25], step=0).p1_resources.plan
+    plan = replace(original, product_resources=tuple(
+        replace(original.product_resources[0], resource_id=f"large-{index}")
+        for index in range(4096)
+    ))
+    sockets = socket.socketpair()
+    for sock in sockets:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+    peers = [LocalhostProtocol3PeerPort(
+        sock, "P1" if index == 0 else "P2", 8 * 1024 * 1024, 10,
+        batch_enabled=True,
+    ) for index, sock in enumerate(sockets)]
+    for peer in peers:
+        peer.bind(plan.session_id)
+        peer.set_batch_round(plan, modulus=client.fixed_point.modulus)
+    outputs = [None, None]
+    errors = []
+
+    def run(index):
+        masks = tuple(ProductMaskPayload(
+            AdditiveShare(client.fixed_point.modulus - 1), AdditiveShare(0), index,
+        ) for _ in plan.product_resources)
+        try:
+            outputs[index] = peers[index].exchange_products(plan, masks)
+        except Exception as error:  # noqa: BLE001 - 跨线程断言实际异常
+            errors.append(error)
+
+    threads = [Thread(target=run, args=(index,)) for index in (0, 1)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=15)
+        assert not any(thread.is_alive() for thread in threads)
+        assert not errors, errors
+        assert all(len(output) == 4096 for output in outputs)
+        assert outputs[0][0].party == 1 and outputs[1][0].party == 0
+    finally:
+        for peer in peers:
+            peer.close()
+
+
+@pytest.mark.parametrize("fault", ("bad_last_member", "lost_product_barrier"))
+def test_dynamic_batch_fault_burns_all_resources_without_stage_or_state_change(fault):
+    from test_two_party_protocol import make_stack
+
+    client, _, _, _, distribution = make_stack()
+    online = client.prepare_online(distribution, [0.25], step=0, rng=random.Random(22))
+    role = P1(rehydrate_offline_material(
+        PartyOfflineMaterial.from_message(distribution.p1), distribution.range_contract,
+    ))
+    local = rehydrate_online_material(
+        PartyOnlineMaterial.from_round(PartyOnlineRound(
+            online.p1_input, online.p1_resources,
+        )), modulus=client.fixed_point.modulus, security_parameter=8,
+    )
+    shares = []
+    endpoint = LocalProtocol3PartyEndpoint(role, local, shares.append)
+    prior_state = role.state_share
+
+    class FaultPeer:
+        def exchange_products(self, plan, masks):
+            result = [ProductMaskPayload(AdditiveShare(0), AdditiveShare(0), 1)
+                      for _ in masks]
+            if fault == "bad_last_member":
+                result[-1] = ProductMaskPayload(AdditiveShare(0), AdditiveShare(0), 0)
+            return tuple(result)
+
+        def product_complete(self, plan):
+            raise TimeoutError("lost product barrier")
+
+    with pytest.raises((ValueError, TimeoutError)):
+        stage_protocol3_batch(endpoint, FaultPeer())
+    assert not shares
+    assert role.state_share == prior_state
+    assert local.resources.consumed_count == 0
+    assert local.resources.aborted_count == (online.p1_resources.plan.triple_count +
+                                             online.p1_resources.plan.truncation_count)
+    with pytest.raises(ValueError, match="重复开始"):
+        stage_protocol3_batch(endpoint, FaultPeer())
+
+
+def test_scalar_layer_rejects_wrong_phase_and_noncanonical_member():
+    from secure_control.execution.lan_scalar_runtime import _SocketScalarPeer
+
+    sockets = socket.socketpair()
+    peer = _SocketScalarPeer(
+        sockets[0], party=0, run_id="run", epoch_id="epoch", session_id="session",
+        physical_step=7, local_step=0, round_id="round",
+        deadline=time.monotonic() + 5, program_sha256="a" * 64, modulus=101,
+    )
+    try:
+        for phase, values in (("complete", ()), ("product", ((101, 0),))):
+            payload = ScalarLayerPayloadV1(phase, "a" * 64, 0, ("resource",), values)
+            frame = ScalarFrameV3(
+                "P2", "P1", "run", "epoch", "session", 7, 0,
+                "round", "layer:0", "peer_layer", payload,
+            )
+            send_frame(sockets[1], encode_scalar_frame_v3(frame),
+                       deadline=time.monotonic() + 5, limit=8 * 1024 * 1024)
+            with pytest.raises(ValueError, match="无效"):
+                peer._receive_layer("product", 0, ("resource",))
+    finally:
+        sockets[0].close()
+        sockets[1].close()
+
+
+def test_dynamic_batch_real_peer_frames_preserve_old_state_output_and_modular_state(
+    monkeypatch,
+):
+    from test_two_party_protocol import make_stack
+
+    from secure_control.execution import _localhost_peer
+
+    client, _, _, _, distribution = make_stack()
+    online = client.prepare_online(distribution, [0.25], step=0, rng=random.Random(20))
+    plan = online.p1_resources.plan
+    p1, p2 = (
+        role_type(rehydrate_offline_material(
+            PartyOfflineMaterial.from_message(material), distribution.range_contract,
+        ))
+        for role_type, material in ((P1, distribution.p1), (P2, distribution.p2))
+    )
+    rounds = tuple(rehydrate_online_material(
+        PartyOnlineMaterial.from_round(PartyOnlineRound(input_share, resources)),
+        modulus=client.fixed_point.modulus, security_parameter=8,
+    ) for input_share, resources in (
+        (online.p1_input, online.p1_resources),
+        (online.p2_input, online.p2_resources),
+    ))
+    shares = [[], []]
+    endpoints = (
+        LocalProtocol3PartyEndpoint(
+            p1, rounds[0], shares[0].append,
+        ),
+        LocalProtocol3PartyEndpoint(
+            p2, rounds[1], shares[1].append,
+        ),
+    )
+    sockets = socket.socketpair()
+    peers = [LocalhostProtocol3PeerPort(
+        sockets[party], "P1" if party == 0 else "P2", 8 * 1024 * 1024, 10,
+        batch_enabled=True,
+    ) for party in (0, 1)]
+    for peer in peers:
+        peer.bind(plan.session_id)
+        peer.set_batch_round(plan, modulus=client.fixed_point.modulus)
+    frames = []
+    original = _localhost_peer.send_envelope
+
+    def counted(*args, **kwargs):
+        frames.append(args[1].operation)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(_localhost_peer, "send_envelope", counted)
+    receipts = [None, None]
+    errors = []
+
+    def run(party):
+        try:
+            receipts[party] = stage_protocol3_batch(endpoints[party], peers[party])
+        except Exception as error:  # noqa: BLE001 - 将线程异常交还断言
+            errors.append(error)
+
+    threads = [Thread(target=run, args=(party,)) for party in (0, 1)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+            assert not thread.is_alive()
+        assert not errors, errors
+        assert frames == ["peer_batch"] * 7
+        assert [(item.products, item.truncations) for item in receipts] == [(9, 2)] * 2
+        assert client.reconstruct_control(shares[0][0], shares[1][0]).tolist() == [0.625]
+        Protocol3Orchestrator().commit(*endpoints)
+        reconstructed = client.fixed_point.decode_residue(
+            client.sharing.reconstruct(p1.state_share, p2.state_share)
+        )
+        assert reconstructed.tolist() == [0.3125, -0.0625]
+    finally:
+        for peer in peers:
+            peer.close()
+
+
+def test_scalar_batch_matches_legacy_integer_shares_with_same_isolated_materials():
+    from test_lan_scalar_v3 import _inputs
+
+    _, _, modulus, evidence, program, certificate = _inputs()
+    materials = prepare_scalar_round(
+        program, {"p": .2, "v": -.4, "beta": .31, "omega": 1.7},
+        certificate, modulus=modulus, modulus_evidence=evidence,
+        round_id="batch-math-oracle", step=0,
+    )
+    public = ScalarProgram(
+        program.inputs, tuple((name, Fraction(0)) for name, _ in program.constants),
+        program.gates, program.output,
+    )
+
+    def execute(*, batch: bool):
+        channels = (Queue(), Queue())
+        events = []
+
+        class Peer:
+            def __init__(self, party):
+                self.party = party
+
+            def send(self, phase, index, ids, values=()):
+                events.append((self.party, phase))
+                channels[1 - self.party].put((phase, index, ids, values))
+
+            def receive(self, phase, index, ids):
+                actual = channels[self.party].get(timeout=10)
+                assert actual[:3] == (phase, index, ids)
+                return actual[3]
+
+            def exchange_layer_products(self, index, ids, values):
+                if self.party == 0:
+                    self.send("product", index, ids, values)
+                    return self.receive("product", index, ids)
+                incoming = self.receive("product", index, ids)
+                self.send("product", index, ids, values)
+                return incoming
+
+            def send_layer_truncations(self, index, ids, values):
+                self.send("truncation", index, ids, values)
+
+            def receive_layer_truncations(self, index, ids):
+                return self.receive("truncation", index, ids)
+
+            def complete_layer(self, index, ids):
+                if self.party == 0:
+                    self.send("complete", index, ids)
+                    self.receive("complete", index, ids)
+                else:
+                    self.receive("complete", index, ids)
+                    self.send("complete", index, ids)
+
+            def exchange_product(self, resource, d, e):
+                self.send("product", 0, (resource,), (d, e))
+                return self.receive("product", 0, (resource,))
+
+            def send_truncation(self, resource, value):
+                self.send("truncation", 0, (resource,), value)
+
+            def receive_truncation(self, resource):
+                return self.receive("truncation", 0, (resource,))
+
+            def complete_gate(self, resource):
+                self.send("complete", 0, (resource,))
+                self.receive("complete", 0, (resource,))
+
+        executors = [ScalarPartyExecutor(
+            public, materials[party], modulus=modulus, fractional_bits=80,
+            security_parameter=80, modulus_evidence=evidence,
+        ) for party in (0, 1)]
+        outputs = [None, None]
+        errors = []
+
+        def run(party):
+            try:
+                executor = executors[party]
+                peer = Peer(party)
+                outputs[party] = (executor.evaluate_batch(peer) if batch
+                                  else executor.evaluate(peer))
+            except Exception as error:  # noqa: BLE001 - 将并发异常交给主线程断言
+                errors.append(error)
+
+        threads = [Thread(target=run, args=(party,)) for party in (0, 1)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+            assert not thread.is_alive()
+        assert not errors, errors
+        assert [item.consumed for item in executors] == [38, 38]
+        return outputs, events
+
+    legacy, legacy_frames = execute(batch=False)
+    batched, batch_frames = execute(batch=True)
+    assert batched == legacy
+    assert len(legacy_frames) == 190
+    assert len(batch_frames) == 80
+
+
+@pytest.mark.parametrize(
+    ("case", "mode", "client_groups", "peer_frames"),
+    [("dynamic", "legacy", 216, 64), ("dynamic", "batch", 6, 7),
+     ("scalar", "legacy", 6, 190), ("scalar", "batch", 6, 80)],
+)
+def test_real_three_process_benchmark_counts_public_frames(
+    case, mode, client_groups, peer_frames,
+):
+    from secure_control.experiments.communication_benchmark import run_local_benchmark
+
+    report = run_local_benchmark(case, mode, steps=2, delay_ms=0)
+    assert report["successful_steps"] == 2
+    assert report["client_request_reply_groups_per_step"] == client_groups
+    assert report["peer_frames_per_step"] == peer_frames
+    assert report["client_phase_p50_ms"]["stage_ms"] > 0
+    assert report["client_step_activity_p50_ms"]["receive_ms"] > 0

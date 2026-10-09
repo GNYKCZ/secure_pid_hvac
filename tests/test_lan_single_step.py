@@ -65,7 +65,7 @@ if fault in {'offline_disconnect', 'stage_ack_loss', 'commit_ack_loss'}:
             print('fault:offline_ack_then_disconnect', file=sys.stderr, flush=True)
             sock.close()
             raise RuntimeError('injected disconnect')
-        if ((fault == 'stage_ack_loss' and endpoint_op == 'stage_output') or
+        if ((fault == 'stage_ack_loss' and endpoint_op in {'stage_output', 'stage_batch'}) or
                 (fault == 'commit_ack_loss' and endpoint_op == 'commit')):
             print('fault:' + fault, file=sys.stderr, flush=True)
             sock.close()
@@ -73,11 +73,11 @@ if fault in {'offline_disconnect', 'stage_ack_loss', 'commit_ack_loss'}:
         return original(sock, request, payload, timeout, **kwargs)
     lan._party_reply = reply
 elif fault in {'peer_half_frame', 'peer_resource_replay'}:
-    original = peer.LocalhostProtocol3PeerPort._send
+    original = peer.LocalhostProtocol3PeerPort._send_batch
     injected = False
-    def send(self, operation, metadata, payload):
+    def send(self, plan, phase, ids, *, products=(), truncations=()):
         global injected
-        if not injected and operation == 'peer_product':
+        if not injected and phase == 'product':
             injected = True
             if fault == 'peer_half_frame':
                 print('fault:peer_half_frame', file=sys.stderr, flush=True)
@@ -85,19 +85,22 @@ elif fault in {'peer_half_frame', 'peer_resource_replay'}:
                 self._connection.close()
                 raise RuntimeError('injected partial frame')
             sequence = self._send_sequence
-            original(self, operation, metadata, payload)
+            original(self, plan, phase, ids, products=products,
+                     truncations=truncations)
             repeated = WireEnvelope(
                 SCHEMA_VERSION, 'request', self._role, self._peer, sequence,
-                operation, metadata.session_id, metadata.round_id, metadata.step,
-                metadata.resource_id, payload,
+                'peer_batch', plan.session_id, plan.round_id, plan.step,
+                None, self._batch_payload(plan, phase, ids, products=products,
+                                          truncations=truncations),
             )
             print('fault:peer_resource_replay', file=sys.stderr, flush=True)
             send_envelope(self._connection, repeated,
                           deadline=self._deadline or deadline_after(self._timeout),
                           limit=self._limit)
             return
-        return original(self, operation, metadata, payload)
-    peer.LocalhostProtocol3PeerPort._send = send
+        return original(self, plan, phase, ids, products=products,
+                        truncations=truncations)
+    peer.LocalhostProtocol3PeerPort._send_batch = send
 elif fault in {'client_ready_replay', 'capture_ready', 'old_session_replay'}:
     original = lan._request
     injected = False

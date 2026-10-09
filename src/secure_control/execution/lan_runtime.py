@@ -30,6 +30,7 @@ from secure_control.protocol.coordinator import (
     dispatch_direct_protocol3_command,
     rehydrate_offline_material,
     rehydrate_online_material,
+    stage_protocol3_batch,
 )
 from secure_control.protocol.messages import (
     ControlShareMessage,
@@ -52,6 +53,7 @@ from .lan_config import LanConfig, Role
 from .lan_transport import accept_role, connect_role, listener
 from .localhost_codec import (
     SCHEMA_VERSION,
+    BatchHelloPayload,
     LanContinuousSetupPayload,
     LanHelloPayload,
     LanSegmentedHelloPayload,
@@ -80,7 +82,7 @@ def _public_reachability_digest(contract: ControllerRangeContract,
     return sha256(b"lan-segmented-v2-public-range\0" + encoded).hexdigest()
 
 
-def run_client_single_step(config: LanConfig, trial: Any) -> dict[str, object]:
+def run_client_single_step(config: LanConfig, trial: Any, *, batch: bool = True) -> dict[str, object]:
     """Client 独立拨号、分发、驱动一次协议、双提交并有界关闭三条连接。"""
     if config.role != "Client":
         raise ValueError("只有 Client 配置可启动 LAN 单步。")
@@ -94,7 +96,8 @@ def run_client_single_step(config: LanConfig, trial: Any) -> dict[str, object]:
     )
     distribution = client.distribute_controller(trial.spec, trial.range_contract)
     session = distribution.session_id
-    hello = LanHelloPayload(config.topology.digest, secrets.token_hex(32))
+    base_hello = LanHelloPayload(config.topology.digest, secrets.token_hex(32))
+    hello = BatchHelloPayload(base_hello) if batch else base_hello
     stamps: dict[str, int] = {"trial_start": time.perf_counter_ns()}
     sockets: list[socket.socket] = []
     committed = False
@@ -173,6 +176,7 @@ def run_client_single_step(config: LanConfig, trial: Any) -> dict[str, object]:
             endpoints[1],
             plan,
             lambda phase: stamps.__setitem__(phase, time.perf_counter_ns()),
+            batch=batch,
         )
         committed = True
         for party, sock in enumerate(sockets):
@@ -224,6 +228,7 @@ class LanContinuousRuntime:
         *, _segment_hello: LanSegmentedHelloPayload | None = None,
         _segment_capacity: int | None = None,
         _controller_epoch: str | None = None,
+        batch: bool = True,
     ) -> None:
         if config.role != "Client" or config.experiment_config is None:
             raise ValueError("连续运行必须使用 Client experiment 配置。")
@@ -260,6 +265,7 @@ class LanContinuousRuntime:
         self._segment_start = 0
         self._segment_capacity = _segment_capacity if v2 else range_contract.horizon_steps
         self._v2 = v2
+        self._batch = batch
         self._products = 0
         self._truncations = 0
         self._confirmed_steps: list[dict[str, int | str]] = []
@@ -267,9 +273,10 @@ class LanContinuousRuntime:
         self._failed = False
         self._finished = False
         self.session_id = self.distribution.session_id
-        hello = (_segment_hello if _segment_hello is not None else
-                 LanHelloPayload(config.topology.digest, secrets.token_hex(32),
-                                 "lan-continuous-v1"))
+        base_hello = (_segment_hello if _segment_hello is not None else
+                      LanHelloPayload(config.topology.digest, secrets.token_hex(32),
+                                      "lan-continuous-v1"))
+        hello = BatchHelloPayload(base_hello) if batch else base_hello
         self._last_result = None
         self._round_started = False
         try:
@@ -358,7 +365,9 @@ class LanContinuousRuntime:
                     sock, party, plan, self._sequences[party] + 1, _FRAME_LIMIT,
                     self.config.step_timeout, deadline,
                 ))
-            result = _complete_client_round(self.client, endpoints[0], endpoints[1], plan)
+            result = _complete_client_round(
+                self.client, endpoints[0], endpoints[1], plan, batch=self._batch,
+            )
             self._sequences = [endpoint.sequence for endpoint in endpoints]
             self._step += 1
             self._products += result.products
@@ -757,8 +766,8 @@ class LanSegmentedRuntime:
             self._segment.close()
 
 
-def run_party_single_step(config: LanConfig) -> dict[str, object]:
-    """P1/P2 只监听固定端口；由 hello 选择单步或有界连续模式。"""
+def run_party_single_step(config: LanConfig, *, batch: bool = True) -> dict[str, object]:
+    """P1/P2 默认只接受批量能力；旧 wire 须由双方显式选择诊断模式。"""
     if config.role not in {"P1", "P2"}:
         raise ValueError("角色命令必须是 P1 或 P2。")
     role: Literal["P1", "P2"] = config.role
@@ -771,7 +780,9 @@ def run_party_single_step(config: LanConfig) -> dict[str, object]:
             peer_listener = listener(config.topology.p1_peer)
         tail = None
         while True:
-            summary, tail = _run_party_session(config, client_listener, peer_listener, tail)
+            summary, tail = _run_party_session(
+                config, client_listener, peer_listener, tail, expected_batch=batch,
+            )
             if tail is None:
                 return summary
     finally:
@@ -815,7 +826,7 @@ def _validate_segment_chain(hello: LanSegmentedHelloPayload, session: str,
 
 def _run_party_session(config: LanConfig, client_listener: socket.socket,
                        peer_listener: socket.socket | None,
-                       tail: _PartyRunTail | _ScalarRunTail | None
+                       tail: _PartyRunTail | _ScalarRunTail | None, *, expected_batch: bool
                        ) -> tuple[dict[str, object], _PartyRunTail | _ScalarRunTail | None]:
     """旧模式与新模式共享唯一的握手、离线装配和 Protocol 3 单段计算。"""
     role = config.role
@@ -826,13 +837,17 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
         _LAN_LOG.info("%s 已启动，正在等待 Client（最多 %.0f 秒）。", role,
                       config.startup_timeout)
         client_socket = accept_role(client_listener, config, "Client", startup_deadline)
-        session, hello = _accept_hello(
+        session, wire_hello = _accept_hello(
             client_socket,
             "Client",
             role,
             config,
             startup_deadline,
         )
+        batch = isinstance(wire_hello, BatchHelloPayload)
+        if batch != expected_batch:
+            raise ValueError("LAN Client 与 Party 批量能力不一致；旧协议须双方显式诊断启用")
+        hello = wire_hello.base if batch else wire_hello
         if isinstance(hello, LanSegmentedHelloPayload):
             if isinstance(tail, _ScalarRunTail):
                 if (
@@ -858,12 +873,13 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
             assert peer_listener is not None
             peer_socket = accept_role(peer_listener, config, "P2", startup_deadline)
             _accept_hello(
-                peer_socket, "P2", "P1", config, startup_deadline, expected=(session, hello)
+                peer_socket, "P2", "P1", config, startup_deadline,
+                expected=(session, wire_hello)
             )
             _LAN_LOG.info("P1 与 P2 的协议连接已建立。")
         else:
             peer_socket = connect_role(config.topology.p1_peer, config, "P1", startup_deadline)
-            _hello(peer_socket, "P2", "P1", session, hello, config.startup_timeout)
+            _hello(peer_socket, "P2", "P1", session, wire_hello, config.startup_timeout)
             _LAN_LOG.info("P2 与 P1 的协议连接已建立。")
         _party_reply(
             client_socket,
@@ -881,6 +897,7 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                     tail.physical_end if isinstance(tail, _ScalarRunTail) else None
                 ),
                 previous_epoch_id=tail.epoch_id if isinstance(tail, _ScalarRunTail) else None,
+                batch=batch,
             )
             next_tail = (
                 _ScalarRunTail(
@@ -955,7 +972,7 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
         _party_reply(client_socket, offline_request, None, config.startup_timeout)
         sequence = 4
         peer_port = LocalhostProtocol3PeerPort(
-            peer_socket, role, _FRAME_LIMIT, config.step_timeout
+            peer_socket, role, _FRAME_LIMIT, config.step_timeout, batch_enabled=batch
         )
         peer_port.bind(session)
         steps = (setup.segment_capacity if v2 else
@@ -1055,6 +1072,16 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                 raise ValueError("在线材料与信封 round identity 不匹配。")
             step_deadline = deadline_after(config.step_timeout)
             peer_port.set_round_deadline(step_deadline)
+            if batch:
+                peer_port.set_batch_round(
+                    endpoint.plan, modulus=fixed.modulus,
+                    run_id=hello.run_id if isinstance(hello, LanSegmentedHelloPayload)
+                    else None,
+                    epoch_id=setup.controller_epoch if v2 else session,
+                    physical_step=(tail.physical_end + global_committed
+                                   if hello.mode == "lan-full-v3"
+                                   and isinstance(tail, _ScalarRunTail) else None),
+                )
             direct = DirectProtocol3PartyEndpoint(endpoint, peer_port)
             _party_reply(client_socket, online_request, None, config.step_timeout,
                          deadline=step_deadline)
@@ -1069,8 +1096,14 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                 ) or not isinstance(command_request.payload, Protocol3EndpointCommand):
                     raise ValueError("endpoint command 与当前 round 不匹配。")
                 try:
-                    result = dispatch_direct_protocol3_command(direct, command_request.payload)
-                    if command_request.payload.operation == "stage_output":
+                    command = command_request.payload.operation
+                    if batch and command == "stage_batch":
+                        result = stage_protocol3_batch(endpoint, peer_port)
+                    elif (batch and command != "commit") or (not batch and command == "stage_batch"):
+                        raise ValueError("endpoint 操作与协商的批量能力不匹配")
+                    else:
+                        result = dispatch_direct_protocol3_command(direct, command_request.payload)
+                    if command in {"stage_output", "stage_batch"}:
                         if not isinstance(result, Protocol3StageReceipt) or len(staged) != 1:
                             raise ValueError("暂存回执与输出份额不完整。")
                         result = PartyStageResult(result, staged[0])
@@ -1080,7 +1113,7 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                     _party_error(client_socket, command_request, error, config.step_timeout)
                     raise
                 sequence += 1
-                if command_request.payload.operation == "commit":
+                if command == "commit":
                     committed += 1
                     if v2:
                         global_committed += 1
@@ -1118,7 +1151,7 @@ def _hello(
     sender: Role,
     recipient: Role,
     session: str,
-    hello: LanHelloPayload | LanSegmentedHelloPayload,
+    hello: LanHelloPayload | LanSegmentedHelloPayload | BatchHelloPayload,
     timeout: float,
 ) -> None:
     envelope = WireEnvelope(
@@ -1164,8 +1197,9 @@ def _accept_hello(
     config: LanConfig,
     deadline: float,
     *,
-    expected: tuple[str, LanHelloPayload | LanSegmentedHelloPayload] | None = None,
-) -> tuple[str, LanHelloPayload | LanSegmentedHelloPayload]:
+    expected: tuple[str, LanHelloPayload | LanSegmentedHelloPayload | BatchHelloPayload]
+    | None = None,
+) -> tuple[str, LanHelloPayload | LanSegmentedHelloPayload | BatchHelloPayload]:
     request = receive_envelope(sock, deadline=deadline, limit=_FRAME_LIMIT)
     payload = request.payload
     if (
@@ -1178,8 +1212,10 @@ def _accept_hello(
         or request.round_id is not None
         or request.step is not None
         or request.resource_id is not None
-        or not isinstance(payload, (LanHelloPayload, LanSegmentedHelloPayload))
-        or payload.profile_sha256 != config.topology.digest
+        or not isinstance(payload, (LanHelloPayload, LanSegmentedHelloPayload,
+                                    BatchHelloPayload))
+        or (payload.base.profile_sha256 if isinstance(payload, BatchHelloPayload)
+            else payload.profile_sha256) != config.topology.digest
         or (expected is not None and (request.session_id, payload) != expected)
     ):
         raise ValueError("LAN hello 的身份、模式、拓扑或 session 不匹配。")

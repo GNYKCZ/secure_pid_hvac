@@ -20,6 +20,7 @@ from secure_control.protocol.coordinator import (
     dispatch_direct_protocol3_command,
     rehydrate_offline_material,
     rehydrate_online_material,
+    stage_protocol3_batch,
 )
 from secure_control.protocol.messages import (
     ControlShareMessage,
@@ -36,6 +37,7 @@ from secure_control.protocol.messages import (
 from ._localhost_peer import LocalhostProtocol3PeerPort, accept_p1_peer, connect_p2_peer
 from .localhost_codec import (
     SCHEMA_VERSION,
+    BatchHelloPayload,
     ClientStepResult,
     HelloPayload,
     PartyStageResult,
@@ -77,6 +79,7 @@ class _ClientPartyEndpoint:
         self._timeout = timeout
         self._deadline = deadline
         self.share: ControlShareMessage | None = None
+        self._pending_batch: WireEnvelope | None = None
 
     @property
     def party(self) -> int:
@@ -127,7 +130,35 @@ class _ClientPartyEndpoint:
     def commit(self) -> None:
         self._command("commit")
 
+    def start_stage_batch(self) -> None:
+        if self._pending_batch is not None:
+            raise RuntimeError("批量 stage 已发送")
+        request = WireEnvelope(
+            SCHEMA_VERSION, "request", "Client", self._role, self.sequence,
+            "endpoint", self._plan.session_id, self._plan.round_id,
+            self._plan.step, None, Protocol3EndpointCommand("stage_batch"),
+        )
+        deadline = self._deadline if self._deadline is not None else deadline_after(self._timeout)
+        send_envelope(self._sock, request, deadline=deadline, limit=self._limit)
+        self.sequence += 1
+        self._pending_batch = request
+
+    def finish_stage_batch(self) -> Protocol3StageReceipt:
+        request = self._pending_batch
+        if request is None:
+            raise RuntimeError("批量 stage 尚未发送")
+        deadline = self._deadline if self._deadline is not None else deadline_after(self._timeout)
+        response = receive_envelope(self._sock, deadline=deadline, limit=self._limit)
+        _validate_party_reply(response, request)
+        self._pending_batch = None
+        if not isinstance(response.payload, PartyStageResult):
+            raise TypeError("批量角色未返回暂存回执和输出份额")
+        self.share = response.payload.share
+        return response.payload.receipt
+
     def _command(self, operation: str, metadata: ResourceMetadata | None = None) -> object:
+        if self._pending_batch is not None:
+            raise RuntimeError("批量 stage 回执未收齐")
         command = Protocol3EndpointCommand(operation, metadata=metadata)
         request = WireEnvelope(
             SCHEMA_VERSION,
@@ -200,8 +231,10 @@ def localhost_client_worker(
         p1 = connect_loopback(party_addresses[0], deadline=startup_deadline)
         p2 = connect_loopback(party_addresses[1], deadline=startup_deadline)
         parties = (p1, p2)
-        _send_hello(p1, "Client", "P1", bootstrap_nonce, startup_deadline, max_frame_bytes)
-        _send_hello(p2, "Client", "P2", bootstrap_nonce, startup_deadline, max_frame_bytes)
+        _send_hello(p1, "Client", "P1", bootstrap_nonce, startup_deadline,
+                    max_frame_bytes, batch=True)
+        _send_hello(p2, "Client", "P2", bootstrap_nonce, startup_deadline,
+                    max_frame_bytes, batch=True)
 
         sharing = TwoPartySharing(fixed_point.modulus)
         client = Client(
@@ -342,7 +375,9 @@ def localhost_client_worker(
                                 step_timeout,
                             )
                         )
-                    result = _complete_client_round(client, endpoints[0], endpoints[1], plan)
+                    result = _complete_client_round(
+                        client, endpoints[0], endpoints[1], plan, batch=True,
+                    )
                     party_sequences = [item.sequence for item in endpoints]
                     expected_step += 1
                     _send_reply(
@@ -420,7 +455,7 @@ def localhost_role_worker(
         client_channel = accept_loopback(data_listener, deadline=startup_deadline)
         data_listener.close()
         hello = receive_envelope(client_channel, deadline=startup_deadline, limit=max_frame_bytes)
-        _validate_hello(hello, "Client", role_name, bootstrap_nonce)
+        _validate_hello(hello, "Client", role_name, bootstrap_nonce, batch=True)
         offline_envelope = receive_envelope(
             client_channel, deadline=startup_deadline, limit=max_frame_bytes
         )
@@ -510,6 +545,8 @@ def localhost_role_worker(
                         ),
                     )
                     direct_endpoint = DirectProtocol3PartyEndpoint(endpoint, peer)
+                    peer.set_round_deadline(deadline_after(step_timeout))
+                    peer.set_batch_round(endpoint.plan, modulus=fixed_point.modulus)
                     if (endpoint.plan.round_id, endpoint.plan.step) != (
                         request.round_id,
                         request.step,
@@ -528,8 +565,14 @@ def localhost_role_worker(
                     endpoint.plan.step,
                 ):
                     raise ValueError("角色请求的 round 或 step identity 不匹配。")
-                result = dispatch_direct_protocol3_command(direct_endpoint, request.payload)
-                if request.payload.operation == "stage_output":
+                command = request.payload.operation
+                if command == "stage_batch":
+                    result = stage_protocol3_batch(endpoint, peer)
+                elif command == "commit":
+                    result = dispatch_direct_protocol3_command(direct_endpoint, request.payload)
+                else:
+                    raise ValueError("endpoint 操作与协商的批量能力不匹配")
+                if command == "stage_batch":
                     if not isinstance(result, Protocol3StageReceipt) or len(staged_shares) != 1:
                         raise ValueError("角色暂存未产生唯一输出份额。")
                     result = PartyStageResult(result, staged_shares[0])
@@ -560,6 +603,7 @@ def _send_hello(
     nonce: str,
     deadline: float,
     limit: int,
+    *, batch: bool = False,
 ) -> None:
     _send_data(
         sock,
@@ -574,7 +618,8 @@ def _send_hello(
             None,
             None,
             None,
-            HelloPayload(nonce, os.getpid()),
+            BatchHelloPayload(HelloPayload(nonce, os.getpid())) if batch
+            else HelloPayload(nonce, os.getpid()),
         ),
         deadline,
         limit,
@@ -586,15 +631,20 @@ def _validate_hello(
     sender: RoleName,
     recipient: Literal["Supervisor", "P1", "P2"],
     nonce: str,
+    *, batch: bool = False,
 ) -> None:
+    payload = message.payload
+    base = payload.base if isinstance(payload, BatchHelloPayload) else payload
     if (
         message.kind != "hello"
         or message.sender != sender
         or message.recipient != recipient
         or message.sequence != 0
         or message.operation != "hello"
-        or not isinstance(message.payload, HelloPayload)
-        or message.payload.nonce != nonce
+        or (batch and not isinstance(payload, BatchHelloPayload))
+        or (not batch and not isinstance(payload, HelloPayload))
+        or not isinstance(base, HelloPayload)
+        or base.nonce != nonce
     ):
         raise ValueError("localhost hello 身份或 nonce 不匹配。")
 
@@ -717,10 +767,12 @@ def _complete_client_round(
     second: _ClientPartyEndpoint,
     plan: StepResourcePlan,
     on_phase: Callable[[str], None] | None = None,
+    *, batch: bool = False,
 ) -> ClientStepResult:
     """仅在两方暂存、重构与双提交均完成后签发父进程可见结果。"""
     orchestrator = Protocol3Orchestrator()
-    receipts = orchestrator.stage(first, second, plan)
+    receipts = (orchestrator.stage_batch(first, second, plan) if batch else
+                orchestrator.stage(first, second, plan))
     if on_phase is not None:
         on_phase("stage")
     shares = (first.share, second.share)

@@ -86,6 +86,14 @@ class Protocol3PartyEndpoint(Protocol):
     def commit(self) -> None: ...
 
 
+class Protocol3BatchPartyEndpoint(Protocol3PartyEndpoint, Protocol):
+    """Client 只启动两方整步任务并收回执，不能驱动逐资源操作。"""
+
+    def start_stage_batch(self) -> None: ...
+
+    def finish_stage_batch(self) -> Protocol3StageReceipt: ...
+
+
 class Protocol3Orchestrator:
     """唯一的 transport-neutral Protocol 3 操作与消息顺序。"""
 
@@ -115,6 +123,24 @@ class Protocol3Orchestrator:
             p1.complete_truncation(metadata)
             p2.complete_truncation(metadata)
         receipts = p1.stage_output(), p2.stage_output()
+        self._validate_receipts(receipts, plan)
+        return receipts
+
+    def stage_batch(
+        self, p1: Protocol3BatchPartyEndpoint, p2: Protocol3BatchPartyEndpoint,
+        plan: StepResourcePlan,
+    ) -> tuple[Protocol3StageReceipt, Protocol3StageReceipt]:
+        self._validate_endpoints(p1, p2, plan)
+        p1.start_stage_batch()
+        p2.start_stage_batch()
+        receipts = p1.finish_stage_batch(), p2.finish_stage_batch()
+        self._validate_receipts(receipts, plan)
+        return receipts
+
+    @staticmethod
+    def _validate_receipts(
+        receipts: tuple[Protocol3StageReceipt, Protocol3StageReceipt], plan: StepResourcePlan,
+    ) -> None:
         expected = (
             plan.session_id,
             plan.round_id,
@@ -135,7 +161,6 @@ class Protocol3Orchestrator:
             for party, receipt in enumerate(receipts)
         ):
             raise ValueError("Protocol 3 暂存回执与资源计划不匹配。")
-        return receipts
 
     def commit(self, p1: Protocol3PartyEndpoint, p2: Protocol3PartyEndpoint) -> None:
         """在调用方完成输出验证后按固定 P1/P2 顺序提交两方 state。"""
@@ -168,6 +193,66 @@ class Protocol3PeerPort(Protocol):
     def send_truncation(self, metadata: ResourceMetadata, payload: P2TruncationPayload) -> None: ...
 
     def receive_truncation(self, metadata: ResourceMetadata) -> P2TruncationPayload: ...
+
+
+class Protocol3BatchPeerPort(Protocol):
+    """对整个本地计划收发和校验；传输层不能决定算术资源次序。"""
+
+    def exchange_products(
+        self, plan: StepResourcePlan, masks: tuple[ProductMaskPayload, ...],
+    ) -> tuple[ProductMaskPayload, ...]: ...
+
+    def product_complete(self, plan: StepResourcePlan) -> None: ...
+
+    def send_truncations(
+        self, plan: StepResourcePlan, values: tuple[P2TruncationPayload, ...],
+    ) -> None: ...
+
+    def receive_truncations(self, plan: StepResourcePlan) -> tuple[P2TruncationPayload, ...]: ...
+
+    def state_complete(self, plan: StepResourcePlan) -> None: ...
+
+
+def stage_protocol3_batch(
+    endpoint: LocalProtocol3PartyEndpoint, peer: Protocol3BatchPeerPort,
+) -> Protocol3StageReceipt:
+    """单方整步阶段；所有产品先聚合，再按原行次序截断并暂存。"""
+    if not isinstance(endpoint, LocalProtocol3PartyEndpoint):
+        raise TypeError("批量 stage 需要 canonical 单方 endpoint")
+    plan = endpoint.plan
+    try:
+        masks = tuple(endpoint.mask_product(item) for item in plan.product_resources)
+        incoming = peer.exchange_products(plan, masks)
+        if len(incoming) != plan.triple_count:
+            raise ValueError("乘法批次不完整")
+        for metadata, value in zip(plan.product_resources, incoming, strict=True):
+            endpoint.finish_product(metadata, value)
+        peer.product_complete(plan)
+        for metadata in plan.product_resources:
+            endpoint.complete_product(metadata)
+        endpoint.finish_products()
+        if plan.state_truncation_resources:
+            for metadata in plan.state_truncation_resources:
+                endpoint.mask_truncation(metadata)
+            if endpoint.party == 1:
+                values = tuple(endpoint.p2_truncation_message_direct(metadata)
+                               for metadata in plan.state_truncation_resources)
+                peer.send_truncations(plan, values)
+                for metadata in plan.state_truncation_resources:
+                    endpoint.finish_truncation_p2(metadata)
+            else:
+                values = peer.receive_truncations(plan)
+                if len(values) != plan.truncation_count:
+                    raise ValueError("截断批次不完整")
+                for metadata, value in zip(plan.state_truncation_resources, values, strict=True):
+                    endpoint.finish_truncation_p1_direct(metadata, value)
+            peer.state_complete(plan)
+            for metadata in plan.state_truncation_resources:
+                endpoint.complete_truncation(metadata)
+        return endpoint.stage_output()
+    except Exception:
+        endpoint.abort()
+        raise
 
 
 class DirectProtocol3PartyEndpoint:

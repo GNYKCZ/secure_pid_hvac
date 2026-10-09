@@ -1,5 +1,30 @@
 # 独立三角色连续 LAN 实验（Issues #86、#84、#75、#92）
 
+## 批量通信（#116）
+
+三个角色默认通过 `control-batch-v1` 能力握手，同一运行必须使用同一版本程序；
+任一角色没有该能力时在 setup 前失败，不自动退回逐门协议。动态控制的一步只向每方
+发送一次完整 stage 命令，双方各返回一次 stage 回执；在 30 个乘法、4 个
+state 截断的动态基准中，P1/P2 发送 7 个 peer 帧。起摆的 38 个乘法保持原资源顺序和逐门截断，按公开
+依赖拓扑分成 16 层，同层交换并在下一层前完成双方屏障，共 80 个 peer 帧。
+原有输出重构、双提交、失败轮次烧毁、控制/实验结果 reader 不变。
+
+在可信本机可用下列命令测量三进程回环；`legacy` 仅是**显式诊断模式**，需
+Client、P1、P2 同时选择，普通入口默认不启用。报告记录整个会话的各方向应用帧
+与字节（含四字节长度头）、Client 逐步耗时、p50/p95/p99、抖动和超过 20 ms
+的步数。`--delay-ms` 在每个应用帧发送前加入单向延迟，不模拟 TLS、真实网络
+或物理对象，不能把回环结果当作三机采样保证。输出目标须是不存在的新文件。
+
+```powershell
+uv run python -m secure_control.experiments.lan_runner benchmark --case dynamic --mode batch --steps 30 --delay-ms 1 --output results/diagnostics/dynamic-batch.json
+uv run python -m secure_control.experiments.lan_runner benchmark --case scalar --mode batch --steps 20 --delay-ms 1 --output results/diagnostics/scalar-batch.json
+```
+
+比较旧算法通信时将 `--mode batch` 改为 `--mode legacy` 并换一个输出文件名。
+诊断报告不保存任何秘密帧、份额、随机数或秘密状态；其 `code_sha`、`dirty`、
+配置引用和环境字段需要与具体结论一起阅读。真实三台机器上的时延、超时与
+可达性须在实际部署后另行测量。
+
 ## 持续分段后端（#100）
 
 三个终端仍分别启动原 P1、P2、Client 文件；持续模式由 Client 显式选择：

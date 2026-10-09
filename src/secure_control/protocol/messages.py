@@ -424,6 +424,62 @@ class StepResourcePlan:
         return len(self.state_truncation_resources)
 
 
+def public_step_plan_sha256(plan: StepResourcePlan) -> str:
+    """仅绑定公开 layout、尺度、资源身份和顺序，不摘要秘密矩阵值。"""
+    if not isinstance(plan, StepResourcePlan):
+        raise TypeError("批次计划需要 StepResourcePlan")
+    encoded = json.dumps(asdict(plan), sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=False, allow_nan=False).encode("utf-8")
+    return sha256(b"control-batch-v1-plan\0" + encoded).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class Protocol3BatchPayload:
+    """Peer 单帧完整批次；数值仅限既有允许公开的遮蔽份额。"""
+
+    phase: Literal["product", "product_complete", "truncation", "state_complete"]
+    plan_sha256: str
+    run_id: str | None
+    epoch_id: str
+    physical_step: int | None
+    batch_index: int
+    resource_ids: tuple[str, ...]
+    products: tuple[ProductMaskPayload, ...] = ()
+    truncations: tuple[P2TruncationPayload, ...] = ()
+    version: Literal["control-batch-v1"] = "control-batch-v1"
+
+    def __post_init__(self) -> None:
+        if (self.version != "control-batch-v1"
+                or self.phase not in {"product", "product_complete", "truncation",
+                                      "state_complete"}
+                or type(self.batch_index) is not int or self.batch_index < 0
+                or not isinstance(self.plan_sha256, str)
+                or len(self.plan_sha256) != 64
+                or not isinstance(self.epoch_id, str) or not self.epoch_id
+                or self.run_id is not None and (not isinstance(self.run_id, str)
+                                                 or not self.run_id)
+                or self.physical_step is not None and (
+                    type(self.physical_step) is not int or self.physical_step < 0
+                )
+                or not isinstance(self.resource_ids, tuple)
+                or any(not isinstance(item, str) or not item for item in self.resource_ids)
+                or len(set(self.resource_ids)) != len(self.resource_ids)):
+            raise ValueError("Protocol 3 批次身份不合法")
+        if self.phase == "product":
+            valid = (len(self.products) == len(self.resource_ids)
+                     and not self.truncations
+                     and all(isinstance(item, ProductMaskPayload) for item in self.products))
+        elif self.phase == "truncation":
+            valid = (len(self.truncations) == len(self.resource_ids)
+                     and not self.products
+                     and all(isinstance(item, P2TruncationPayload)
+                             for item in self.truncations))
+        else:
+            valid = not self.products and not self.truncations
+        if not valid:
+            raise ValueError("Protocol 3 批次 shape、类型或阶段不匹配")
+
+
 class _ResourceLifecycle:
     """绑定同一逻辑资源的两份局部材料，阻止跨会话、跨轮次或失败后的重放。"""
 
@@ -634,6 +690,7 @@ class Protocol3StageReceipt:
 
 
 Protocol3Operation = Literal[
+    "stage_batch",
     "mask_product",
     "finish_product",
     "complete_product",

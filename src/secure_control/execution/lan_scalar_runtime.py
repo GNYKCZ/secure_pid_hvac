@@ -20,8 +20,10 @@ from secure_control.protocol.arithmetic import (
 from .lan_config import LanConfig
 from .lan_transport import connect_role
 from .localhost_codec import (
+    BatchHelloPayload,
     LanHelloPayload,
     ScalarFrameV3,
+    ScalarLayerPayloadV1,
     ScalarSetupV3,
     ScalarStageV3,
     decode_scalar_frame_v3,
@@ -85,6 +87,7 @@ class _SocketScalarPeer(ScalarPeerPort):
         self, sock: socket.socket, *, party: int, run_id: str, epoch_id: str,
         session_id: str, physical_step: int, local_step: int,
         round_id: str, deadline: float,
+        program_sha256: str | None = None, modulus: int | None = None,
     ) -> None:
         self.sock = sock
         self.party = party
@@ -95,6 +98,8 @@ class _SocketScalarPeer(ScalarPeerPort):
         self.local_step = local_step
         self.round_id = round_id
         self.deadline = deadline
+        self.program_sha256 = program_sha256
+        self.modulus = modulus
 
     def _frame(self, operation: str, resource: str, payload: object, *, incoming=False):
         sender = "P1" if self.party == 0 else "P2"
@@ -140,6 +145,74 @@ class _SocketScalarPeer(ScalarPeerPort):
             self.deadline,
         )
 
+    def _layer_payload(
+        self, phase: str, layer_index: int, ids: tuple[str, ...],
+        values: tuple[tuple[int, ...], ...] = (),
+    ) -> ScalarLayerPayloadV1:
+        if self.program_sha256 is None or self.modulus is None:
+            raise ValueError("标量 peer 没有协商批量层能力")
+        return ScalarLayerPayloadV1(phase, self.program_sha256, layer_index, ids, values)
+
+    def _send_layer(self, payload: ScalarLayerPayloadV1) -> None:
+        _send(self.sock, self._frame("peer_layer", f"layer:{payload.layer_index}", payload),
+              self.deadline)
+
+    def _receive_layer(
+        self, phase: str, layer_index: int, ids: tuple[str, ...],
+    ) -> ScalarLayerPayloadV1:
+        payload = _receive(
+            self.sock, self._frame("peer_layer", f"layer:{layer_index}", None,
+                                   incoming=True), self.deadline,
+        ).payload
+        if (not isinstance(payload, ScalarLayerPayloadV1)
+                or (payload.phase, payload.program_sha256, payload.layer_index,
+                    payload.resource_ids, payload.version)
+                != (phase, self.program_sha256, layer_index, ids, "control-batch-v1")
+                or any(not 0 <= value < self.modulus
+                       for row in payload.values for value in row)):
+            raise ValueError("标量层批次身份、顺序或 residue 无效")
+        return payload
+
+    def exchange_layer_products(
+        self, layer_index: int, resource_ids: tuple[str, ...],
+        values: tuple[tuple[int, int], ...],
+    ) -> tuple[tuple[int, int], ...]:
+        outgoing = self._layer_payload("product", layer_index, resource_ids, values)
+        if self.party == 0:
+            self._send_layer(outgoing)
+            incoming = self._receive_layer("product", layer_index, resource_ids)
+        else:
+            incoming = self._receive_layer("product", layer_index, resource_ids)
+            self._send_layer(outgoing)
+        return incoming.values
+
+    def send_layer_truncations(
+        self, layer_index: int, resource_ids: tuple[str, ...], values: tuple[int, ...],
+    ) -> None:
+        if self.party != 1:
+            raise ValueError("只有 P2 能发送标量截断层")
+        self._send_layer(self._layer_payload(
+            "truncation", layer_index, resource_ids, tuple((value,) for value in values),
+        ))
+
+    def receive_layer_truncations(
+        self, layer_index: int, resource_ids: tuple[str, ...],
+    ) -> tuple[int, ...]:
+        if self.party != 0:
+            raise ValueError("只有 P1 能接收标量截断层")
+        return tuple(row[0] for row in self._receive_layer(
+            "truncation", layer_index, resource_ids,
+        ).values)
+
+    def complete_layer(self, layer_index: int, resource_ids: tuple[str, ...]) -> None:
+        payload = self._layer_payload("complete", layer_index, resource_ids)
+        if self.party == 0:
+            self._send_layer(payload)
+            self._receive_layer("complete", layer_index, resource_ids)
+        else:
+            self._receive_layer("complete", layer_index, resource_ids)
+            self._send_layer(payload)
+
 
 class LanScalarRuntime:
     """Client 对一个无递推状态的固定门 epoch 独占两条 party 连接。"""
@@ -148,6 +221,7 @@ class LanScalarRuntime:
         self, config: LanConfig, program: ScalarProgram, certificate: ScalarCertificate,
         *, modulus: int, modulus_evidence: PrimeModulusEvidence | None,
         run_id: str, epoch_id: str, start_physical_step: int,
+        batch: bool = True,
     ) -> None:
         if config.role != "Client" or config.experiment_config is None:
             raise ValueError("v3 标量运行须使用 Client 配置")
@@ -165,12 +239,15 @@ class LanScalarRuntime:
         self.epoch_id = epoch_id
         self.session_id = f"scalar-{secrets.token_hex(16)}"
         self.start_physical_step = start_physical_step
+        self.batch = batch
         self.local_step = 0
         self._sockets: list[socket.socket] = []
         self._spent: set[str] = set()
         self._failed = False
         self._ended = False
-        hello = LanHelloPayload(config.topology.digest, secrets.token_hex(32), "lan-scalar-v3")
+        base_hello = LanHelloPayload(config.topology.digest, secrets.token_hex(32),
+                                     "lan-scalar-v3")
+        hello = BatchHelloPayload(base_hello) if batch else base_hello
         try:
             from .lan_runtime import _hello, _request
 
@@ -320,6 +397,7 @@ def run_party_scalar_session(
     config: LanConfig, client_sock: socket.socket, peer_sock: socket.socket,
     *, role: str, session_id: str, expected_run_id: str | None = None,
     expected_physical_step: int | None = None, previous_epoch_id: str | None = None,
+    batch: bool = False,
 ) -> dict[str, object]:
     """已完成既有 hello/peer 身份验证后执行一个 v3 固定门 epoch。"""
     party = 0 if role == "P1" else 1
@@ -407,8 +485,10 @@ def run_party_scalar_session(
             peer_sock, party=party, run_id=run_id, epoch_id=epoch_id,
             session_id=session_id, physical_step=physical_start + committed,
             local_step=committed, round_id=round_id, deadline=step_deadline,
+            program_sha256=public.topology_sha256() if batch else None,
+            modulus=setup.modulus if batch else None,
         )
-        share = executor.evaluate(peer)
+        share = executor.evaluate_batch(peer) if batch else executor.evaluate(peer)
         _send(client_sock, ScalarFrameV3(
             role, "Client", run_id, epoch_id, session_id,
             physical_start + committed, committed, round_id, None, "result",
