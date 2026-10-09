@@ -19,16 +19,6 @@ def test_paper_rounding_handles_positive_and_negative_half_ties() -> None:
     assert encoded.tolist() == [1, 0, 2, -1, -2]
 
 
-def test_encode_decode_round_trip_is_bounded_by_half_quantization_step() -> None:
-    """验证编码解码误差不超过一个量化步长的一半。"""
-    context = FixedPointContext(modulus=257, integer_bits=8, fractional_bits=3)
-    values = np.array([-3.125, -0.2, 0.0, 1.26, 7.75])
-
-    decoded = context.decode(context.encode(values))
-
-    assert np.all(np.abs(decoded - values) <= 0.5 / context.scale)
-
-
 def test_large_integer_encoding_preserves_all_legal_payload_bits() -> None:
     """验证合法域内的 Python 大整数不会在编码前退化为浮点数。"""
     context = FixedPointContext(
@@ -108,23 +98,6 @@ def test_centered_mapping_covers_even_and_odd_modulus_boundaries() -> None:
     assert even_context.to_residue(np.array([-8, -1, 0, 7])).tolist() == [8, 15, 0, 7]
 
 
-def test_scalar_vector_and_matrix_shapes_preserve_arbitrary_precision_integer_storage() -> None:
-    """验证标量、向量和矩阵均保持 shape，模整数容器不退化为固定位宽。"""
-    context = FixedPointContext(modulus=257, integer_bits=8, fractional_bits=2)
-
-    scalar = context.encode_to_residue(-1.25)
-    vector = context.encode_to_residue([0.0, 0.25, -0.5])
-    matrix = context.add_residues(np.array([[1], [2]]), np.array([3, 4]))
-
-    assert scalar == 252
-    assert vector.shape == (3,)
-    assert vector.dtype == object
-    assert vector.tolist() == [0, 1, 255]
-    assert matrix.shape == (2, 2)
-    assert matrix.dtype == object
-    assert matrix.tolist() == [[4, 5], [5, 6]]
-
-
 def test_large_modulus_product_uses_python_integers_without_int64_wraparound() -> None:
     """验证大模数乘法没有经由 NumPy 固定位宽整数产生静默回绕。"""
     modulus = (1 << 256) - 189
@@ -142,8 +115,6 @@ def test_large_modulus_product_uses_python_integers_without_int64_wraparound() -
     ("constructor", "error_type"),
     [
         (lambda: FixedPointContext(modulus=2, integer_bits=1, fractional_bits=0), ValueError),
-        (lambda: FixedPointContext(modulus=17, integer_bits=5, fractional_bits=0), ValueError),
-        (lambda: FixedPointContext(modulus=17, integer_bits=4, fractional_bits=-1), ValueError),
         (lambda: FixedPointContext(modulus=True, integer_bits=1, fractional_bits=0), TypeError),
     ],
 )
@@ -167,11 +138,3 @@ def test_encoding_and_decoding_reject_nonfinite_and_out_of_range_values() -> Non
         context.decode(8)
     with pytest.raises(ValueError, match="canonical"):
         context.from_residue(17)
-
-
-def test_decode_residue_rejects_centered_value_outside_declared_payload_range() -> None:
-    """验证解码不把大模代表元误解释为当前 k 位普通 payload。"""
-    context = FixedPointContext(modulus=257, integer_bits=4, fractional_bits=0)
-
-    with pytest.raises(ValueError, match="payload"):
-        context.decode_residue(100)

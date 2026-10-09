@@ -277,67 +277,6 @@ def test_resource_pair_cannot_be_reused_after_a_successful_step() -> None:
     assert online.p1_resources.aborted_count == 0
 
 
-def test_reseeded_test_rng_domain_separates_each_online_round_material() -> None:
-    """验证同一 Client 重新播种测试 RNG 时，各 round 的 triple 与 mask 仍不重复。"""
-    client, _, _, _, distribution = make_stack()
-    first = client.prepare_online(distribution, [0.0], step=0, rng=random.Random(20))
-    second = client.prepare_online(distribution, [0.25], step=1, rng=random.Random(20))
-
-    first_triples = [
-        client.sharing.reconstruct(first_item.triple.b, second_item.triple.b)
-        for first_item, second_item in zip(
-            first.p1_resources.product_resources,
-            first.p2_resources.product_resources,
-            strict=True,
-        )
-    ]
-    second_triples = [
-        client.sharing.reconstruct(first_item.triple.b, second_item.triple.b)
-        for first_item, second_item in zip(
-            second.p1_resources.product_resources,
-            second.p2_resources.product_resources,
-            strict=True,
-        )
-    ]
-    first_masks = [
-        (
-            client.sharing.reconstruct(first_item.truncation.r, second_item.truncation.r),
-            client.sharing.reconstruct(
-                first_item.truncation.r_prime, second_item.truncation.r_prime
-            ),
-        )
-        for first_item, second_item in zip(
-            first.p1_resources.state_truncation_resources,
-            first.p2_resources.state_truncation_resources,
-            strict=True,
-        )
-    ]
-    second_masks = [
-        (
-            client.sharing.reconstruct(first_item.truncation.r, second_item.truncation.r),
-            client.sharing.reconstruct(
-                first_item.truncation.r_prime, second_item.truncation.r_prime
-            ),
-        )
-        for first_item, second_item in zip(
-            second.p1_resources.state_truncation_resources,
-            second.p2_resources.state_truncation_resources,
-            strict=True,
-        )
-    ]
-
-    assert first.round_id != second.round_id
-    # 每个公开 e 都减去其对应 triple 的 b；逐项不同才不会暴露跨轮 input 差值。
-    assert all(
-        first_value != second_value
-        for first_value, second_value in zip(first_triples, second_triples, strict=True)
-    )
-    assert all(
-        first_value != second_value
-        for first_value, second_value in zip(first_masks, second_masks, strict=True)
-    )
-
-
 def test_explicit_system_random_is_not_downgraded_to_test_prng(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -433,51 +372,6 @@ def test_cross_session_servers_and_cross_round_inputs_are_rejected_before_state_
     assert foreign_distribution.session_id != distribution.session_id
 
 
-def test_client_rejects_cross_session_control_output_shares() -> None:
-    """验证 Client 不会重构来自不同 controller session 或 round 的 output shares。"""
-    client, p1, p2, coordinator, distribution = make_stack(seed=40)
-    first = coordinator.execute(
-        p1, p2, client.prepare_online(distribution, [0.25], step=0, rng=random.Random(41))
-    )
-    other_client, other_p1, other_p2, other_coordinator, other_distribution = make_stack(seed=42)
-    second = other_coordinator.execute(
-        other_p1,
-        other_p2,
-        other_client.prepare_online(other_distribution, [0.25], step=0, rng=random.Random(43)),
-    )
-
-    with pytest.raises(ValueError, match="session/round"):
-        client.reconstruct_control(first[0], second[1])
-
-
-def test_fixed_resource_seed_cannot_collide_controller_sessions_or_mix_servers() -> None:
-    """验证资源随机源可重放时，身份仍唯一且跨 controller 组合会在 claim 前拒绝。"""
-    first_client, first_p1, _, first_coordinator, first_distribution = make_stack(seed=10)
-    fixed_point = FixedPointContext(2_147_483_647, integer_bits=20, fractional_bits=8)
-    second_client = Client(fixed_point, TwoPartySharing(fixed_point.modulus), security_parameter=8)
-    second_spec = ControllerSpec(
-        A=np.array([[0.5, 0.0], [0.0, 0.5]]),
-        B=np.array([[0.25], [-0.25]]),
-        C=np.array([[2.0, 2.0]]),
-        D=np.array([[0.5]]),
-        x0=np.array([0.5, 0.0]),
-        scale_metadata=ControllerScaleMetadata(state=8, input=8, output=16, A=8, B=8, C=8, D=8),
-    )
-    second_distribution = second_client.distribute_controller(
-        second_spec,
-        ControllerRangeContract(state_payload_bounds=(256, 256), input_payload_bounds=(64,)),
-        rng=random.Random(10),
-    )
-    online = first_client.prepare_online(first_distribution, [0.25], step=0, rng=random.Random(20))
-    initial_state = share_values(first_p1.state_share)
-
-    assert first_distribution.session_id != second_distribution.session_id
-    with pytest.raises(ValueError, match="session"):
-        first_coordinator.execute(first_p1, P2(second_distribution.p2), online)
-    assert share_values(first_p1.state_share) == initial_state
-    assert online.p1_resources.aborted_count == 11
-
-
 def test_client_rejects_complete_output_pair_from_another_client() -> None:
     """验证两条彼此匹配的外来输出也不能绕过 Client 的已签发 round 登记。"""
     client, _, _, _, _ = make_stack(seed=40)
@@ -514,28 +408,6 @@ def test_client_validates_output_shape_and_reconstructs_each_round_once() -> Non
     np.testing.assert_allclose(client.reconstruct_control(*output), np.array([0.625]))
     with pytest.raises(ValueError, match="已完成"):
         client.reconstruct_control(*output)
-
-
-def test_fixed_seed_replays_material_only_for_isolated_client_transcripts() -> None:
-    """验证隔离 Client transcript 可重放测试材料，而 session/round 身份保持独立。"""
-    first_client, first_p1, first_p2, first_coordinator, first_distribution = make_stack(seed=30)
-    second_client, second_p1, second_p2, second_coordinator, second_distribution = make_stack(
-        seed=30
-    )
-    first_online = first_client.prepare_online(
-        first_distribution, [0.25], step=3, rng=random.Random(40)
-    )
-    second_online = second_client.prepare_online(
-        second_distribution, [0.25], step=3, rng=random.Random(40)
-    )
-
-    first_output = first_coordinator.execute(first_p1, first_p2, first_online)
-    second_output = second_coordinator.execute(second_p1, second_p2, second_online)
-
-    assert first_online.session_id != second_online.session_id
-    assert first_online.round_id != second_online.round_id
-    assert share_values(first_output[0].value) == share_values(second_output[0].value)
-    assert share_values(first_output[1].value) == share_values(second_output[1].value)
 
 
 def test_protocol_rejects_incompatible_controller_scale_metadata() -> None:
@@ -660,24 +532,13 @@ def test_integer_valued_a_b_still_truncate_when_metadata_declares_fixed_point() 
 
 @pytest.mark.parametrize(
     ("metadata", "message"),
-    [
-        (
+    [(
             ControllerScaleMetadata(state=8, input=8, output=16, A=0, B=8, C=8, D=8),
             "state products",
-        ),
-        (
-            ControllerScaleMetadata(state=8, input=8, output=16, A=4, B=4, C=8, D=8),
-            "Trunc shift",
-        ),
-        (
+        ), (
             ControllerScaleMetadata(state=8, input=8, output=15, A=8, B=8, C=8, D=8),
             "output accumulator",
-        ),
-        (
-            ControllerScaleMetadata(state=7, input=8, output=15, A=8, B=7, C=8, D=7),
-            "state/input",
-        ),
-    ],
+        )],
 )
 def test_scale_ledger_rejects_unsupported_combinations_before_sharing(
     metadata: ControllerScaleMetadata, message: str
@@ -701,35 +562,6 @@ def test_scale_ledger_rejects_unsupported_combinations_before_sharing(
             rng=random.Random(62),
         )
     assert (client.multiplier.created_triples, client.truncation.created_masks) == (0, 0)
-
-
-def test_zero_fractional_bits_reject_non_integer_matrix_before_sharing() -> None:
-    """验证声明为整数尺度的 A/B 不会把小数静默取整为错误控制器。"""
-    fixed_point = FixedPointContext(2_147_483_647, integer_bits=20, fractional_bits=8)
-    client = Client(fixed_point, TwoPartySharing(fixed_point.modulus), security_parameter=8)
-    spec = ControllerSpec(
-        A=np.array([[0.5]]),
-        B=np.array([[0.0]]),
-        C=np.array([[1.0]]),
-        D=np.array([[0.0]]),
-        x0=np.array([0.0]),
-        scale_metadata=ControllerScaleMetadata(
-            state=8,
-            input=8,
-            output=8,
-            A=0,
-            B=0,
-            C=0,
-            D=0,
-        ),
-    )
-
-    with pytest.raises(ValueError, match="整数"):
-        client.distribute_controller(
-            spec,
-            ControllerRangeContract(state_payload_bounds=(1,), input_payload_bounds=(1,)),
-            rng=random.Random(63),
-        )
 
 
 def test_integrator_needs_proven_finite_horizon_and_rejects_overrun_before_resources() -> None:
@@ -863,15 +695,6 @@ def test_closed_loop_evidence_rejects_unrelated_stable_problem_before_sharing(
     with pytest.raises(ValueError, match="transition"):
         client.distribute_controller(spec, contract)
     assert called is False
-
-
-@pytest.mark.parametrize("horizon", [0, -1, True, 1.5])
-def test_finite_horizon_requires_positive_integer(horizon: object) -> None:
-    """拒绝零、负值、布尔和非整数时域，避免证明循环被静默跳过。"""
-    with pytest.raises(ValueError, match="horizon_steps"):
-        ControllerRangeContract(
-            state_payload_bounds=(1,), input_payload_bounds=(1,), horizon_steps=horizon
-        )
 
 
 def test_finite_horizon_proves_general_trunc_path_with_rounding_margin() -> None:

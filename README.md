@@ -80,6 +80,9 @@ uv sync --locked
 uv run pytest
 ```
 
+默认执行精简后保留的全部测试。当前保留范围、已退出的历史验收，
+以及快速、进程集成、GUI和长时入口，见[测试指南](docs/testing.md)。
+
 运行静态检查：
 
 ```powershell
@@ -100,7 +103,8 @@ uv run python -c "import secure_control; print(secure_control.__version__)"
 无需启动 P1/P2；其明文报告不代表已实现安全起摆。
 从下垂起点分别完成两测量动态捕获的明文与三进程安全路线、v3 验证结果和 GUI 入口见
 [完整路线指南](docs/cart_pole_full_route.md)。
-旧 HVAC 命令不再作为用户入口展示，示例输入移入测试夹具；底层实现和相应回归仍供内部验证。
+旧 HVAC 命令不再作为用户入口展示，示例输入移入测试夹具；底层实现保留，
+HVAC专属回归已按 #117 的测试范围收缩退出。
 
 ## 安全算术基线
 

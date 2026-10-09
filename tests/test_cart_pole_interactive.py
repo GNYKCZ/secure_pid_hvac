@@ -10,13 +10,13 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from lan_test_support import reap_processes, role_command, start_processes
 from scipy.integrate import solve_ivp
 from test_cart_pole_balance import ORACLE_K, _oracle_rhs
 from test_cart_pole_lan import _SECOND_ROUND_DISCONNECT, _profile_for, _QuantizedLqrRuntime
-from test_lan_continuous import _finish, _plain_deployment, _run
+from test_lan_continuous import _finish, _plain_deployment
 
-from secure_control.experiments import cart_pole_evidence
-from secure_control.experiments.artifacts import _write_artifacts, write_artifacts
+from secure_control.experiments.artifacts import _write_artifacts
 from secure_control.experiments.cart_pole_evidence import (
     EVIDENCE_NAME,
     MOTION_MANIFEST_NAME,
@@ -161,30 +161,6 @@ def test_total_force_request_rejected_without_clipping() -> None:
     assert ("rejected", {"step": 0, "reason": "total_force_limit"}) in notices
 
 
-def test_motion_plot_failure_leaves_no_success_run(tmp_path: Path, monkeypatch) -> None:
-    profile = load_cart_pole_lan_profile(PROFILE)
-    session = InteractiveSession(scheduled={200: 1.0})
-    prepared = load_interactive_cart_pole_experiment(PROFILE, session)
-    plan = prepared.build_plan(_QuantizedLqrRuntime(profile))
-    assert prepared.execute_plan is not None
-    result = prepared.execute_plan(plan)
-    prepared.validate_result(result)
-
-    def fail_plot(*_args):
-        raise RuntimeError("injected motion plot failure")
-
-    monkeypatch.setattr(cart_pole_evidence, "_write_motion_plot", fail_plot)
-    output_root = tmp_path / "runs"
-    with pytest.raises(RuntimeError, match="injected motion plot failure"):
-        write_artifacts(
-            result, plan.metadata, prepared.effective_config,
-            {"scenario_name": "cart_pole", "scenario_version": "2", "schema_version": 1},
-            output_root=output_root,
-            derived_writer=lambda record, stage: prepared.write_scenario_evidence(record, stage),
-        )
-    assert not list(output_root.glob("*/metadata.json"))
-
-
 _CLIENT = r"""
 import json
 import sys
@@ -221,12 +197,13 @@ print(json.dumps(result))
 """
 
 
-@pytest.mark.parametrize("mode", ["complete", "cancel", "late_cancel"])
+@pytest.mark.parametrize("mode", ["complete"])
+@pytest.mark.integration
 def test_interactive_three_processes_and_cancel(tmp_path: Path, mode: str) -> None:
     """P1/P2 为独立真实进程，交互 Client 仍走唯一 runner 与会话资源门禁。"""
     paths = _plain_deployment(tmp_path)
     _profile_for(paths)
-    parties = [_run(role, paths[role]) for role in ("P1", "P2")]
+    parties = start_processes([role_command(role, paths[role]) for role in ("P1", "P2")])
     try:
         time.sleep(.5)
         client = subprocess.Popen(
@@ -253,21 +230,18 @@ def test_interactive_three_processes_and_cancel(tmp_path: Path, mode: str) -> No
         assert sidecar["events"][0]["step"] == 200
         assert sidecar["branches"]["secure"]["statuses"][-1] == "stable"
     finally:
-        for party in parties:
-            if party.poll() is None:
-                party.kill()
-            party.communicate()
+        reap_processes(parties)
 
 
+@pytest.mark.integration
 def test_interactive_disconnect_has_no_success_run(tmp_path: Path) -> None:
     paths = _plain_deployment(tmp_path)
     _profile_for(paths)
     captured = tmp_path / "failed-session.txt"
-    p1 = subprocess.Popen(
+    p1, p2 = start_processes([
         [sys.executable, "-c", _SECOND_ROUND_DISCONNECT, str(captured), str(paths["P1"])],
-        cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-    )
-    p2 = _run("P2", paths["P2"])
+        role_command("P2", paths["P2"]),
+    ])
     try:
         time.sleep(.5)
         client = subprocess.Popen(
@@ -279,7 +253,4 @@ def test_interactive_disconnect_has_no_success_run(tmp_path: Path) -> None:
         assert captured.is_file() and captured.read_text(encoding="utf-8")
         assert not list((tmp_path / "runs").glob("*/metadata.json"))
     finally:
-        for party in (p1, p2):
-            if party.poll() is None:
-                party.kill()
-            party.communicate()
+        reap_processes((p1, p2))

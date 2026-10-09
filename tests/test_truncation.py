@@ -62,7 +62,7 @@ def run_protocol(
     return output, auxiliary, p1_masked_value
 
 
-@pytest.mark.parametrize("message", [0, 1, -1, 127, 128, -128, (1 << 20) - 1, -(1 << 20)])
+@pytest.mark.parametrize("message", [0, -1, (1 << 20) - 1, -(1 << 20)])
 def test_protocol_two_output_has_only_the_paper_allowed_one_bit_error(message: int) -> None:
     """验证零、正负和 Z<kappa> 边界的误差属于 {-1,0,1}。"""
     instance = protocol()

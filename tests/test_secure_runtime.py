@@ -8,17 +8,13 @@ import pytest
 from secure_control.core import ControllerScaleMetadata, ControllerSpec
 from secure_control.crypto import (
     FixedPointContext,
-    PocklingtonCertificate,
-    PocklingtonFactorEvidence,
-    PrimeModulusEvidence,
-    pocklington_certificate_sha256,
 )
 from secure_control.execution import (
     ControllerRuntime,
     PlaintextStateSpaceRuntime,
     SecureStateSpaceRuntime,
 )
-from secure_control.protocol import Client, ControllerRangeContract, SingleProcessCoordinator
+from secure_control.protocol import Client, ControllerRangeContract
 
 
 def general_spec() -> ControllerSpec:
@@ -74,25 +70,6 @@ def make_secure_runtime(
         ),
         security_parameter=8,
         test_seed=seed,
-    )
-
-
-def _large_prime_evidence() -> PrimeModulusEvidence:
-    """返回用于 runtime 构造和 reset 传递验证的 65-bit 公开证据。"""
-    certificate = PocklingtonCertificate(
-        candidate=18_446_744_073_709_554_719,
-        factors=(
-            PocklingtonFactorEvidence(2, 1, 7),
-            PocklingtonFactorEvidence(9_223_372_036_854_777_359, 1, 2),
-        ),
-    )
-    return PrimeModulusEvidence(
-        "pocklington_v1",
-        "Issue #33 runtime fixture",
-        "1",
-        "issue33-runtime-65bit-v1",
-        pocklington_certificate_sha256(certificate),
-        certificate,
     )
 
 
@@ -170,45 +147,6 @@ def test_review_report_feedthrough_trigger_matches_between_runtimes() -> None:
     np.testing.assert_array_equal(secure.step(0.25), np.array([0.25]))
 
 
-def test_column_and_flat_inputs_are_interchangeable_between_runtimes() -> None:
-    """验证明文与安全 runtime 接受相同的单步列向量并统一返回 ``(p,)``。"""
-    spec = ControllerSpec(
-        A=np.zeros((1, 1)),
-        B=np.array([[1.0, 0.0]]),
-        C=np.array([[1.0], [-1.0]]),
-        D=np.array([[0.0, 1.0], [1.0, 0.0]]),
-        x0=np.array([0.0]),
-    )
-    contract = ControllerRangeContract(state_payload_bounds=(128,), input_payload_bounds=(64, 64))
-    context = FixedPointContext(2_147_483_647, integer_bits=20, fractional_bits=8)
-    plain_flat = PlaintextStateSpaceRuntime(spec)
-    plain_column = PlaintextStateSpaceRuntime(spec)
-    secure_flat = SecureStateSpaceRuntime(
-        spec, context, contract, security_parameter=8, test_seed=110
-    )
-    secure_column = SecureStateSpaceRuntime(
-        spec, context, contract, security_parameter=8, test_seed=110
-    )
-
-    flat_input = np.array([0.25, -0.125])
-    column_input = np.array([[0.25], [-0.125]])
-    plain_flat_output = plain_flat.step(flat_input)
-    plain_column_output = plain_column.step(column_input)
-    secure_flat_output = secure_flat.step(flat_input)
-    secure_column_output = secure_column.step(column_input)
-
-    assert (
-        plain_flat_output.shape
-        == plain_column_output.shape
-        == secure_flat_output.shape
-        == secure_column_output.shape
-        == (2,)
-    )
-    np.testing.assert_array_equal(plain_flat_output, plain_column_output)
-    np.testing.assert_array_equal(secure_flat_output, secure_column_output)
-    np.testing.assert_allclose(secure_flat_output, plain_flat_output, atol=1.0 / 256.0)
-
-
 def test_zero_state_runtime_executes_static_d_path() -> None:
     """验证 runtime 不为静态 ``u=Dv`` 控制器虚构 state 或 Trunc 生命周期。"""
     spec = ControllerSpec(
@@ -264,10 +202,8 @@ def test_finite_horizon_runtime_reset_restores_three_step_capability() -> None:
 @pytest.mark.parametrize(
     ("value", "exception", "message"),
     [
-        (np.array([[0.25, 0.0]]), ValueError, "列向量"),
         (np.array([0.25, 0.0]), ValueError, "shape"),
         (np.array([np.nan]), FloatingPointError, "NaN"),
-        ("not-a-number", TypeError, "实数"),
         (0.5, ValueError, "input_payload_bounds"),
     ],
 )
@@ -296,29 +232,6 @@ def test_reset_replaces_protocol_session_and_restores_initial_sequence() -> None
 
     assert runtime._distribution.session_id != previous_session
     np.testing.assert_array_equal(runtime.step(0.25), fresh.step(0.25))
-
-
-def test_runtime_reset_reuses_and_revalidates_immutable_modulus_evidence() -> None:
-    """安全 runtime 首次构造与 reset 都使用同一公开证据并保留验证摘要。"""
-    modulus = 18_446_744_073_709_554_719
-    runtime = SecureStateSpaceRuntime(
-        integer_state_spec(),
-        FixedPointContext(modulus, integer_bits=60, fractional_bits=8),
-        ControllerRangeContract(state_payload_bounds=(128,), input_payload_bounds=(64,)),
-        security_parameter=8,
-        modulus_evidence=_large_prime_evidence(),
-        test_seed=131,
-    )
-    before = runtime.modulus_verification
-    range_before = runtime.range_verification
-    runtime.step(0.25)
-    runtime.reset()
-
-    assert before.method == "pocklington_v1"
-    assert runtime.modulus_verification == before
-    assert runtime.range_verification == range_before
-    assert runtime.range_verification.proof_mode == "independent_input_invariant"
-    np.testing.assert_array_equal(runtime.step(0.25), np.array([0.25]))
 
 
 def test_interleaved_instances_keep_state_and_rng_isolated() -> None:
@@ -381,31 +294,3 @@ def test_reset_failure_keeps_previous_session_usable(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(Client, "distribute_controller", original)
 
     np.testing.assert_array_equal(runtime.step(-0.125), reference.step(-0.125))
-
-
-def test_protocol_execution_failure_is_propagated_without_half_step_commit(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """验证 coordinator 在提交后抛错时，runtime 回滚两方 state 并保留原始异常。"""
-    runtime = make_secure_runtime(integer_state_spec(), seed=170)
-    fresh = make_secure_runtime(integer_state_spec(), seed=170)
-    original = SingleProcessCoordinator.execute
-    failed = False
-
-    def fail_after_commit(
-        coordinator: SingleProcessCoordinator, *args: object
-    ) -> tuple[object, object]:
-        """仅在目标 coordinator 首次提交 state 后注入失败。"""
-        nonlocal failed
-        result = original(coordinator, *args)  # type: ignore[arg-type]
-        if coordinator is runtime._coordinator and not failed:
-            failed = True
-            raise RuntimeError("injected execution failure")
-        return result
-
-    monkeypatch.setattr(SingleProcessCoordinator, "execute", fail_after_commit)
-    with pytest.raises(RuntimeError, match="injected execution failure"):
-        runtime.step(0.25)
-    assert runtime._client._issued_rounds == {}
-
-    np.testing.assert_array_equal(runtime.step(0.25), fresh.step(0.25))

@@ -18,6 +18,8 @@ from secure_control.experiments.paper_pid_fig3 import (
 CONFIGS = Path(__file__).resolve().parents[1] / "configs"
 
 
+@pytest.mark.integration
+@pytest.mark.stress
 def test_four_saved_runs_and_figure_are_derived_from_verified_reader(tmp_path: Path) -> None:
     root = run_sweep(CONFIGS / "paper_pid_fig3_sweep.yaml", output_root=tmp_path / "runs")
     manifest = render_saved_sweep(root)
@@ -33,6 +35,8 @@ def test_four_saved_runs_and_figure_are_derived_from_verified_reader(tmp_path: P
         render_saved_sweep(root)
 
 
+@pytest.mark.integration
+@pytest.mark.stress
 def test_missing_point_or_tampered_manifest_rejected(tmp_path: Path) -> None:
     root = run_sweep(CONFIGS / "paper_pid_fig3_sweep.yaml", output_root=tmp_path / "runs")
     path = root / "manifest.json"
@@ -43,6 +47,8 @@ def test_missing_point_or_tampered_manifest_rejected(tmp_path: Path) -> None:
         render_saved_sweep(root)
 
 
+@pytest.mark.integration
+@pytest.mark.stress
 def test_source_drift_and_wrong_precision_fail_before_publish(tmp_path: Path) -> None:
     for name in ("paper_pid_fig3_sweep.yaml", "paper_pid_cascade_zoh.yaml",
                  "hvac_2r2c_sweep_prime.yaml"):

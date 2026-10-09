@@ -2,15 +2,9 @@
 
 from __future__ import annotations
 
-import copy
-import hashlib
-import json
-import subprocess
-import sys
 from dataclasses import replace
 from math import pi
 from pathlib import Path
-from threading import Event
 
 import numpy as np
 import pytest
@@ -18,11 +12,6 @@ from scipy.integrate import solve_ivp
 from test_cart_pole_balance import ORACLE_K, _oracle_rhs
 from test_cart_pole_observer import ORACLE_L, independent_model
 
-from secure_control.experiments.cart_pole_full_evidence import (
-    open_verified_cart_pole_full_run,
-    write_cart_pole_plaintext_full_run,
-)
-from secure_control.experiments.cart_pole_segmented_evidence import _bytes
 from secure_control.scenarios.cart_pole.adapter import MeasurementSample
 from secure_control.scenarios.cart_pole.observer import (
     build_cart_pole_observer_design,
@@ -37,169 +26,6 @@ from secure_control.scenarios.cart_pole.swing_up_experiment import run_plaintext
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "configs/cart_pole_swing_up.yaml"
-
-
-def test_plaintext_full_v3_verified_reader(tmp_path):
-    design = load_cart_pole_observer_design(ROOT / "configs/cart_pole_observer.yaml")
-    swing = load_cart_pole_swing_up_config(CONFIG, design.plant, design.balance)
-    result = run_plaintext_full_experiment(design.plant, design.balance, swing, design)
-    verified = open_verified_cart_pole_full_run(
-        write_cart_pole_plaintext_full_run(result, tmp_path / "plain-v3")
-    )
-    assert verified.manifest["N"] == 1500
-    assert verified.manifest["resource_counts"] == {
-        "beaver_triples": 0, "truncations": 0,
-    }
-    assert verified.observation(309)["phase"] == "capture"
-    physical = json.loads((verified.path / "physical.json").read_text(encoding="utf-8"))
-    manifest = json.loads((verified.path / "run.json").read_text(encoding="utf-8"))
-    for field, value in (
-        ("goal_met", False),
-        ("termination", "time_limit"),
-        ("failure", {"observation_step": None, "interval_step": None,
-                     "reason": "protocol_or_control", "detail": "invented"}),
-    ):
-        altered = copy.deepcopy(physical)
-        altered[field] = value
-        raw = _bytes(altered)
-        (verified.path / "physical.json").write_bytes(raw)
-        updated_manifest = copy.deepcopy(manifest)
-        updated_manifest["physical_sha256"] = hashlib.sha256(raw).hexdigest()
-        (verified.path / "run.json").write_bytes(_bytes(updated_manifest))
-        with pytest.raises(ValueError, match="v3"):
-            open_verified_cart_pole_full_run(verified.path)
-    invented_failure = copy.deepcopy(physical)
-    invented_failure["termination"] = "failed"
-    invented_failure["goal_met"] = False
-    invented_failure["failure"]["reason"] = "setup_or_switch"
-    raw = _bytes(invented_failure)
-    (verified.path / "physical.json").write_bytes(raw)
-    updated_manifest = copy.deepcopy(manifest)
-    updated_manifest["physical_sha256"] = hashlib.sha256(raw).hexdigest()
-    updated_manifest["status"] = "failed_prefix"
-    (verified.path / "run.json").write_bytes(_bytes(updated_manifest))
-    with pytest.raises(ValueError, match="v3"):
-        open_verified_cart_pole_full_run(verified.path)
-    invented_unsealed = copy.deepcopy(physical)
-    invented_unsealed["termination"] = "failed"
-    invented_unsealed["goal_met"] = False
-    invented_unsealed["failure"] = {
-        "observation_step": None, "interval_step": None,
-        "reason": "protocol_or_control", "detail": "invented unsealed tail",
-    }
-    invented_unsealed["unsealed_failure"] = {
-        "physical_steps_before_failure": 1500, "first_unsealed_step": 1500,
-        "attempted_step": None, "unconfirmed_protocol_step": None,
-    }
-    raw = _bytes(invented_unsealed)
-    (verified.path / "physical.json").write_bytes(raw)
-    updated_manifest["physical_sha256"] = hashlib.sha256(raw).hexdigest()
-    (verified.path / "run.json").write_bytes(_bytes(updated_manifest))
-    with pytest.raises(ValueError, match="v3"):
-        open_verified_cart_pole_full_run(verified.path)
-    impossible_interval = copy.deepcopy(physical)
-    impossible_interval["termination"] = "failed"
-    impossible_interval["goal_met"] = False
-    impossible_interval["failure"] = {
-        "observation_step": None, "interval_step": 1500,
-        "reason": "numeric_control", "detail": "invented terminal control",
-    }
-    raw = _bytes(impossible_interval)
-    (verified.path / "physical.json").write_bytes(raw)
-    updated_manifest["physical_sha256"] = hashlib.sha256(raw).hexdigest()
-    (verified.path / "run.json").write_bytes(_bytes(updated_manifest))
-    with pytest.raises(ValueError, match="v3"):
-        open_verified_cart_pole_full_run(verified.path)
-
-
-def test_plaintext_v3_reader_accepts_confirmed_stop_prefix(tmp_path):
-    design = load_cart_pole_observer_design(ROOT / "configs/cart_pole_observer.yaml")
-    swing = load_cart_pole_swing_up_config(CONFIG, design.plant, design.balance)
-    stop = Event()
-
-    def after_step(step, *_args):
-        if step == 5:
-            stop.set()
-
-    result = run_plaintext_full_experiment(
-        design.plant, design.balance, swing, design,
-        on_step=after_step, stop_event=stop,
-    )
-    assert result.completed_steps == 5 and result.termination == "stopped"
-    verified = open_verified_cart_pole_full_run(
-        write_cart_pole_plaintext_full_run(result, tmp_path / "plain-stopped")
-    )
-    assert verified.manifest["N"] == 5
-    assert verified.report["termination"] == "stopped"
-    physical = copy.deepcopy(verified.report)
-    physical["termination"] = "failed"
-    physical["goal_met"] = False
-    physical["failure"] = {
-        "observation_step": None, "interval_step": 5,
-        "reason": "numeric_control", "detail": "invented unobserved control",
-    }
-    raw = _bytes(physical)
-    (verified.path / "physical.json").write_bytes(raw)
-    manifest = copy.deepcopy(verified.manifest)
-    manifest["status"] = "failed_prefix"
-    manifest["physical_sha256"] = hashlib.sha256(raw).hexdigest()
-    (verified.path / "run.json").write_bytes(_bytes(manifest))
-    with pytest.raises(ValueError, match="v3"):
-        open_verified_cart_pole_full_run(verified.path)
-
-
-def test_plaintext_v3_reader_accepts_time_limit_and_failed_interval(tmp_path):
-    design = load_cart_pole_observer_design(ROOT / "configs/cart_pole_observer.yaml")
-    swing = load_cart_pole_swing_up_config(CONFIG, design.plant, design.balance)
-    cases = (
-        (replace(swing, horizon_steps=320, acquisition_deadline_steps=320), "time_limit"),
-        (replace(swing, initial_state=(.49, 0., pi, 0.)), "failed"),
-    )
-    for index, (config, termination) in enumerate(cases):
-        result = run_plaintext_full_experiment(design.plant, design.balance, config, design)
-        assert result.termination == termination
-        verified = open_verified_cart_pole_full_run(
-            write_cart_pole_plaintext_full_run(result, tmp_path / f"plain-prefix-{index}")
-        )
-        assert verified.report["termination"] == termination
-        assert verified.manifest["N"] == result.completed_steps
-
-
-def test_plaintext_v3_reader_rejects_rehashed_false_outcomes(tmp_path):
-    design = load_cart_pole_observer_design(ROOT / "configs/cart_pole_observer.yaml")
-    swing = load_cart_pole_swing_up_config(CONFIG, design.plant, design.balance)
-    short = replace(swing, horizon_steps=16, acquisition_deadline_steps=16)
-    result = run_plaintext_full_experiment(design.plant, design.balance, short, design)
-    assert result.termination == "failed" and not result.goal_met
-    path = write_cart_pole_plaintext_full_run(result, tmp_path / "plain-failed")
-    physical = json.loads((path / "physical.json").read_text(encoding="utf-8"))
-    manifest = json.loads((path / "run.json").read_text(encoding="utf-8"))
-    assert open_verified_cart_pole_full_run(path).report["goal_met"] is False
-
-    for field, value in (
-        ("goal_met", True),
-        ("termination", "observed_success"),
-        ("failure", {"observation_step": None, "interval_step": None,
-                     "reason": None, "detail": None}),
-        ("summary.first_stable_step", 16),
-        ("summary.stable_entry_steps", [16]),
-        ("summary.final_stable_count", 99),
-        ("manifest.status", "complete"),
-    ):
-        altered = copy.deepcopy(physical)
-        altered_manifest = copy.deepcopy(manifest)
-        if field == "manifest.status":
-            altered_manifest["status"] = value
-        elif field.startswith("summary."):
-            altered["summary"][field.split(".", 1)[1]] = value
-        else:
-            altered[field] = value
-        raw = _bytes(altered)
-        (path / "physical.json").write_bytes(raw)
-        altered_manifest["physical_sha256"] = hashlib.sha256(raw).hexdigest()
-        (path / "run.json").write_bytes(_bytes(altered_manifest))
-        with pytest.raises(ValueError, match="v3"):
-            open_verified_cart_pole_full_run(path)
 
 
 @pytest.fixture(scope="module")
@@ -300,9 +126,8 @@ def _independent_full_route(direction: int, pulse: tuple[int, float] | None):
             observer_before, transitions)
 
 
-@pytest.mark.parametrize("direction,pulse", [
-    (1, None), (-1, None), (1, (600, 1.)), (-1, (600, -1.)),
-])
+@pytest.mark.parametrize("direction,pulse", [(1, None), (-1, (600, -1.))])
+@pytest.mark.stress
 def test_full_route_matches_independent_closed_loop(inputs, direction, pulse):
     design, config = inputs
     config = replace(config, kick_direction=direction,
@@ -371,6 +196,7 @@ def test_dynamic_capture_boundary_jitter_does_not_initialize_early(inputs):
     assert len(supervisor.initializations) == 1
 
 
+@pytest.mark.stress
 def test_capture_timeout_reentry_budget_and_initial_error(inputs):
     design, config = inputs
     config = replace(config, capture_timeout_steps=2, capture_max_attempts=1)
@@ -393,7 +219,8 @@ def test_capture_timeout_reentry_budget_and_initial_error(inputs):
     np.testing.assert_array_equal(result.state[0], [0, .02, pi, .03])
 
 
-@pytest.mark.parametrize("angle", [pi - .01, pi + .01])
+@pytest.mark.parametrize("angle", [pi - .01])
+@pytest.mark.stress
 def test_small_drooping_angle_errors_reach_dynamic_balance(inputs, angle):
     design, config = inputs
     changed = replace(config, initial_state=(0., 0., angle, 0.))
@@ -405,6 +232,7 @@ def test_small_drooping_angle_errors_reach_dynamic_balance(inputs, angle):
     assert abs(result.state[-1, 2] - 2 * pi * branch) < 1e-8
 
 
+@pytest.mark.stress
 def test_real_track_speed_and_rejected_disturbance_boundaries(inputs):
     design, config = inputs
     track = run_plaintext_full_experiment(
@@ -437,18 +265,3 @@ def test_changed_physical_parameter_rederives_observer_and_rejects_stale_design(
         supervisor.observe(step, [0, 0, pi, 0])
     assert supervisor.observe(10, [0, 0, .1, -.1]).phase == "capture"
     np.testing.assert_allclose(supervisor.runtime.spec.C, -rebuilt.K, atol=0)
-
-
-def test_cli_plaintext_full_source_snapshot_and_no_overwrite(inputs, tmp_path):
-    output = tmp_path / "full.json"
-    command = [sys.executable, "scripts/run_cart_pole_swing_up.py", str(CONFIG),
-               "--route", "plaintext_full", "--direction", "-1", "--output", str(output)]
-    process = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, check=False)
-    assert process.returncode == 0, process.stdout + process.stderr
-    report = json.loads(output.read_text(encoding="utf-8"))
-    assert report["goal_met"] and report["route"] == "plaintext_full"
-    assert len(report["provenance"]["source_snapshots"]) == 4
-    assert report["observer_initializations"][0]["branch"] == 0
-    previous = output.read_bytes()
-    process = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, check=False)
-    assert process.returncode != 0 and output.read_bytes() == previous

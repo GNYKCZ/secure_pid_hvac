@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
-import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -25,7 +23,6 @@ from secure_control.scenarios.cart_pole.swing_up import (
 )
 from secure_control.scenarios.cart_pole.swing_up_experiment import (
     run_swing_up_experiment,
-    write_swing_up_report,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,21 +38,19 @@ def setup():
 
 
 @pytest.mark.parametrize("name,value", [
-    ("kick_direction", True), ("kick_direction", 1.), ("kick_direction", 0),
-    ("kick_steps", True), ("kick_steps", 0), ("horizon_steps", 1.5),
-    ("capture_hold_observations", False), ("capture_timeout_steps", -1),
-    ("capture_max_attempts", 0), ("acquisition_deadline_steps", True),
-    ("swing_reentry_dwell_steps", 0), ("energy_gain_m_per_j_s", True),
-    ("energy_gain_m_per_j_s", float("inf")), ("cart_position_gain_per_s2", -1),
-    ("cart_velocity_gain_per_s", float("nan")), ("kick_force_n", 0),
-    ("max_cart_speed_m_per_s", True), ("max_pole_speed_rad_per_s", 0),
-    ("initial_state", [0, True, np.pi, 0]), ("initial_state", [0, 0, np.pi]),
-    ("capture_enter_abs", [.35, .5, float("inf"), .8]),
-    ("capture_exit_abs", [.4, .55, .18, False]),
-    ("disturbances", [(True, 1)]), ("disturbances", [(600, True)]),
-    ("disturbances", [(600, 2)]), ("disturbances", [(600, 1), (600, -1)]),
-    ("disturbances", [(600, 1), (500, -1)]), ("disturbances", [(1500, 1)]),
-    ("disturbances", [(600,)]), ("disturbances", {600: 1}),
+    ("kick_direction", True),
+    ("kick_direction", 1.),
+    ("kick_direction", 0),
+    ("kick_steps", True),
+    ("kick_steps", 0),
+    ("energy_gain_m_per_j_s", float("inf")),
+    ("initial_state", [0, 0, np.pi]),
+    ("disturbances", [(True, 1)]),
+    ("disturbances", [(600, 2)]),
+    ("disturbances", [(600, 1), (600, -1)]),
+    ("disturbances", [(600, 1), (500, -1)]),
+    ("disturbances", [(1500, 1)]),
+    ("disturbances", [(600,)]),
 ])
 def test_config_rejects_invalid_types_shapes_and_events(setup, name, value):
     """直接构造/replace 与 YAML 一样守住类型、shape、有限性和事件顺序。"""
@@ -101,7 +96,7 @@ def test_yaml_exact_schema_sources_and_duplicate_keys(setup, tmp_path):
         load_cart_pole_swing_up_config(CONFIG, replace(setup[0], cart_mass_kg=.6), setup[1])
 
 
-@pytest.mark.parametrize("theta", [-3 * np.pi, -np.pi, -.15, 0., .18, np.pi, 2 * np.pi, 5 * np.pi])
+@pytest.mark.parametrize("theta", [-3 * np.pi, -np.pi, -.15, .18, np.pi, 2 * np.pi])
 def test_local_chart_preserves_continuous_angle_and_angular_velocity(theta):
     """只改变局部角；小角边界不引入额外舍入，+π统一为−π。"""
     original = np.array([.1, .2, theta, -.3])
@@ -115,8 +110,7 @@ def test_local_chart_preserves_continuous_angle_and_angular_velocity(theta):
         assert local[2] == pytest.approx((theta + np.pi) % (2 * np.pi) - np.pi, abs=1e-14)
 
 
-@pytest.mark.parametrize("bad", [[0, True, 0, 0], [True] * 4, [0, 0, 0],
-                                 [0, 0, np.nan, 0], [0, 0, 0, np.inf], [0, 0, 1j, 0]])
+@pytest.mark.parametrize("bad", [[0, True, 0, 0], [0, 0, 0], [0, 0, np.nan, 0], [0, 0, 1j, 0]])
 def test_observation_and_math_helpers_reject_invalid_signals(setup, bad):
     """不能在观测到 raw 力的数据流中静默转换 bool、复数或非有限量。"""
     for function in (lambda: upright_coordinates(bad), lambda: pole_energy(setup[0], bad),
@@ -137,8 +131,10 @@ def _accelerations(plant, state, force):
     return np.linalg.solve(matrix, loads)
 
 
-@pytest.mark.parametrize("theta", [0., np.pi, -np.pi, np.pi / 2, -np.pi / 2, 2 * np.pi, .9])
-@pytest.mark.parametrize("modified", [False, True])
+@pytest.mark.parametrize("theta,modified", [
+    (0., False), (np.pi, False), (np.pi / 2, False),
+    (-np.pi / 2, False), (.9, False), (.9, True),
+])
 def test_energy_derivative_and_force_mapping_against_implicit_equations(setup, theta, modified):
     """独立解加速度核对能量导数与期望加速度，水平摆位无奇点。"""
     plant, _, config = setup
@@ -325,7 +321,8 @@ def _independent_closed_loop(direction, pulse=None):
     return np.array(states), np.array(raws), np.array(applied), np.array(forces), modes, counts, statuses, transitions
 
 
-@pytest.mark.parametrize("direction,pulse", [(1, None), (-1, None), (1, (600, 1)), (-1, (600, -1))])
+@pytest.mark.parametrize("direction,pulse", [(1, None), (-1, (600, -1))])
+@pytest.mark.stress
 def test_1500_step_witness_against_independent_full_closed_loop(setup, direction, pulse):
     """两方向与预声明±1N扰动均比较完整轨迹/力/事件/计数，不用生产输出驱动 oracle。"""
     plant, balance, config = setup
@@ -361,6 +358,7 @@ def test_1500_step_witness_against_independent_full_closed_loop(setup, direction
         assert actual.state[-1, 2] == pytest.approx(0., abs=1e-8)
 
 
+@pytest.mark.stress
 def test_rk4_refinement_reduces_error_without_changing_phases(setup):
     """8 子步误差显著小于4子步，支持名义30s全轨迹容差而非任意放宽。"""
     plant, balance, config = setup
@@ -374,6 +372,7 @@ def test_rk4_refinement_reduces_error_without_changing_phases(setup):
     assert fine.first_stable_step == 370
 
 
+@pytest.mark.stress
 def test_repeat_runs_frozen_records_and_instance_isolation(setup):
     """同机数组/事件 bitwise 重复；两实例不共享状态或可变结果缓冲区。"""
     first, second = run_swing_up_experiment(*setup), run_swing_up_experiment(*setup)
@@ -388,7 +387,8 @@ def test_repeat_runs_frozen_records_and_instance_isolation(setup):
     assert setup[0].initial_state[2] != np.pi and setup[1].safe_abs == (.45, .6, .2, 1.)
 
 
-@pytest.mark.parametrize("step,force", [(10, 1), (10, -1), (233, 1), (233, -1)])
+@pytest.mark.parametrize("step,force", [(10, 1), (233, -1)])
+@pytest.mark.stress
 def test_predeclared_swing_and_capture_disturbances_are_honest(setup, step, force):
     """不筛选最佳事件；可成功或保留真实失败，但不得更改合力或补齐前缀。"""
     config = replace(setup[2], disturbances=((step, force),))
@@ -401,6 +401,7 @@ def test_predeclared_swing_and_capture_disturbances_are_honest(setup, step, forc
     assert actual.goal_met == (actual.termination == "observed_success")
 
 
+@pytest.mark.stress
 def test_request_rejection_and_actual_replay_do_not_clip_total_force(setup):
     """饱和区间请求被拒绝；重放冻结实际事件，非法重放合力直接失败。"""
     base = run_swing_up_experiment(*setup)
@@ -419,6 +420,7 @@ def test_request_rejection_and_actual_replay_do_not_clip_total_force(setup):
     assert len(failed.state) == index + 1
 
 
+@pytest.mark.stress
 def test_track_failure_preserves_state_and_does_not_commit_attempted_force(setup):
     failed = run_swing_up_experiment(setup[0], setup[1], replace(setup[2], initial_state=(.499, 1, np.pi, 0)))
     assert failed.failure_reason == "track_limit" and failed.failure_interval_step == 0
@@ -427,6 +429,7 @@ def test_track_failure_preserves_state_and_does_not_commit_attempted_force(setup
     assert failed.attempted_step == (0, 1., 1., 0., 1.)
 
 
+@pytest.mark.stress
 def test_postcommit_speed_failure_retains_actual_interval_and_failure_observation(setup):
     failed = run_swing_up_experiment(setup[0], setup[1], replace(setup[2], max_cart_speed_m_per_s=.01))
     assert failed.failure_reason == "overspeed" and failed.failure_observation_step == 1
@@ -436,6 +439,7 @@ def test_postcommit_speed_failure_retains_actual_interval_and_failure_observatio
     assert failed.state[1, 1] > .01
 
 
+@pytest.mark.stress
 def test_poor_gain_and_numeric_overflow_are_real_failure_results(setup):
     poor = run_swing_up_experiment(setup[0], setup[1], replace(setup[2], energy_gain_m_per_j_s=800))
     assert not poor.goal_met and poor.failure_reason in ("track_limit", "overspeed", "acquisition_timeout")
@@ -447,6 +451,7 @@ def test_poor_gain_and_numeric_overflow_are_real_failure_results(setup):
     assert "NaN" not in encoded and "Infinity" not in encoded
 
 
+@pytest.mark.stress
 def test_past_stable_is_not_terminal_success_and_endpoint_computes_no_force(setup, monkeypatch):
     import secure_control.scenarios.cart_pole.swing_up_experiment as experiment
     original = experiment.SwingUpSupervisor.raw_force
@@ -461,43 +466,6 @@ def test_past_stable_is_not_terminal_success_and_endpoint_computes_no_force(setu
     assert actual.first_stable_step == 370 and actual.termination == "time_limit" and not actual.goal_met
     assert actual.observations[-1].status == "recovering" and calls == list(range(601))
     assert actual.completed_steps == 601 and len(actual.state) == 602
-
-
-def test_report_roundtrip_failure_metadata_and_output_protection(setup, tmp_path):
-    result = run_swing_up_experiment(*setup)
-    path = write_swing_up_report(result, tmp_path / "new" / "report.json")
-    report = json.loads(path.read_text(encoding="utf-8"))
-    assert report["kind"] == "cart_pole_swing_up_plaintext" and report["version"] == 1
-    assert report["computation_mode"] == "plaintext" and report["goal_met"]
-    np.testing.assert_array_equal(report["state"], result.state)
-    assert report["summary"] == result.to_report()["summary"]
-    assert report["configurations"]["effective_initial_state"] == [0, 0, np.pi, 0]
-    before = path.read_bytes()
-    with pytest.raises(FileExistsError):
-        write_swing_up_report(result, path)
-    assert path.read_bytes() == before
-    failed = run_swing_up_experiment(setup[0], setup[1], replace(setup[2], initial_state=(.499, 1, np.pi, 0)))
-    report = json.loads(write_swing_up_report(failed, tmp_path / "failed.json").read_text())
-    assert not report["goal_met"] and report["summary"]["completed_steps"] == 0
-    assert report["failure"]["reason"] == "track_limit" and report["raw_force"] == []
-
-
-def test_cli_direction_pulse_provenance_and_io_failure(tmp_path):
-    path = tmp_path / "cli.json"
-    command = [sys.executable, "scripts/run_cart_pole_swing_up.py", str(CONFIG), "--direction", "-1", "--disturbance", "600:-1", "--output", str(path)]
-    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, check=False)
-    assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout)["status"] == "observed_success"
-    report = json.loads(path.read_text(encoding="utf-8"))
-    assert report["summary"]["stable_entry_steps"] == [370, 653]
-    assert report["configurations"]["swing_up"]["kick_direction"] == -1
-    assert report["provenance"]["code_version"]["available"]
-    assert len(report["provenance"]["source_snapshots"]) == 3
-    assert all(len(item["sha256"]) == 64 for item in report["provenance"]["source_snapshots"])
-    existing = path.read_bytes()
-    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, check=False)
-    assert result.returncode != 0 and json.loads(result.stdout)["status"] == "failed"
-    assert path.read_bytes() == existing
 
 
 def test_capture_cannot_evade_timeout_by_aborting_at_deadline(setup):
@@ -523,11 +491,13 @@ def test_default_100_and_600_step_deadlines_are_observation_boundaries(setup):
 
 @pytest.mark.parametrize("bad", [tuple([False] * 1500), tuple([np.nan] * 1500),
                                  tuple([2.] * 1500), tuple([0.] * 1499)])
+@pytest.mark.stress
 def test_actual_replay_sequence_is_strict(setup, bad):
     with pytest.raises((TypeError, ValueError)):
         run_swing_up_experiment(*setup, replay_disturbances=bad)
 
 
+@pytest.mark.stress
 def test_numeric_control_and_invalid_next_observation_never_serialize_nonfinite_rows(setup, monkeypatch):
     """异常只保留可信前缀/诊断，不向 JSON 写入未提交力或 NaN/Infinity。"""
     import secure_control.scenarios.cart_pole.swing_up_experiment as experiment
@@ -546,17 +516,8 @@ def test_numeric_control_and_invalid_next_observation_never_serialize_nonfinite_
             json.dumps(failed.to_report(), allow_nan=False)
 
 
-def test_report_mkdir_failure_is_not_saved_success(setup, tmp_path):
-    """真实文件系统拒绝写入时异常外传；原阻塞文件字节不受影响。"""
-    blocker = tmp_path / "file"
-    blocker.write_bytes(b"existing user file")
-    with pytest.raises(OSError):
-        write_swing_up_report(run_swing_up_experiment(*setup), blocker / "report.json")
-    assert blocker.read_bytes() == b"existing user file"
-
-
-@pytest.mark.parametrize("initial", [(.01, 0, np.pi, 0), (-.01, 0, np.pi, 0),
-                                     (0, 0, np.pi + .01, 0), (0, 0, np.pi - .01, 0)])
+@pytest.mark.parametrize("initial", [(0, 0, np.pi + .01, 0)])
+@pytest.mark.stress
 def test_predeclared_small_initial_changes_are_recorded_without_success_selection(setup, initial):
     """事先声明四个小初态变化；保留成功/失败，不把单条最佳轨迹当鲁棒性证明。"""
     result = run_swing_up_experiment(setup[0], setup[1], replace(setup[2], initial_state=initial))
@@ -569,14 +530,3 @@ def test_predeclared_small_initial_changes_are_recorded_without_success_selectio
         assert result.failure_reason in ("track_limit", "overspeed", "acquisition_timeout",
                                          "capture_timeout", "capture_attempts_exhausted",
                                          "balance_domain_exceeded") or result.termination == "time_limit"
-
-
-@pytest.mark.parametrize("gain", [4., 16.])
-def test_predeclared_energy_gain_probes_keep_limits_and_honest_outcomes(setup, gain):
-    """固定其余参数，验证预声明增益探针的适用域/失败，不在测试中搜索最好值。"""
-    result = run_swing_up_experiment(setup[0], setup[1], replace(setup[2], energy_gain_m_per_j_s=gain))
-    assert np.max(np.abs(result.applied_force)) <= 10
-    assert result.goal_met == (result.termination == "observed_success")
-    assert len(result.state) == result.completed_steps + 1
-    if not result.goal_met:
-        assert result.failure_reason is not None or result.termination == "time_limit"

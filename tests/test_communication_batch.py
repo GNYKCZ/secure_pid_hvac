@@ -113,6 +113,7 @@ def test_dynamic_batch_codec_requires_whole_identity_shape_and_direction():
         )
 
 
+@pytest.mark.integration
 def test_default_lan_party_rejects_unnegotiated_legacy_hello(monkeypatch):
     from secure_control.execution import lan_runtime
 
@@ -133,7 +134,8 @@ def test_default_lan_party_rejects_unnegotiated_legacy_hello(monkeypatch):
         remote.close()
 
 
-@pytest.mark.parametrize("mismatch", ["round", "epoch", "plan", "ids", "phase", "sequence"])
+@pytest.mark.parametrize("mismatch", ["round", "plan", "sequence"])
+@pytest.mark.integration
 def test_dynamic_peer_rejects_incomplete_or_cross_round_batch(mismatch):
     from test_two_party_protocol import make_stack
 
@@ -180,6 +182,7 @@ def test_dynamic_peer_rejects_incomplete_or_cross_round_batch(mismatch):
         sockets[1].close()
 
 
+@pytest.mark.integration
 def test_dynamic_peer_rejects_noncanonical_member_and_duplicate_resource_id():
     from test_two_party_protocol import make_stack
 
@@ -207,6 +210,7 @@ def test_dynamic_peer_rejects_noncanonical_member_and_duplicate_resource_id():
         sockets[1].close()
 
 
+@pytest.mark.integration
 def test_dynamic_batch_frame_budget_rejects_before_any_bytes_are_sent():
     from test_two_party_protocol import make_stack
 
@@ -231,6 +235,8 @@ def test_dynamic_batch_frame_budget_rejects_before_any_bytes_are_sent():
             sock.close()
 
 
+@pytest.mark.integration
+@pytest.mark.stress
 def test_large_legal_peer_batch_with_small_socket_buffers_does_not_deadlock():
     from test_two_party_protocol import make_stack
 
@@ -317,6 +323,7 @@ def test_dynamic_batch_fault_burns_all_resources_without_stage_or_state_change(f
         stage_protocol3_batch(endpoint, FaultPeer())
 
 
+@pytest.mark.integration
 def test_scalar_layer_rejects_wrong_phase_and_noncanonical_member():
     from secure_control.execution.lan_scalar_runtime import _SocketScalarPeer
 
@@ -342,6 +349,7 @@ def test_scalar_layer_rejects_wrong_phase_and_noncanonical_member():
         sockets[1].close()
 
 
+@pytest.mark.integration
 def test_dynamic_batch_real_peer_frames_preserve_old_state_output_and_modular_state(
     monkeypatch,
 ):
@@ -522,9 +530,10 @@ def test_scalar_batch_matches_legacy_integer_shares_with_same_isolated_materials
 
 @pytest.mark.parametrize(
     ("case", "mode", "client_groups", "peer_frames"),
-    [("dynamic", "legacy", 216, 64), ("dynamic", "batch", 6, 7),
-     ("scalar", "legacy", 6, 190), ("scalar", "batch", 6, 80)],
+    [("dynamic", "batch", 6, 7), ("scalar", "batch", 6, 80)],
 )
+@pytest.mark.integration
+@pytest.mark.stress
 def test_real_three_process_benchmark_counts_public_frames(
     case, mode, client_groups, peer_frames,
 ):

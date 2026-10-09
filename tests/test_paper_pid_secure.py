@@ -82,6 +82,7 @@ def test_paper_parameter_width_cannot_be_reused_for_dynamic_state() -> None:
         )
 
 
+@pytest.mark.integration
 def test_localhost_three_roles_51_steps_and_actual_resource_counts() -> None:
     plan, runtime, _ = _plan(32, backend="localhost")
     try:
@@ -95,6 +96,7 @@ def test_localhost_three_roles_51_steps_and_actual_resource_counts() -> None:
         runtime.close()
 
 
+@pytest.mark.integration
 def test_localhost_input_failure_closes_session_without_consuming_resources() -> None:
     _, runtime, _ = _plan(32, backend="localhost", bound=1)
     try:

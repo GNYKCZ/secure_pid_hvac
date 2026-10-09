@@ -23,6 +23,12 @@ module-name = "secure_control"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = ["--strict-markers"]
+markers = [
+    "integration: real processes, sockets, TLS or fixtures producing network evidence",
+    "gui: actual Tk windows and desktop interactions",
+    "stress: long trajectories, tuning, resource growth and performance witnesses",
+]
 
 [tool.ruff]
 target-version = "py311"
