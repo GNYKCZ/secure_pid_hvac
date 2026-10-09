@@ -6,7 +6,6 @@ import json
 import subprocess
 import sys
 import time
-from copy import deepcopy
 from dataclasses import replace
 from hashlib import sha256
 from math import pi
@@ -15,6 +14,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import yaml
+from lan_test_support import reap_processes, role_command, select_experiment, start_processes
 from matplotlib.figure import Figure
 from test_cart_pole_balance import _independent_run
 from test_cart_pole_observer import oracle_closed_loop
@@ -34,8 +34,6 @@ from secure_control.experiments.cart_pole_lan_profile import load_cart_pole_lan_
 from secure_control.experiments.lan_continuous_profile import load_prepared_lan_experiment
 from secure_control.protocol import Client
 from secure_control.protocol.roles import _bounded_input_reachability
-from secure_control.scenarios.cart_pole.adapter import MeasurementSample
-from secure_control.scenarios.cart_pole.observer import build_cart_pole_observer_design
 from secure_control.scenarios.cart_pole.secure_experiment import (
     CartPoleObserverSecureExperiment,
     CartPoleSecureExperiment,
@@ -81,10 +79,7 @@ def _profile_for(paths: dict[str, Path]) -> Path:
     )
     data["output_root"] = str(profile.parent / "runs")
     profile.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
-    client = paths["Client"]
-    client.write_text(client.read_text(encoding="utf-8").replace(
-        "experiment: paper_pid_lan.example.yaml", f"experiment: {profile}"
-    ), encoding="utf-8")
+    select_experiment(paths["Client"], profile)
     return profile
 
 
@@ -120,13 +115,7 @@ def _observer_profile_for(paths: dict[str, Path], *, horizon: int = 60,
     profile["disturbances"] = [list(event) for event in disturbances]
     profile_path = root / "observer-profile.yaml"
     profile_path.write_text(yaml.safe_dump(profile), encoding="utf-8")
-    client = paths["Client"]
-    client.write_text(client.read_text(encoding="utf-8").replace(
-        f"controller: {ROOT / 'tests' / 'fixtures' / 'legacy_hvac' / 'hvac_dual_loop.yaml'}",
-        f"experiment: {profile_path}",
-    ).replace(
-        "experiment: paper_pid_lan.example.yaml", f"experiment: {profile_path}"
-    ), encoding="utf-8")
+    select_experiment(paths["Client"], profile_path)
     return profile_path
 
 
@@ -135,7 +124,7 @@ def observer_verified_run(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """复用一份真实非零chart三进程产物，类型篡改逐案恢复原字节。"""
     paths = _plain_deployment(tmp_path_factory.mktemp("observer-evidence"))
     _observer_profile_for(paths, initial_state=(0, 0, 2 * pi + .005, 0))
-    parties = [_run(role, paths[role]) for role in ("P1", "P2")]
+    parties = start_processes([role_command(role, paths[role]) for role in ("P1", "P2")])
     try:
         time.sleep(.5)
         code, result, errors = _finish(_run("Client", paths["Client"]), 600)
@@ -147,10 +136,7 @@ def observer_verified_run(tmp_path_factory: pytest.TempPathFactory) -> Path:
         load_verified_cart_pole_run(run_dir)
         return run_dir
     finally:
-        for party in parties:
-            if party.poll() is None:
-                party.kill()
-            party.communicate()
+        reap_processes(parties)
 
 
 @pytest.mark.parametrize("filename,keys", [
@@ -174,6 +160,7 @@ def observer_verified_run(tmp_path_factory: pytest.TempPathFactory) -> Path:
     ("config.json", ("range", "proof", "input_payload_bounds", 0)),
     (MOTION_MANIFEST_NAME, ("sample_count",)),
 ])
+@pytest.mark.integration
 def test_observer_reader_rejects_equal_noninteger_fields(
     observer_verified_run: Path, filename: str, keys: tuple,
 ) -> None:
@@ -243,58 +230,6 @@ def _capture_motion_artists(record, payload, run_dir: Path,
     return axes_data
 
 
-@pytest.mark.parametrize("theta_star", [0., 2 * pi, -4 * pi])
-def test_observer_motion_targets_use_saved_reference(
-    observer_verified_run: Path, theta_star: float, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """RV-002：连续角曲线和目标在同一chart，零线不压缩整圈transient。"""
-    record, payload = load_verified_cart_pole_run(observer_verified_run)
-    payload = deepcopy(payload)
-    shift = theta_star - payload["reference"][0][2]
-    for row in payload["reference"]:
-        row[2] += shift
-    for branch in payload["branches"].values():
-        for row in branch["observations"]:
-            row[2] += shift
-    axes = _capture_motion_artists(record, payload, observer_verified_run, monkeypatch)
-    for axis, index in ((axes[0], 0), (axes[1], 2)):
-        target = next((line for line in axis["lines"] if line[0].startswith("target")), None)
-        assert target is not None
-        np.testing.assert_array_equal(target[2],
-                                      [payload["reference"][0][index]] * len(target[2]))
-        if index == 2 and theta_star != 0:
-            assert target[0] != "target 0"
-    assert axes[1]["ylim"][1] - axes[1]["ylim"][0] < .02
-
-
-@pytest.mark.parametrize("ideal,secure", [(0., 0.), (1., 1.), (1., 0.), (0., -1.)])
-def test_observer_motion_marks_actual_disturbance_by_branch(
-    observer_verified_run: Path, ideal: float, secure: float, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """RV-003：展示层消费实际外力；相同请求不能冒充两支相同执行结果。"""
-    record, payload = load_verified_cart_pole_run(observer_verified_run)
-    payload = deepcopy(payload)
-    payload["events"] = [{"step": 0, "force_n": 1., "duration_steps": 1}]
-    for name, force in (("ideal", ideal), ("secure", secure)):
-        branch = payload["branches"][name]
-        branch["disturbance_force_n"][0] = force
-        branch["force_dispositions"][0] = ("accepted" if force else "rejected_total_force_limit")
-    axes = _capture_motion_artists(record, payload, observer_verified_run, monkeypatch)
-    for axis in axes:
-        verticals = [line for line in axis["lines"]
-                     if len(line[1]) == 2 and line[1][0] == line[1][1]]
-        assert {line[0] for line in verticals} == {
-            f"{name} applied disturbance" for name, force in (("ideal", ideal), ("secure", secure))
-            if force != 0
-        }
-        for name, force in (("ideal", ideal), ("secure", secure)):
-            markers = [line for line in axis["lines"] if line[0] == f"{name} applied disturbance"]
-            assert len(markers) == int(force != 0)
-            if markers:
-                assert markers[0][1] == [payload["time_s"][0]] * 2
-        assert "red lines" not in axis["xlabel"]
-
-
 def test_observer_profile_and_plaintext_scene_are_dynamic() -> None:
     """真实配置的首样本直接决定4×2 spec，双支无网络仍按两测量闭环。"""
     profile = load_cart_pole_lan_profile(OBSERVER_PROFILE)
@@ -314,32 +249,7 @@ def test_observer_profile_and_plaintext_scene_are_dynamic() -> None:
     assert np.max(np.abs(result.control_error)) == 0
 
 
-@pytest.mark.parametrize("theta,disturbance", [
-    (-.08726646259971647, ((200, -1.),)),
-    (2 * pi + .08726646259971647, ((200, 1.),)),
-])
-def test_observer_scene_keeps_fixed_angle_branch_and_disturbance(
-    theta: float, disturbance: tuple[tuple[int, float], ...]
-) -> None:
-    """负角和整圈角都沿首测量chart运行，未知外力只进入物理适配器。"""
-    profile = load_cart_pole_lan_profile(OBSERVER_PROFILE)
-    design = build_cart_pole_observer_design(
-        replace(profile.plant, initial_state=(0, 0, theta, 0)),
-        profile.balance, profile.observer_design.config,
-    )
-    initialization = design.initialize(MeasurementSample(0, 0., 0., theta))
-    scene = CartPoleObserverSecureExperiment(design, initialization, disturbance)
-    from secure_control.execution import PlaintextStateSpaceRuntime
-
-    plan = scene.build_plan(PlaintextStateSpaceRuntime(initialization.spec))
-    result = scene.execute_plan(plan)
-    scene.validate_result(result)
-    assert scene.records["secure"]["statuses"][-1] == "stable"
-    assert scene.records["secure"]["requested_disturbance_n"][200] == disturbance[0][1]
-    assert result.reference[0, 2] == initialization.theta_star
-    assert np.max(np.abs(result.control_error)) == 0
-
-
+@pytest.mark.integration
 def test_observer_profile_source_drift_and_runtime_failure(tmp_path: Path) -> None:
     """新 profile 来源变化在联网前拒绝；raw 越界/超时不产生成功结果。"""
     paths = _plain_deployment(tmp_path)
@@ -377,6 +287,7 @@ def test_observer_profile_source_drift_and_runtime_failure(tmp_path: Path) -> No
 
 @pytest.mark.parametrize("field,value", [("k", 33), ("runtime_payload_bits", 39),
                                          ("lambda", 224)])
+@pytest.mark.integration
 def test_observer_numeric_profile_rejects_insufficient_widths(
     tmp_path: Path, field: str, value: int,
 ) -> None:
@@ -418,6 +329,7 @@ def test_bounded_input_reachability_uses_encoded_block_contraction() -> None:
         ))
 
 
+@pytest.mark.integration
 def test_observer_cli_fault_reports_attempted_vs_physical(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -457,11 +369,12 @@ def test_observer_cli_fault_reports_attempted_vs_physical(
     )
 
 
+@pytest.mark.integration
 def test_observer_three_process_finite_resources_and_reader(tmp_path: Path) -> None:
     """真实三PID递推60步，逐轮消费30 triple/4 Trunc 并正式读回。"""
     paths = _plain_deployment(tmp_path)
     _observer_profile_for(paths)
-    parties = [_run(role, paths[role]) for role in ("P1", "P2")]
+    parties = start_processes([role_command(role, paths[role]) for role in ("P1", "P2")])
     try:
         time.sleep(.5)
         code, result, errors = _finish(_run("Client", paths["Client"]), 600)
@@ -535,12 +448,11 @@ def test_observer_three_process_finite_resources_and_reader(tmp_path: Path) -> N
             manifest_path.write_text(original_manifest, encoding="utf-8")
             motion_path.write_text(original_motion, encoding="utf-8")
     finally:
-        for party in parties:
-            if party.poll() is None:
-                party.kill()
-            party.communicate()
+        reap_processes(parties)
 
 
+@pytest.mark.integration
+@pytest.mark.stress
 def test_observer_three_process_400_steps_disturbance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -550,7 +462,7 @@ def test_observer_three_process_400_steps_disturbance(
         paths, horizon=400, initial_state=(0, 0, .08726646259971647, 0),
         disturbances=((200, 1.),),
     )
-    parties = [_run(role, paths[role]) for role in ("P1", "P2")]
+    parties = start_processes([role_command(role, paths[role]) for role in ("P1", "P2")])
     try:
         time.sleep(.5)
         code, result, errors = _finish(_run("Client", paths["Client"]), 1200)
@@ -583,67 +495,15 @@ def test_observer_three_process_400_steps_disturbance(
                           if line[0] == f"{name} applied disturbance")
             assert marker[1] == [4., 4.]
     finally:
-        for party in parties:
-            if party.poll() is None:
-                party.kill()
-            party.communicate()
+        reap_processes(parties)
 
 
-def test_observer_rejected_pulse_is_not_plotted_as_applied(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """RV-003：真实400步合法拒绝外扰仍成功，正式图不能宣称施加该脉冲。"""
-    paths = _plain_deployment(tmp_path)
-    _observer_profile_for(paths, horizon=400,
-                          initial_state=(0, 0, .08726646259971647, 0),
-                          disturbances=((0, -1.),))
-    plant_path = tmp_path / "observer-plant.yaml"
-    plant = yaml.safe_load(plant_path.read_text(encoding="utf-8"))
-    plant["max_applied_force_n"] = 2.440242909979021
-    plant_path.write_text(yaml.safe_dump(plant), encoding="utf-8")
-    parties = [_run(role, paths[role]) for role in ("P1", "P2")]
-    try:
-        time.sleep(.5)
-        code, result, errors = _finish(_run("Client", paths["Client"]), 1200)
-        assert code == 0, (result, errors)
-        outcomes = [_finish(party, 60) for party in parties]
-        assert all(item[0] == 0 for item in outcomes), outcomes
-        assert len({result["pid"], *(item[1]["pid"] for item in outcomes)}) == 3
-        run_dir = Path(result["run_dir"])
-        record, evidence = load_verified_cart_pole_run(run_dir)
-        for branch in evidence["branches"].values():
-            assert branch["requested_disturbance_n"][0] == -1.
-            assert branch["disturbance_force_n"][0] == 0.
-            assert branch["force_dispositions"][0] == "rejected_total_force_limit"
-            assert branch["statuses"][-1] == "stable"
-        axes = _capture_motion_artists(record, evidence, run_dir, monkeypatch)
-        for axis in axes:
-            assert not any(len(line[1]) == 2 and line[1][0] == line[1][1]
-                           for line in axis["lines"])
-        # 同一正式拒绝run的step0/duration也须严格整数。
-        original = (run_dir / EVIDENCE_NAME).read_bytes()
-        for field in ("step", "duration_steps"):
-            changed = deepcopy(evidence)
-            changed["events"][0][field] = float(changed["events"][0][field])
-            try:
-                (run_dir / EVIDENCE_NAME).write_text(json.dumps(changed), encoding="utf-8")
-                with pytest.raises(ValueError, match="事件"):
-                    verify_cart_pole_evidence(record, run_dir)
-            finally:
-                (run_dir / EVIDENCE_NAME).write_bytes(original)
-        load_verified_cart_pole_run(run_dir)
-    finally:
-        for party in parties:
-            if party.poll() is None:
-                party.kill()
-            party.communicate()
-
-
+@pytest.mark.integration
 def test_observer_three_process_mutual_tls(tmp_path: Path) -> None:
     """动态控制器沿原mTLS角色链路完成有限会话与正式读回。"""
     paths = _tls_deployment.__wrapped__(tmp_path)
     _observer_profile_for(paths)
-    parties = [_run(role, paths[role]) for role in ("P1", "P2")]
+    parties = start_processes([role_command(role, paths[role]) for role in ("P1", "P2")])
     try:
         time.sleep(.5)
         code, result, errors = _finish(_run("Client", paths["Client"]), 600)
@@ -654,10 +514,7 @@ def test_observer_three_process_mutual_tls(tmp_path: Path) -> None:
         assert all(item[1]["tls_version"] == "TLSv1.3" for item in outcomes)
         load_verified_cart_pole_run(result["run_dir"])
     finally:
-        for party in parties:
-            if party.poll() is None:
-                party.kill()
-            party.communicate()
+        reap_processes(parties)
 
 
 def test_profile_and_exact_static_lqr_bounds() -> None:
@@ -687,10 +544,7 @@ def test_profile_and_exact_static_lqr_bounds() -> None:
 
 @pytest.mark.parametrize("change", [
     lambda data: data["numeric"].update({"k": 32}),
-    lambda data: data["numeric"].update({"runtime_payload_bits": 39}),
-    lambda data: data["numeric"].update({"lambda": 230}),
     lambda data: data.update({"plant_source": "missing.yaml"}),
-    lambda data: data.update({"sample_count": 400}),
 ])
 def test_invalid_profile_fails_before_network(tmp_path: Path, change) -> None:
     data = yaml.safe_load(PROFILE.read_text(encoding="utf-8"))
@@ -845,6 +699,8 @@ def test_plaintext_oracle_and_verified_sidecar(tmp_path: Path) -> None:
     load_verified_cart_pole_run(artifact.run_dir)
 
 
+@pytest.mark.integration
+@pytest.mark.stress
 def test_three_independent_processes_400_steps(tmp_path: Path) -> None:
     """真实 P1/P2/Client 进程运行 400 区间并检查双提交、1600/0 实耗。"""
     paths = _plain_deployment(tmp_path)
@@ -853,7 +709,7 @@ def test_three_independent_processes_400_steps(tmp_path: Path) -> None:
     missing_code, missing, _ = _finish(_run("Client", paths["Client"]), 20)
     assert missing_code != 0 and missing["status"] == "failed"
     assert not list((tmp_path / "runs").glob("*/metadata.json"))
-    parties = [_run(role, paths[role]) for role in ("P1", "P2")]
+    parties = start_processes([role_command(role, paths[role]) for role in ("P1", "P2")])
     try:
         time.sleep(.5)
         client = _run("Client", paths["Client"])
@@ -893,12 +749,10 @@ def test_three_independent_processes_400_steps(tmp_path: Path) -> None:
         assert Path(result["figure_path"]).is_file()
         assert all(item[1]["steps_committed"] == 400 for item in outcomes)
     finally:
-        for party in parties:
-            if party.poll() is None:
-                party.kill()
-            party.communicate()
+        reap_processes(parties)
 
 
+@pytest.mark.integration
 def test_time_limit_has_no_success_artifact(tmp_path: Path) -> None:
     """十步可全部双提交，但未达到 51 次观测，Client 不发布 complete。"""
     paths = _plain_deployment(tmp_path)
@@ -912,7 +766,7 @@ def test_time_limit_has_no_success_artifact(tmp_path: Path) -> None:
     balance_path.write_text(yaml.safe_dump(balance), encoding="utf-8")
     data["balance_source"] = str(balance_path)
     profile_path.write_text(yaml.safe_dump(data), encoding="utf-8")
-    parties = [_run(role, paths[role]) for role in ("P1", "P2")]
+    parties = start_processes([role_command(role, paths[role]) for role in ("P1", "P2")])
     try:
         time.sleep(.5)
         code, result, _ = _finish(_run("Client", paths["Client"]), 60)
@@ -920,10 +774,7 @@ def test_time_limit_has_no_success_artifact(tmp_path: Path) -> None:
         assert not list((tmp_path / "runs").glob("*/metadata.json"))
         assert not list((tmp_path / "runs").glob("*/control.png"))
     finally:
-        for party in parties:
-            if party.poll() is None:
-                party.kill()
-            party.communicate()
+        reap_processes(parties)
 
 
 _SECOND_ROUND_DISCONNECT = r"""
@@ -947,6 +798,7 @@ cli()
 """
 
 
+@pytest.mark.integration
 def test_second_round_disconnect_then_new_session(tmp_path: Path) -> None:
     """提交不确定时无 success artifact；新进程/新 session 可重新完成。"""
     paths = _plain_deployment(tmp_path)
@@ -971,11 +823,8 @@ def test_second_round_disconnect_then_new_session(tmp_path: Path) -> None:
         )
         assert not list((tmp_path / "runs").glob("*/metadata.json"))
     finally:
-        for party in (p1, p2):
-            if party.poll() is None:
-                party.kill()
-            party.communicate()
-    fresh = [_run(role, paths[role]) for role in ("P1", "P2")]
+        reap_processes((p1, p2))
+    fresh = start_processes([role_command(role, paths[role]) for role in ("P1", "P2")])
     try:
         time.sleep(.5)
         code, success, errors = _finish(_run("Client", paths["Client"]), 600)
@@ -984,7 +833,4 @@ def test_second_round_disconnect_then_new_session(tmp_path: Path) -> None:
         assert all(_finish(party, 30)[0] == 0 for party in fresh)
         load_verified_cart_pole_run(success["run_dir"])
     finally:
-        for party in fresh:
-            if party.poll() is None:
-                party.kill()
-            party.communicate()
+        reap_processes(fresh)

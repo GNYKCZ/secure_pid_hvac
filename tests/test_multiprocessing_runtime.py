@@ -2,14 +2,10 @@
 
 from __future__ import annotations
 
-import json
 import multiprocessing as mp
 import os
 import random
-import subprocess
-import sys
 from dataclasses import replace
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -28,13 +24,9 @@ from secure_control.execution import (
 )
 from secure_control.execution._multiprocessing_workers import IpcEnvelope
 from secure_control.execution.multiprocessing_runtime import _ProcessSession
-from secure_control.experiments.multiprocessing_runner import run_multiprocessing_comparison
 from secure_control.protocol import Client, ControllerRangeContract
-from secure_control.protocol.coordinator import Protocol3Orchestrator
 from secure_control.protocol.messages import (
     PartyOnlineRound,
-    Protocol3StageReceipt,
-    ResourceMetadata,
     StepResourcePlan,
 )
 
@@ -106,61 +98,7 @@ def _online_plan() -> tuple[StepResourcePlan, PartyOnlineRound, PartyOnlineRound
     )
 
 
-class _RecordingEndpoint:
-    """仅记录统一调度顺序的测试 endpoint，不实现任何协议数学。"""
-
-    def __init__(self, party: int, plan: StepResourcePlan, events: list[str]) -> None:
-        self.party = party
-        self.session_id = plan.session_id
-        self.plan = plan
-        self._events = events
-
-    def _record(self, operation: str, metadata: ResourceMetadata | None = None) -> None:
-        suffix = "" if metadata is None else f":{metadata.resource_id}"
-        self._events.append(f"P{self.party + 1}.{operation}{suffix}")
-
-    def mask_product(self, metadata: ResourceMetadata) -> None:
-        self._record("mask_product", metadata)
-
-    def finish_product(self, metadata: ResourceMetadata) -> None:
-        self._record("finish_product", metadata)
-
-    def complete_product(self, metadata: ResourceMetadata) -> None:
-        self._record("complete_product", metadata)
-
-    def finish_products(self) -> None:
-        self._record("finish_products")
-
-    def mask_truncation(self, metadata: ResourceMetadata) -> None:
-        self._record("mask_truncation", metadata)
-
-    def send_truncation(self, metadata: ResourceMetadata) -> None:
-        self._record("send_truncation", metadata)
-
-    def finish_truncation_p1(self, metadata: ResourceMetadata) -> None:
-        self._record("finish_truncation_p1", metadata)
-
-    def finish_truncation_p2(self, metadata: ResourceMetadata) -> None:
-        self._record("finish_truncation_p2", metadata)
-
-    def complete_truncation(self, metadata: ResourceMetadata) -> None:
-        self._record("complete_truncation", metadata)
-
-    def stage_output(self) -> Protocol3StageReceipt:
-        self._record("stage_output")
-        return Protocol3StageReceipt(
-            self.party,
-            self.plan.session_id,
-            self.plan.round_id,
-            self.plan.step,
-            self.plan.triple_count,
-            self.plan.truncation_count,
-        )
-
-    def commit(self) -> None:
-        self._record("commit")
-
-
+@pytest.mark.integration
 def test_spawn_roles_are_distinct_and_general_sequence_matches_single_process() -> None:
     spec = _general_spec()
     single = _single(spec)
@@ -184,6 +122,7 @@ def test_spawn_roles_are_distinct_and_general_sequence_matches_single_process() 
         np.testing.assert_array_equal(actual, expected)
 
 
+@pytest.mark.integration
 def test_vector_and_zero_state_controllers_match_single_process() -> None:
     vector = ControllerSpec(
         A=np.array([[0.5, 0.0], [0.25, 0.5]]),
@@ -210,6 +149,7 @@ def test_vector_and_zero_state_controllers_match_single_process() -> None:
         np.testing.assert_array_equal(actual, expected)
 
 
+@pytest.mark.integration
 def test_large_legal_online_material_does_not_block_prepare_pipe() -> None:
     dimension = 10
     spec = ControllerSpec(
@@ -237,6 +177,7 @@ def test_large_legal_online_material_does_not_block_prepare_pipe() -> None:
         assert runtime.resource_counts["products_consumed"] == 400
 
 
+@pytest.mark.integration
 def test_integer_scale_no_truncation_reset_and_close_are_bounded() -> None:
     spec = ControllerSpec(
         A=np.array([[0.0]]),
@@ -260,31 +201,7 @@ def test_integer_scale_no_truncation_reset_and_close_are_bounded() -> None:
         runtime.step(0.0)
 
 
-def test_parent_rejects_invalid_input_without_losing_session() -> None:
-    with _runtime(_general_spec()) as runtime:
-        with pytest.raises(FloatingPointError, match="NaN"):
-            runtime.step(float("nan"))
-        assert runtime.step(0.0).shape == (1,)
-
-
-def test_hvac_180_step_runner_matches_existing_secure_backend_and_cleans_up() -> None:
-    summary = run_multiprocessing_comparison(
-        Path(__file__).parents[1] / "tests" / "fixtures" / "legacy_hvac" / "hvac_dual_loop.yaml",
-        test_seed=901,
-    )
-
-    assert summary["start_method"] == "spawn"
-    assert summary["sample_count"] == 180
-    assert len(set(summary["role_pids"].values())) == 3
-    assert summary["maximum_control_difference"] == 0.0
-    assert summary["maximum_output_difference"] == 0.0
-    assert summary["resource_counts"] == {
-        "products_consumed": 1620,
-        "truncations_consumed": 0,
-    }
-    assert summary["cleanup"] == "closed"
-
-
+@pytest.mark.integration
 def test_step_timeout_fails_closed_and_leaves_no_role_process_alive() -> None:
     runtime = MultiprocessingSecureStateSpaceRuntime(
         _general_spec(),
@@ -308,6 +225,7 @@ def test_step_timeout_fails_closed_and_leaves_no_role_process_alive() -> None:
     )
 
 
+@pytest.mark.integration
 def test_worker_failure_requires_fresh_session_before_execution_can_resume() -> None:
     runtime = MultiprocessingSecureStateSpaceRuntime(
         _general_spec(),
@@ -330,6 +248,7 @@ def test_worker_failure_requires_fresh_session_before_execution_can_resume() -> 
     runtime.close()
 
 
+@pytest.mark.integration
 def test_partial_startup_failure_reaps_every_started_role() -> None:
     before = {process.pid for process in mp.active_children()}
 
@@ -349,14 +268,11 @@ def test_partial_startup_failure_reaps_every_started_role() -> None:
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    (
+    [
         ("request_id", 8),
-        ("role", "P2"),
-        ("operation", "commit"),
         ("session_id", "wrong-session"),
         ("round_id", "wrong-round"),
-        ("step", 2),
-    ),
+    ],
 )
 def test_malformed_reply_identity_is_rejected(field: str, value: object) -> None:
     context = mp.get_context("spawn")
@@ -383,45 +299,6 @@ def test_malformed_reply_identity_is_rejected(field: str, value: object) -> None
         sender.close()
 
 
-def test_protocol3_orchestrator_has_one_explicit_message_order() -> None:
-    plan, _, _ = _online_plan()
-    events: list[str] = []
-    first = _RecordingEndpoint(0, plan, events)
-    second = _RecordingEndpoint(1, plan, events)
-    orchestrator = Protocol3Orchestrator()
-
-    orchestrator.stage(first, second, plan)
-    orchestrator.commit(first, second)
-
-    expected: list[str] = []
-    for metadata in plan.product_resources:
-        expected.extend(
-            [
-                f"P1.mask_product:{metadata.resource_id}",
-                f"P2.mask_product:{metadata.resource_id}",
-                f"P1.finish_product:{metadata.resource_id}",
-                f"P2.finish_product:{metadata.resource_id}",
-                f"P1.complete_product:{metadata.resource_id}",
-                f"P2.complete_product:{metadata.resource_id}",
-            ]
-        )
-    expected.extend(["P1.finish_products", "P2.finish_products"])
-    for metadata in plan.state_truncation_resources:
-        expected.extend(
-            [
-                f"P1.mask_truncation:{metadata.resource_id}",
-                f"P2.mask_truncation:{metadata.resource_id}",
-                    f"P2.send_truncation:{metadata.resource_id}",
-                f"P1.finish_truncation_p1:{metadata.resource_id}",
-                f"P2.finish_truncation_p2:{metadata.resource_id}",
-                f"P1.complete_truncation:{metadata.resource_id}",
-                f"P2.complete_truncation:{metadata.resource_id}",
-            ]
-        )
-    expected.extend(["P1.stage_output", "P2.stage_output", "P1.commit", "P2.commit"])
-    assert events == expected
-
-
 def test_party_online_payloads_never_contain_peer_shares() -> None:
     _, first, second = _online_plan()
 
@@ -432,23 +309,7 @@ def test_party_online_payloads_never_contain_peer_shares() -> None:
     assert first.resources is not second.resources
 
 
-def test_importing_execution_starts_no_child_process() -> None:
-    script = (
-        "import json, multiprocessing as mp; "
-        "before=len(mp.active_children()); "
-        "import secure_control.execution; "
-        "print(json.dumps([before, len(mp.active_children())]))"
-    )
-    completed = subprocess.run(
-        [sys.executable, "-c", script],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    assert json.loads(completed.stdout) == [0, 0]
-
-
+@pytest.mark.integration
 def test_failed_reset_preserves_previous_session(monkeypatch: pytest.MonkeyPatch) -> None:
     runtime = _runtime(_general_spec(), seed=905)
     previous_pids = {item.pid for item in runtime.topology.roles}

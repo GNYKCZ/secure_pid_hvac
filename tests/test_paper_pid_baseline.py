@@ -142,6 +142,7 @@ def test_51_step_baseline_matches_independent_difference_and_plant_recurrence() 
     )
 
 
+@pytest.mark.integration
 def test_runner_publishes_replayable_paper_inspired_artifacts(tmp_path: Path) -> None:
     """两次运行数值完全一致；元数据保留来源/矩阵/稳定诊断而不伪装原例。"""
     root = tmp_path / "artifacts"
@@ -200,6 +201,7 @@ def test_runner_rejects_drifted_config_without_publishing(
     assert not root.exists()
 
 
+@pytest.mark.integration
 def test_writer_failure_leaves_no_success_directory(tmp_path: Path, monkeypatch) -> None:
     """CSV 写入失败后临时 staging 自动清理，不出现 success sidecar。"""
     from secure_control.experiments import paper_pid_runner

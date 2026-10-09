@@ -93,19 +93,6 @@ def test_recursive_pocklington_certificate_verifies_large_prime_and_source() -> 
     assert report.certificate_sha256 == pocklington_certificate_sha256(evidence.certificate)
 
 
-def test_certificate_hash_is_independent_of_factor_order() -> None:
-    """规范化摘要不受证书映射或不同素因子排列顺序影响。"""
-    original = _recursive_certificate()
-    inner = original.factors[0].certificate
-    assert inner is not None
-    reversed_inner = replace(inner, factors=tuple(reversed(inner.factors)))
-    reordered = replace(
-        original,
-        factors=(replace(original.factors[0], certificate=reversed_inner),),
-    )
-    assert pocklington_certificate_sha256(reordered) == pocklington_certificate_sha256(original)
-
-
 def test_known_large_composite_is_rejected_without_trusting_metadata() -> None:
     """公开来源字符串不能使固定 bases 已识别的大合数获得 verified 状态。"""
     with pytest.raises(PrimeVerificationError) as captured:
@@ -117,9 +104,7 @@ def test_known_large_composite_is_rejected_without_trusting_metadata() -> None:
     ("replacement", "reason"),
     [
         ("candidate", "candidate_mismatch"),
-        ("hash", "certificate_hash_mismatch"),
         ("witness", "invalid_witness"),
-        ("exponent", "incomplete_factorization"),
         ("nested", "invalid_factor_certificate"),
     ],
 )

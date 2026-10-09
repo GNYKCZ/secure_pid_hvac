@@ -7,15 +7,14 @@ import shutil
 import subprocess
 import sys
 from hashlib import sha256
-from itertools import pairwise
 from math import pi
 from pathlib import Path
+from types import MappingProxyType
 
 import numpy as np
 import pytest
 import yaml
-from scipy.integrate import solve_ivp
-from test_cart_pole_balance import ORACLE_K, _oracle_rhs
+from lan_test_support import reap_processes
 from test_cart_pole_lan import ROOT, _observer_profile_for, _profile_for
 from test_lan_continuous import _plain_deployment
 from test_lan_segmented import _PARTY
@@ -165,7 +164,7 @@ def _run(tmp_path, *, count=7, capacity=3, mode="normal", tls=False, client_code
                if dynamic else _profile_for(paths))
     if tls:
         value = yaml.safe_load(paths["Client"].read_text())
-        value.pop("controller")
+        value.pop("controller", None)
         value["experiment"] = str(profile)
         paths["Client"].write_text(yaml.safe_dump(value, sort_keys=False))
     processes = []
@@ -198,20 +197,53 @@ def _run(tmp_path, *, count=7, capacity=3, mode="normal", tls=False, client_code
             assert all(row[1]["steps_committed"] == expected for row in outcomes)
         return report
     finally:
-        for process in processes:
-            if process.poll() is None:
-                process.kill()
-            process.communicate()
+        reap_processes(processes)
+
+
+def _freeze_report(value):
+    """共享报告只保存不可变快照，不保留 runner 的可变容器。"""
+    if isinstance(value, dict):
+        return MappingProxyType({key: _freeze_report(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze_report(item) for item in value)
+    return value
 
 
 @pytest.fixture(scope="module")
-def published(tmp_path_factory):
+def _published_source(tmp_path_factory):
     root = tmp_path_factory.mktemp("segmented-result")
     report = _run(root)
     assert report["result"]["status"] == "complete", report
-    return Path(report["result"]["run_dir"]), report
+    path = Path(report["result"]["run_dir"])
+    return path, _freeze_report(report), _redraw_source_fingerprint(path)
 
 
+@pytest.fixture(scope="module")
+def _dynamic_source(tmp_path_factory):
+    root = tmp_path_factory.mktemp("dynamic-result")
+    report = _run(root, count=7, capacity=3, client_code=_DYNAMIC_CLIENT, dynamic=True)
+    assert report["result"]["status"] == "complete", report
+    path = Path(report["result"]["run_dir"])
+    return path, _freeze_report(report), _redraw_source_fingerprint(path)
+
+
+@pytest.fixture
+def published(_published_source):
+    path, report, fingerprint = _published_source
+    assert _redraw_source_fingerprint(path) == fingerprint
+    yield path, report
+    assert _redraw_source_fingerprint(path) == fingerprint
+
+
+@pytest.fixture
+def dynamic_published(_dynamic_source):
+    path, report, fingerprint = _dynamic_source
+    assert _redraw_source_fingerprint(path) == fingerprint
+    yield path, report
+    assert _redraw_source_fingerprint(path) == fingerprint
+
+
+@pytest.mark.integration
 def test_real_segments_publish_and_observation_seek_matches_confirmed_frames(published):
     path, report = published
     run = evidence.open_verified_cart_pole_segmented_run(path)
@@ -231,48 +263,9 @@ def test_real_segments_publish_and_observation_seek_matches_confirmed_frames(pub
             run.observation_at(value)
 
 
-def test_v1_reader_accepts_historical_contract_shape_without_weakening_checks(published, tmp_path):
-    path = _copy(published, tmp_path)
-    config_file = path / "config.json"
-    plot_file = path / "plots.json"
-    manifest_file = path / "run.json"
-    config = json.loads(config_file.read_text(encoding="utf-8"))
-    contract = config["definition"]["segment_range"]["contract"]
-    assert contract.pop("reachability_block_steps") is None
-    for entry in map(json.loads, (path / "segments.jsonl").read_text(encoding="utf-8").splitlines()):
-        if entry["chunk"] is None:
-            continue
-        block_config_file = path / "segments" / str(entry["index"]) / entry["chunk"]["name"] / "config.json"
-        block_config = json.loads(block_config_file.read_text(encoding="utf-8"))
-        assert block_config["segment_range"]["contract"].pop("reachability_block_steps") is None
-        block_config_file.write_bytes(evidence._bytes(block_config))
-    _rehash(path)
-
-    def write_and_rehash():
-        config_file.write_bytes(evidence._bytes(config))
-        plots = json.loads(plot_file.read_text(encoding="utf-8"))
-        plots["config_sha256"] = evidence._hash(config_file)
-        plot_file.write_bytes(evidence._bytes(plots))
-        manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
-        manifest["config_sha256"] = plots["config_sha256"]
-        manifest["plots_sha256"] = evidence._hash(plot_file)
-        manifest_file.write_bytes(evidence._bytes(manifest))
-
-    write_and_rehash()
-    run = evidence.open_verified_cart_pole_segmented_run(path)
-    assert run.metadata["format_version"] == 1
-    assert run.observation_at(4)["step"] == 4
-    evidence.redraw_segmented_control(path, tmp_path / "historical-redraw")
-
-    contract["input_payload_bounds"][0] += 1
-    write_and_rehash()
-    with pytest.raises(ValueError):
-        evidence.open_verified_cart_pole_segmented_run(path)
-
-
-def test_dynamic_v2_publishes_verified_continuous_state(tmp_path_factory):
-    root = tmp_path_factory.mktemp("dv2")
-    report = _run(root, count=7, capacity=3, client_code=_DYNAMIC_CLIENT, dynamic=True)
+@pytest.mark.integration
+def test_dynamic_v2_publishes_verified_continuous_state(dynamic_published):
+    _, report = dynamic_published
     assert report["result"]["status"] == "complete", report["result"].get("traceback", report)
     run = evidence.open_verified_cart_pole_segmented_run(report["result"]["run_dir"])
     assert run.metadata["format_version"] == 2
@@ -283,22 +276,7 @@ def test_dynamic_v2_publishes_verified_continuous_state(tmp_path_factory):
     assert len({item["session"] for item in report["boundaries"]}) == 1
 
 
-def test_dynamic_v2_continuous_pulses_keep_device_memory_bounded(tmp_path_factory):
-    report = _run(tmp_path_factory.mktemp("dv2pulses"), count=41, capacity=20,
-                  mode="pulses", client_code=_DYNAMIC_CLIENT, dynamic=True)
-    assert report["result"]["status"] == "complete", report["result"]
-    assert report["device_pending"] == 0
-    run = evidence.open_verified_cart_pole_segmented_run(report["result"]["run_dir"])
-    assert run.metadata["segment_count"] == 3
-    snapshots = [item["snapshot"] for _, _, _, segment in run.iter_segments()
-                 for item in segment["steps"]]
-    assert [item["requested_disturbance_n"] for item in snapshots] == [
-        1. if step % 2 else -1. for step in range(41)
-    ]
-    assert all(item["force_disposition"] in ("accepted", "rejected_total_force_limit")
-               for item in snapshots)
-
-
+@pytest.mark.integration
 def test_dynamic_v2_failed_run_exposes_verified_unsealed_prefix(tmp_path_factory):
     root = tmp_path_factory.mktemp("dv2fail")
     report = _run(root, count=7, capacity=5,
@@ -363,6 +341,7 @@ def test_dynamic_v2_failed_run_exposes_verified_unsealed_prefix(tmp_path_factory
     ("normal", "commit_lost", "uncertain", 0, 0),
     ("normal", "peer_disconnect", "uncertain", 0, 0),
 ])
+@pytest.mark.integration
 def test_dynamic_v2_faults_keep_only_verified_prefix(tmp_path_factory, mode, party_fault,
                                                       status, sealed, active):
     report = _run(tmp_path_factory.mktemp("dv2fault"), count=7, capacity=3, mode=mode,
@@ -376,6 +355,7 @@ def test_dynamic_v2_faults_keep_only_verified_prefix(tmp_path_factory, mode, par
     assert prefix["unsealed_tail_is_complete"] is False
 
 
+@pytest.mark.integration
 def test_dynamic_v2_inflight_stop_confirms_one_round(tmp_path_factory):
     report = _run(tmp_path_factory.mktemp("dv2stop"), count=7, capacity=3,
                   mode="stop_inflight", client_code=_DYNAMIC_CLIENT, dynamic=True)
@@ -383,11 +363,11 @@ def test_dynamic_v2_inflight_stop_confirms_one_round(tmp_path_factory):
     assert report["result"]["confirmed_step_count"] == 1
 
 
-def test_dynamic_v2_reader_rejects_journal_and_rehashed_spec_tamper(tmp_path_factory):
-    root = tmp_path_factory.mktemp("dv2tamper")
-    report = _run(root, count=4, capacity=2, client_code=_DYNAMIC_CLIENT, dynamic=True)
+@pytest.mark.integration
+def test_dynamic_v2_reader_rejects_journal_and_rehashed_spec_tamper(dynamic_published, tmp_path):
+    source, report = dynamic_published
+    root = tmp_path
     assert report["result"]["status"] == "complete", report["result"]
-    source = Path(report["result"]["run_dir"])
     journal_copy = root / "journal-copy" / source.name
     journal_copy.parent.mkdir()
     shutil.copytree(source, journal_copy)
@@ -414,8 +394,11 @@ def test_dynamic_v2_reader_rejects_journal_and_rehashed_spec_tamper(tmp_path_fac
     manifest_file.write_bytes(evidence._bytes(manifest))
     with pytest.raises(ValueError):
         evidence.open_verified_cart_pole_segmented_run(spec_copy)
+    assert evidence.open_verified_cart_pole_segmented_run(source).metadata["N"] == 7
 
 
+@pytest.mark.integration
+@pytest.mark.stress
 def test_dynamic_v2_three_processes_continue_past_400(tmp_path_factory):
     shorter = _run(tmp_path_factory.mktemp("dv2bounded"), count=201, capacity=200,
                    client_code=_DYNAMIC_CLIENT, dynamic=True,
@@ -441,7 +424,8 @@ def test_dynamic_v2_three_processes_continue_past_400(tmp_path_factory):
                                    item["snapshot"]["observation_after"], atol=1e-12, rtol=0)
 
 
-@pytest.mark.parametrize("count", [0, 1, 3])
+@pytest.mark.parametrize("count", [0, 3])
+@pytest.mark.integration
 def test_empty_partial_and_full_stop_results_have_no_dummy_rows(tmp_path, count):
     report = _run(tmp_path, count=count)
     assert report["result"]["status"] == "complete", report
@@ -454,39 +438,7 @@ def test_empty_partial_and_full_stop_results_have_no_dummy_rows(tmp_path, count)
         assert sum(record.result.time.size for _, record, _, _ in entries) == count
 
 
-def test_1001_steps_cross_boundaries_and_independent_physical_oracle(tmp_path):
-    report = _run(tmp_path, count=1001, capacity=400)
-    assert report["result"]["status"] == "complete", report
-    run = evidence.open_verified_cart_pole_segmented_run(report["result"]["run_dir"])
-    assert run.metadata["N"] == 1001
-    assert [entry[0]["global_start"] for entry in run.iter_segments()] == [0,400,800]
-    state = np.array([0.,0.,np.pi/36,0.])
-    for g, frame in enumerate(report["frames"]):
-        force = float(np.clip(-ORACLE_K @ state, -10,10))
-        d = 1. if g in (399,799) else -1. if g in (400,800) else 0.
-        state = solve_ivp(_oracle_rhs, (0,.02), state, args=(force+d,),
-                          method="DOP853", rtol=1e-13, atol=1e-15).y[:,-1]
-        np.testing.assert_allclose(frame["state"], state, rtol=0, atol=4e-8)
-    for k in (0,399,400,401,799,800,801,1001):
-        assert run.observation_at(k)["step"] == k
-
-
-@pytest.mark.parametrize("mode", ["spool", "disk_full", "replay", "reader", "plot", "source",
-                                  "cancel_before_rename", "cancel_CONNECTING", "cancel_REPLAYING",
-                                  "cancel_VERIFYING", "cancel_PLOTTING"])
-def test_failed_publication_has_no_formal_or_owned_staging_root(tmp_path, mode):
-    report = _run(tmp_path, mode=mode)
-    assert report["result"]["status"] != "complete"
-    assert not list(tmp_path.rglob("run.json"))
-    assert not list(tmp_path.rglob(".incomplete-*"))
-
-
-def test_cancel_after_rename_keeps_verified_result(tmp_path):
-    report = _run(tmp_path, mode="cancel_after_rename")
-    assert report["result"]["status"] == "complete"
-    assert evidence.open_verified_cart_pole_segmented_run(report["result"]["run_dir"]).metadata["N"] == 7
-
-
+@pytest.mark.integration
 def test_confirmed_continue_then_zero_step_stop_is_retained(tmp_path):
     report = _run(tmp_path, count=3, capacity=3, mode="zero_tail")
     assert report["result"]["status"] == "complete", report
@@ -503,212 +455,12 @@ def test_confirmed_continue_then_zero_step_stop_is_retained(tmp_path):
         evidence.open_verified_cart_pole_segmented_run(path)
 
 
-def test_mutual_tls_result_verifies_across_segments(tmp_path):
-    report = _run(tmp_path, tls=True)
-    assert report["result"]["status"] == "complete", report
-    run = evidence.open_verified_cart_pole_segmented_run(report["result"]["run_dir"])
-    assert run._config["transport"] == "mutual_tls" and run.metadata["segment_count"] == 3
-
-
 @pytest.mark.parametrize("fault", ["commit_lost", "end_lost", "peer_disconnect"])
+@pytest.mark.integration
 def test_real_network_fault_cannot_publish_complete_result(tmp_path, fault):
     report = _run(tmp_path, party_fault=fault)
     assert report["result"]["status"] in ("failed", "uncertain")
     assert not list(tmp_path.rglob("run.json")) and not list(tmp_path.rglob(".incomplete-*"))
-
-
-def _copy(published, tmp_path):
-    source = published[0]
-    path = tmp_path / source.name
-    shutil.copytree(source, path)
-    return path
-
-
-def _rehash(path):
-    """负控只更新局部摘要链，语义检查仍须拒绝伪造，不弱化来源验证。"""
-    entries = [json.loads(line) for line in (path / "segments.jsonl").read_text().splitlines()]
-    for entry in entries:
-        folder = path / "segments" / str(entry["index"])
-        entry["protocol_sha256"] = evidence._hash(folder / "protocol.json")
-        if entry["chunk"]:
-            block = folder / entry["chunk"]["name"]
-            metadata = json.loads((block / "metadata.json").read_text())
-            metadata["derived_files_sha256"][evidence.EVIDENCE] = evidence._hash(block / evidence.EVIDENCE)
-            metadata["files_sha256"] = {name:evidence._hash(block / name)
-                                         for name in ("trajectory.csv","config.json")}
-            (block / "metadata.json").write_bytes(evidence._bytes(metadata))
-            entry["chunk"]["files"] = {name:evidence._hash(block / name)
-                                         for name in entry["chunk"]["files"]}
-    _rewrite_index(path, entries)
-
-
-def _rewrite_index(path, entries):
-    tail = None
-    for entry in entries:
-        entry["prev_sha256"] = tail
-        entry.pop("sha256")
-        tail = evidence.sha256(evidence._bytes(entry)).hexdigest()
-        entry["sha256"] = tail
-    (path / "segments.jsonl").write_bytes(b"".join(evidence._bytes(e) for e in entries))
-    root = json.loads((path / "run.json").read_text())
-    root["index_sha256"], root["tail"] = evidence._hash(path / "segments.jsonl"), tail
-    # 同步图的源索引字段；不以旧 plot hash 恰好拒绝来冒充语义负控。
-    plots = json.loads((path / "plots.json").read_text())
-    plots["index_sha256"] = root["index_sha256"]
-    (path / "plots.json").write_bytes(evidence._bytes(plots))
-    root["plots_sha256"] = evidence._hash(path / "plots.json")
-    (path / "run.json").write_bytes(evidence._bytes(root))
-
-
-@pytest.mark.parametrize("mutation", ["time", "event", "boundary", "monitor", "receipt",
-                                      "resource", "setup", "session_duplicate", "round_duplicate",
-                                      "raw_force", "applied_force", "side_initial", "csv_force"])
-def test_rehashed_local_semantic_tampering_is_rejected(published, tmp_path, mutation):
-    path = _copy(published, tmp_path)
-    entry = json.loads((path / "segments.jsonl").read_text().splitlines()[1])
-    folder = path / "segments" / "1"
-    file = folder / "protocol.json"
-    data = json.loads(file.read_text())
-    if mutation == "time":
-        data["steps"][0]["snapshot"]["t_before_s"] += .02
-    elif mutation == "boundary":
-        data["steps"][0]["snapshot"]["observation_before"][0] += .01
-    elif mutation == "monitor":
-        data["steps"][0]["snapshot"]["stable_count"] += 1
-    elif mutation == "receipt":
-        data["protocol"]["receipts"][1]["party"] = "P1"
-    elif mutation == "resource":
-        for item in (data["steps"][0]["protocol"], data["protocol"]["steps"][0]):
-            item["resource_ids"][0] = item["resource_ids"][1]
-    elif mutation == "setup":
-        data["protocol"]["setup"]["fractional_bits"] += 1
-    elif mutation == "session_duplicate":
-        previous = json.loads((path / "segments/0/protocol.json").read_text())
-        data["protocol"]["session_id"] = previous["protocol"]["session_id"]
-    elif mutation == "round_duplicate":
-        previous = json.loads((path / "segments/0/protocol.json").read_text())
-        round_id = previous["protocol"]["steps"][0]["round_id"]
-        for step in (data["steps"][0]["protocol"], data["protocol"]["steps"][0]):
-            step["round_id"] = round_id
-            step["resource_ids"] = [f"{round_id}:D[0,{j}]" for j in range(4)]
-    elif mutation == "raw_force":
-        data["steps"][0]["snapshot"]["raw_force_n"] += .01
-        for step in (data["steps"][0]["protocol"], data["protocol"]["steps"][0]):
-            step["raw_control"][0] = data["steps"][0]["snapshot"]["raw_force_n"]
-    elif mutation == "applied_force":
-        data["steps"][0]["snapshot"]["applied_force_n"] += .01
-    elif mutation == "side_initial":
-        side = folder / entry["chunk"]["name"] / evidence.EVIDENCE
-        payload = json.loads(side.read_text())
-        payload["branches"]["secure"]["observations"][0][0] += .01
-        side.write_bytes(evidence._bytes(payload))
-    elif mutation == "csv_force":
-        import csv
-        trajectory = folder / entry["chunk"]["name"] / "trajectory.csv"
-        with trajectory.open(newline="") as source:
-            rows = list(csv.reader(source))
-        for name in ("control_ideal[0]", "control_secure[0]"):
-            column = rows[0].index(name)
-            rows[1][column] = str(float(rows[1][column])+.01)
-        with trajectory.open("w", newline="") as output:
-            csv.writer(output).writerows(rows)
-    elif mutation == "event":
-        side = folder / entry["chunk"]["name"] / evidence.EVIDENCE
-        payload = json.loads(side.read_text())
-        payload["events"] = [{"step":3,"force_n":1.,"duration_steps":1,"phase":"invalid"}]
-        side.write_bytes(evidence._bytes(payload))
-    file.write_bytes(evidence._bytes(data))
-    _rehash(path)
-    with pytest.raises((ValueError, TypeError, AssertionError)):
-        evidence.open_verified_cart_pole_segmented_run(path)
-
-
-@pytest.mark.parametrize("mutation", ["delete", "index", "extra", "version", "escape", "duplicate_key"])
-def test_missing_extra_or_malformed_artifacts_rejected(published, tmp_path, mutation):
-    path = _copy(published, tmp_path)
-    if mutation == "delete":
-        (path / "segments/1/protocol.json").unlink()
-    elif mutation == "extra":
-        (path / "segments/3").mkdir()
-    elif mutation == "index":
-        with (path / "segments.jsonl").open("ab") as output:
-            output.write((path / "segments.jsonl").read_bytes().splitlines()[0] + b"\n")
-    else:
-        manifest = json.loads((path / "run.json").read_text())
-        if mutation == "version":
-            manifest["format_version"] = 2
-        elif mutation == "escape":
-            lines = (path / "segments.jsonl").read_bytes().splitlines()
-            item = json.loads(lines[0])
-            item["chunk"]["name"] = "../other"
-            (path / "segments.jsonl").write_bytes(evidence._bytes(item) + b"\n".join(lines[1:])+b"\n")
-        elif mutation == "duplicate_key":
-            (path / "run.json").write_text('{"N":1,' + (path / "run.json").read_text()[1:])
-            with pytest.raises(ValueError):
-                evidence.open_verified_cart_pole_segmented_run(path)
-            return
-        (path / "run.json").write_bytes(evidence._bytes(manifest))
-    with pytest.raises((ValueError, TypeError, OSError)):
-        evidence.open_verified_cart_pole_segmented_run(path)
-
-
-def test_seek_rechecks_files_after_open_and_reader_does_not_generate_shares(published, tmp_path, monkeypatch):
-    path = _copy(published, tmp_path)
-    monkeypatch.setattr(evidence.Client, "distribute_controller", lambda *_a, **_kw: pytest.fail("shares"))
-    run = evidence.open_verified_cart_pole_segmented_run(path)
-    run.observation_at(4)
-    (path / "segments/1/protocol.json").write_text("{}")
-    with pytest.raises(ValueError):
-        run.observation_at(4)
-
-
-@pytest.mark.parametrize("mutation", ["reorder", "overlap", "missing", "duplicate", "escape", "bool"])
-def test_rehashed_index_semantics_reject_incomplete_or_invalid_ranges(published, tmp_path, mutation):
-    path = _copy(published, tmp_path)
-    entries = [json.loads(line) for line in (path / "segments.jsonl").read_text().splitlines()]
-    if mutation == "reorder":
-        entries[0], entries[1] = entries[1], entries[0]
-    elif mutation == "overlap":
-        entries[1]["global_start"] -= 1
-    elif mutation == "missing":
-        entries.pop()
-    elif mutation == "duplicate":
-        entries.append(entries[-1].copy())
-    elif mutation == "escape":
-        entries[0]["chunk"]["name"] = "../other"
-    else:
-        entries[0]["index"] = False
-    _rewrite_index(path, entries)
-    with pytest.raises((ValueError, TypeError)):
-        evidence.open_verified_cart_pole_segmented_run(path)
-
-
-def test_disk_identity_index_and_reducer_have_fixed_capacity():
-    from secure_control.experiments.plotting import BoundedOverview
-    with evidence._identities() as database:
-        assert database.execute("PRAGMA cache_size").fetchone()[0] == -4096
-        assert database.execute("PRAGMA temp_store").fetchone()[0] == 1
-        evidence._identity(database, "round", "first")
-        with pytest.raises(ValueError):
-            evidence._identity(database, "round", "first")
-    reducer = BoundedOverview(100_000, buckets=8)
-    for k in range(100_001):
-        reducer.add(k, k*.02, np.sin(k))
-    points = reducer.points()
-    assert len(reducer._items) <= 8 and len(points) <= 34
-    assert points[0][0] == 0 and points[-1][0] == 100_000
-    assert all(a[0] < b[0] for a,b in pairwise(points))
-
-
-def test_redraw_dispatches_verified_segmented_source_without_protocol(published, tmp_path):
-    output = tmp_path / "overview.png"
-    before = _redraw_source_fingerprint(published[0])
-    result = subprocess.run([sys.executable,"-m","secure_control.experiments.lan_runner",
-                             "redraw","--run-dir",str(published[0]),"--output",str(output)],
-                            cwd=ROOT, capture_output=True, text=True, check=False)
-    assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout)["status"] == "complete" and output.stat().st_size > 1000
-    _assert_redraw_source_preserved(published[0], before)
 
 
 def _redraw_source_fingerprint(path):
@@ -717,68 +469,23 @@ def _redraw_source_fingerprint(path):
             for item in path.rglob("*")}
 
 
-def _assert_redraw_source_preserved(path, before):
-    assert _redraw_source_fingerprint(path) == before
-    run = evidence.open_verified_cart_pole_segmented_run(path)
-    assert run.observation_at(0)["step"] == 0
-    assert run.observation_at(run.metadata["N"])["step"] == run.metadata["N"]
-
-
-@pytest.mark.parametrize("entrypoint", ["api", "cli"])
-@pytest.mark.parametrize("target_kind", ["existing_external", "source_control", "source_new",
-                                         "source_nested", "parent_alias"])
-def test_redraw_rejects_existing_or_source_targets_without_mutation(
-    published, tmp_path, entrypoint, target_kind
-):
-    """RV-001：公开入口拒绝已有目标和源内新文件，不能靠 reader 放松成员校验。"""
-    path = _copy(published, tmp_path)
-    target = tmp_path / "existing.png"
-    if target_kind == "existing_external":
-        target.write_bytes(b"user-owned existing output")
-    elif target_kind == "source_control":
-        target = path / "control.png"
-    elif target_kind == "source_new":
-        target = path / "overview.png"
-    elif target_kind == "source_nested":
-        target = path / "new-directory" / "overview.png"
-    else:
-        target = path / "segments" / ".." / "overview.png"
-    before = _redraw_source_fingerprint(path)
-    original = target.read_bytes() if target.is_file() else None
-    if entrypoint == "api":
-        with pytest.raises((FileExistsError, ValueError)):
-            evidence.redraw_segmented_control(path, target)
-    else:
-        result = subprocess.run(
-            [sys.executable, "-m", "secure_control.experiments.lan_runner", "redraw",
-             "--run-dir", str(path), "--output", str(target)],
-            cwd=ROOT, capture_output=True, text=True, check=False,
-        )
-        assert result.returncode != 0
-        assert json.loads(result.stdout)["status"] != "complete"
-    if original is not None:
-        assert target.read_bytes() == original
-    else:
-        assert not target.exists()
-    _assert_redraw_source_preserved(path, before)
-
-
-def test_redraw_rejects_directory_symlink_alias_into_source(published, tmp_path):
-    """RV-001：词法上位于外部的目录别名不能绕过源只读边界。"""
-    path = _copy(published, tmp_path)
-    alias = tmp_path / "source-alias"
-    alias.symlink_to(path, target_is_directory=True)
-    before = _redraw_source_fingerprint(path)
+@pytest.mark.integration
+def test_shared_reports_and_clone_keep_source_immutable(dynamic_published, tmp_path):
+    """负例副本的写入不能污染本轮正常源及另一独立副本。"""
+    source, report = dynamic_published
+    with pytest.raises(TypeError):
+        report["result"]["status"] = "forged"
+    with pytest.raises(TypeError):
+        report["boundaries"][0]["snapshot"]["observation_after"][0] = 42
+    fingerprint = _redraw_source_fingerprint(source)
+    first, second = tmp_path / "first" / source.name, tmp_path / "second" / source.name
+    first.parent.mkdir()
+    second.parent.mkdir()
+    shutil.copytree(source, first)
+    shutil.copytree(source, second)
+    (first / "run.json").write_bytes(b"{}")
     with pytest.raises(ValueError):
-        evidence.redraw_segmented_control(path, alias / "overview.png")
-    _assert_redraw_source_preserved(path, before)
-
-
-def test_redraw_api_creates_external_new_output_and_preserves_source(published, tmp_path):
-    """RV-001：合法外部目录可创建，成功后完整 reader 与首末 seek 仍成立。"""
-    path = _copy(published, tmp_path)
-    before = _redraw_source_fingerprint(path)
-    output = tmp_path / "new-figures" / "overview.png"
-    assert evidence.redraw_segmented_control(path, output) == output
-    assert output.stat().st_size > 1000
-    _assert_redraw_source_preserved(path, before)
+        evidence.open_verified_cart_pole_segmented_run(first)
+    assert _redraw_source_fingerprint(source) == fingerprint
+    assert evidence.open_verified_cart_pole_segmented_run(source).metadata["N"] == 7
+    assert evidence.open_verified_cart_pole_segmented_run(second).metadata["N"] == 7

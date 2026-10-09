@@ -98,7 +98,7 @@ measurement 输入或原始数据。
 | --- | --- | --- |
 | 2R2C HVAC 双闭环与 sweep | 场景层拥有 `reference -> v=r-T_air`、2R2C plant、60 s/180 步、PID、`[0,12] kW` actuator；[`docs/precision_sweep.md`](precision_sweep.md) 记录结果范围。 | **场景适配**。不能称论文 Fig. 3 原例。 |
 | `control_ideal/control_secure` 和 Fig. 3 adapted | 正式证据记录的是 actuator 后的 **applied** control；原始控制误差只作数值机制诊断。见 [`docs/secure_execution_evidence.md`](secure_execution_evidence.md)。 | **场景适配**。不能把 applied-control 指标改称论文 Eq. (4) 的未裁剪原例 `u-u_hat`。 |
-| 整数 A/B no-Trunc 路径 | 当前 PID 的 A/B 是零 fractional-bit 整数；每步 Protocol 1 仍执行，但 Protocol 2 计数为零。见 [`tests/test_hvac_dual_loop.py`](../tests/test_hvac_dual_loop.py) 和 [`docs/final_hvac_evidence_chain.md`](final_hvac_evidence_chain.md)。 | **场景适配**。它不证明 Protocol 2 在完整 HVAC 闭环或论文 Fig. 4 中实际执行。 |
+| 整数 A/B no-Trunc 路径 | 当前 PID 的 A/B 是零 fractional-bit 整数；每步 Protocol 1 仍执行，但 Protocol 2 计数为零。通用机制见 [`tests/test_two_party_protocol.py`](../tests/test_two_party_protocol.py)，历史HVAC证据见 [`docs/final_hvac_evidence_chain.md`](final_hvac_evidence_chain.md)；HVAC专属回归已退出当前测试范围。 | **场景适配**。它不证明 Protocol 2 在完整 HVAC 闭环或论文 Fig. 4 中实际执行。 |
 | final HVAC evidence chain | 文档列出 sweep、safety、public evidence、report 和 exact-grid sidecar 的 ID/manifest/hash，以及当时 12 点成功的记录。 | **场景适配**，且本轮仅核对索引与 reader/测试，未重读本地不存在的原始 artifact。 |
 
 ## 历史路线图与当前状态

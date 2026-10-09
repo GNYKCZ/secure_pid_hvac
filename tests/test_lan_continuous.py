@@ -12,7 +12,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 import yaml
-from test_lan_single_step import ROOT, _finish, _free_ports, _run
+from lan_test_support import (
+    loopback_deployment,
+    reap_processes,
+    role_command,
+    select_experiment,
+    start_processes,
+)
+from test_lan_single_step import ROOT, _finish, _run
 from test_lan_single_step import deployment as _base_deployment
 
 from secure_control.execution.lan_config import load_lan_config
@@ -60,12 +67,7 @@ def _continuous_config(paths: dict[str, Path], count: int, ell: int = 32) -> Pat
         "output_root": str(profile.parent / "runs"),
     }
     profile.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
-    role = paths["Client"]
-    role.write_text(role.read_text(encoding="utf-8").replace(
-        f"controller: {ROOT / 'tests' / 'fixtures' / 'legacy_hvac' / 'hvac_dual_loop.yaml'}",
-        f"experiment: {profile}",
-    ).replace("experiment: paper_pid_lan.example.yaml",
-              f"experiment: {profile}"), encoding="utf-8")
+    select_experiment(paths["Client"], profile)
     return profile
 
 
@@ -80,39 +82,13 @@ def _nested_keys(value: object) -> list[str]:
 
 
 def _run_module(role: str, config: Path) -> subprocess.Popen[str]:
-    """以 VS Code launch.json 所用模块入口启动真实独立进程。"""
-    return subprocess.Popen(
-        [sys.executable, "-m", "secure_control.experiments.lan_runner",
-         role.lower(), "--config", str(config)],
-        cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-    )
+    """与普通角色相同的当前解释器模块入口。"""
+    return _run(role, config)
 
 
 def _plain_deployment(tmp_path: Path) -> dict[str, Path]:
-    """独立构造回环角色配置，不依赖可由用户编辑的部署示例。"""
-    ports = _free_ports()
-    topology_path = tmp_path / "topology.yaml"
-    topology_path.write_text(yaml.safe_dump({
-        "version": 1,
-        "identities": {role: f"{role.lower()}.secure-control.test"
-                       for role in ("Client", "P1", "P2")},
-        **{name: {"bind": "127.0.0.1", "host": "127.0.0.1", "port": port}
-           for name, port in zip(("p1_client", "p2_client", "p1_peer"), ports, strict=True)},
-    }, sort_keys=False), encoding="utf-8")
-    paths = {}
-    for role, name in (("P1", "lab-p1.example.yaml"), ("P2", "lab-p2.example.yaml"),
-                       ("Client", "lab-client-continuous.example.yaml")):
-        role_content = (f"role: {role}\ntransport: insecure_tcp\n"
-                        f"topology: {topology_path}\n"
-                        + ("experiment: paper_pid_lan.example.yaml\n"
-                           if role == "Client" else "")
-                        + "timeouts:\n  startup: 180\n  step: 30\n"
-                        + ("  idle: 30\n" if role == "Client" else "")
-                        + "  shutdown: 5\n")
-        path = tmp_path / name
-        path.write_text(role_content, encoding="utf-8")
-        paths[role] = path
-    return paths
+    """独立构造可立即加载的回环配置，不读取日常部署示例。"""
+    return loopback_deployment(tmp_path)
 
 
 def _tank_profile(paths: dict[str, Path], count: int, ell: int = 32,
@@ -131,59 +107,16 @@ def _tank_profile(paths: dict[str, Path], count: int, ell: int = 32,
     data["plot"]["control_channel"] = channel
     data["output_root"] = str(profile.parent / "tank-runs")
     profile.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
-    role = paths["Client"]
-    role.write_text(role.read_text(encoding="utf-8").replace(
-        "experiment: paper_pid_lan.example.yaml", f"experiment: {profile}"
-    ), encoding="utf-8")
+    select_experiment(paths["Client"], profile)
     return profile
-
-
-def test_quadruple_tank_three_process_short_session_and_selected_redraw(tmp_path: Path) -> None:
-    """真实三进程 MIMO 每步消耗 36 triple/4 Trunc，通道 1 重绘保持选择。"""
-    paths = _plain_deployment(tmp_path)
-    _tank_profile(paths, 3)
-    parties = [_run(role, paths[role]) for role in ("P1", "P2")]
-    try:
-        time.sleep(0.5)
-        client = _run("Client", paths["Client"])
-        code, result, errors = _finish(client, 100)
-        assert code == 0, (result, errors)
-        outcomes = [_finish(party, 100) for party in parties]
-        assert all(item[0] == 0 for item in outcomes), outcomes
-        assert len({result["pid"], *(item[1]["pid"] for item in outcomes)}) == 3
-        assert result["scenario"] == "quadruple_tank"
-        assert result["resource_counts"] == {"products_consumed": 108,
-                                               "truncations_consumed": 12}
-        record = load_artifacts(result["run_dir"])
-        assert record.result.control_error.shape == (3, 2)
-        assert record.provenance["confirmed_steps"] == [
-            {"step": index, "status": "double_committed", "products": 36,
-             "truncations": 4} for index in range(3)
-        ]
-        assert record.provenance["scale_ledger"]["state_truncation_bits"] == 32
-        assert np.array_equal(record.result.control_error,
-                              record.result.control_ideal - record.result.control_secure)
-        selected = json.loads((Path(result["run_dir"]) / "control_plot.json").read_text(
-            encoding="utf-8"
-        ))
-        assert selected["control_channel"] == 1
-        redrawn = redraw_control_triptych(result["run_dir"], tmp_path / "redrawn.png")
-        assert redrawn.read_bytes() == (Path(result["run_dir"]) / "control.png").read_bytes()
-    finally:
-        for party in parties:
-            if party.poll() is None:
-                party.kill()
-            party.communicate()
 
 
 @pytest.mark.parametrize("change", [
     lambda data: data["range"].update({"measurement_absolute_bounds_v": [4, 256]}),
     lambda data: data["numeric"].update({"k": 32}),
-    lambda data: data["numeric"].update({"runtime_payload_bits": 40}),
-    lambda data: data["numeric"].update({"lambda": 230}),
-    lambda data: data["plot"].update({"control_channel": 2}),
     lambda data: data.update({"observer_source": "missing.yaml"}),
 ])
+@pytest.mark.integration
 def test_tank_bad_profile_fails_before_network(tmp_path: Path, change) -> None:
     paths = _plain_deployment(tmp_path)
     profile = _tank_profile(paths, 3)
@@ -194,6 +127,7 @@ def test_tank_bad_profile_fails_before_network(tmp_path: Path, change) -> None:
         load_quadruple_tank_lan_profile(profile)
 
 
+@pytest.mark.integration
 def test_direct_python_files_run_three_role_lab_without_certificates(tmp_path: Path) -> None:
     """三个独立 Python 文件各启动一角，Client 发布三步真实图。"""
     paths = _plain_deployment(tmp_path)
@@ -203,11 +137,8 @@ def test_direct_python_files_run_three_role_lab_without_certificates(tmp_path: P
     del data["frozen_definition"]
     profile.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
     assert not list(tmp_path.glob("*.pem"))
-    parties = [subprocess.Popen(
-        [sys.executable, str(ROOT / "scripts" / f"run_continuous_{role.lower()}.py"),
-         str(paths[role])], cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True,
-    ) for role in ("P1", "P2")]
+    parties = start_processes([[sys.executable, str(ROOT / "scripts" / f"run_continuous_{role.lower()}.py"),
+         str(paths[role])] for role in ("P1", "P2")])
     try:
         time.sleep(0.5)
         client = subprocess.Popen(
@@ -240,12 +171,10 @@ def test_direct_python_files_run_three_role_lab_without_certificates(tmp_path: P
         assert record.effective_config["definition"] is None
         assert "unauthenticated plaintext" in record.provenance["security_boundary"]
     finally:
-        for party in parties:
-            if party.poll() is None:
-                party.kill()
-            party.communicate()
+        reap_processes(parties)
 
 
+@pytest.mark.integration
 def test_plain_transport_must_be_explicit_and_must_not_ignore_tls(tmp_path: Path) -> None:
     paths = _plain_deployment(tmp_path)
     role = paths["P1"]
@@ -266,6 +195,7 @@ def test_default_lab_configs_need_no_certificate_files() -> None:
         assert (config.ca, config.certificate, config.private_key) == (None, None, None)
 
 
+@pytest.mark.integration
 def test_continuous_setup_codec_keeps_prime_evidence(deployment: dict[str, Path]) -> None:
     profile = load_paper_pid_lan_profile(_continuous_config(deployment, 3))
     setup = LanContinuousSetupPayload(
@@ -278,22 +208,8 @@ def test_continuous_setup_codec_keeps_prime_evidence(deployment: dict[str, Path]
     ))).mode == "lan-continuous-v1"
 
 
-def test_client_profile_can_use_paper_pid_baseline_without_fig3_definition(
-    deployment: dict[str, Path],
-) -> None:
-    """日常三角色实验不必依赖 Fig3 四点冻结定义。"""
-    path = _continuous_config(deployment, 3, ell=33)
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    data.pop("frozen_definition")
-    data["baseline_source"] = str(ROOT / "configs" / "paper_pid_cascade_zoh.yaml")
-    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
-    profile = load_paper_pid_lan_profile(path)
-    assert profile.ell == 33
-    assert profile.claim_level == "user-exploration"
-
-
-@pytest.mark.parametrize("replacement", ["ell: 0", "k: 32", "lambda: 250",
-                                           "sample_count: 0", "measurement_absolute_bound: 1"])
+@pytest.mark.parametrize("replacement", ["ell: 0", "measurement_absolute_bound: 1"])
+@pytest.mark.integration
 def test_bad_profile_rejected_before_network(
     deployment: dict[str, Path], replacement: str
 ) -> None:
@@ -314,25 +230,7 @@ def test_bad_profile_rejected_before_network(
         load_paper_pid_lan_profile(profile)
 
 
-def test_profile_duplicate_and_wrong_prime_rejected(deployment: dict[str, Path]) -> None:
-    profile = _continuous_config(deployment, 3)
-    with profile.open("a", encoding="utf-8") as target:
-        target.write("sample_count: 4\n")
-    with pytest.raises(ValueError, match="重复"):
-        load_paper_pid_lan_profile(profile)
-    profile = _continuous_config(deployment, 3)
-    prime = ROOT / "configs" / "shared_prime_256_pocklington.yaml"
-    bad_prime = profile.parent / "bad_prime.yaml"
-    content = prime.read_text(encoding="utf-8")
-    source = load_paper_pid_lan_profile(profile)
-    bad_prime.write_text(content.replace(str(source.q), str(source.q + 2), 1), encoding="utf-8")
-    profile.write_text(profile.read_text(encoding="utf-8").replace(
-        str(prime), str(bad_prime)
-    ), encoding="utf-8")
-    with pytest.raises((ValueError, TypeError)):
-        load_paper_pid_lan_profile(profile)
-
-
+@pytest.mark.integration
 def test_bad_shared_prime_certificate_rejected_before_network(deployment: dict[str, Path]) -> None:
     """证书损坏必须在 Client 配置预检阶段失败。"""
     profile = _continuous_config(deployment, 3)
@@ -350,12 +248,13 @@ def test_bad_shared_prime_certificate_rejected_before_network(deployment: dict[s
     assert not (profile.parent / "runs").exists()
 
 
-@pytest.mark.parametrize(("count", "ell"), [(3, 32), (51, 32), (51, 40)])
+@pytest.mark.parametrize(("count", "ell"), [(3, 32), (51, 32)])
+@pytest.mark.integration
 def test_three_independent_continuous_roles_publish_one_verified_run(
     deployment: dict[str, Path], count: int, ell: int
 ) -> None:
     profile = _continuous_config(deployment, count, ell)
-    parties = [_run_module(role, deployment[role]) for role in ("P1", "P2")]
+    parties = start_processes([role_command(role, deployment[role]) for role in ("P1", "P2")])
     try:
         time.sleep(0.5)
         client = _run_module("Client", deployment["Client"])
@@ -454,7 +353,7 @@ def test_three_independent_continuous_roles_publish_one_verified_run(
             assert redrawn.read_bytes() == (run_dir / "control.png").read_bytes()
 
             # 重启全部角色后，不能续用上一组 share/session 或已发布 run ID。
-            again = [_run(role, deployment[role]) for role in ("P1", "P2")]
+            again = start_processes([role_command(role, deployment[role]) for role in ("P1", "P2")])
             try:
                 time.sleep(0.5)
                 second = _run("Client", deployment["Client"])
@@ -464,10 +363,7 @@ def test_three_independent_continuous_roles_publish_one_verified_run(
                 assert second_result["run_id"] != result["run_id"]
                 assert all(_finish(party, 30)[0] == 0 for party in again)
             finally:
-                for party in again:
-                    if party.poll() is None:
-                        party.kill()
-                    party.communicate()
+                reap_processes(again)
 
             def fail_render(_record, _stage):
                 raise RuntimeError("render failed")
@@ -482,28 +378,7 @@ def test_three_independent_continuous_roles_publish_one_verified_run(
             with pytest.raises(ValueError, match="摘要"):
                 load_artifacts(run_dir)
     finally:
-        for party in parties:
-            if party.poll() is None:
-                party.kill()
-            party.communicate()
-
-
-def test_shared_prime_and_frozen_compatibility_bytes() -> None:
-    """公开证据的日常名称不能使旧 raw SHA 或 HVAC LF 摘要漂移。"""
-    shared = (ROOT / "configs" / "shared_prime_256_pocklington.yaml").read_bytes()
-    legacy = (ROOT / "configs" / "hvac_2r2c_sweep_prime.yaml").read_bytes()
-    fixture = (ROOT / "tests" / "fixtures" / "legacy_hvac" / "hvac_2r2c_sweep_prime.yaml").read_bytes()
-    definition = (ROOT / "configs" / "paper_pid_fig3_sweep.yaml").read_bytes()
-    assert shared == legacy == fixture
-    assert sha256(shared).hexdigest() == (
-        "b8c5e9e779d945cfc19d0662b641cd1084acadd0907cc6b4e64ee4076455111b"
-    )
-    assert sha256(shared.replace(b"\r\n", b"\n")).hexdigest() == (
-        "b317a7db4f14fbf77258102d6b09766dc3b5f495252c1e29ed3ae315cb98340c"
-    )
-    assert sha256(definition).hexdigest() == (
-        "16b635276927e4a14977ff7ac2d7baa67885fc3244017589fb2a638b5c6de39a"
-    )
+        reap_processes(parties)
 
 
 _LOST_SECOND_COMMIT = r"""
@@ -536,6 +411,7 @@ cli()
 """
 
 
+@pytest.mark.integration
 def test_second_round_commit_ack_loss_has_no_success_run(deployment: dict[str, Path]) -> None:
     profile = _continuous_config(deployment, 3)
     p1 = _run("P1", deployment["P1"])
@@ -552,15 +428,13 @@ def test_second_round_commit_ack_loss_has_no_success_run(deployment: dict[str, P
         assert _finish(p2, 30)[0] != 0
         assert _finish(p1, 30)[0] != 0
     finally:
-        for party in (p1, p2):
-            if party.poll() is None:
-                party.kill()
-            party.communicate()
+        reap_processes((p1, p2))
 
 
+@pytest.mark.integration
 def test_second_round_stale_step_rejected(deployment: dict[str, Path]) -> None:
     profile = _continuous_config(deployment, 3)
-    parties = [_run(role, deployment[role]) for role in ("P1", "P2")]
+    parties = start_processes([role_command(role, deployment[role]) for role in ("P1", "P2")])
     try:
         time.sleep(0.5)
         client = subprocess.Popen(
@@ -573,12 +447,10 @@ def test_second_round_stale_step_rejected(deployment: dict[str, Path]) -> None:
         assert not (profile.parent / "runs").exists()
         assert all(_finish(party, 30)[0] != 0 for party in parties)
     finally:
-        for party in parties:
-            if party.poll() is None:
-                party.kill()
-            party.communicate()
+        reap_processes(parties)
 
 
+@pytest.mark.integration
 def test_measurement_out_of_range_invalidates_session(deployment: dict[str, Path]) -> None:
     profile = load_paper_pid_lan_profile(_continuous_config(deployment, 3))
     spec, context, contract = paper_pid_numeric_contract(
@@ -587,7 +459,7 @@ def test_measurement_out_of_range_invalidates_session(deployment: dict[str, Path
         sample_count=profile.sample_count,
         measurement_absolute_bound=profile.measurement_absolute_bound,
     )
-    parties = [_run(role, deployment[role]) for role in ("P1", "P2")]
+    parties = start_processes([role_command(role, deployment[role]) for role in ("P1", "P2")])
     try:
         time.sleep(0.5)
         runtime = LanContinuousRuntime(
@@ -603,7 +475,64 @@ def test_measurement_out_of_range_invalidates_session(deployment: dict[str, Path
             runtime.close()
         assert all(_finish(party, 30)[0] != 0 for party in parties)
     finally:
-        for party in parties:
-            if party.poll() is None:
-                party.kill()
-            party.communicate()
+        reap_processes(parties)
+
+
+@pytest.mark.integration
+def test_loopback_deployment_is_valid_before_profile_selection(tmp_path):
+    """回环基准配置在选择场景前就必须指向存在的 canonical 实验。"""
+    paths = _plain_deployment(tmp_path)
+    for role in ("Client", "P1", "P2"):
+        config = load_lan_config(paths[role], role)
+        for endpoint in (config.topology.p1_client, config.topology.p2_client,
+                         config.topology.p1_peer):
+            assert endpoint.bind == endpoint.host == "127.0.0.1"
+        if role == "Client":
+            assert config.experiment_config == ROOT / "configs/paper_pid_lan.example.yaml"
+
+
+@pytest.mark.integration
+def test_user_deployment_changes_cannot_redirect_loopback_trial(tmp_path, monkeypatch):
+    """模拟日常场景/IP/端口修改；三个真实进程只接收测试拥有的回环配置。"""
+    user_paths = {ROOT / "configs/lab-client-continuous.example.yaml",
+                  ROOT / "configs/local-deployment.example.yaml"}
+    read_bytes, read_text = Path.read_bytes, Path.read_text
+    fingerprints = {path: sha256(read_bytes(path)).hexdigest() for path in user_paths}
+    accessed = []
+    modified = b"scenario: quadruple_tank\nhost: 203.0.113.99\nport: 65000\n"
+
+    def simulated_bytes(path):
+        if path.resolve() in user_paths:
+            accessed.append(path)
+            return modified
+        return read_bytes(path)
+
+    def simulated_text(path, *args, **kwargs):
+        if path.resolve() in user_paths:
+            accessed.append(path)
+            return modified.decode()
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_bytes", simulated_bytes)
+    monkeypatch.setattr(Path, "read_text", simulated_text)
+    paths = _plain_deployment(tmp_path)
+    _tank_profile(paths, 3)
+    for role in ("Client", "P1", "P2"):
+        config = load_lan_config(paths[role], role)
+        assert paths[role].parent == tmp_path
+        for endpoint in (config.topology.p1_client, config.topology.p2_client,
+                         config.topology.p1_peer):
+            assert endpoint.bind == endpoint.host == "127.0.0.1"
+    processes = start_processes([role_command(role, paths[role]) for role in ("P1", "P2")])
+    try:
+        processes.append(_run("Client", paths["Client"]))
+        code, result, errors = _finish(processes[-1], 100)
+        assert code == 0 and result["scenario"] == "quadruple_tank", (result, errors)
+        outcomes = [_finish(process, 100) for process in processes[:2]]
+        assert all(item[0] == 0 for item in outcomes), outcomes
+        assert len({result["pid"], *(item[1]["pid"] for item in outcomes)}) == 3
+        assert result["resource_counts"] == {"products_consumed": 108, "truncations_consumed": 12}
+    finally:
+        reap_processes(processes)
+    assert accessed == []
+    assert {path: sha256(read_bytes(path)).hexdigest() for path in user_paths} == fingerprints

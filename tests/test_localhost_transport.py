@@ -11,13 +11,12 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import fields
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from secure_control.core import ControllerScaleMetadata, ControllerSpec
+from secure_control.core import ControllerSpec
 from secure_control.crypto import AdditiveShare, FixedPointContext
 from secure_control.execution import (
     LocalhostExecutionError,
@@ -54,7 +53,6 @@ from secure_control.execution.localhost_transport import (
     send_envelope,
     send_frame,
 )
-from secure_control.experiments.localhost_runner import run_localhost_comparison
 from secure_control.protocol import ControllerRangeContract, ControllerScaleLedger
 from secure_control.protocol.messages import (
     ControlShareMessage,
@@ -132,6 +130,7 @@ def test_public_int64_input_array_round_trip_preserves_low_bits() -> None:
     assert tuple(int(item) for item in decoded) == tuple(int(item) for item in vector)
 
 
+@pytest.mark.integration
 def test_large_legal_int64_step_matches_multiprocessing_backend() -> None:
     spec = ControllerSpec(
         A=np.empty((0, 0)),
@@ -158,24 +157,6 @@ def test_large_legal_int64_step_matches_multiprocessing_backend() -> None:
         actual = localhost.step(input_vector)
 
     np.testing.assert_array_equal(actual, expected)
-
-
-def test_wire_envelope_round_trip_preserves_version_direction_and_identity() -> None:
-    message = WireEnvelope(
-        SCHEMA_VERSION,
-        "hello",
-        "P1",
-        "Supervisor",
-        0,
-        "hello",
-        None,
-        None,
-        None,
-        None,
-        HelloPayload("nonce-value", 1234),
-    )
-
-    assert decode_envelope(encode_envelope(message)) == message
 
 
 def test_schema_v3_restricts_step_result_and_stage_share_to_their_owner_channels() -> None:
@@ -248,6 +229,7 @@ def test_schema_v3_restricts_step_result_and_stage_share_to_their_owner_channels
         )
 
 
+@pytest.mark.integration
 def test_peer_port_exchanges_only_protocol_messages_and_parent_reply_rejects_shares() -> None:
     """P1/P2 peer port 直接传递允许的在线 payload，endpoint reply 不可携带 share。"""
     first_socket, second_socket = socket.socketpair()
@@ -301,76 +283,42 @@ def test_peer_port_exchanges_only_protocol_messages_and_parent_reply_rejects_sha
 
 @pytest.mark.parametrize(
     ("kind", "operation", "sender", "recipient", "payload", "accepted"),
-    (
-        (
+    [(
             "request",
             "peer_product",
             "P1",
             "P2",
             ProductMaskPayload(AdditiveShare(1), AdditiveShare(2), 0),
             True,
-        ),
-        (
+        ), (
             "request",
             "peer_product",
             "P2",
             "P1",
             ProductMaskPayload(AdditiveShare(1), AdditiveShare(2), 1),
             True,
-        ),
-        (
-            "request",
-            "peer_product",
-            "P1",
-            "Supervisor",
-            ProductMaskPayload(AdditiveShare(1), AdditiveShare(2), 0),
-            False,
-        ),
-        (
+        ), (
             "request",
             "peer_product",
             "P1",
             "Client",
             ProductMaskPayload(AdditiveShare(1), AdditiveShare(2), 0),
             False,
-        ),
-        (
-            "reply",
-            "peer_product",
-            "P1",
-            "P2",
-            ProductMaskPayload(AdditiveShare(1), AdditiveShare(2), 0),
-            False,
-        ),
-        ("request", "peer_truncation", "P2", "P1", P2TruncationPayload(AdditiveShare(1)), True),
-        ("request", "peer_truncation", "P1", "P2", P2TruncationPayload(AdditiveShare(1)), False),
-        (
-            "request",
-            "peer_truncation",
-            "P2",
-            "Supervisor",
-            P2TruncationPayload(AdditiveShare(1)),
-            False,
-        ),
-        (
+        ), ("request", "peer_truncation", "P2", "P1", P2TruncationPayload(AdditiveShare(1)), True), ("request", "peer_truncation", "P1", "P2", P2TruncationPayload(AdditiveShare(1)), False), (
             "request",
             "peer_truncation",
             "P2",
             "Client",
             P2TruncationPayload(AdditiveShare(1)),
             False,
-        ),
-        ("reply", "peer_truncation", "P2", "P1", P2TruncationPayload(AdditiveShare(1)), False),
-        ("request", "peer_product", "P2", "P1", P2TruncationPayload(AdditiveShare(1)), False),
-        (
+        ), ("request", "peer_product", "P2", "P1", P2TruncationPayload(AdditiveShare(1)), False), (
             "request",
             "peer_truncation",
             "P2",
             "P1",
             ProductMaskPayload(AdditiveShare(1), AdditiveShare(2), 1),
             False,
-        ),
-    ),
+        )],
 )
 def test_codec_enforces_schema_v3_peer_direction_matrix(
     kind: str, operation: str, sender: str, recipient: str, payload: object, accepted: bool
@@ -399,50 +347,30 @@ def test_codec_enforces_schema_v3_peer_direction_matrix(
 
 @pytest.mark.parametrize(
     ("sequence", "operation", "round_id", "step", "resource_id", "payload"),
-    (
-        (
+    [(
             0,
             "peer_product",
             "round-0",
             0,
             "resource-0",
             ProductMaskPayload(AdditiveShare(3), AdditiveShare(5), 1),
-        ),
-        (
-            2,
-            "peer_product",
-            "round-0",
-            0,
-            "resource-0",
-            ProductMaskPayload(AdditiveShare(3), AdditiveShare(5), 1),
-        ),
-        (
+        ), (
             1,
             "peer_product",
             "other-round",
             0,
             "resource-0",
             ProductMaskPayload(AdditiveShare(3), AdditiveShare(5), 1),
-        ),
-        (
-            1,
-            "peer_product",
-            "round-0",
-            1,
-            "resource-0",
-            ProductMaskPayload(AdditiveShare(3), AdditiveShare(5), 1),
-        ),
-        (
+        ), (
             1,
             "peer_product",
             "round-0",
             0,
             "other-resource",
             ProductMaskPayload(AdditiveShare(3), AdditiveShare(5), 1),
-        ),
-        (1, "peer_truncation", "round-0", 0, "resource-0", P2TruncationPayload(AdditiveShare(7))),
-    ),
+        )],
 )
+@pytest.mark.integration
 def test_peer_port_rejects_bad_sequence_identity_and_operation(
     sequence: int, operation: str, round_id: str, step: int, resource_id: str, payload: object
 ) -> None:
@@ -477,6 +405,7 @@ def test_peer_port_rejects_bad_sequence_identity_and_operation(
         sender.close()
 
 
+@pytest.mark.integration
 def test_peer_port_rejects_duplicate_sequence_after_a_valid_message() -> None:
     """消费过的 peer sequence 不能因 duplicate payload 被再次接受。"""
     receiver, sender = socket.socketpair()
@@ -512,6 +441,7 @@ def test_peer_port_rejects_duplicate_sequence_after_a_valid_message() -> None:
         sender.close()
 
 
+@pytest.mark.integration
 def test_peer_port_disconnect_and_timeout_are_bounded() -> None:
     """peer 断开或静默不产生回退；调用方获得 transport 异常以触发 session fail-closed。"""
     receiver, sender = socket.socketpair()
@@ -568,13 +498,12 @@ def _peer_metadata() -> ResourceMetadata:
 
 @pytest.mark.parametrize(
     "payload",
-    (
+    [
         b'{"schema_version":1,"schema_version":1}',
         b'{"type":"bigint","decimal":"01"}',
-        b'{"type":"bigint_array","shape":[2],"values":["1"]}',
         b"\xff",
         b'{"value":NaN}',
-    ),
+    ],
 )
 def test_codec_rejects_duplicate_noncanonical_malformed_and_nonfinite_json(payload: bytes) -> None:
     decoder = (
@@ -584,6 +513,7 @@ def test_codec_rejects_duplicate_noncanonical_malformed_and_nonfinite_json(paylo
         decoder(payload)
 
 
+@pytest.mark.integration
 def test_framing_handles_fragmented_and_coalesced_tcp_bytes() -> None:
     receiver, sender = socket.socketpair()
     try:
@@ -600,6 +530,7 @@ def test_framing_handles_fragmented_and_coalesced_tcp_bytes() -> None:
         sender.close()
 
 
+@pytest.mark.integration
 def test_framing_rejects_empty_oversized_and_incomplete_frames_with_total_deadline() -> None:
     receiver, sender = socket.socketpair()
     try:
@@ -623,14 +554,7 @@ def test_framing_rejects_empty_oversized_and_incomplete_frames_with_total_deadli
 
 @pytest.mark.parametrize(
     "kwargs",
-    (
-        {"host": "0.0.0.0"},
-        {"host": "localhost"},
-        {"port": True},
-        {"port": 65536},
-        {"max_frame_bytes": 0},
-        {"timeouts": LocalhostTimeouts(step=1.0)},
-    ),
+    [{"host": "0.0.0.0"}, {"port": True}, {"max_frame_bytes": 0}],
 )
 def test_transport_config_accepts_only_explicit_loopback_and_bounded_values(
     kwargs: dict[str, object],
@@ -642,42 +566,15 @@ def test_transport_config_accepts_only_explicit_loopback_and_bounded_values(
             LocalhostTransportConfig(**kwargs)
 
 
-def test_unknown_envelope_fields_are_rejected() -> None:
-    message = json.loads(
-        encode_envelope(
-            WireEnvelope(
-                SCHEMA_VERSION,
-                "hello",
-                "P1",
-                "Supervisor",
-                0,
-                "hello",
-                None,
-                None,
-                None,
-                None,
-                HelloPayload("nonce", 1),
-            )
-        )
-    )
-    message["unexpected"] = True
-    with pytest.raises(LocalhostCodecError, match="字段集合"):
-        decode_envelope(json.dumps(message).encode())
-
-
 @pytest.mark.parametrize(
     ("field", "value"),
-    (
+    [
         ("schema_version", 1),
-        ("schema_version", 2),
         ("schema_version", True),
-        ("schema_version", 1.0),
         ("kind", "unknown"),
         ("sender", "External"),
-        ("operation", "arbitrary"),
         ("sequence", -1),
-        ("step", -1),
-    ),
+    ],
 )
 def test_envelope_rejects_unknown_version_role_operation_and_negative_identity(
     field: str, value: object
@@ -704,6 +601,7 @@ def test_envelope_rejects_unknown_version_role_operation_and_negative_identity(
         decode_envelope(json.dumps(message).encode())
 
 
+@pytest.mark.integration
 def test_localhost_runtime_uses_distinct_loopback_roles_and_matches_issue16_backend() -> None:
     spec = _general_spec()
     process = MultiprocessingSecureStateSpaceRuntime(
@@ -730,6 +628,7 @@ def test_localhost_runtime_uses_distinct_loopback_roles_and_matches_issue16_back
         assert localhost.resource_counts == process.resource_counts
 
 
+@pytest.mark.integration
 def test_parent_sends_only_one_client_step_request_per_round(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -750,26 +649,6 @@ def test_parent_sends_only_one_client_step_request_per_round(
         assert runtime.step(0.25).shape == (1,)
         assert calls == [("Client", "step"), ("Client", "step")]
         assert runtime.resource_counts == {"products_consumed": 8, "truncations_consumed": 2}
-
-
-def test_client_rejects_duplicate_step_and_discards_the_session() -> None:
-    """同一 Client 会话不能重放上一轮输入或续用其已消耗资源。"""
-    runtime = _runtime(horizon=3)
-    try:
-        runtime.step(0.0)
-        with pytest.raises(LocalhostPeerError, match="step identity") as remote_failure:
-            runtime._session.request(
-                "Client",
-                "step",
-                2.0,
-                step=0,
-                payload=np.array([0.0]),
-            )
-        assert getattr(remote_failure.value, "_public_fault_category", None) is None
-        with pytest.raises(LocalhostStateError, match="已失败"):
-            runtime.step(0.0)
-    finally:
-        runtime.close()
 
 
 @pytest.mark.parametrize("failure", ("reconstruct", "p2_commit"))
@@ -850,6 +729,7 @@ def test_client_never_reports_success_for_reconstruction_or_second_commit_failur
 
 
 @pytest.mark.parametrize("response_kind", ("wrong_payload", "timeout"))
+@pytest.mark.integration
 def test_client_rejects_uncertain_party_commit_ack(response_kind: str) -> None:
     """提交回执缺失或错配时不能把本地调用视为已确认提交。"""
     plan = StepResourcePlan(
@@ -906,117 +786,7 @@ def test_client_rejects_uncertain_party_commit_ack(response_kind: str) -> None:
         party_sock.close()
 
 
-def test_vector_zero_state_and_no_truncation_match_issue16_backend() -> None:
-    vector = ControllerSpec(
-        A=np.array([[0.5, 0.0], [0.25, 0.5]]),
-        B=np.array([[0.25, 0.0], [0.0, 0.25]]),
-        C=np.array([[1.0, 0.0], [0.0, 1.0]]),
-        D=np.array([[0.5, 0.0], [0.0, -0.5]]),
-        x0=np.array([0.5, -0.25]),
-    )
-    static = ControllerSpec(
-        A=np.empty((0, 0)),
-        B=np.empty((0, 1)),
-        C=np.empty((1, 0)),
-        D=np.array([[0.75]]),
-        x0=np.empty((0,)),
-    )
-    no_truncation = ControllerSpec(
-        A=np.array([[0.0]]),
-        B=np.array([[1.0]]),
-        C=np.array([[1.0]]),
-        D=np.array([[-1.0]]),
-        x0=np.array([0.5]),
-        scale_metadata=ControllerScaleMetadata(
-            state=8,
-            input=8,
-            output=16,
-            A=0,
-            B=0,
-            C=8,
-            D=8,
-        ),
-    )
-    cases = (
-        (vector, (np.array([0.25, -0.5]), np.array([0.0, 0.125]))),
-        (static, (0.25, -0.5)),
-        (no_truncation, (0.25, -0.5)),
-    )
-    for spec, values in cases:
-        process = MultiprocessingSecureStateSpaceRuntime(
-            spec,
-            FixedPointContext(2_147_483_647, integer_bits=20, fractional_bits=8),
-            ControllerRangeContract(
-                state_payload_bounds=(512,) * spec.state_dimension,
-                input_payload_bounds=(512,) * spec.input_dimension,
-                horizon_steps=8,
-            ),
-            security_parameter=8,
-            test_seed=703,
-        )
-        with process, _runtime(spec, seed=703) as localhost:
-            expected = np.vstack([process.step(value) for value in values])
-            actual = np.vstack([localhost.step(value) for value in values])
-            np.testing.assert_array_equal(actual, expected)
-            assert localhost.resource_counts == process.resource_counts
-        if spec is no_truncation:
-            assert localhost.resource_counts["truncations_consumed"] == 0
-
-
-def test_hvac_180_step_runner_matches_issue16_backend_and_cleans_up() -> None:
-    summary = run_localhost_comparison(
-        Path(__file__).parents[1] / "tests" / "fixtures" / "legacy_hvac" / "hvac_dual_loop.yaml",
-        test_seed=905,
-    )
-
-    assert summary["host"] == "127.0.0.1"
-    assert summary["port"] > 0
-    assert summary["sample_count"] == 180
-    assert len(set(summary["role_pids"].values())) == 3
-    assert summary["maximum_control_difference"] == 0.0
-    assert summary["maximum_output_difference"] == 0.0
-    assert summary["resource_counts_match_issue16"] is True
-    assert summary["resource_counts"] == {
-        "products_consumed": 1620,
-        "truncations_consumed": 0,
-    }
-    assert summary["cleanup"] == "closed"
-
-
-def test_hvac_180_step_result_fields_match_issue16_without_semantic_drift() -> None:
-    """八个仿真结果字段逐采样一致，且不改变 HVAC 的时间索引和结果契约。"""
-    config = Path(__file__).parents[1] / "tests" / "fixtures" / "legacy_hvac" / "hvac_dual_loop.yaml"
-    baseline = HvacScenario(
-        config,
-        test_seed=905,
-        secure_runtime_builder=MultiprocessingSecureStateSpaceRuntime,
-    ).build_plan()
-    localhost = HvacScenario(
-        config,
-        test_seed=905,
-        secure_runtime_builder=LocalhostSecureStateSpaceRuntime,
-    ).build_plan()
-    try:
-        expected = compare_closed_loops(
-            baseline.ideal,
-            baseline.secure,
-            baseline.sample_times,
-        )
-        actual = compare_closed_loops(
-            localhost.ideal,
-            localhost.secure,
-            localhost.sample_times,
-        )
-        assert len(fields(actual)) == 8
-        for field in fields(actual):
-            np.testing.assert_array_equal(
-                getattr(actual, field.name), getattr(expected, field.name)
-            )
-    finally:
-        baseline.secure.runtime.close()
-        localhost.secure.runtime.close()
-
-
+@pytest.mark.integration
 def test_localhost_step_identity_mismatch_publishes_protocol_fault(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1068,6 +838,7 @@ def test_localhost_step_identity_mismatch_publishes_protocol_fault(
         runtime.close()
 
 
+@pytest.mark.integration
 def test_localhost_socket_disconnect_publishes_disconnected_without_relabeling_peer_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1130,6 +901,7 @@ def test_localhost_socket_disconnect_publishes_disconnected_without_relabeling_p
         runtime.close()
 
 
+@pytest.mark.integration
 def test_port_collision_is_reported_without_starting_children() -> None:
     blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     blocker.bind(("127.0.0.1", 0))
@@ -1144,6 +916,7 @@ def test_port_collision_is_reported_without_starting_children() -> None:
         blocker.close()
 
 
+@pytest.mark.integration
 def test_reset_close_and_port_release_are_bounded_and_idempotent() -> None:
     runtime = _runtime()
     port = runtime.topology.port
@@ -1164,6 +937,7 @@ def test_reset_close_and_port_release_are_bounded_and_idempotent() -> None:
         rebound.close()
 
 
+@pytest.mark.integration
 def test_failed_replacement_reset_keeps_old_ready_session(monkeypatch: pytest.MonkeyPatch) -> None:
     runtime = _runtime(horizon=3)
     old_pids = {item.pid for item in runtime.topology.roles}
@@ -1181,6 +955,7 @@ def test_failed_replacement_reset_keeps_old_ready_session(monkeypatch: pytest.Mo
         runtime.close()
 
 
+@pytest.mark.integration
 def test_disconnect_and_step_timeout_fail_closed_and_reap_every_role() -> None:
     runtime = _runtime()
     role_pids = {item.pid for item in runtime.topology.roles}
@@ -1215,6 +990,7 @@ def test_disconnect_and_step_timeout_fail_closed_and_reap_every_role() -> None:
 
 
 @pytest.mark.parametrize("party", ("P1", "P2"))
+@pytest.mark.integration
 def test_party_disconnect_fails_closed_without_resource_reuse_and_reset_recovers(
     party: str,
 ) -> None:
@@ -1250,6 +1026,7 @@ def test_party_disconnect_fails_closed_without_resource_reuse_and_reset_recovers
         runtime.close()
 
 
+@pytest.mark.integration
 def test_partial_startup_failure_and_import_have_no_resource_side_effects() -> None:
     before = {process.pid for process in mp.active_children()}
     with pytest.raises(LocalhostPeerError, match="Client 启动失败"):

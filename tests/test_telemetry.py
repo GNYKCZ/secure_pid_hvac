@@ -259,6 +259,7 @@ def test_delivery_exception_is_not_control_fault_and_receiver_handles_gap() -> N
 
 
 @pytest.mark.parametrize("consumer_mode", ["slow", "disconnected"])
+@pytest.mark.integration
 def test_real_localhost_client_trajectory_and_resources_ignore_consumer(
     consumer_mode: str,
 ) -> None:

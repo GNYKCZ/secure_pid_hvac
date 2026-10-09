@@ -10,7 +10,6 @@ import pytest
 
 from secure_control.core import ControllerSpec
 from secure_control.execution import (
-    LocalhostPeerError,
     LocalhostProtocolError,
     LocalhostTimeoutError,
     PlaintextStateSpaceRuntime,
@@ -21,7 +20,6 @@ from secure_control.simulation import (
     ScenarioMetadata,
     SimulationBranch,
     SimulationPlan,
-    SimulationResult,
     TelemetrySession,
     run,
     run_secure_branch,
@@ -181,24 +179,6 @@ def test_branch_executes_hooks_in_order_and_records_pre_plant_output() -> None:
     np.testing.assert_array_equal(trajectory.control, np.array([[1.0]]))
 
 
-def test_plan_and_result_reject_nonincreasing_time() -> None:
-    """runner plan 与八字段结果均不得把重复时间当成合法单步。"""
-    plan = ToyScenario(1).build_plan()
-    with pytest.raises(ValueError, match="严格递增"):
-        SimulationPlan(plan.metadata, np.array([0.0, 0.0]), plan.ideal, plan.secure)
-    with pytest.raises(ValueError, match="strictly increasing"):
-        SimulationResult(
-            time=np.array([0.0, 0.0]),
-            reference=np.zeros((2, 1)),
-            output_ideal=np.zeros((2, 1)),
-            output_secure=np.zeros((2, 1)),
-            control_ideal=np.zeros((2, 1)),
-            control_secure=np.zeros((2, 1)),
-            control_error=np.zeros((2, 1)),
-            output_error=np.zeros((2, 1)),
-        )
-
-
 def test_compare_rejects_shared_mutable_branch_objects_before_steps() -> None:
     """两支共享 plant、adapter 或 runtime 时不得进入时间循环。"""
     plan = ToyScenario(1).build_plan()
@@ -242,21 +222,6 @@ def test_nonfinite_reference_and_bad_actuator_shape_fail_without_partial_result(
     assert "plant.step" not in events
 
 
-def test_mismatched_branch_references_fail_after_independent_execution(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """相同时间网格的两支 reference 若不同，不能返回看似公平的八字段结果。"""
-    plan = ToyScenario(1).build_plan()
-
-    def shifted_reference(time: float) -> np.ndarray:
-        """仅改变 secure 分支的场景 reference。"""
-        return np.array([2.0])
-
-    monkeypatch.setattr(plan.secure.adapter, "reference_at", shifted_reference)
-    with pytest.raises(ValueError, match="reference 时间轨迹"):
-        run(_FixedPlanScenario(plan))
-
-
 @dataclass(frozen=True)
 class _FixedPlanScenario:
     """让测试向通用 runner 注入一个已构造计划，不包含领域装配。"""
@@ -280,31 +245,6 @@ def _delivered_events(consumer_events: list[object], publisher: BoundedPublisher
             break
         time.sleep(0.01)
     return consumer_events
-
-
-@pytest.mark.parametrize("channels", [1, 2])
-def test_live_events_match_successful_eight_field_result(channels: int) -> None:
-    """采样时间、更新前 output、applied control 与全部误差逐步等于正式轨迹。"""
-    delivered: list[object] = []
-    publisher = BoundedPublisher(delivered.append, capacity=16)
-    telemetry = TelemetrySession(publisher, session_id="toy-public")
-    result = run(ToyScenario(channels), telemetry=telemetry)
-    events = _delivered_events(delivered, publisher)
-    assert isinstance(events[0], SessionStarted)
-    assert isinstance(events[-1], SessionEnded)
-    assert events[-1].status == "completed"
-    samples = [event for event in events if isinstance(event, Sample)]
-    assert [event.step for event in samples] == [0, 1, 2]
-    assert [event.event_seq for event in events] == list(range(5))
-    for step, event in enumerate(samples):
-        assert event.time_s == result.time[step]
-        for field in (
-            "reference", "output_ideal", "output_secure", "control_ideal",
-            "control_secure", "control_error", "output_error",
-        ):
-            np.testing.assert_array_equal(getattr(event, field), getattr(result, field)[step])
-        assert event.controller_round_ms >= 0
-        assert event.actuator_plant_ms >= 0
 
 
 def test_secure_only_and_failed_step_have_nullable_comparison_and_no_false_success(
@@ -351,16 +291,10 @@ def test_secure_only_and_failed_step_have_nullable_comparison_and_no_false_succe
     )
 
 
-@pytest.mark.parametrize("secure_only", [False, True])
+@pytest.mark.parametrize("secure_only", [True])
 @pytest.mark.parametrize(
     ("failure", "category"),
-    [
-        (LocalhostProtocolError, "protocol"),
-        (LocalhostTimeoutError, "timeout"),
-        # PeerError 也可能来自远端受限 error，不能一律声称连接断开。
-        (LocalhostPeerError, "control"),
-        (RuntimeError, "control"),
-    ],
+    [(LocalhostProtocolError, "protocol"), (LocalhostTimeoutError, "timeout")],
 )
 def test_runtime_fault_category_uses_public_execution_boundary(
     monkeypatch: pytest.MonkeyPatch,

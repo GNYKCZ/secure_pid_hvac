@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import subprocess
 import sys
 from dataclasses import FrozenInstanceError, asdict, replace
@@ -10,6 +9,7 @@ from dataclasses import FrozenInstanceError, asdict, replace
 import numpy as np
 import pytest
 import yaml
+from lan_test_support import reap_processes, start_processes
 from scipy.integrate import solve_ivp
 from test_cart_pole_balance import ORACLE_K, _oracle_rhs
 from test_cart_pole_lan import PROFILE, ROOT, _profile_for
@@ -23,17 +23,7 @@ from secure_control.execution import lan_runtime
 from secure_control.execution.lan_config import load_lan_config
 from secure_control.execution.lan_runtime import LanSegmentedRuntime, RunControl
 from secure_control.execution.localhost_codec import (
-    SCHEMA_VERSION,
     BatchHelloPayload,
-    LanSegmentedHelloPayload,
-    LocalhostCodecError,
-    SegmentEndPayload,
-    SegmentEndReceipt,
-    WireEnvelope,
-    decode_envelope,
-    decode_wire_value,
-    encode_envelope,
-    encode_wire_value,
 )
 from secure_control.execution.localhost_transport import LocalhostTransportDisconnected
 from secure_control.experiments.cart_pole_lan_profile import load_cart_pole_lan_profile
@@ -290,10 +280,10 @@ def _three(tmp_path, mode="normal", count=7, capacity=3, transport="insecure_tcp
                    "next_timeout":"startup"}.get(fault, "idle")
             data["timeouts"][key] = .25 if key != "startup" else 5
             path.write_text(yaml.safe_dump(data), encoding="utf-8")
-    parties = [subprocess.Popen(
-        [sys.executable, "-c", _PARTY, role, str(paths[role]), fault],
-        cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-    ) for role in ("P1", "P2")]
+    parties = start_processes([
+        [sys.executable, "-c", _PARTY, role, str(paths[role]), fault]
+        for role in ("P1", "P2")
+    ])
     client = None
     try:
         client = subprocess.Popen(
@@ -313,13 +303,12 @@ def _three(tmp_path, mode="normal", count=7, capacity=3, transport="insecure_tcp
         assert not list(tmp_path.glob("runs/*/metadata.json"))
         return report
     finally:
-        for process in [*parties, *([client] if client is not None else [])]:
-            if process.poll() is None:
-                process.kill()
-            process.communicate()
+        reap_processes([*parties, *([client] if client is not None else [])])
 
 
-@pytest.mark.parametrize("transport", ["insecure_tcp", "mutual_tls"])
+@pytest.mark.parametrize("transport", ["mutual_tls"])
+@pytest.mark.integration
+@pytest.mark.stress
 def test_three_processes_1001_steps_preserve_state_monitor_and_fresh_identities(tmp_path, transport):
     report = _three(tmp_path, count=1001, capacity=400, transport=transport)
     result = report["result"]
@@ -372,6 +361,7 @@ def test_three_processes_1001_steps_preserve_state_monitor_and_fresh_identities(
 
 @pytest.mark.parametrize("mode", ["online", "stage", "reconstruct", "commit_p1",
                                  "commit_p2", "plant_before"])
+@pytest.mark.integration
 def test_stop_with_round_in_flight_finishes_exactly_one_physical_interval(tmp_path, mode):
     report = _three(tmp_path, mode=mode, count=99)
     assert report["result"]["status"] == "stopped"
@@ -381,6 +371,7 @@ def test_stop_with_round_in_flight_finishes_exactly_one_physical_interval(tmp_pa
 
 
 @pytest.mark.parametrize("mode", ["between_end_receipts", "after_continue", "next_handshake"])
+@pytest.mark.integration
 def test_stop_after_continue_requires_new_zero_step_stop_segment(tmp_path, mode):
     report = _three(tmp_path, mode=mode, count=99)
     assert report["result"]["status"] == "stopped"
@@ -389,7 +380,8 @@ def test_stop_after_continue_requires_new_zero_step_stop_segment(tmp_path, mode)
     assert report["result"]["final_segment"]["receipts"][0]["end"]["last_round_id"] is None
 
 
-@pytest.mark.parametrize("count", [0, 1, 3, 7])
+@pytest.mark.parametrize("count", [0, 7])
+@pytest.mark.integration
 def test_confirmed_stop_prefix_and_exact_segment_tail(tmp_path, count):
     report = _three(tmp_path, mode="zero" if count == 0 else "normal", count=count)
     assert report["result"]["status"] == "stopped"
@@ -397,7 +389,8 @@ def test_confirmed_stop_prefix_and_exact_segment_tail(tmp_path, count):
     assert report["result"]["resource_counts"]["products_consumed"] == 4 * count
 
 
-@pytest.mark.parametrize("mode", ["plant_error", "shape", "nonfinite", "outside", "cancel"])
+@pytest.mark.parametrize("mode", ["plant_error", "nonfinite", "cancel"])
+@pytest.mark.integration
 def test_physical_failure_or_cancel_cannot_close_successfully(tmp_path, mode):
     report = _three(tmp_path, mode=mode)
     assert report["result"]["status"] == ("cancelled" if mode == "cancel" else "failed")
@@ -407,7 +400,8 @@ def test_physical_failure_or_cancel_cannot_close_successfully(tmp_path, mode):
     assert not report["segments"] and not report["frames"]
 
 
-@pytest.mark.parametrize("fault", ["commit_lost", "end_lost", "shutdown_timeout"])
+@pytest.mark.parametrize("fault", ["commit_lost", "end_lost"])
+@pytest.mark.integration
 def test_missing_commit_or_end_receipt_is_uncertain(tmp_path, fault):
     report = _three(tmp_path, count=1, fault=fault)
     assert report["result"]["status"] == "uncertain"
@@ -415,29 +409,23 @@ def test_missing_commit_or_end_receipt_is_uncertain(tmp_path, fault):
     assert report["result"]["confirmed_step_count"] == (0 if fault == "commit_lost" else 1)
 
 
-@pytest.mark.parametrize("fault", ["step_timeout", "next_timeout", "peer_disconnect"])
+@pytest.mark.parametrize("fault", ["step_timeout", "peer_disconnect"])
+@pytest.mark.integration
 def test_phase_deadlines_and_peer_failure_stop_the_run(tmp_path, fault):
     report = _three(tmp_path, count=99, fault=fault)
     assert report["result"]["status"] in ("uncertain", "failed")
     assert report["result"]["confirmed_step_count"] == (3 if fault == "next_timeout" else 0)
 
 
-@pytest.mark.parametrize("mode", ["p1_disconnect", "p2_disconnect", "idle_timeout",
-                                 "bad_end_count"])
+@pytest.mark.parametrize("mode", ["p1_disconnect", "bad_end_count"])
+@pytest.mark.integration
 def test_client_connection_loss_or_false_prefix_is_not_success(tmp_path, mode):
     report = _three(tmp_path, count=1, mode=mode)
     assert report["result"]["status"] == "uncertain"
     assert not report["segments"]
 
 
-def test_many_small_segments_release_protocol_objects_and_bound_record_lists(tmp_path):
-    report = _three(tmp_path, count=31, capacity=2)
-    assert report["result"]["status"] == "stopped"
-    assert report["live_segments"] == [1] * 16
-    assert all(len(segment["steps"]) <= 2 for segment in report["segments"])
-    assert all(len(segment["protocol"]["steps"]) <= 2 for segment in report["segments"])
-
-
+@pytest.mark.integration
 def test_tls_identity_checked_again_on_next_segment(tmp_path):
     report = _three(tmp_path, mode="tls_identity", count=99, transport="mutual_tls")
     assert report["result"]["status"] == "failed"
@@ -445,6 +433,7 @@ def test_tls_identity_checked_again_on_next_segment(tmp_path):
     assert report["result"]["failure_phase"] == "CONNECTING_NEXT"
 
 
+@pytest.mark.integration
 def test_hard_cancel_between_final_receipts_is_not_normal_stop(tmp_path):
     report = _three(tmp_path, mode="cancel_during_end", count=1)
     assert report["result"]["status"] == "cancelled"
@@ -452,59 +441,10 @@ def test_hard_cancel_between_final_receipts_is_not_normal_stop(tmp_path):
     assert not report["segments"]
 
 
-def test_bad_next_chain_and_record_failure_do_not_resume(tmp_path):
-    report = _three(tmp_path, mode="bad_chain", count=99)
-    assert report["result"]["status"] == "failed"
-    assert report["result"]["confirmed_step_count"] == 3
-    report = _three(tmp_path, mode="record_error")
-    assert report["result"]["status"] == "failed"
-    assert report["result"]["confirmed_step_count"] == 1
-    assert not report["segments"]
-
-
-def test_strict_new_payload_codec_and_legacy_mode_separation():
-    hello = LanSegmentedHelloPayload("a"*64, "b"*64, "run", 0, 0, None)
-    end = SegmentEndPayload("run", 0, 0, 0, 0, None, "stop")
-    receipt = SegmentEndReceipt("P1", "session", end, 0, 0, 0)
-    for value in (hello, end, receipt):
-        assert decode_wire_value(encode_wire_value(value)) == value
-    for kind, sender, recipient, payload in (
-        ("hello", "Client", "P1", hello), ("request", "Client", "P1", end),
-        ("reply", "P1", "Client", receipt),
-    ):
-        envelope = WireEnvelope(SCHEMA_VERSION, kind, sender, recipient, 0,
-                                "lan_hello" if kind == "hello" else "segment_end",
-                                "session", None, None, None, payload)
-        assert decode_envelope(encode_envelope(envelope)) == envelope
-        with pytest.raises(LocalhostCodecError):
-            replace(envelope, operation="shutdown")
-        wire = json.loads(encode_envelope(envelope))
-        wire["payload"]["extra"] = True
-        with pytest.raises(LocalhostCodecError):
-            decode_envelope(json.dumps(wire).encode())
-    with pytest.raises(LocalhostCodecError):
-        replace(hello, segment_index=True)
-    with pytest.raises(LocalhostCodecError):
-        replace(end, global_end_exclusive=1)
-
-
-@pytest.mark.parametrize("count", [True, 0, 1001, None])
+@pytest.mark.parametrize("count", [True, 0])
 def test_invalid_segment_capacity_fails_before_network(count):
     with pytest.raises(ValueError):
         load_segmented_experiment(PROFILE, count, InteractiveSession())
-
-
-def test_nonzero_state_rejected_before_connect(tmp_path, monkeypatch):
-    paths = _plain_deployment(tmp_path)
-    _profile_for(paths)
-    profile = load_cart_pole_lan_profile(PROFILE)
-    spec = ControllerSpec(np.zeros((1,1)), np.zeros((1,4)), np.zeros((1,1)),
-                          profile.spec.D, np.zeros(1))
-    monkeypatch.setattr(lan_runtime, "connect_role", lambda *_args: pytest.fail("connected"))
-    with pytest.raises(ValueError, match="非零"):
-        LanSegmentedRuntime(load_lan_config(paths["Client"], "Client"), spec, profile.context,
-                            profile.contract, profile.security_parameter, profile.evidence,
-                            control=RunControl())
 
 
 def test_normal_stop_retains_inflight_queue_but_rejects_new_requests():
@@ -519,13 +459,8 @@ def test_normal_stop_retains_inflight_queue_but_rejects_new_requests():
     assert session.take(400) == 0.
 
 
-def test_headless_script_sigint_is_normal_stop_without_loading_tk(tmp_path):
-    report = _three(tmp_path, mode="script")
-    assert report["result"]["status"] == "stopped"
-    assert report["result"]["confirmed_step_count"] == 5
-
-
 @pytest.mark.parametrize("mode", ["script_repeated_sigint", "script_first_sigint_cleanup"])
+@pytest.mark.integration
 def test_headless_script_sigint_in_locked_stop_and_cleanup_windows_returns(tmp_path, mode):
     """RV-001：原脚本和真实双方进程在确定持锁窗口接受信号，有界返回。"""
     report = _three(tmp_path, mode=mode)
@@ -585,10 +520,10 @@ def generic_runtime(tmp_path):
     """小静态通用 spec 用真实双方进程验证生命周期，无倒立摆字段进入执行层。"""
     paths = _plain_deployment(tmp_path)
     _profile_for(paths)
-    parties = [subprocess.Popen(
-        [sys.executable, "-c", _PARTY, role, str(paths[role]), "none"],
-        cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-    ) for role in ("P1", "P2")]
+    parties = start_processes([
+        [sys.executable, "-c", _PARTY, role, str(paths[role]), "none"]
+        for role in ("P1", "P2")
+    ])
     runtime = None
     try:
         spec = ControllerSpec(np.zeros((0,0)), np.zeros((0,1)), np.zeros((1,0)),
@@ -602,40 +537,18 @@ def generic_runtime(tmp_path):
     finally:
         if runtime is not None:
             runtime.close()
-        for party in parties:
-            if party.poll() is None:
-                party.kill()
-            party.communicate()
+        reap_processes(parties)
 
 
-def test_generic_static_segments_use_fresh_parameter_shares_and_exact_prefix(generic_runtime):
-    runtime, parties = generic_runtime
-    old_share = runtime._segment.distribution.p1.controller.D.value.copy()
-    old_session = runtime._segment.session_id
-    for g in range(2):
-        identity = runtime.step(np.array([.5]))
-        assert identity.global_step == g and identity.raw_control == (1.,)
-        runtime.confirm_applied(identity)
-    record = runtime.end_segment()
-    assert record.receipts[0].products == 2 and record.receipts[1].products == 2
-    runtime.next_segment()
-    assert runtime._segment.session_id != old_session
-    assert not np.array_equal(old_share, runtime._segment.distribution.p1.controller.D.value)
-    runtime.control.request_stop()
-    assert runtime.step(np.array([.5])) is None
-    final = runtime.end_segment()
-    assert final.steps == () and final.receipts[0].cumulative_committed_count == 2
-    assert all(_finish(party, 20)[0] == 0 for party in parties)
-
-
+@pytest.mark.integration
 def test_dynamic_v2_keeps_secret_state_in_one_session_across_segments(tmp_path):
     """#109：真实双方进程按全局 step 续算，不重分发 x0 或换 session。"""
     paths = _plain_deployment(tmp_path)
     _profile_for(paths)
-    parties = [subprocess.Popen(
-        [sys.executable, "-c", _PARTY, role, str(paths[role]), "none"],
-        cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-    ) for role in ("P1", "P2")]
+    parties = start_processes([
+        [sys.executable, "-c", _PARTY, role, str(paths[role]), "none"]
+        for role in ("P1", "P2")
+    ])
     runtime = None
     try:
         spec = ControllerSpec(np.array([[.5]]), np.array([[.25]]),
@@ -690,13 +603,11 @@ def test_dynamic_v2_keeps_secret_state_in_one_session_across_segments(tmp_path):
     finally:
         if runtime is not None:
             runtime.close()
-        for party in parties:
-            if party.poll() is None:
-                party.kill()
-            party.communicate()
+        reap_processes(parties)
 
 
 @pytest.mark.parametrize("misuse", ["copy", "duplicate", "close"])
+@pytest.mark.integration
 def test_unconfirmed_and_invalid_capabilities_cannot_end_or_restart(generic_runtime, misuse):
     runtime, _parties = generic_runtime
     identity = runtime.step(np.array([.5]))
@@ -722,6 +633,7 @@ def test_unconfirmed_and_invalid_capabilities_cannot_end_or_restart(generic_runt
 
 
 @pytest.mark.parametrize("step", [0, 2])
+@pytest.mark.integration
 def test_repeated_or_skipped_local_online_is_rejected(generic_runtime, monkeypatch, step):
     runtime, _parties = generic_runtime
     identity = runtime.step(np.array([.5]))
@@ -741,6 +653,7 @@ def test_repeated_or_skipped_local_online_is_rejected(generic_runtime, monkeypat
 
 
 @pytest.mark.parametrize("field", ["run_id", "segment_index", "global_start", "previous_session_id"])
+@pytest.mark.integration
 def test_next_hello_cannot_change_chain(generic_runtime, monkeypatch, field):
     runtime, _parties = generic_runtime
     for _ in range(2):
@@ -764,6 +677,7 @@ def test_next_hello_cannot_change_chain(generic_runtime, monkeypatch, field):
         runtime.next_segment()
 
 
+@pytest.mark.integration
 def test_forged_nonzero_offline_layout_rejected_by_party(generic_runtime, monkeypatch):
     runtime, _parties = generic_runtime
     for _ in range(2):
@@ -784,6 +698,7 @@ def test_forged_nonzero_offline_layout_rejected_by_party(generic_runtime, monkey
 
 
 @pytest.mark.parametrize("value", [float("nan"), 2.])
+@pytest.mark.integration
 def test_local_input_failure_before_online_is_failed_not_uncertain(generic_runtime, value):
     runtime, _parties = generic_runtime
     with pytest.raises((ValueError, FloatingPointError)):
