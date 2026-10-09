@@ -936,7 +936,7 @@ capture = Path(sys.argv[1])
 original = lan._party_reply
 def reply(sock, request, payload, timeout, **kwargs):
     if (request.operation == 'endpoint' and request.step == 1
-            and getattr(request.payload, 'operation', None) == 'stage_output'):
+            and getattr(request.payload, 'operation', None) == 'stage_batch'):
         capture.write_text(request.session_id, encoding='utf-8')
         sock.close()
         raise RuntimeError('injected second-round disconnect')

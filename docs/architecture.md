@@ -106,6 +106,12 @@ Client 单方材料与调度命令经私有 `127.0.0.1` TCP 通道传递，P1/P2
 位于 `execution`；`simulation` 不导入或分支判断 socket，`protocol` 也不反向依赖网络。详见
 [localhost 通信传输](localhost_transport.md)。
 
+Issue #116 的 `control-batch-v1` 只改变三条连接的在线消息分组。Protocol 3 的
+完整单方 stage 及 scalar 逐门 Beaver/Trunc 仍由 `protocol` 执行；`execution`
+验证握手能力、公开计划/层身份、消息顺序与长度，并按 P1 发、P2 收、P2 发、
+P1 收交换批次。协议材料与 state/output 数学、双提交及旧结果格式不变。
+普通 LAN/localhost 入口默认要求该能力，旧逐项 wire 仅供双方显式诊断比较。
+
 依赖素数域前提的 Protocol 2 统一调用 `crypto.primes`。该模块对 64 位范围执行确定性 MR64，
 对更大模数只接受本地可复核的递归 Pocklington 证据；它不读取 YAML 或访问网络。证据只沿
 `scenario -> execution -> protocol -> crypto` 单向传递，场景层仅映射配置 schema，不能复制

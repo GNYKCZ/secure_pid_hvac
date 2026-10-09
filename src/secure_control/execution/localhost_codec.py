@@ -36,6 +36,7 @@ from secure_control.protocol.messages import (
     PartyOnlineMaterial,
     ProductMaskPayload,
     ProductResourceMaterial,
+    Protocol3BatchPayload,
     Protocol3EndpointCommand,
     Protocol3StageReceipt,
     ResourceMetadata,
@@ -61,6 +62,7 @@ _OPERATIONS = {
     "endpoint",
     "peer_product",
     "peer_truncation",
+    "peer_batch",
     "shutdown",
 }
 _CANONICAL_INTEGER = re.compile(r"(?:0|-[1-9][0-9]*|[1-9][0-9]*)\Z")
@@ -119,6 +121,20 @@ class LanHelloPayload:
     profile_sha256: str
     nonce: str
     mode: Literal["lan-single-step-v1", "lan-continuous-v1", "lan-scalar-v3"] = "lan-single-step-v1"
+
+
+@dataclass(frozen=True, slots=True)
+class BatchHelloPayload:
+    """新能力显式包裹原 hello；旧 wire 字段集合不改变。"""
+
+    base: HelloPayload | LanHelloPayload | LanSegmentedHelloPayload
+    capability: Literal["control-batch-v1"] = "control-batch-v1"
+
+    def __post_init__(self) -> None:
+        if self.capability != "control-batch-v1" or not isinstance(
+            self.base, (HelloPayload, LanHelloPayload, LanSegmentedHelloPayload)
+        ):
+            raise LocalhostCodecError("批量 hello 能力或原模式无效")
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,6 +322,7 @@ WirePayload = (
     | StepResourcePlan
     | Protocol3EndpointCommand
     | ProductMaskPayload
+    | Protocol3BatchPayload
     | TruncationMaskPayload
     | P2TruncationPayload
     | Protocol3StageReceipt
@@ -315,6 +332,7 @@ WirePayload = (
     | ClientStepResult
     | PartyStageResult
     | LanHelloPayload
+    | BatchHelloPayload
     | LanSetupPayload
     | LanContinuousSetupPayload
     | LanSegmentedSetupV2Payload
@@ -469,6 +487,9 @@ def _encode_value(value: object) -> object:
             "nonce": value.nonce,
             "mode": value.mode,
         }
+    if isinstance(value, BatchHelloPayload):
+        return {"type": "batch_hello", "capability": value.capability,
+                "base": _encode_value(value.base)}
     if isinstance(value, LanSegmentedHelloPayload):
         return {"type": "lan_segmented_hello", **asdict(value)}
     if isinstance(value, SegmentEndPayload):
@@ -665,6 +686,16 @@ def _encode_value(value: object) -> object:
             "e": _encode_value(value.e),
             "party": value.party,
         }
+    if isinstance(value, Protocol3BatchPayload):
+        return {
+            "type": "protocol3_batch", "version": value.version,
+            "phase": value.phase, "plan_sha256": value.plan_sha256,
+            "run_id": value.run_id, "epoch_id": value.epoch_id,
+            "physical_step": value.physical_step, "batch_index": value.batch_index,
+            "resource_ids": list(value.resource_ids),
+            "products": [_encode_value(item) for item in value.products],
+            "truncations": [_encode_value(item) for item in value.truncations],
+        }
     if isinstance(value, TruncationMaskPayload):
         return {
             "type": "truncation_mask",
@@ -806,6 +837,10 @@ def _decode_value(value: object) -> object:
             _required_sha256(mapping["nonce"], "nonce"),
             mode,
         )
+    if kind == "batch_hello":
+        _exact_fields(mapping, {"type", "capability", "base"}, kind)
+        base = _decode_value(mapping["base"])
+        return BatchHelloPayload(base, _text(mapping["capability"], "capability"))
     if kind in {"lan_segmented_hello", "segment_end", "segment_end_receipt",
                 "segment_begin"}:
         cls = {"lan_segmented_hello": LanSegmentedHelloPayload,
@@ -1098,6 +1133,26 @@ def _decode_value(value: object) -> object:
             _typed(mapping["e"], AdditiveShare),
             _party(mapping["party"]),
         )
+    if kind == "protocol3_batch":
+        _exact_fields(mapping, {"type", "version", "phase", "plan_sha256", "run_id",
+                                "epoch_id", "physical_step", "batch_index", "resource_ids",
+                                "products", "truncations"}, kind)
+        ids = mapping["resource_ids"]
+        if not isinstance(ids, list) or len(ids) > 1_000_000:
+            raise LocalhostCodecError("批次资源列表无效")
+        return Protocol3BatchPayload(
+            _text(mapping["phase"], "phase"),
+            _required_sha256(mapping["plan_sha256"], "plan_sha256"),
+            _optional_text(mapping["run_id"], "run_id"),
+            _text(mapping["epoch_id"], "epoch_id"),
+            None if mapping["physical_step"] is None else
+            _nonnegative(mapping["physical_step"], "physical_step"),
+            _nonnegative(mapping["batch_index"], "batch_index"),
+            tuple(_text(item, "resource_id") for item in ids),
+            _typed_tuple(mapping["products"], ProductMaskPayload),
+            _typed_tuple(mapping["truncations"], P2TruncationPayload),
+            _text(mapping["version"], "version"),
+        )
     if kind == "truncation_mask":
         _exact_fields(mapping, {"type", "value", "party"}, kind)
         return TruncationMaskPayload(
@@ -1189,6 +1244,7 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
         ("error", "endpoint"): to_client,
         ("request", "peer_product"): peer,
         ("request", "peer_truncation"): {("P2", "P1")},
+        ("request", "peer_batch"): peer,
         ("shutdown", "shutdown"): {("Supervisor", "Client")} | to_party,
         ("reply", "shutdown"): {("Client", "Supervisor")} | to_client,
         ("error", "shutdown"): {("Client", "Supervisor")} | to_client,
@@ -1205,9 +1261,9 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
         raise LocalhostCodecError("Protocol 2 peer 消息必须由 P2 发送给 P1。")
     expected: tuple[type[object], ...] | None
     if key == ("hello", "hello"):
-        expected = (HelloPayload,)
+        expected = (HelloPayload, BatchHelloPayload)
     elif key == ("hello", "lan_hello"):
-        expected = (LanHelloPayload, LanSegmentedHelloPayload)
+        expected = (LanHelloPayload, LanSegmentedHelloPayload, BatchHelloPayload)
     elif key == ("ready", "ready"):
         expected = (ReadyPayload,)
     elif message.kind == "error":
@@ -1224,6 +1280,8 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
         expected = (ProductMaskPayload,)
     elif key == ("request", "peer_truncation"):
         expected = (P2TruncationPayload,)
+    elif key == ("request", "peer_batch"):
+        expected = (Protocol3BatchPayload,)
     elif key == ("request", "offline"):
         expected = (PartyOfflineMaterial,)
     elif key == ("request", "lan_setup"):
@@ -1253,6 +1311,20 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
         expected = None
     if expected is None or not isinstance(payload, expected):
         raise LocalhostCodecError("wire kind/operation 与 payload 类型组合非法。")
+    if isinstance(payload, BatchHelloPayload) and (
+        message.operation == "hello" and not isinstance(payload.base, HelloPayload)
+        or message.operation == "lan_hello" and not isinstance(
+            payload.base, (LanHelloPayload, LanSegmentedHelloPayload)
+        )
+    ):
+        raise LocalhostCodecError("批量 hello 与原握手模式不匹配")
+    if (message.operation == "peer_batch" and isinstance(payload, Protocol3BatchPayload)
+            and (message.round_id is None or message.step is None
+                 or message.resource_id is not None
+                 or payload.phase == "truncation" and direction != ("P2", "P1")
+                 or payload.batch_index != {"product": 0, "product_complete": 1,
+                                            "truncation": 2, "state_complete": 3}[payload.phase])):
+        raise LocalhostCodecError("Protocol 3 批次方向、阶段或身份非法")
     if message.operation in {"segment_end", "segment_begin"} and (
         message.session_id is None or message.round_id is not None
         or message.step is not None or message.resource_id is not None
@@ -1549,6 +1621,35 @@ class ScalarStageV3:
 
 
 @dataclass(frozen=True, slots=True)
+class ScalarLayerPayloadV1:
+    """v3 会话内的新层帧；仅含公开门身份与原协议遮蔽整数。"""
+
+    phase: Literal["product", "truncation", "complete"]
+    program_sha256: str
+    layer_index: int
+    resource_ids: tuple[str, ...]
+    values: tuple[tuple[int, ...], ...] = ()
+    version: Literal["control-batch-v1"] = "control-batch-v1"
+
+    def __post_init__(self) -> None:
+        width = {"product": 2, "truncation": 1, "complete": 0}.get(self.phase)
+        if (width is None or self.version != "control-batch-v1"
+                or type(self.layer_index) is not int or self.layer_index < 0
+                or not isinstance(self.program_sha256, str)
+                or len(self.program_sha256) != 64
+                or not isinstance(self.resource_ids, tuple)
+                or len(self.resource_ids) > 256
+                or any(not isinstance(item, str) or not item for item in self.resource_ids)
+                or len(set(self.resource_ids)) != len(self.resource_ids)
+                or not isinstance(self.values, tuple)
+                or len(self.values) != (0 if width == 0 else len(self.resource_ids))
+                or any(not isinstance(row, tuple) or len(row) != width
+                       or any(type(value) is not int or value < 0 for value in row)
+                       for row in self.values)):
+            raise LocalhostCodecError("标量层批次 shape、身份或整数无效")
+
+
+@dataclass(frozen=True, slots=True)
 class ScalarFrameV3:
     """v3 算术消息统一绑定角色、run、epoch、session 与物理/局部步。"""
 
@@ -1567,7 +1668,7 @@ class ScalarFrameV3:
 
 _SCALAR_OPERATIONS = {
     "setup", "ready", "material", "compute", "result", "commit", "committed",
-    "end", "ended", "peer_product", "peer_truncation", "peer_complete",
+    "end", "ended", "peer_product", "peer_truncation", "peer_complete", "peer_layer",
 }
 
 
@@ -1606,6 +1707,12 @@ def encode_scalar_frame_v3(frame: ScalarFrameV3) -> bytes:
     elif isinstance(payload, ScalarStageV3):
         body = {"output_share": _decimal(payload.output_share),
                 "products": payload.products, "truncations": payload.truncations}
+    elif isinstance(payload, ScalarLayerPayloadV1):
+        body = {"version": payload.version, "phase": payload.phase,
+                "program_sha256": payload.program_sha256,
+                "layer_index": payload.layer_index,
+                "resource_ids": list(payload.resource_ids),
+                "values": [[_decimal(value) for value in row] for row in payload.values]}
     elif isinstance(payload, tuple):
         body = [_decimal(value) for value in payload]
     elif isinstance(payload, int):
@@ -1706,6 +1813,25 @@ def decode_scalar_frame_v3(encoded: bytes) -> ScalarFrameV3:
         payload = tuple(_parse_decimal(value) for value in raw)
     elif operation == "peer_truncation":
         payload = _parse_decimal(raw)
+    elif operation == "peer_layer":
+        layer = _mapping(raw, "peer_layer")
+        _exact_fields(layer, {"version", "phase", "program_sha256", "layer_index",
+                              "resource_ids", "values"}, "peer_layer")
+        ids = layer["resource_ids"]
+        values = layer["values"]
+        if not isinstance(ids, list) or not isinstance(values, list):
+            raise LocalhostCodecError("标量层列表无效")
+        payload = ScalarLayerPayloadV1(
+            _text(layer["phase"], "phase"),
+            _required_sha256(layer["program_sha256"], "program_sha256"),
+            _nonnegative(layer["layer_index"], "layer_index"),
+            tuple(_text(item, "resource_id") for item in ids),
+            tuple(tuple(_parse_decimal(value) for value in row)
+                  for row in values if isinstance(row, list)),
+            _text(layer["version"], "version"),
+        )
+        if len(payload.values) != len(values):
+            raise LocalhostCodecError("标量层数值行类型无效")
     elif operation in {"committed", "ended"}:
         payload = _nonnegative(_parse_decimal(raw), operation)
     elif operation == "end":
@@ -1744,7 +1870,7 @@ def _validate_scalar_frame_v3(frame: ScalarFrameV3) -> None:
     party = {"P1", "P2"}
     client_to_party = {"setup", "material", "compute", "commit", "end"}
     party_to_client = {"ready", "result", "committed", "ended"}
-    peer = {"peer_product", "peer_complete"}
+    peer = {"peer_product", "peer_complete", "peer_layer"}
     if not (
         (frame.operation in client_to_party and frame.sender == "Client"
          and frame.recipient in party)
@@ -1764,8 +1890,15 @@ def _validate_scalar_frame_v3(frame: ScalarFrameV3) -> None:
     expected = {
         "setup": ScalarSetupV3, "material": ScalarPartyMaterial,
         "result": ScalarStageV3, "peer_product": tuple,
-        "peer_truncation": int, "committed": int, "ended": int, "end": str,
+        "peer_truncation": int, "peer_layer": ScalarLayerPayloadV1,
+        "committed": int, "ended": int, "end": str,
     }
     required = expected.get(frame.operation, type(None))
     if not isinstance(frame.payload, required):
         raise LocalhostCodecError("v3 payload 类型与操作不符")
+    if frame.operation == "peer_layer" and (
+        frame.resource_id != f"layer:{frame.payload.layer_index}"
+        or frame.payload.phase == "truncation"
+        and (frame.sender, frame.recipient) != ("P2", "P1")
+    ):
+        raise LocalhostCodecError("v3 标量层方向或身份无效")

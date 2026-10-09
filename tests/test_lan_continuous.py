@@ -89,20 +89,26 @@ def _run_module(role: str, config: Path) -> subprocess.Popen[str]:
 
 
 def _plain_deployment(tmp_path: Path) -> dict[str, Path]:
-    """无证书文件的随机端口实验配置，验证三份直接运行脚本。"""
+    """独立构造回环角色配置，不依赖可由用户编辑的部署示例。"""
     ports = _free_ports()
-    topology = ROOT / "configs" / "local-deployment.example.yaml"
-    content = topology.read_text(encoding="utf-8")
-    for old, new in zip((34401, 34402, 34403), ports, strict=True):
-        content = content.replace(f"port: {old}", f"port: {new}")
     topology_path = tmp_path / "topology.yaml"
-    topology_path.write_text(content, encoding="utf-8")
+    topology_path.write_text(yaml.safe_dump({
+        "version": 1,
+        "identities": {role: f"{role.lower()}.secure-control.test"
+                       for role in ("Client", "P1", "P2")},
+        **{name: {"bind": "127.0.0.1", "host": "127.0.0.1", "port": port}
+           for name, port in zip(("p1_client", "p2_client", "p1_peer"), ports, strict=True)},
+    }, sort_keys=False), encoding="utf-8")
     paths = {}
     for role, name in (("P1", "lab-p1.example.yaml"), ("P2", "lab-p2.example.yaml"),
                        ("Client", "lab-client-continuous.example.yaml")):
-        role_content = (ROOT / "configs" / name).read_text(encoding="utf-8")
-        role_content = role_content.replace("topology: local-deployment.example.yaml",
-                                            f"topology: {topology_path}")
+        role_content = (f"role: {role}\ntransport: insecure_tcp\n"
+                        f"topology: {topology_path}\n"
+                        + ("experiment: paper_pid_lan.example.yaml\n"
+                           if role == "Client" else "")
+                        + "timeouts:\n  startup: 180\n  step: 30\n"
+                        + ("  idle: 30\n" if role == "Client" else "")
+                        + "  shutdown: 5\n")
         path = tmp_path / name
         path.write_text(role_content, encoding="utf-8")
         paths[role] = path

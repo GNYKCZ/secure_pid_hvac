@@ -24,6 +24,7 @@ from secure_control.execution.lan_config import load_lan_config
 from secure_control.execution.lan_runtime import LanSegmentedRuntime, RunControl
 from secure_control.execution.localhost_codec import (
     SCHEMA_VERSION,
+    BatchHelloPayload,
     LanSegmentedHelloPayload,
     LocalhostCodecError,
     SegmentEndPayload,
@@ -76,10 +77,10 @@ send.staged = False
 lan.send_envelope = send
 if fault == 'peer_disconnect':
     from secure_control.execution._localhost_peer import LocalhostProtocol3PeerPort
-    def broken_peer(self, *args):
+    def broken_peer(self, *args, **kwargs):
         self.close()
         raise RuntimeError('injected peer disconnect')
-    LocalhostProtocol3PeerPort._send = broken_peer
+    LocalhostProtocol3PeerPort._send_batch = broken_peer
 try:
     result = lan.run_party_single_step(load_lan_config(Path(sys.argv[2]), sys.argv[1]))
 except Exception as error:
@@ -123,14 +124,19 @@ lan.LanSegmentedRuntime._connect = connected
 command = _ClientPartyEndpoint._command
 def cmd(self, operation, *args):
     result = command(self, operation, *args)
-    if mode == 'stage' and operation == 'stage_output':
-        control.request_stop()
     if mode == 'commit_p1' and operation == 'commit' and self.party == 0:
         control.request_stop()
     if mode == 'commit_p2' and operation == 'commit' and self.party == 1:
         control.request_stop()
     return result
 _ClientPartyEndpoint._command = cmd
+finish_batch = _ClientPartyEndpoint.finish_stage_batch
+def batch_staged(self):
+    result = finish_batch(self)
+    if mode == 'stage':
+        control.request_stop()
+    return result
+_ClientPartyEndpoint.finish_stage_batch = batch_staged
 reconstruct = Client.reconstruct_control
 def rebuilt(self, *args, **kwargs):
     result = reconstruct(self, *args, **kwargs)
@@ -167,8 +173,10 @@ def received(*args, **kwargs):
 lan.receive_envelope = received
 hello = lan._hello
 def greeted(sock, sender, recipient, session_id, payload, timeout):
-    if mode == 'bad_chain' and payload.segment_index == 1:
-        payload = replace(payload, global_start=payload.global_start+1)
+    base = payload.base if hasattr(payload, 'base') else payload
+    if mode == 'bad_chain' and base.segment_index == 1:
+        changed = replace(base, global_start=base.global_start+1)
+        payload = replace(payload, base=changed) if hasattr(payload, 'base') else changed
     return hello(sock,sender,recipient,session_id,payload,timeout)
 lan._hello = greeted
 advance = SustainedCartPoleExperiment.advance
@@ -742,7 +750,10 @@ def test_next_hello_cannot_change_chain(generic_runtime, monkeypatch, field):
 
     def changed(sock, sender, recipient, session, payload, timeout):
         value = "wrong" if field in ("run_id", "previous_session_id") else 99
-        return hello(sock, sender, recipient, session, replace(payload, **{field:value}), timeout)
+        base = payload.base if isinstance(payload, BatchHelloPayload) else payload
+        changed = replace(base, **{field:value})
+        wire = replace(payload, base=changed) if isinstance(payload, BatchHelloPayload) else changed
+        return hello(sock, sender, recipient, session, wire, timeout)
 
     monkeypatch.setattr(lan_runtime, "_hello", changed)
     with pytest.raises(LocalhostTransportDisconnected):

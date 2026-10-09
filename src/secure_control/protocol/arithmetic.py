@@ -21,6 +21,7 @@ from secure_control.crypto.fixed_point import FixedPointContext
 from secure_control.crypto.primes import PrimeModulusEvidence, verify_prime_modulus
 from secure_control.crypto.secret_sharing import AdditiveShare, TwoPartySharing
 from secure_control.crypto.truncation import (
+    MaskedTruncationShare,
     P2MaskedMessage,
     SecureTruncation,
     TruncationAuxiliaryShare,
@@ -81,6 +82,34 @@ class ScalarProgram:
             "output": self.output,
         }
         return hashlib.sha256(json.dumps(payload, separators=(",", ":")).encode()).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class ScalarLayerPlan:
+    """仅由公开拓扑派生的乘法依赖层；材料仍保持原门次序。"""
+
+    program_sha256: str
+    layers: tuple[tuple[str, ...], ...]
+
+
+def build_scalar_layer_plan(program: ScalarProgram) -> ScalarLayerPlan:
+    """加减不增加通信深度，乘法增加一层，同层按原拓扑次序。"""
+    if not isinstance(program, ScalarProgram):
+        raise TypeError("标量层计划需要已验证程序")
+    depth = {name: 0 for name in program.inputs}
+    depth.update({name: 0 for name, _ in program.constants})
+    layers: list[list[str]] = []
+    for gate in program.gates:
+        level = max(depth[gate.left], depth[gate.right])
+        if gate.operation == "multiply":
+            level += 1
+            while len(layers) < level:
+                layers.append([])
+            layers[level - 1].append(gate.name)
+        depth[gate.name] = level
+    if any(not layer for layer in layers):
+        raise ValueError("标量程序的乘法层不能有空隙")
+    return ScalarLayerPlan(program.topology_sha256(), tuple(tuple(x) for x in layers))
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,6 +318,41 @@ class ScalarPeerPort(Protocol):
     def complete_gate(self, resource_id: str) -> None: ...
 
 
+class ScalarBatchPeerPort(Protocol):
+    """按公开层交换遮蔽值，下一层须等待双方整层完成屏障。"""
+
+    def exchange_layer_products(
+        self, layer_index: int, resource_ids: tuple[str, ...],
+        values: tuple[tuple[int, int], ...],
+    ) -> tuple[tuple[int, int], ...]: ...
+
+    def send_layer_truncations(
+        self, layer_index: int, resource_ids: tuple[str, ...], values: tuple[int, ...],
+    ) -> None: ...
+
+    def receive_layer_truncations(
+        self, layer_index: int, resource_ids: tuple[str, ...],
+    ) -> tuple[int, ...]: ...
+
+    def complete_layer(self, layer_index: int, resource_ids: tuple[str, ...]) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingProduct:
+    lifecycle: _TripleLifecycle
+    triple: BeaverTripleShare
+    masked: MaskedDifferenceShare
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingTruncation:
+    product: AdditiveShare
+    mask: TruncationAuxiliaryShare
+    masked: MaskedTruncationShare
+    lifecycle: _MaskLifecycle
+    product_lifecycle: _TripleLifecycle
+
+
 class ScalarPartyExecutor:
     """单方按固定拓扑执行分享算术，拒绝材料重复或错序。"""
 
@@ -327,6 +391,67 @@ class ScalarPartyExecutor:
             raise ValueError("单方材料必须是 canonical residue")
         return value
 
+    def _prepare_product(
+        self, left: AdditiveShare, right: AdditiveShare, item: ScalarGateMaterial,
+    ) -> _PendingProduct:
+        lifecycle = _TripleLifecycle(self.multiplier)
+        triple = BeaverTripleShare(
+            AdditiveShare(item.a), AdditiveShare(item.b), AdditiveShare(item.c),
+            self.material.party, lifecycle,
+        )
+        return _PendingProduct(lifecycle, triple,
+                               self.multiplier.mask_inputs(left, right, triple))
+
+    def _finish_product(
+        self, pending: _PendingProduct, d: int, e: int,
+        item: ScalarGateMaterial,
+    ) -> _PendingTruncation:
+        other = 1 - self.material.party
+        pending.lifecycle.claim_masking(other)
+        rebound = MaskedDifferenceShare(
+            AdditiveShare(self._checked_residue(d)),
+            AdditiveShare(self._checked_residue(e)), other, pending.lifecycle,
+        )
+        opened = self.multiplier.open_masked_differences(pending.masked, rebound)
+        product = self.multiplier.finish(pending.triple, opened)
+        lifecycle = _MaskLifecycle(self.truncation)
+        mask = TruncationAuxiliaryShare(
+            AdditiveShare(item.r), AdditiveShare(item.r_prime),
+            self.material.party, lifecycle,
+        )
+        return _PendingTruncation(
+            product, mask, self.truncation.mask_input(product, mask), lifecycle,
+            pending.lifecycle,
+        )
+
+    def _p2_truncation_message(self, pending: _PendingTruncation) -> int:
+        pending.lifecycle.claim_mask(0)
+        outgoing = self.truncation.p2_send_masked(pending.masked)
+        return int(outgoing.value.value)
+
+    def _finish_truncation(self, pending: _PendingTruncation, incoming: int | None) -> AdditiveShare:
+        if self.material.party == 0:
+            if incoming is None:
+                raise ValueError("P1 截断消息缺失")
+            pending.lifecycle.claim_mask(1)
+            pending.lifecycle.claim_p2_send()
+            centered = self.truncation.p1_reconstruct_masked(
+                pending.masked,
+                P2MaskedMessage(AdditiveShare(self._checked_residue(incoming)),
+                                pending.lifecycle),
+            )
+            return self.truncation.finish_p1(pending.product, pending.mask, centered)
+        if incoming is not None:
+            raise ValueError("P2 不接收截断消息")
+        pending.lifecycle.claim_p1_reconstruction()
+        return self.truncation.finish_p2(pending.product, pending.mask)
+
+    def _complete_gate(self, pending: _PendingTruncation) -> None:
+        other = 1 - self.material.party
+        pending.product_lifecycle.claim_finish(other)
+        pending.lifecycle.claim_finish(other)
+        self.consumed += 1
+
     def evaluate(self, peer: ScalarPeerPort) -> int:
         """每门完成双向遮蔽、P2→P1 截断与双完成屏障后才继续。"""
         if self._done:
@@ -343,46 +468,85 @@ class ScalarPartyExecutor:
                 nodes[gate.name] = self.sharing.subtract(left, right)
                 continue
             item = next(materials)
-            triple_lifecycle = _TripleLifecycle(self.multiplier)
-            triple = BeaverTripleShare(
-                AdditiveShare(item.a), AdditiveShare(item.b), AdditiveShare(item.c),
-                self.material.party, triple_lifecycle,
-            )
-            masked = self.multiplier.mask_inputs(left, right, triple)
-            other = 1 - self.material.party
+            pending = self._prepare_product(left, right, item)
             d, e = peer.exchange_product(
-                item.resource_id, int(masked.d.value), int(masked.e.value),
+                item.resource_id, int(pending.masked.d.value), int(pending.masked.e.value),
             )
-            triple_lifecycle.claim_masking(other)
-            rebound = MaskedDifferenceShare(
-                AdditiveShare(self._checked_residue(d)),
-                AdditiveShare(self._checked_residue(e)), other, triple_lifecycle,
-            )
-            opened = self.multiplier.open_masked_differences(masked, rebound)
-            product = self.multiplier.finish(triple, opened)
-            trunc_lifecycle = _MaskLifecycle(self.truncation)
-            mask = TruncationAuxiliaryShare(
-                AdditiveShare(item.r), AdditiveShare(item.r_prime),
-                self.material.party, trunc_lifecycle,
-            )
-            masked_trunc = self.truncation.mask_input(product, mask)
+            truncation = self._finish_product(pending, d, e, item)
             if self.material.party == 0:
-                incoming = self._checked_residue(peer.receive_truncation(item.resource_id))
-                trunc_lifecycle.claim_mask(1)
-                trunc_lifecycle.claim_p2_send()
-                centered = self.truncation.p1_reconstruct_masked(
-                    masked_trunc, P2MaskedMessage(AdditiveShare(incoming), trunc_lifecycle),
+                result = self._finish_truncation(
+                    truncation, peer.receive_truncation(item.resource_id),
                 )
-                result = self.truncation.finish_p1(product, mask, centered)
             else:
-                trunc_lifecycle.claim_mask(0)
-                outgoing = self.truncation.p2_send_masked(masked_trunc)
-                peer.send_truncation(item.resource_id, int(outgoing.value.value))
-                trunc_lifecycle.claim_p1_reconstruction()
-                result = self.truncation.finish_p2(product, mask)
+                peer.send_truncation(item.resource_id,
+                                     self._p2_truncation_message(truncation))
+                result = self._finish_truncation(truncation, None)
             peer.complete_gate(item.resource_id)
-            triple_lifecycle.claim_finish(other)
-            trunc_lifecycle.claim_finish(other)
+            self._complete_gate(truncation)
             nodes[gate.name] = result
-            self.consumed += 1
+        return int(nodes[self.program.output].value)
+
+    def evaluate_batch(self, peer: ScalarBatchPeerPort) -> int:
+        """独立乘法同层交换，每门仍按原资源单独 Beaver 和 Trunc。"""
+        if self._done:
+            raise RuntimeError("同一标量 round 不得重试或重复消费材料")
+        self._done = True
+        plan = build_scalar_layer_plan(self.program)
+        nodes = {name: AdditiveShare(value) for name, value in self.material.values}
+        gates = {gate.name: gate for gate in self.program.gates}
+        materials = {item.gate: item for item in self.material.gates}
+
+        def local_closure() -> None:
+            for gate in self.program.gates:
+                if gate.operation == "multiply" or gate.name in nodes:
+                    continue
+                if gate.left not in nodes or gate.right not in nodes:
+                    continue
+                left, right = nodes[gate.left], nodes[gate.right]
+                nodes[gate.name] = (self.sharing.add(left, right)
+                                    if gate.operation == "add"
+                                    else self.sharing.subtract(left, right))
+
+        for layer_index, layer in enumerate(plan.layers):
+            local_closure()
+            items = tuple(materials[name] for name in layer)
+            ids = tuple(item.resource_id for item in items)
+            pending = tuple(self._prepare_product(nodes[gates[name].left],
+                                                  nodes[gates[name].right], item)
+                            for name, item in zip(layer, items, strict=True))
+            outgoing = tuple((int(item.masked.d.value), int(item.masked.e.value))
+                             for item in pending)
+            incoming = peer.exchange_layer_products(layer_index, ids, outgoing)
+            if len(incoming) != len(layer) or any(
+                not isinstance(pair, tuple) or len(pair) != 2
+                for pair in incoming
+            ):
+                raise ValueError("乘法层批次 shape 与公开计划不匹配")
+            # 整层先验证完毕，不能在一个坏值之前消费有效前缀。
+            for pair in incoming:
+                self._checked_residue(pair[0])
+                self._checked_residue(pair[1])
+            truncations = tuple(self._finish_product(started, pair[0], pair[1], item)
+                                for started, pair, item in zip(pending, incoming, items,
+                                                               strict=True))
+            if self.material.party == 0:
+                received = peer.receive_layer_truncations(layer_index, ids)
+                if len(received) != len(layer):
+                    raise ValueError("截断层批次缺项")
+                for value in received:
+                    self._checked_residue(value)
+                results = tuple(self._finish_truncation(item, value)
+                                for item, value in zip(truncations, received, strict=True))
+            else:
+                values = tuple(self._p2_truncation_message(item) for item in truncations)
+                peer.send_layer_truncations(layer_index, ids, values)
+                results = tuple(self._finish_truncation(item, None)
+                                for item in truncations)
+            peer.complete_layer(layer_index, ids)
+            for name, item, value in zip(layer, truncations, results, strict=True):
+                self._complete_gate(item)
+                nodes[name] = value
+        local_closure()
+        if self.program.output not in nodes or self.consumed != len(materials):
+            raise ValueError("标量层计划未完成全部公开门")
         return int(nodes[self.program.output].value)
