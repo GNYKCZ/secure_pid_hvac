@@ -566,6 +566,8 @@ def _run() -> int:
     benchmark.add_argument("--material-slots", type=int, choices=(0, 4, 16), default=16)
     benchmark.add_argument("--preload-steps", type=int, default=0)
     benchmark.add_argument("--preload-execution", choices=("staged", "fused"), default="fused")
+    benchmark.add_argument("--diagnostic", action="store_true",
+                           help="本机cycle有限CPU/GC观测，不作为正式资格")
     benchmark.add_argument("--role-config", type=Path)
     benchmark.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
@@ -582,10 +584,11 @@ def _run() -> int:
                     optimized=args.case == "cycle", material_slots=args.material_slots,
                     preload_steps=args.preload_steps, preload_execution=args.preload_execution,
                     role_config=args.role_config,
+                    diagnostic=args.diagnostic,
                 )
             else:
-                if args.preload_steps:
-                    raise ValueError("预送观察仅支持cycle动态v2入口")
+                if args.preload_steps or args.diagnostic:
+                    raise ValueError("预送/有限诊断仅支持cycle动态v2入口")
                 report = run_local_benchmark(
                     args.case, args.mode, steps=args.steps, delay_ms=args.delay_ms,
                 )

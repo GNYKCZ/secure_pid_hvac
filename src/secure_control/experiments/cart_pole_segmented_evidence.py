@@ -1629,6 +1629,8 @@ class _Spool:
         stats = {"started_ns": perf_counter_ns(), "segment_index": self.count,
                  "row_count": len(rows), "phases": {}, "row_validation_ns": 0,
                  "buffer_high_water": 0, "error_type": None}
+        # 基准可装配只读计时observer；正常入口不读CPU时钟或保存诊断事件。
+        observer = getattr(self, "_validation_observer", None)
         try:
             with _batch_phase(stats, "source"):
                 self.prepared.recheck_sources()
@@ -1653,6 +1655,7 @@ class _Spool:
                 buffer = _BufferedChunks(stream, on_write=written, stats=stats)
                 for index, raw in enumerate(rows):
                     started = perf_counter_ns()
+                    token = observer.begin("row_validation") if observer is not None else None
                     try:
                         if len(raw) > INDEX_LINE_LIMIT:
                             raise ValueError("动态步骤记录超出行界。")
@@ -1663,11 +1666,14 @@ class _Spool:
                             _same(data["protocol"], asdict(identities[index]))
                     finally:
                         stats["row_validation_ns"] += perf_counter_ns() - started
+                        if observer is not None:
+                            observer.end(token)
                     self._append_step(data, output=buffer)
                     del data
                 buffer.finish()
-                stream.flush()
-                os.fsync(stream.fileno())
+                with _batch_phase(stats, "journal_flush_fsync"):
+                    stream.flush()
+                    os.fsync(stream.fileno())
                 self.disk_metrics["fsync_count"] += 1
             if protocol is not None:
                 self._validate_segment_prefix(protocol, len(rows))

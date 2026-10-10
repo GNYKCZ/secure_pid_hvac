@@ -375,6 +375,112 @@ def test_continuous_observation_retains_first_failed_attempt_without_error_paylo
     assert "private-value-must-not-appear" not in str(report)
 
 
+def test_finite_diagnostic_same_thread_missing_clock_gc_and_bounded_events(monkeypatch):
+    import gc
+    import json
+    from itertools import count
+    from threading import Thread
+
+    from secure_control.experiments.communication_benchmark import _Diagnostic
+
+    wall, cpu = count(0, 100), count(0, 10)
+    diag = _Diagnostic("Client", wall=lambda: next(wall), cpu=lambda: next(cpu), limit=3)
+    before = list(gc.callbacks), gc.isenabled(), gc.get_threshold()
+    with diag.installed():
+        diag.select(2)
+        with diag.scope("ignored"):
+            pass
+        assert all(slot is None for slot in diag.slots)
+        diag.select(0)
+        for _ in range(2):
+            with diag.scope("input"):
+                pass
+        diag._gc("start", {"generation": 0})
+        diag._gc("stop", {"generation": 0})
+        diag._gc("start", {"generation": 1})
+        with diag.scope("dropped"):
+            pass
+    assert (list(gc.callbacks), gc.isenabled(), gc.get_threshold()) == before
+    report = diag.report()
+    value = next(item for item in report["events"] if item["kind"] == "phase")
+    assert (value["calls"], value["wall_ns"], value["cpu_ns"], value["non_cpu_ns"]) == (2, 200, 20, 180)
+    assert len(report["events"]) == 3 and report["overflow"] == 2
+    assert report["callback_restored"] and report["gc_before"] == report["gc_after"]
+
+    def unavailable():
+        raise NotImplementedError
+
+    missing = _Diagnostic("P1", cpu=unavailable)
+    missing.select(397)
+    with missing.scope("restore"):
+        pass
+    value = missing.report()["events"][0]
+    assert value["cpu_ns"] is None and value["non_cpu_ns"] is None
+    assert value["cpu_missing_calls"] == 1 and missing.cpu_errors > 0
+    token = missing.begin("thread_check")
+    errors = []
+
+    def wrong_thread():
+        try:
+            missing.end(token)
+        except RuntimeError as error:
+            errors.append(type(error).__name__)
+
+    worker = Thread(target=wrong_thread)
+    worker.start()
+    worker.join()
+    assert errors == ["RuntimeError"]
+    missing.end(token)
+
+    large = _Diagnostic("Client")
+    large.select(405)
+    for index in range(600):
+        with large.scope("public_phase_" + str(index)):
+            pass
+    large_report = large.report()
+    assert large_report["overflow"] == 88 and large_report["encoded_overflow"] > 0
+    assert len(json.dumps(large_report, separators=(",", ":")).encode()) < 80 * 1024
+
+
+@pytest.mark.integration
+def test_finite_diagnostic_keeps_failed_null_cycle_and_restores_canonical_hooks(monkeypatch):
+    import gc
+    import json
+    import os
+
+    from secure_control.execution import lan_runtime, localhost_transport
+    from secure_control.experiments import cart_pole_segmented_evidence as evidence
+    from secure_control.experiments.communication_benchmark import run_continuous_observation
+    from secure_control.protocol import Client
+
+    before = (list(gc.callbacks), gc.isenabled(), gc.get_threshold(),
+              evidence._batch_phase, evidence._Spool.record_batch, os.fsync,
+              lan_runtime.receive_envelope, localhost_transport._send_exact)
+
+    def failed(*args, **kwargs):
+        raise ValueError("secret-diagnostic-must-not-appear")
+
+    monkeypatch.setattr(Client, "bind_preloaded_input", failed)
+    report = run_continuous_observation(steps=1, delay_ms=0, segment_steps=2,
+                                       optimized=True, preload_steps=1, diagnostic=True)
+    assert report["diagnostic"] and not report["qualification_pass"]
+    assert not report["stage_pass"] and report["successful_steps"] == 0
+    assert len(report["cycles"]) == 1
+    cycle = report["cycles"][0]
+    assert cycle["device_completed_ns"] is None and cycle["cycle_completed_ns"] is None
+    assert cycle["physically_confirmed_count"] == cycle["protocol_committed_count"] == 0
+    assert report["recording_summary"]["durable_step_count"] == 0
+    assert "secret-diagnostic-must-not-appear" not in json.dumps(report)
+    assert (list(gc.callbacks), gc.isenabled(), gc.get_threshold(),
+            evidence._batch_phase, evidence._Spool.record_batch, os.fsync,
+            lan_runtime.receive_envelope, localhost_transport._send_exact) == before
+    diag = report["diagnostic_report"]
+    assert len(json.dumps(diag, separators=(",", ":"), ensure_ascii=False).encode()) == diag["encoded_bytes"]
+    assert diag["encoded_bytes"] <= 256 * 1024 and len(diag["roles"]) == 3
+    assert all(role["callback_restored"] and role["gc_before"] == role["gc_after"]
+               for role in diag["roles"])
+
+
 def test_swing_up_has_38_products_in_16_public_layers():
     from test_lan_scalar_v3 import _inputs
 

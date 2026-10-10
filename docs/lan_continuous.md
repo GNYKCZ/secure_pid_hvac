@@ -422,6 +422,20 @@ P1/P2、`LanContinuousRuntime`、crypto/protocol 与 schema v1 writer/reader
 checkpoint。缓冲不是新的逻辑段，可靠计数和原库存预算保持不变。每批公开起止
 和嵌套阶段时长用于分析与控制周期的重叠；这些数据界不构成调度或耗时保证。
 
+本机 `benchmark --case cycle --diagnostic` 可显式启用有限诊断（默认关闭）。
+控制线程、记录线程及 P1/P2 分别保存同线程 `thread_time_ns` 与墙钟区间，
+以及原正常 GC 的公开阶段/线程/代数事件；只观察首两轮及 global397…405。
+记录批次按最后一个公开步骤定位，逐行校验按批汇总，不产生逐行诊断日志。
+每角色共用最多512事件槽，事件编码最多72KiB，三角色诊断总编码最多256KiB；
+槽位/编码截断均公开 overflow，缺失CPU时钟填null。正式记录8MiB/两段额度不变。
+callback不写盘、不序列化、不查看对象；退出还原hook，不修改GC/调度设置。
+重复阶段的首末时刻只是包络，内部有间隔；嵌套成本不可相加，wall−CPU仅为
+综合未执行时间，不能直接解释为GIL、网络或磁盘。报告给出时钟实现/分辨率、
+启动时钟读取探针和实际峰值RSS，测量开销仍计入原绝对20ms期限。
+诊断允许单步请求，标记 `diagnostic=true`，不作为正式qualification资格。
+当前获批观察仅为fused/stock1000/段400的零注入406步和1ms每帧1步，各一次；
+失败即停，退出集中输出。未复现也不得循环追样本或用诊断PASS代替1000/10k验收。
+
 - `configs/lab-p1.example.yaml`、`lab-p2.example.yaml`、`lab-client-continuous.example.yaml`：三个独立角色入口。
 - `configs/local-deployment.example.yaml`：三条连接的地址和端口；三台电脑内容须一致。
 - `configs/paper_pid_lan.example.yaml`：Client 日常参数，直接读取 `paper_pid_cascade_zoh.yaml` 和共享素数证明；不依赖 Fig3 四点定义，运行声明为 `user-exploration`。

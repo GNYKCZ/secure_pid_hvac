@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import multiprocessing as mp
 import os
@@ -14,10 +15,10 @@ import time
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, replace
 from hashlib import sha256
-from itertools import pairwise
+from itertools import count, pairwise
 from pathlib import Path
 from queue import Empty
-from threading import current_thread
+from threading import current_thread, get_ident, get_native_id, local
 from unittest.mock import patch
 
 import numpy as np
@@ -27,6 +28,179 @@ from secure_control.execution.lan_runtime import LanContinuousRuntime, run_party
 from secure_control.execution.lan_scalar_runtime import LanScalarRuntime
 
 _ROOT = Path(__file__).resolve().parents[3]
+
+
+class _Diagnostic:
+    """基准专用有界观测；嵌套/重复阶段不可相加成独占成本。"""
+
+    LIMIT = 512
+
+    def __init__(self, role, *, wall=None, cpu=None, limit=LIMIT):
+        self.role = role
+        self.wall = wall or time.perf_counter_ns
+        self.cpu = cpu or getattr(time, "thread_time_ns", None)
+        self.slots = [None] * limit
+        self.overflow = 0
+        self.free = iter(range(limit))
+        self.dropped = count(1)
+        self.keys = {}
+        self.state = local()
+        self.cpu_errors = 0
+        self.gc_before = None
+        samples = []
+        for _ in range(16):
+            started = self.wall()
+            self._cpu()
+            self._cpu()
+            samples.append(self.wall() - started)
+        self.clock_probe = {"pairs": 16, "min_ns": min(samples), "max_ns": max(samples),
+                            "mean_ns": sum(samples) / len(samples),
+                            "scope": "startup clock reads only; observer/GC allocations are additional"}
+
+    def reserve(self):
+        # next在本CPython里原子领取唯一槽位；callback不拿会重入死锁的锁。
+        try:
+            return next(self.free)
+        except StopIteration:
+            self.overflow = next(self.dropped)
+            return None
+
+    def _cpu(self):
+        if self.cpu is None:
+            return None
+        try:
+            return self.cpu()
+        except (OSError, NotImplementedError):
+            self.cpu_errors += 1
+            return None
+
+    def select(self, step):
+        self.state.step = step
+
+    def selected(self):
+        step = getattr(self.state, "step", None)
+        return type(step) is int and (0 <= step <= 1 or 397 <= step <= 405)
+
+    def begin(self, phase):
+        if not self.selected():
+            return None
+        previous = getattr(self.state, "phase", None)
+        self.state.phase = phase
+        return (get_ident(), get_native_id(), self.state.step, phase, previous,
+                self.wall(), self._cpu())
+
+    def end(self, token):
+        if token is None:
+            return
+        ended, cpu = self.wall(), self._cpu()
+        thread, native, step, phase, previous, started, initial_cpu = token
+        if thread != get_ident():
+            raise RuntimeError("CPU时钟区间必须在同一线程结束。")
+        self.state.phase = previous
+        owner = "writer" if current_thread().name == "segment-evidence-writer" else self.role
+        key = (owner, thread, step, phase)
+        index = self.keys.get(key)
+        if index is None:
+            index = self.reserve()
+            if index is None:
+                return
+            self.keys[key] = index
+            self.slots[index] = {"kind": "phase", "owner": owner, "thread_id": thread,
+                                 "native_thread_id": native, "global_step": step,
+                                 "phase": phase, "first_start_ns": started,
+                                 "last_end_ns": ended, "wall_ns": 0, "cpu_ns": 0,
+                                 "calls": 0, "cpu_missing_calls": 0}
+        value = self.slots[index]
+        value["last_end_ns"] = max(value["last_end_ns"], ended)
+        value["wall_ns"] += ended - started
+        value["calls"] += 1
+        if cpu is None or initial_cpu is None:
+            value["cpu_missing_calls"] += 1
+        else:
+            value["cpu_ns"] += cpu - initial_cpu
+
+    @contextmanager
+    def scope(self, phase):
+        token = self.begin(phase)
+        try:
+            yield
+        finally:
+            self.end(token)
+
+    def wrap(self, phase, original):
+        def measured(*args, **kwargs):
+            if not self.selected():
+                return original(*args, **kwargs)
+            with self.scope(phase):
+                return original(*args, **kwargs)
+        return measured
+
+    def _gc(self, phase, info):
+        # callback只存定长公共tuple；不查看对象、不调用JSON/I/O或主动GC。
+        if not self.selected():
+            return
+        index = self.reserve()
+        if index is None:
+            return
+        self.slots[index] = ("gc", phase, info.get("generation"), self.wall(),
+                                 self._cpu(), get_ident(), get_native_id(),
+                                 self.state.step, getattr(self.state, "phase", None))
+
+    @contextmanager
+    def installed(self):
+        self.gc_before = {"enabled": gc.isenabled(), "threshold": list(gc.get_threshold())}
+        gc.callbacks.append(self._gc)
+        try:
+            yield self
+        finally:
+            gc.callbacks.remove(self._gc)
+
+    def report(self):
+        # count的归约参数是下一个整数；只读快照，不因多次report改变overflow。
+        overflow = self.dropped.__reduce__()[1][0] - 1
+        events = []
+        for slot in self.slots:
+            if slot is None:
+                continue
+            if isinstance(slot, tuple):
+                _, phase, generation, wall, cpu, thread, native, step, active = slot
+                events.append({"kind": "gc", "phase": phase, "generation": generation,
+                               "wall_ns": wall, "cpu_ns": cpu, "thread_id": thread,
+                               "native_thread_id": native, "global_step": step,
+                               "active_phase": active})
+            else:
+                value = dict(slot)
+                if value["cpu_missing_calls"]:
+                    value["cpu_ns"] = None
+                value["non_cpu_ns"] = (None if value["cpu_ns"] is None else
+                                       value["wall_ns"] - value["cpu_ns"])
+                events.append(value)
+        clocks = {}
+        for name in ("perf_counter", "thread_time"):
+            try:
+                value = time.get_clock_info(name)
+                clocks[name] = {field: getattr(value, field) for field in
+                                ("implementation", "monotonic", "adjustable", "resolution")}
+            except ValueError:
+                clocks[name] = None
+        # 三角色总编码上界；退出后才计算长度，超过的尾事件显式计数。
+        bounded, encoded, omitted = [], 0, 0
+        for event in events:
+            size = len(json.dumps(event, separators=(",", ":"), ensure_ascii=False).encode()) + 1
+            if encoded + size > 72 * 1024:
+                omitted += 1
+            else:
+                bounded.append(event)
+                encoded += size
+        return {"role": self.role, "events": bounded, "event_limit": len(self.slots),
+                "encoded_events_limit": 72 * 1024, "encoded_overflow": omitted,
+                "overflow": overflow, "cpu_errors": self.cpu_errors,
+                "cpu_function_available": self.cpu is not None,
+                "cpu_supported": self.cpu is not None and self.cpu_errors == 0, "clocks": clocks,
+                "clock_pair_probe": self.clock_probe,
+                "gc_before": self.gc_before,
+                "gc_after": {"enabled": gc.isenabled(), "threshold": list(gc.get_threshold())},
+                "callback_restored": self._gc not in gc.callbacks}
 
 
 def _source_fingerprints():
@@ -107,7 +281,8 @@ def _config(role: str, ports: tuple[int, int, int]) -> LanConfig:
     )
 
 
-def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=None):
+def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=None,
+           diagnostic=None):
     """包住既有 framing 最外层，只数发送次数/字节，不解码或保存 payload。"""
     from secure_control.execution import lan_scalar_runtime, localhost_transport
 
@@ -125,14 +300,14 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
         "scalar_decode": lan_scalar_runtime.decode_scalar_frame_v3,
     }
 
-    def timed(name, original):
+    def timed(name, original, label=None):
         def call(*args, **kwargs):
             started = time.perf_counter_ns()
             try:
                 return original(*args, **kwargs)
             finally:
                 activity[name] += (time.perf_counter_ns() - started) / 1e6
-        return call
+        return diagnostic.wrap(label or name, call) if diagnostic else call
 
     def measured(sock, payload, deadline):
         started = time.perf_counter_ns()
@@ -155,7 +330,8 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
         finally:
             activity["send_ms"] += (time.perf_counter_ns() - started) / 1e6
 
-    localhost_transport._send_exact = measured
+    localhost_transport._send_exact = (diagnostic.wrap("send_ms", measured)
+                                       if diagnostic else measured)
     localhost_transport._receive_exact = timed("receive_ms", originals["receive"])
     localhost_transport.encode_envelope = timed("encode_ms", originals["encode"])
     localhost_transport.decode_envelope = timed("decode_ms", originals["decode"])
@@ -168,6 +344,32 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
     observations = ExitStack()
     from secure_control.execution import _localhost_peer, lan_runtime
     from secure_control.protocol import coordinator
+
+    if diagnostic and role != "Client":
+        receive = lan_runtime.receive_envelope
+
+        def observed_request(*args, **kwargs):
+            started, cpu = diagnostic.wall(), diagnostic._cpu()
+            request = receive(*args, **kwargs)
+            if request.sender == "Client" and request.step is not None:
+                diagnostic.select(request.step)
+                if diagnostic.selected():
+                    diagnostic.end((get_ident(), get_native_id(), request.step, "receive_request",
+                                    getattr(diagnostic.state, "phase", None), started, cpu))
+            return request
+
+        observations.enter_context(patch.object(lan_runtime, "receive_envelope", observed_request))
+        observations.enter_context(patch.object(
+            coordinator._OnlineMaterialRecovery, "restore",
+            diagnostic.wrap("material_restore", coordinator._OnlineMaterialRecovery.restore),
+        ))
+        observations.enter_context(patch.object(
+            lan_runtime, "_party_reply", diagnostic.wrap("result_reply", lan_runtime._party_reply),
+        ))
+        observations.enter_context(patch.object(
+            lan_runtime, "stage_protocol3_batch",
+            diagnostic.wrap("party_stage", lan_runtime.stage_protocol3_batch),
+        ))
 
     observations.enter_context(patch.object(
         _localhost_peer, "public_step_plan_sha256",
@@ -199,7 +401,9 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
         ), "peer_exchange_ms"),
     ):
         for name in names:
-            observations.enter_context(patch.object(owner, name, timed(category, getattr(owner, name))))
+            observations.enter_context(patch.object(
+                owner, name, timed(category, getattr(owner, name), category + "." + name),
+            ))
     if role_steps is not None:
         reply = lan_runtime._party_reply
         previous = dict(activity)
@@ -236,20 +440,30 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
 
 def _party_job(
     config: LanConfig, ports: tuple[int, int, int], delay_ms: float, batch: bool, queue,
+    diagnostic_enabled=False,
 ) -> None:
     role_steps = []
-    counts, activity, restore = _meter(config.role, ports, delay_ms, role_steps)
+    diagnostic = _Diagnostic(config.role) if diagnostic_enabled else None
+    observations = ExitStack()
+    if diagnostic:
+        observations.enter_context(diagnostic.installed())
+    counts, activity, restore = _meter(config.role, ports, delay_ms, role_steps, diagnostic)
+    outcome = {"role": config.role}
     try:
         result = run_party_single_step(config, batch=batch)
-        queue.put({"role": config.role, "status": result.get("status", "closed"),
+        outcome.update({"status": result.get("status", "closed"),
                    "directions": counts, "activity_ms": activity, "steps": role_steps,
                    "memory": _process_memory(), "material_summary": result.get("material_summary")})
     except Exception as error:  # noqa: BLE001 - 基准仅导出公开错误类别
-        queue.put({"role": config.role, "status": "failed",
+        outcome.update({"status": "failed",
                    "error_type": type(error).__name__, "directions": counts,
                    "activity_ms": activity, "steps": role_steps, "memory": _process_memory()})
     finally:
         restore()
+        observations.close()
+        if diagnostic:
+            outcome["diagnostic"] = diagnostic.report()
+        queue.put(outcome)
 
 
 def _quantile(values: list[float], fraction: float) -> float:
@@ -360,10 +574,68 @@ def _observe_dynamic(marks):
         yield
 
 
+@contextmanager
+def _observe_diagnostic(diagnostic):
+    """临时包住canonical方法；只读取公开阶段，不另建控制实现。"""
+    from secure_control.execution import lan_runtime
+    from secure_control.execution._localhost_workers import _ClientPartyEndpoint
+    from secure_control.protocol import Client
+    from secure_control.protocol.coordinator import Protocol3Orchestrator
+
+    from . import cart_pole_segmented_evidence as evidence
+
+    original_phase = evidence._batch_phase
+    original_batch = evidence._Spool.record_batch
+    original_commit = _ClientPartyEndpoint.commit
+
+    def committed(self):
+        with diagnostic.scope(f"p{self.party + 1}_commit"):
+            return original_commit(self)
+
+    @contextmanager
+    def batch_phase(stats, name):
+        with diagnostic.scope(name), original_phase(stats, name):
+            yield
+
+    def batch(self, rows, segment=None):
+        # identities是已有公开DTO。残段没有header，使用本方已确认前缀定位。
+        diagnostic.select(segment[1][-1].global_step if segment and segment[1]
+                          else max(0, self.end + len(rows) - 1))
+        had_observer = "_validation_observer" in self.__dict__
+        previous_observer = getattr(self, "_validation_observer", None)
+        self._validation_observer = diagnostic
+        try:
+            with diagnostic.scope("record_batch"):
+                return original_batch(self, rows, segment)
+        finally:
+            if had_observer:
+                self._validation_observer = previous_observer
+            else:
+                del self._validation_observer
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(evidence, "_batch_phase", batch_phase))
+        stack.enter_context(patch.object(evidence._Spool, "record_batch", batch))
+        stack.enter_context(patch.object(_ClientPartyEndpoint, "commit", committed))
+        for owner, names in (
+            (Client, ("prepare_online", "bind_online_input", "bind_preloaded_input",
+                      "reconstruct_control")),
+            (Protocol3Orchestrator, ("stage_batch",)),
+            (lan_runtime.LanSegmentedRuntime, ("end_segment", "next_segment")),
+            (evidence._Spool, ("_append_step",)),
+            (evidence._BufferedChunks, ("finish",)),
+            (evidence._BatchWriter, ("record_deferred", "release_segment")),
+        ):
+            for name in names:
+                stack.enter_context(patch.object(owner, name,
+                    diagnostic.wrap(owner.__name__ + "." + name, getattr(owner, name))))
+        yield
+
+
 def run_continuous_observation(*, steps: int, delay_ms: float,
                                segment_steps: int, optimized=False, material_slots=16,
                                role_config: Path | None = None, preload_steps=0,
-                               preload_execution="fused") -> dict[str, object]:
+                               preload_execution="fused", diagnostic=False) -> dict[str, object]:
     """实际持续动态循环及原同步 writer；退出后报告观察，不发布图或更改调度。"""
     from secure_control.execution.lan_runtime import RunControl
     from secure_control.scenarios.cart_pole.interactive import InteractiveSession
@@ -373,8 +645,11 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
     from .lan_runner import _run_prepared_segmented
 
     maximum = 10000 if optimized else 400
-    if type(steps) is not int or not 2 <= steps <= maximum:
-        raise ValueError(f"观察步数必须在2..{maximum}，首步不剔除。")
+    minimum = 1 if diagnostic else 2
+    if type(diagnostic) is not bool or (diagnostic and (not optimized or role_config is not None)):
+        raise ValueError("有限诊断只支持本机canonical cycle观察。")
+    if type(steps) is not int or not minimum <= steps <= maximum:
+        raise ValueError(f"观察步数必须在{minimum}..{maximum}，首步不剔除。")
     if material_slots not in (0, 4, 16) or isinstance(material_slots, bool):
         raise ValueError("资格观察材料库存只可显式选择 0/4/16。")
     if (type(preload_steps) is not int or not 0 <= preload_steps <= 1000
@@ -394,7 +669,7 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
     context = mp.get_context("spawn")
     queue = context.Queue()
     parties = [context.Process(target=_party_job, args=(
-        _config(role, ports), ports, delay_ms, True, queue,
+        _config(role, ports), ports, delay_ms, True, queue, diagnostic,
     )) for role in ("P1", "P2")] if role_config is None else []
     records, events, outcomes, writer_batches = [], [], [], []
     cycles = []
@@ -402,16 +677,24 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                           "source_check_ms": 0., "source_check_control_ms": 0.,
                           "source_check_writer_ms": 0., "source_check_control_count": 0,
                           "source_check_writer_count": 0}
-    counts, activity, restore = _meter("Client", ports, delay_ms)
+    diagnostic_observer = _Diagnostic("Client") if diagnostic else None
+    counts, activity, restore = _meter("Client", ports, delay_ms, diagnostic=diagnostic_observer)
     control, session = RunControl(), InteractiveSession()
     fsync, checkpoint = os.fsync, _Spool._checkpoint
     before_activity, before_storage = dict(activity), dict(storage)
     before_counts = {}
     current_phase, phase_start, started = None, time.perf_counter_ns(), time.perf_counter_ns()
     attempt = None
+    diagnostic_phase = None
 
     def phase(name):
         nonlocal current_phase, phase_start, attempt, before_activity, before_storage, before_counts
+        nonlocal diagnostic_phase
+        if diagnostic_observer:
+            diagnostic_observer.end(diagnostic_phase)
+            if name == "INPUT":
+                diagnostic_observer.select(len(records))
+            diagnostic_phase = diagnostic_observer.begin(name)
         now = time.perf_counter_ns()
         if current_phase is not None:
             events.append({"phase": current_phase, "duration_ms": (now - phase_start) / 1e6,
@@ -442,6 +725,10 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
             control.request_stop()
 
     def observed_cycle(timing):
+        nonlocal diagnostic_phase
+        if diagnostic_observer:
+            diagnostic_observer.end(diagnostic_phase)
+            diagnostic_phase = None
         sent = {k: v["frames"] - before_counts.get(k, {}).get("frames", 0)
                 for k, v in counts.items()}
         byte_counts = {k: v["application_bytes"] - before_counts.get(k, {}).get("application_bytes", 0)
@@ -466,6 +753,12 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
         finally:
             storage["checkpoint_ms"] += (time.perf_counter_ns() - start) / 1e6
 
+    diagnostic_context = ExitStack()
+    if diagnostic_observer:
+        diagnostic_context.enter_context(diagnostic_observer.installed())
+        diagnostic_context.enter_context(_observe_diagnostic(diagnostic_observer))
+        fsync = diagnostic_observer.wrap("fsync", fsync)
+        checkpoint = diagnostic_observer.wrap("checkpoint_call", checkpoint)
     try:
         with tempfile.TemporaryDirectory(prefix="secure-control-observation-") as folder:
             assembly_start = time.perf_counter_ns()
@@ -482,6 +775,9 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                     owner = "writer" if current_thread().name == "segment-evidence-writer" else "control"
                     storage[f"source_check_{owner}_ms"] += elapsed
                     storage[f"source_check_{owner}_count"] += 1
+
+            if diagnostic_observer:
+                measured_sources = diagnostic_observer.wrap("source_check", measured_sources)
 
             prepared = replace(prepared, output_root=Path(folder), recheck_sources=measured_sources)
             transaction = _Spool(prepared, config, session, phase)
@@ -533,6 +829,9 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                 party.join(timeout=10)
     finally:
         restore()
+        if diagnostic_observer:
+            diagnostic_observer.end(diagnostic_phase)
+        diagnostic_context.close()
         for party in parties:
             if party.is_alive():
                 party.terminate()
@@ -545,8 +844,24 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                             for row in cycles if row["cycle_completed_ns"] is not None])
     device_timing = _timing([(row["device_completed_ns"] - row["scheduled_start_ns"]) / 1e6
                              for row in cycles if row["device_completed_ns"] is not None])
+    diagnostic_report = None
+    if diagnostic_observer:
+        diagnostic_report = {"diagnostic": True, "roles": [diagnostic_observer.report()] +
+            [item.pop("diagnostic", {"role": item["role"], "missing": True}) for item in outcomes],
+            "selected_global_steps": "0..1 and 397..405; writer batch identified by final public step",
+            "scope": "same-host perf_counter/QPC; same-thread CPU; repeated windows are envelopes, "
+                     "not continuous execution; nested durations overlap; non_cpu is not a GIL/I/O cause",
+            "python_implementation": platform.python_implementation(),
+            "encoded_limit": 256 * 1024}
+        diagnostic_report["encoded_bytes"] = 0
+        for _ in range(3):
+            diagnostic_report["encoded_bytes"] = len(json.dumps(
+                diagnostic_report, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode())
+        if diagnostic_report["encoded_bytes"] > diagnostic_report["encoded_limit"]:
+            raise RuntimeError("有限诊断编码超出预声明预算。")
     return {
         "schema": "cycle-qualification-v1" if optimized else "continuous-observation-v1",
+        "diagnostic": diagnostic, "diagnostic_report": diagnostic_report,
         "case": "cycle" if optimized else "continuous", "mode": "batch",
         "code_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=_ROOT, text=True).strip(),
         "dirty": bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=_ROOT, text=True)),
@@ -608,7 +923,7 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
         "startup_gc": result.get("startup_gc"),
         "activity_scope": "local arithmetic excludes peer calls; peer_exchange includes I/O, encoding and waits; send/receive/codec overlap; checkpoint includes its fsync",
         "byte_scope": "application payload plus 4-byte header; excludes TCP/TLS overhead",
-        "qualification_pass": (optimized and steps == 10000 and result["status"] == "stopped"
+        "qualification_pass": (not diagnostic and optimized and steps == 10000 and result["status"] == "stopped"
                                and len(cycles) == steps
                                and result.get("cycle_summary", {}).get("misses") == 0
                                and all(row["status"] == "confirmed" and row["cycle_completed_ns"] is not None

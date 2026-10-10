@@ -285,9 +285,11 @@ def test_fused_activation_preflights_both_frames_and_burns_window_on_partial_fai
 def test_preloaded_real_three_party_staged_and_fused_keep_commits_and_cross_segments():
     from secure_control.experiments.communication_benchmark import run_continuous_observation
 
-    for mode, frames in (("staged", 19), ("fused", 15)):
+    for mode, frames, diagnostic in (("staged", 19, False), ("fused", 15, False),
+                                     ("fused", 15, True)):
         report = run_continuous_observation(steps=3, delay_ms=0, segment_steps=2,
-                                           optimized=True, preload_steps=3, preload_execution=mode)
+                                           optimized=True, preload_steps=3, preload_execution=mode,
+                                           diagnostic=diagnostic)
         assert report["status"] == "stopped", report["failed_phase"]
         assert report["stage_pass"] and not report["qualification_pass"]
         assert report["successful_steps"] == 3
@@ -298,3 +300,15 @@ def test_preloaded_real_three_party_staged_and_fused_keep_commits_and_cross_segm
                      for outcome in report["party_outcomes"])
         assert count == frames
         assert all(outcome["material_summary"]["committed"] == 3 for outcome in report["party_outcomes"])
+        if diagnostic:
+            roles = report["diagnostic_report"]["roles"]
+            events = roles[0]["events"]
+            assert any(item.get("owner") == "writer" and item.get("phase") == "row_validation"
+                       and item["calls"] == 2 for item in events)
+            assert any(item.get("phase") == "journal_flush_fsync" for item in events)
+            for name in ("p1_commit", "p2_commit"):
+                assert any(item.get("phase") == name and item["global_step"] == 0
+                           and item["calls"] == 1 for item in events)
+            assert all(any(event.get("phase") == "local_arithmetic_ms.commit"
+                           for event in role["events"]) for role in roles[1:])
+            assert all(role["overflow"] == role["encoded_overflow"] == 0 for role in roles)
