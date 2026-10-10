@@ -417,6 +417,11 @@ P1/P2、`LanContinuousRuntime`、crypto/protocol 与 schema v1 writer/reader
 阶段不填零。观察报告分别列出控制线程与记录线程的来源复核累计时长和次数，
 这些累计量不能当作某一次边界读取的耗时。
 
+后台动态批次逐行校验规范编码与身份，使用最多 64 KiB 临时缓冲写出 journal、
+原格式 spool 和计时 sidecar；保留完整哈希链读回、来源核验与批末同步/原子
+checkpoint。缓冲不是新的逻辑段，可靠计数和原库存预算保持不变。每批公开起止
+和嵌套阶段时长用于分析与控制周期的重叠；这些数据界不构成调度或耗时保证。
+
 - `configs/lab-p1.example.yaml`、`lab-p2.example.yaml`、`lab-client-continuous.example.yaml`：三个独立角色入口。
 - `configs/local-deployment.example.yaml`：三条连接的地址和端口；三台电脑内容须一致。
 - `configs/paper_pid_lan.example.yaml`：Client 日常参数，直接读取 `paper_pid_cascade_zoh.yaml` 和共享素数证明；不依赖 Fig3 四点定义，运行声明为 `user-exploration`。

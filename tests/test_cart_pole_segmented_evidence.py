@@ -6,7 +6,7 @@ import json
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
 from math import pi
 from pathlib import Path
@@ -153,6 +153,30 @@ def test_deferred_writer_finish_drains_fifo_without_release(tmp_path):
     assert not writer._thread.is_alive()
 
 
+def test_streamed_spool_preserves_canonical_bytes_with_bounded_writes(tmp_path):
+    """逐字对照旧规范编码，包括UTF8、负零、布尔、空段和超过一个块的输入。"""
+    for count in (0, 1, 80):
+        identities = tuple(_GateRecord(i) for i in range(count))
+        rows = tuple(evidence._bytes({"protocol": {"protocol": i}, "snapshot": {
+            "text": '汉字λ\\"steps":[]' * 250, "negative_zero": -0.0,
+            "bool": True, "none": None,
+        }}) for i in range(count))
+        header = {"steps": [], "unicode": "汉", "float": -0.0, "flag": False}
+        expected = evidence._bytes({"protocol": {**header, "steps": [
+            {"protocol": i} for i in range(count)]}, "steps": [evidence._decode(row) for row in rows]})
+        stats = {}
+        path = tmp_path / f"stream-{count}.json"
+        size = evidence._write(path, None, _chunks=evidence._spool_chunks(header, identities, rows),
+                               _stats=stats)
+        assert path.read_bytes() == expected and size == len(expected)
+        assert stats["buffer_high_water"] <= 64 * 1024
+        assert stats["write_calls"] == (len(expected) + 64 * 1024 - 1) // (64 * 1024)
+        with pytest.raises(FileExistsError):
+            evidence._write(path, None, _chunks=iter((b"{}\n",)))
+    with pytest.raises(ValueError):
+        evidence._write(tmp_path / "limited.json", None, 10, _chunks=iter((b"123456", b"123456")))
+
+
 _CLIENT = r'''
 import json, sys
 from pathlib import Path
@@ -168,10 +192,10 @@ if count == 0:
     control.request_stop()
 if mode in ('spool', 'disk_full'):
     original = e._write
-    def write(path, *args):
+    def write(path, *args, **kwargs):
         if path.name.startswith('spool-'):
             raise OSError(28, 'injected disk full')
-        return original(path, *args)
+        return original(path, *args, **kwargs)
     e._write = write
 if mode == 'plot':
     def plot(*args, **kwargs):
@@ -468,7 +492,8 @@ def test_batch_writer_counts_inflight_and_preserves_checkpoint_on_disk_failure(
 
     packet = None
     try:
-        writer.record(submit(0))
+        first = submit(0)
+        writer.record(first)
         assert entered.wait(timeout=5)
         assert writer.snapshot()["durable_step_count"] == 0
         packet = submit(1)
@@ -485,6 +510,16 @@ def test_batch_writer_counts_inflight_and_preserves_checkpoint_on_disk_failure(
             writer.finish()
     assert not writer._thread.is_alive()
     assert writer.snapshot()["durable_step_count"] == 3
+    # 与改动前的canonical实现逐字对照，包含真实v2字段和哈希链。
+    assert (spool.stage / "spool-0.json").read_bytes() == evidence._bytes(asdict(first))
+    previous, journal = None, bytearray()
+    for record in first.steps:
+        entry = {"step": asdict(record), "prev_sha256": previous}
+        previous = sha256(evidence._bytes(entry)).hexdigest()
+        journal.extend(evidence._bytes({**entry, "sha256": previous}))
+    assert (spool.stage / "journal/0.jsonl").read_bytes() == journal
+    assert spool.last_batch["error_type"] == ("OSError" if failure == "disk" else "ValueError")
+    assert spool.last_batch["buffer_high_water"] <= 64 * 1024
     monkeypatch.setattr(spool, "_checkpoint", original_checkpoint)
     spool.fail({"status": "failed", "category": "OSError", "failure_phase": "WRITER"})
     prefix = evidence.open_verified_cart_pole_segmented_prefix(spool.stage)
@@ -493,6 +528,94 @@ def test_batch_writer_counts_inflight_and_preserves_checkpoint_on_disk_failure(
         assert spool.disk_metrics["fsync_count"] == 8  # 两批均 fsync，只有首批 checkpoint 发布
     else:
         assert spool.disk_metrics["fsync_count"] < 8  # 来源变化在第二批写盘前拒绝。
+
+
+def test_stream_batch_rejects_invalid_data_and_partial_io_without_promoting_prefix(
+    dynamic_published, tmp_path, monkeypatch,
+):
+    source, _ = dynamic_published
+    for fault in ("noncanonical", "duplicate", "nan", "identity", "extra_journal",
+                  "journal_write", "spool_write", "fsync", "checkpoint", "limit"):
+        _check_stream_fault(source, tmp_path / fault, monkeypatch, fault)
+
+
+def _check_stream_fault(source, root, monkeypatch, fault):
+    root.mkdir()
+    paths = _plain_deployment(root)
+    _observer_profile_for(paths)
+    config = load_lan_config(paths["Client"], "Client")
+    session = InteractiveSession()
+    prepared = load_segmented_experiment(config.experiment_config, 3, session)
+    spool = evidence._Spool(prepared, config, session, lambda _: None)
+    spool.config = json.loads((source / "config.json").read_bytes())
+    setup = decode_wire_value(evidence._bytes(spool.config["setup"]))
+    backend = json.loads((source / "run.json").read_bytes())["backend_run_id"]
+    spool.begin(SimpleNamespace(run_id=backend, controller_epoch=setup.controller_epoch), setup)
+    data = json.loads((source / "segments/0/protocol.json").read_bytes())
+    rows = [evidence._bytes(row) for row in data["steps"]]
+    identities = tuple(SegmentedStep(**{**row, "raw_control": tuple(row["raw_control"]),
+                                        "resource_ids": tuple(row["resource_ids"])})
+                       for row in data["protocol"]["steps"])
+    header = evidence._bytes({**data["protocol"], "steps": []})
+    initial_checkpoint = (spool.stage / "checkpoint.json").read_bytes()
+    with monkeypatch.context() as patch:
+        if fault == "noncanonical":
+            rows[-1] = json.dumps(data["steps"][-1], indent=1).encode()
+        elif fault == "duplicate":
+            rows[-1] = b'{"protocol":{},"protocol":{}}\n'
+        elif fault == "nan":
+            rows[-1] = b'{"protocol":{},"value":NaN}\n'
+        elif fault == "identity":
+            identities = (identities[0], replace(identities[1], global_step=True), identities[2])
+        elif fault == "extra_journal":
+            original_iter = evidence._iter_journal
+
+            def tampered(path, *args, **kwargs):
+                with path.open("ab") as output:
+                    output.write(b"extra")
+                yield from original_iter(path, *args, **kwargs)
+
+            patch.setattr(evidence, "_iter_journal", tampered)
+        elif fault == "journal_write":
+            original_finish = evidence._BufferedChunks.finish
+
+            def partial(writer):
+                if str(writer.stream.name).endswith(".jsonl"):
+                    writer.stream.write(writer.buffer[:10])
+                    raise OSError("injected partial journal write")
+                return original_finish(writer)
+
+            patch.setattr(evidence._BufferedChunks, "finish", partial)
+        elif fault in {"spool_write", "limit"}:
+            original_write = evidence._write
+
+            def partial_spool(path, value, *args, **kwargs):
+                if path.name.startswith("spool-"):
+                    if fault == "limit":
+                        return original_write(path, value, 10, **kwargs)
+                    with path.open("xb") as output:
+                        output.write(b"partial")
+                    raise OSError("injected partial spool write")
+                return original_write(path, value, *args, **kwargs)
+
+            patch.setattr(evidence, "_write", partial_spool)
+        elif fault == "fsync":
+            def failed_fsync(fd):
+                raise OSError("injected fsync failure")
+            patch.setattr(evidence.os, "fsync", failed_fsync)
+        elif fault == "checkpoint":
+            def failed_checkpoint(*args):
+                raise OSError("injected checkpoint failure")
+            patch.setattr(spool, "_checkpoint", failed_checkpoint)
+        with pytest.raises((ValueError, OSError)):
+            spool.record_batch(rows, (header, identities))
+    assert (spool.count, spool.end, spool.tail_count, spool.tail_bytes, spool.tail_hash) == (0, 0, 0, 0, None)
+    assert (spool.stage / "checkpoint.json").read_bytes() == initial_checkpoint
+    assert spool.last_batch["error_type"] is not None
+    assert spool.last_batch["buffer_high_water"] <= 64 * 1024
+    spool.fail({"status": "failed", "category": "injected", "failure_phase": "WRITER"})
+    prefix = evidence.open_verified_cart_pole_segmented_prefix(spool.stage)
+    assert prefix["confirmed_step_count"] == prefix["sealed_segment_count"] == 0
 
 
 @pytest.mark.integration

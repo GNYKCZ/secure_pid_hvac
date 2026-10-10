@@ -396,7 +396,7 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
     parties = [context.Process(target=_party_job, args=(
         _config(role, ports), ports, delay_ms, True, queue,
     )) for role in ("P1", "P2")] if role_config is None else []
-    records, events, outcomes = [], [], []
+    records, events, outcomes, writer_batches = [], [], [], []
     cycles = []
     marks, storage = {}, {"fsync_ms": 0., "fsync_count": 0, "checkpoint_ms": 0.,
                           "source_check_ms": 0., "source_check_control_ms": 0.,
@@ -485,7 +485,7 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
 
             prepared = replace(prepared, output_root=Path(folder), recheck_sources=measured_sources)
             transaction = _Spool(prepared, config, session, phase)
-            writer = _BatchWriter(transaction) if optimized else None
+            writer = _BatchWriter(transaction, on_batch=writer_batches.append) if optimized else None
             sink = writer if writer is not None else transaction
             initial_assembly_ms = (time.perf_counter_ns() - assembly_start) / 1e6
             for party in parties:
@@ -590,6 +590,10 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
         "recording_summary": writer.snapshot() if writer else None,
         "stop_drain_ns": writer.drain_ns if writer else 0,
         "spool_io": dict(transaction.disk_metrics),
+        "writer_batches": writer_batches,
+        "writer_batch_scope": ("Client perf_counter_ns windows include waits; rows_journal includes "
+                               "row_validation_ns, spool includes spool fsync; nested durations cannot "
+                               "be added as exclusive costs; buffer high water is bytes, not a time bound"),
         "storage_active": active_storage, "storage_all": storage,
         "client_memory": _process_memory(),
         "resource_counts": result["resource_counts"], "directions_all_session": directions,
