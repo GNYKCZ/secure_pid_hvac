@@ -30,10 +30,13 @@ class CartPoleWindow:
     """网络与正式写入在工作线程；画面从已提交状态或正式 reader 来。"""
 
     def __init__(self, root: tk.Tk, config_path: Path, *, segment_steps=400,
-                 mode="segmented") -> None:
+                 mode="segmented", preload_steps=0, preload_execution="fused") -> None:
         if mode not in ("segmented", "finite"):
             raise ValueError("窗口模式无效。")
         self.mode, self.segment_steps = mode, segment_steps
+        if preload_steps and mode != "segmented":
+            raise ValueError("预送只支持动态持续窗口")
+        self.preload_steps, self.preload_execution = preload_steps, preload_execution
         self.root = root
         self.messages: deque[tuple[str, object]] = deque(maxlen=64)
         self._frame_lock = threading.Lock()
@@ -64,7 +67,8 @@ class CartPoleWindow:
         self._track_limit_m = float(
             self.prepared.effective_config["plant_contract"]["track_center_limit_m"]
         )
-        root.title("Cart-pole secure Client · near-upright simulation")
+        root.title("Cart-pole secure Client · near-upright simulation" + (
+            f" · 有限预送 {preload_steps} 步" if preload_steps else ""))
         root.geometry("860x720")
         self.phase = tk.StringVar(value="初态 / 待连接")
         self.values = tk.StringVar(
@@ -260,6 +264,7 @@ class CartPoleWindow:
                     session=self.session, segment_steps=self.segment_steps,
                     phase=lambda value: self._notify("phase", value),
                     on_step=self._confirmed_frame,
+                    preload_steps=self.preload_steps, preload_execution=self.preload_execution,
                 )
                 if result["status"] != "complete":
                     self._notify("failed", result["status"])
@@ -350,7 +355,8 @@ class CartPoleWindow:
                     self._verified = value
                     self._final_count = value.metadata["N"]
                     status = value.metadata["termination"]["observed_status"]
-                    self.phase.set(f"用户停止；结果已验证；N={self._final_count}；停止时 {status}")
+                    reason = "预送库存耗尽" if self.preload_steps and self._final_count == self.preload_steps else "用户停止"
+                    self.phase.set(f"{reason}；结果已验证；N={self._final_count}；停止时 {status}")
                     self._seek_worker = threading.Thread(target=self._read_seek,
                                                           name="cart-pole-replay")
                     self._seek_worker.start()
@@ -392,11 +398,13 @@ class CartPoleWindow:
         self.phase.set("取消中：等待当前网络超时或安全边界关闭")
 
 
-def run_window(config_path: Path, *, segment_steps=400, mode="segmented") -> None:
+def run_window(config_path: Path, *, segment_steps=400, mode="segmented",
+               preload_steps=0, preload_execution="fused") -> None:
     """配置和 Tk 创建均在拨号前完成；没有窗口时直接失败。"""
     root = tk.Tk()
     try:
-        window = CartPoleWindow(root, config_path, segment_steps=segment_steps, mode=mode)
+        window = CartPoleWindow(root, config_path, segment_steps=segment_steps, mode=mode,
+                               preload_steps=preload_steps, preload_execution=preload_execution)
     except Exception:
         root.destroy()
         raise

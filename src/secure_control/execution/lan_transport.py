@@ -5,9 +5,9 @@ from __future__ import annotations
 import socket
 import ssl
 import threading
-import time
 from queue import Empty, Queue
 
+from .cycle_timing import remaining_seconds
 from .lan_config import LanConfig, LanEndpoint, Role
 
 
@@ -177,7 +177,7 @@ def _dial(addresses: list[tuple], deadline: float) -> socket.socket:
 
 
 def _remaining(deadline: float) -> float:
-    remaining = deadline - time.monotonic()
+    remaining = remaining_seconds(deadline)
     if remaining <= 0:
         raise LanTimeoutError("LAN 连接或握手超过绝对 deadline。")
     return remaining

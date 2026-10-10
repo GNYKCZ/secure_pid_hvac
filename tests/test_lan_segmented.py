@@ -24,6 +24,8 @@ from secure_control.execution.lan_config import load_lan_config
 from secure_control.execution.lan_runtime import LanSegmentedRuntime, RunControl
 from secure_control.execution.localhost_codec import (
     BatchHelloPayload,
+    decode_envelope,
+    encode_envelope,
 )
 from secure_control.execution.localhost_transport import LocalhostTransportDisconnected
 from secure_control.experiments.cart_pole_lan_profile import load_cart_pole_lan_profile
@@ -87,6 +89,7 @@ import numpy as np
 from secure_control.execution import lan_runtime as lan
 from secure_control.execution.lan_config import load_lan_config
 from secure_control.execution._localhost_workers import _ClientPartyEndpoint
+from secure_control.execution.localhost_codec import decode_envelope
 from secure_control.experiments.lan_runner import run_client_segmented
 from secure_control.protocol import Client
 from secure_control.scenarios.cart_pole.interactive import InteractiveSession
@@ -134,16 +137,17 @@ def rebuilt(self, *args, **kwargs):
         control.request_stop()
     return result
 Client.reconstruct_control = rebuilt
-request = lan._request
-def requested(*args, **kwargs):
-    result = request(*args, **kwargs)
-    if mode in ('p1_disconnect', 'p2_disconnect') and args[3] == 'online':
-        if args[1] == ('P1' if mode == 'p1_disconnect' else 'P2'):
-            args[0].close()
-    if mode == 'online' and args[3] == 'online':
+send_frame = lan.localhost_transport.send_frame
+def sent_frame(sock, payload, **kwargs):
+    message = decode_envelope(payload)
+    result = send_frame(sock, payload, **kwargs)
+    if mode in ('p1_disconnect', 'p2_disconnect') and message.operation == 'online':
+        if message.recipient == ('P1' if mode == 'p1_disconnect' else 'P2'):
+            sock.close()
+    if mode == 'online' and message.operation == 'online':
         control.request_stop()
     return result
-lan._request = requested
+lan.localhost_transport.send_frame = sent_frame
 send = lan.send_envelope
 def sent(sock, message, **kwargs):
     if mode == 'bad_end_count' and message.operation == 'segment_end':
@@ -638,18 +642,22 @@ def test_repeated_or_skipped_local_online_is_rejected(generic_runtime, monkeypat
     runtime, _parties = generic_runtime
     identity = runtime.step(np.array([.5]))
     runtime.confirm_applied(identity)
-    request = lan_runtime._request
+    send_frame = lan_runtime.localhost_transport.send_frame
+    injected = []
 
-    def corrupt(sock, role, sequence, operation, session, timeout, *args, **kwargs):
-        if operation == "online":
-            args = (*args[:2], step)
-        return request(sock, role, sequence, operation, session, timeout, *args, **kwargs)
+    def corrupt(sock, payload, **kwargs):
+        message = decode_envelope(payload)
+        if message.operation == "online":
+            injected.append(message.step)
+            payload = encode_envelope(replace(message, step=step))
+        return send_frame(sock, payload, **kwargs)
 
-    monkeypatch.setattr(lan_runtime, "_request", corrupt)
+    monkeypatch.setattr(lan_runtime.localhost_transport, "send_frame", corrupt)
     with pytest.raises(LocalhostTransportDisconnected):
         runtime.step(np.array([.5]))
     assert runtime.phase == "UNCERTAIN"
     assert runtime.confirmed_step_count == 1
+    assert injected == [1, 1]
 
 
 @pytest.mark.parametrize("field", ["run_id", "segment_index", "global_start", "previous_session_id"])

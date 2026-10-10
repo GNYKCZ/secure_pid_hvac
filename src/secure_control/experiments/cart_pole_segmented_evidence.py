@@ -9,13 +9,15 @@ import re
 import shutil
 import sqlite3
 import tempfile
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from fractions import Fraction
 from hashlib import sha256
 from pathlib import Path
+from threading import Condition, Thread
+from time import perf_counter_ns
 from types import MappingProxyType
 
 import numpy as np
@@ -170,12 +172,104 @@ def _hash(path: Path, check: Callable[[], None] = lambda: None) -> str:
     return digest.hexdigest()
 
 
-def _write(path: Path, value, limit=SEGMENT_LIMIT) -> None:
+class _BufferedChunks:
+    """一个64KiB临时缓冲；只改变写粒度，flush/fsync由原批次owner负责。"""
+
+    def __init__(self, stream, *, limit=None, on_write=None, stats=None):
+        self.stream, self.limit, self.on_write = stream, limit, on_write
+        self.stats = stats if stats is not None else {}
+        self.buffer = bytearray()
+        self.total = 0
+        self.stats.setdefault("buffer_high_water", 0)
+        self.stats.setdefault("write_calls", 0)
+        self.stats.setdefault("write_bytes", 0)
+
+    def write(self, raw):
+        if self.limit is not None and self.total + len(raw) > self.limit:
+            raise ValueError("分段记录超过有界大小。")
+        self.total += len(raw)
+        view = memoryview(raw)
+        while view:
+            count = min(len(view), 64 * 1024 - len(self.buffer))
+            self.buffer.extend(view[:count])
+            view = view[count:]
+            self.stats["buffer_high_water"] = max(self.stats["buffer_high_water"], len(self.buffer))
+            if len(self.buffer) == 64 * 1024:
+                self.finish()
+        return len(raw)
+
+    def finish(self):
+        if self.buffer:
+            size = len(self.buffer)
+            written = self.stream.write(self.buffer)
+            if written != size:
+                raise OSError("有界记录写出不完整。")
+            self.stats["write_calls"] += 1
+            self.stats["write_bytes"] += size
+            if self.on_write is not None:
+                self.on_write(size)
+            self.buffer.clear()
+
+
+def _write(path: Path, value, limit=SEGMENT_LIMIT, *, _chunks=None, _stats=None) -> int:
+    if _chunks is not None:
+        if value is not None:
+            raise ValueError("流式写出不得同时提供完整对象。")
+        with path.open("xb") as output:
+            writer = _BufferedChunks(output, limit=limit, stats=_stats)
+            for chunk in _chunks:
+                writer.write(chunk)
+            writer.finish()
+            return writer.total
     raw = _bytes(value)
     if len(raw) > limit:
         raise ValueError("分段记录超过有界大小。")
     with path.open("xb") as output:
         output.write(raw)
+    return len(raw)
+
+
+def _json_chunks(value):
+    encoder = json.JSONEncoder(sort_keys=True, ensure_ascii=False, allow_nan=False,
+                               separators=(",", ":"))
+    for text in encoder.iterencode(value):
+        yield text.encode("utf-8")
+
+
+def _spool_chunks(protocol, identities, rows):
+    """同一规范JSON对象；输入行必须由record_batch先验证规范及身份。"""
+    yield b'{"protocol":{'
+    for index, key in enumerate(sorted(protocol)):
+        if index:
+            yield b","
+        yield _bytes(key)[:-1]
+        yield b":"
+        if key == "steps":
+            yield b"["
+            for offset, identity in enumerate(identities):
+                if offset:
+                    yield b","
+                yield from _json_chunks(asdict(identity))
+            yield b"]"
+        else:
+            yield from _json_chunks(protocol[key])
+    yield b'},"steps":['
+    for index, raw in enumerate(rows):
+        if index:
+            yield b","
+        yield raw[:-1]
+    yield b"]}\n"
+
+
+@contextmanager
+def _batch_phase(stats, name):
+    started = perf_counter_ns()
+    try:
+        yield
+    finally:
+        ended = perf_counter_ns()
+        stats["phases"][name] = {"started_ns": started, "ended_ns": ended,
+                                "duration_ns": ended - started}
 
 
 def _freeze(value):
@@ -1437,6 +1531,9 @@ class _Spool:
         self.tail_hash = None
         self.backend_id = None
         self.published = False
+        self.last_batch = None
+        self.disk_metrics = {"write_calls": 0, "write_bytes": 0, "fsync_count": 0,
+                             "checkpoint_replacements": 0}
         setup = (None if self.dynamic else LanContinuousSetupPayload(
             prepared.context.modulus, prepared.context.integer_bits,
             prepared.context.fractional_bits, prepared.security_parameter,
@@ -1462,10 +1559,15 @@ class _Spool:
                  "active_bytes": self.tail_bytes, "failure": failure}
         temporary = self.stage / "checkpoint.tmp"
         with temporary.open("wb") as output:
-            output.write(_bytes(value))
+            raw = _bytes(value)
+            output.write(raw)
+            self.disk_metrics["write_calls"] += 1
+            self.disk_metrics["write_bytes"] += len(raw)
             output.flush()
             os.fsync(output.fileno())
+            self.disk_metrics["fsync_count"] += 1
         os.replace(temporary, self.stage / "checkpoint.json")
+        self.disk_metrics["checkpoint_replacements"] += 1
 
     def begin(self, lifecycle, setup):
         if not self.dynamic:
@@ -1477,7 +1579,11 @@ class _Spool:
         self.backend_id = lifecycle.run_id
         self.config["setup"] = _decode(encode_wire_value(setup))
         _DynamicDefinition(self.config)
-        _write(self.stage / "config.json", self.config, HEADER_LIMIT)
+        self.disk_metrics["write_bytes"] += _write(self.stage / "config.json", self.config, HEADER_LIMIT)
+        self.disk_metrics["write_calls"] += 1
+        with (self.stage / "config.json").open("r+b") as stream:
+            os.fsync(stream.fileno())
+            self.disk_metrics["fsync_count"] += 1
         self._checkpoint("running")
 
     def record_step(self, step):
@@ -1487,6 +1593,11 @@ class _Spool:
         if self.backend_id is None:
             raise ValueError("动态 setup 尚未冻结。")
         data = asdict(step)
+        self._append_step(data)
+        self._checkpoint("running")
+
+    def _append_step(self, data, *, output=None):
+        """canonical 身份/哈希校验共用；batch 的文件由唯一 writer 一次 flush/fsync。"""
         identity = data["protocol"]
         if (identity["run_id"] != self.backend_id
                 or identity["segment_index"] != self.count
@@ -1498,14 +1609,101 @@ class _Spool:
         raw = _bytes({**entry, "sha256": digest})
         if len(raw) > INDEX_LINE_LIMIT:
             raise ValueError("动态步骤记录超出行界。")
-        with (self.stage / "journal" / f"{self.count}.jsonl").open("ab") as output:
+        if output is None:
+            with (self.stage / "journal" / f"{self.count}.jsonl").open("ab") as stream:
+                stream.write(raw)
+                self.disk_metrics["write_calls"] += 1
+                self.disk_metrics["write_bytes"] += len(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+                self.disk_metrics["fsync_count"] += 1
+        else:
             output.write(raw)
-            output.flush()
-            os.fsync(output.fileno())
         self.tail_bytes += len(raw)
         self.tail_count += 1
         self.tail_hash = digest
-        self._checkpoint("running")
+
+    def record_batch(self, rows, segment=None):
+        """按逻辑段批量可靠提交；失败只保留旧 checkpoint 所承诺的前缀。"""
+        saved = (self.count, self.end, self.tail_count, self.tail_bytes, self.tail_hash)
+        stats = {"started_ns": perf_counter_ns(), "segment_index": self.count,
+                 "row_count": len(rows), "phases": {}, "row_validation_ns": 0,
+                 "buffer_high_water": 0, "error_type": None}
+        # 基准可装配只读计时observer；正常入口不读CPU时钟或保存诊断事件。
+        observer = getattr(self, "_validation_observer", None)
+        try:
+            with _batch_phase(stats, "source"):
+                self.prepared.recheck_sources()
+            if not self.dynamic or self.backend_id is None:
+                raise ValueError("批量 writer 仅接收已冻结的动态 setup。")
+            protocol, identities = None, None
+            if segment is not None:
+                header, identities = segment
+                if len(header) > HEADER_LIMIT:
+                    raise ValueError("公开封段header超出预留预算。")
+                protocol = _decode(header)
+                if (header != _bytes(protocol) or protocol.get("steps") != []
+                        or len(rows) != len(identities)):
+                    raise ValueError("公开批次header或行/身份数量无效。")
+
+            def written(size):
+                self.disk_metrics["write_calls"] += 1
+                self.disk_metrics["write_bytes"] += size
+
+            with (_batch_phase(stats, "rows_journal"),
+                  (self.stage / "journal" / f"{self.count}.jsonl").open("ab") as stream):
+                buffer = _BufferedChunks(stream, on_write=written, stats=stats)
+                for index, raw in enumerate(rows):
+                    started = perf_counter_ns()
+                    token = observer.begin("row_validation") if observer is not None else None
+                    try:
+                        if len(raw) > INDEX_LINE_LIMIT:
+                            raise ValueError("动态步骤记录超出行界。")
+                        data = _decode(raw)
+                        if raw != _bytes(data):
+                            raise ValueError("动态批次行不是规范JSON。")
+                        if identities is not None:
+                            _same(data["protocol"], asdict(identities[index]))
+                    finally:
+                        stats["row_validation_ns"] += perf_counter_ns() - started
+                        if observer is not None:
+                            observer.end(token)
+                    self._append_step(data, output=buffer)
+                    del data
+                buffer.finish()
+                with _batch_phase(stats, "journal_flush_fsync"):
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                self.disk_metrics["fsync_count"] += 1
+            if protocol is not None:
+                self._validate_segment_prefix(protocol, len(rows))
+                with _batch_phase(stats, "journal_readback"):
+                    journal = self.stage / "journal" / f"{self.count}.jsonl"
+                    for actual, raw in zip(_iter_journal(journal, self.tail_count, self.tail_bytes,
+                                                        self.tail_hash), rows, strict=True):
+                        if _bytes(actual) != raw:
+                            raise ValueError("日志读回与接管的规范行不一致。")
+                with _batch_phase(stats, "spool"):
+                    spool_stats = {}
+                    try:
+                        _write(self.stage / f"spool-{self.count}.json", None,
+                               _chunks=_spool_chunks(protocol, identities, rows), _stats=spool_stats)
+                    finally:
+                        self.disk_metrics["write_bytes"] += spool_stats.get("write_bytes", 0)
+                        self.disk_metrics["write_calls"] += spool_stats.get("write_calls", 0)
+                        stats["buffer_high_water"] = max(stats["buffer_high_water"],
+                                                         spool_stats.get("buffer_high_water", 0))
+                    self._finish_segment(len(rows), checkpoint=False)
+            with _batch_phase(stats, "checkpoint"):
+                self._checkpoint("running")
+        except Exception as error:
+            # 未发布的 append/spool 属于未承诺尾部，不能由 fail 再宣称可靠。
+            self.count, self.end, self.tail_count, self.tail_bytes, self.tail_hash = saved
+            stats["error_type"] = type(error).__name__
+            raise
+        finally:
+            stats["ended_ns"] = perf_counter_ns()
+            self.last_batch = stats
 
     def fail(self, result):
         if (not self.dynamic or self.published or self.backend_id is None
@@ -1533,7 +1731,11 @@ class _Spool:
         """可靠段出口：任何序列化/磁盘错误抛回唯一后端，不能丢段后伪成功。"""
         self.check()
         data = asdict(segment)
-        hello = data["protocol"]["hello"]
+        self._record_data(data)
+
+    def _validate_segment_prefix(self, protocol, step_count):
+        """原直接与批量出口共用run/前缀/setup校验，不能信任流式header。"""
+        hello = protocol["hello"]
         if hello["segment_index"] != self.count or hello["global_start"] != self.end:
             raise ValueError("暂存段前缀不一致。")
         if self.backend_id is None:
@@ -1541,22 +1743,39 @@ class _Spool:
         if hello["run_id"] != self.backend_id:
             raise ValueError("暂存 run 身份变化。")
         if self.dynamic:
-            setup = data["protocol"]["setup"]
+            setup = protocol["setup"]
             _same(setup, asdict(decode_wire_value(_bytes(self.config["setup"]))))
-            if len(data["steps"]) != self.tail_count:
+            if step_count != self.tail_count:
                 raise ValueError("已封段步骤与可靠逐步前缀不一致。")
+
+    def _record_data(self, data, *, checkpoint=True, allow_cancelled=False):
+        if not allow_cancelled:
+            self.check()
+        self._validate_segment_prefix(data["protocol"], len(data["steps"]))
+        if self.dynamic:
             journal = self.stage / "journal" / f"{self.count}.jsonl"
             if not journal.exists():
                 journal.touch()
             _journal_rows(journal, self.tail_count, self.tail_bytes, self.tail_hash,
                           data["steps"])
-        _write(self.stage / f"spool-{self.count}.json", data)
-        self.end += len(data["steps"])
+        self.disk_metrics["write_bytes"] += _write(self.stage / f"spool-{self.count}.json", data)
+        self.disk_metrics["write_calls"] += 1
+        self._finish_segment(len(data["steps"]), checkpoint=checkpoint)
+
+    def _finish_segment(self, step_count, *, checkpoint):
+        """完整spool先fsync，后更新原段元数据；checkpoint仍由原可靠出口发布。"""
+        if self.dynamic:
+            # checkpoint 依赖的封段文件必须先可靠写入，不能仅 fsync journal。
+            with (self.stage / f"spool-{self.count}.json").open("r+b") as stream:
+                os.fsync(stream.fileno())
+                self.disk_metrics["fsync_count"] += 1
+        self.end += step_count
         self.count += 1
         if self.dynamic:
             self.tail_count = self.tail_bytes = 0
             self.tail_hash = None
-            self._checkpoint("running")
+            if checkpoint:
+                self._checkpoint("running")
 
     def publish(self, stopped):
         """只接受真正 stopped；重放、图、reader 全部成功后由原 guard 发布。"""
@@ -1662,9 +1881,189 @@ class _Spool:
                                  for name in ("control.png", "cart_pole_motion.png")]}
 
 
+class _BatchWriter:
+    """唯一 spool owner；活跃段、排队段及在途段共用 8 MiB canonical 编码预算。"""
+
+    def __init__(self, transaction, *, on_batch=None):
+        self.transaction = transaction
+        self._condition = Condition()
+        self._pending = deque()
+        self._rows, self._cycles = [], []
+        self._active_charge = self._held = self._sealed = 0
+        self._closing = self._error = False
+        self._thread = None
+        self._deferred = None
+        self.last_batch = None
+        self._on_batch = on_batch
+        self._durable = self._byte_high = self._segment_high = 0
+        self._reserved = 4 * HEADER_LIMIT + 2 * INDEX_LINE_LIMIT
+        self.drain_ns = 0
+        # 公共计时 sidecar 位于正式 run 之外，不改变严格 v2 root/schema。
+        self.timing_path = transaction.root / (".timing-" + transaction.run_id + ".jsonl")
+
+    def begin(self, lifecycle, setup):
+        """初始配置可靠写入后转移 owner，首次控制采样之前完成。"""
+        self.transaction.begin(lifecycle, setup)
+        self._thread = Thread(target=self._run, name="segment-evidence-writer")
+        self._thread.start()
+
+    def check(self):
+        """控制线程每轮采样前检查故障，不能在 writer 失败后继续发起新轮。"""
+        with self._condition:
+            if self._error or self._closing:
+                raise RuntimeError("后台证据 writer 已失败或关闭。")
+
+    def _accept(self, raw, target):
+        if len(raw) > INDEX_LINE_LIMIT:
+            raise ValueError("公开步骤/周期超出有界行长。")
+        with self._condition:
+            if self._error or self._closing:
+                raise RuntimeError("后台证据 writer 已失败或关闭。")
+            # 四倍 canonical 大小保守覆盖：当前段/序列化副本/worker 解码与 journal。
+            # 固定 reserve 覆盖两段 metadata、单条瞬时编码及 terminal/failure 通知。
+            charge = 4 * len(raw)
+            if self._held + charge + self._reserved > SEGMENT_LIMIT:
+                raise BufferError("后台记录总编码预算已满。")
+            target.append(raw)
+            self._active_charge += charge
+            self._held += charge
+            self._byte_high = max(self._byte_high, self._held + self._reserved)
+
+    def record_step(self, record):
+        """只保存不可变 public bytes，GUI 原回调仍由控制线程执行。"""
+        self.check()
+        self._accept(_bytes(asdict(record)), self._rows)
+
+    def record_cycle(self, timing):
+        """公开周期事实随批次写 sidecar；正式结果不增加内部计时字段。"""
+        self._accept(_bytes(asdict(timing)), self._cycles)
+
+    def record(self, segment):
+        """非阻塞封段；两段上限包含 worker 已取走但未可靠发布的段。"""
+        self._record(segment, ready=True)
+
+    def record_deferred(self, segment):
+        """立即接管并计预算，等待同一原始段过渡完成后放行。"""
+        self._record(segment, ready=False)
+
+    def release_segment(self, segment):
+        """只放行原始已接管项；不改协议状态，不等待可靠写入。"""
+        with self._condition:
+            if self._deferred is None or self._deferred[0] is not segment:
+                raise ValueError("放行不是当前原始已接管段")
+            self._deferred[1][4] = True
+            self._deferred = None
+            self._condition.notify_all()
+
+    def _record(self, segment, *, ready):
+        self.check()
+        # 原协议记录本身已 frozen，steps 为 tuple；只在控制线程冻结小 header。
+        # 大块逐步证据的组装/序列化由 writer 完成，不在段边界重复 asdict 全段。
+        identities = segment.protocol.steps
+        if (len(segment.steps) != len(self._rows)
+                or tuple(step.protocol for step in segment.steps) != identities):
+            raise ValueError("公开段与已入队的物理确认记录不一致。")
+        raw = _bytes(asdict(replace(segment.protocol, steps=())))
+        if len(raw) > HEADER_LIMIT:
+            raise ValueError("公开封段 header 超出预留预算。")
+        with self._condition:
+            if (self._error or self._closing or self._sealed >= 2
+                    or not ready and self._deferred is not None):
+                raise BufferError("后台封段库存已满或 writer 已失效。")
+            job = [self._rows, self._cycles, (raw, identities), self._active_charge, ready]
+            self._pending.append(job)
+            if not ready:
+                self._deferred = (segment, job)
+            self._rows, self._cycles, self._active_charge = [], [], 0
+            self._sealed += 1
+            self._segment_high = max(self._segment_high, self._sealed)
+            if ready:
+                self._condition.notify()
+
+    def snapshot(self):
+        """durable 只在 checkpoint 已原子发布后增长，不在队列出队时增长。"""
+        with self._condition:
+            return {"durable_step_count": self._durable, "writer_encoded_bytes": self._held,
+                    "writer_encoded_high_water": self._byte_high,
+                    "writer_sealed_segments": self._sealed,
+                    "writer_segment_high_water": self._segment_high}
+
+    def _run(self):
+        try:
+            with self.timing_path.open("xb") as timings:
+                while True:
+                    with self._condition:
+                        self._condition.wait_for(lambda: self._closing or (
+                            self._pending and self._pending[0][4]))
+                        if self._pending:
+                            rows, cycles, segment, charge, _ = self._pending.popleft()
+                        elif self._closing:
+                            rows, cycles, segment, charge = self._rows, self._cycles, None, self._active_charge
+                            self._rows, self._cycles, self._active_charge = [], [], 0
+                        else:
+                            continue
+                    summary = {"started_ns": perf_counter_ns(), "phases": {},
+                               "buffer_high_water": 0, "error_type": None, "spool": None}
+                    try:
+                        if rows or segment is not None:
+                            self.transaction.record_batch(rows, segment)
+                            with self._condition:
+                                self._durable = self.transaction.end + self.transaction.tail_count
+                        if cycles:
+                            with _batch_phase(summary, "sidecar"):
+                                buffer = _BufferedChunks(timings, stats=summary)
+                                for timing in cycles:
+                                    buffer.write(timing)
+                                buffer.finish()
+                                timings.flush()
+                                os.fsync(timings.fileno())
+                    except Exception as error:
+                        summary["error_type"] = type(error).__name__
+                        raise
+                    finally:
+                        if rows or segment is not None:
+                            summary["spool"] = getattr(self.transaction, "last_batch", None)
+                        summary["ended_ns"] = perf_counter_ns()
+                        self.last_batch = summary
+                        if self._on_batch is not None:
+                            self._on_batch(summary)
+                    sealed = segment is not None
+                    del rows, cycles, segment
+                    with self._condition:
+                        self._held -= charge
+                        if sealed:
+                            self._sealed -= 1
+                        if self._closing and not self._pending and not self._rows and not self._cycles:
+                            return
+        except Exception as error:  # noqa: BLE001 - public 错误不携带任何记录载荷
+            with self._condition:
+                self._error = type(error).__name__
+
+    def finish(self):
+        """停止后 drain 并 join；只有 writer 结束才允许主线程 fail/publish/cleanup。"""
+        started = perf_counter_ns()
+        with self._condition:
+            self._closing = True
+            self._deferred = None
+            self._condition.notify_all()
+        if self._thread is not None:
+            self._thread.join(timeout=30)
+            if self._thread.is_alive():
+                raise TimeoutError("后台磁盘 writer 尚未退出，spool owner 尚未交回。")
+        self.drain_ns = perf_counter_ns() - started
+        if self._error:
+            with self._condition:
+                self._pending.clear()
+                self._rows.clear()
+                self._cycles.clear()
+                self._held = self._active_charge = self._sealed = 0
+            raise OSError("后台批量保存失败。")
+
+
 def run_cart_pole_segmented(config, *, control: RunControl, session: InteractiveSession,
                            segment_steps=400, prepared: PreparedSegmentedExperiment | None = None,
-                           on_step=None, phase=None) -> dict:
+                           on_step=None, phase=None, realtime=None,
+                           preload_steps=0, preload_execution="fused") -> dict:
     """Client 专用发布协调；安全循环只有一份，后端失败不会进入成功出版。"""
     if not isinstance(control, RunControl) or not isinstance(session, InteractiveSession):
         raise TypeError("持续发布需要原 RunControl/InteractiveSession。")
@@ -1677,29 +2076,63 @@ def run_cart_pole_segmented(config, *, control: RunControl, session: Interactive
         raise ValueError("必须消费同一次持续装配与队列。")
     phase = phase if phase is not None else lambda _: None
     transaction = _Spool(prepared, config, session, phase)
+    writer = _BatchWriter(transaction) if transaction.dynamic else None
+    sink = writer if writer is not None else transaction
     try:
         def durable_step(record):
-            transaction.record_step(record)
+            sink.record_step(record)
             if on_step is not None:
                 on_step(record)
 
         stopped = _run_prepared_segmented(config, prepared, control=control, session=session,
-                                          on_step=durable_step, on_segment=transaction.record,
-                                          on_start=transaction.begin, phase=phase)
+                                          on_step=durable_step,
+                                          on_segment=writer.record_deferred if writer else sink.record,
+                                          on_segment_ready=writer.release_segment if writer else None,
+                                          on_start=sink.begin, phase=phase, realtime=realtime,
+                                          on_cycle=writer.record_cycle if writer else None,
+                                          cycle_snapshot=writer.snapshot if writer else None,
+                                          before_sample=writer.check if writer else None,
+                                          preload_steps=preload_steps,
+                                          preload_execution=preload_execution)
+        if writer is not None:
+            try:
+                writer.finish()
+            except (OSError, TimeoutError) as error:
+                stopped = {**stopped, "status": "failed", "category": type(error).__name__,
+                           "failure_phase": "WRITER_DRAIN"}
+                if writer._thread is not None and writer._thread.is_alive():
+                    # 真实磁盘阻塞时不能抢走 spool owner；旧 checkpoint 仍是唯一可靠依据。
+                    return {**stopped, "prefix_dir": str(transaction.stage),
+                            "recording_summary": writer.snapshot()}
+            stopped["recording_summary"] = {**writer.snapshot(), "drain_ns": writer.drain_ns,
+                                             "timing_path": str(writer.timing_path),
+                                             "spool_io": dict(transaction.disk_metrics),
+                                             "last_batch": writer.last_batch}
         if stopped["status"] != "stopped":
-            transaction.fail(stopped)
+            try:
+                transaction.fail(stopped)
+            except OSError as error:
+                # 磁盘持续故障时保持旧 checkpoint，不伪造已发布的 failure 状态。
+                stopped["checkpoint_error"] = type(error).__name__
             if transaction.dynamic and (transaction.stage / "checkpoint.json").is_file():
                 stopped["prefix_dir"] = str(transaction.stage)
             return stopped
         try:
-            return transaction.publish(stopped)
+            published = transaction.publish(stopped)
+            if writer is not None:
+                published["recording_summary"] = stopped["recording_summary"]
+            return published
         except Exception as error:
             if not transaction.dynamic:
                 raise
             failure = {"status": "failed", "category": type(error).__name__,
                        "failure_phase": "PUBLISHING", "backend": stopped,
                        "prefix_dir": str(transaction.stage)}
-            transaction.fail(failure)
+            try:
+                transaction.fail(failure)
+            except OSError as checkpoint_error:
+                failure["checkpoint_error"] = type(checkpoint_error).__name__
             return failure
     finally:
-        transaction.cleanup()
+        if writer is None or writer._thread is None or not writer._thread.is_alive():
+            transaction.cleanup()

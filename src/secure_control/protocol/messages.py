@@ -504,6 +504,12 @@ class _ResourceLifecycle:
         if self.status == "prepared":
             self.status = "aborted"
 
+    def export(self) -> None:
+        """移交到单方预送缓存；已导出并不代表实际计算已消费。"""
+        if self.status != "prepared" or self.claimed_by:
+            raise ValueError("已领取资源不能导出")
+        self.status = "exported"
+
 
 @dataclass(frozen=True, slots=True)
 class ProductResourceShare:
@@ -545,6 +551,150 @@ class PartyResources:
         """返回因当前 round 失败而不可恢复地废弃的资源数量。"""
         resources = (*self.product_resources, *self.state_truncation_resources)
         return sum(resource._lifecycle.status == "aborted" for resource in resources)
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class PreparedOnlineResources:
+    """输入无关的本机一次性能力；不属于 wire 类型，不能作为输出签发凭据。"""
+
+    p1_resources: PartyResources
+    p2_resources: PartyResources
+    _owner: object = field(repr=False, compare=False)
+    _token: object = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class PreloadedResourceManifest:
+    """有限预送窗口的公开身份；不携带数值材料或输出签发能力。"""
+
+    run_id: str
+    controller_epoch: str
+    session_id: str
+    batch_id: str
+    start_step: int
+    round_ids: tuple[str, ...]
+    layout: ControllerLayout
+    modulus: int
+    stage_mode: Literal["staged", "fused"]
+    block_steps: int
+    version: Literal["control-preloaded-v1"] = "control-preloaded-v1"
+
+    def __post_init__(self) -> None:
+        if (self.version != "control-preloaded-v1"
+                or self.stage_mode not in {"staged", "fused"}
+                or type(self.start_step) is not int or self.start_step != 0
+                or type(self.modulus) is not int or self.modulus < 3
+                or not isinstance(self.layout, ControllerLayout)
+                or not isinstance(self.round_ids, tuple) or not 1 <= len(self.round_ids) <= 1000
+                or any(not isinstance(v, str) or len(v) != 38 or not v.startswith("round-")
+                       or any(c not in "0123456789abcdef" for c in v[6:]) for v in self.round_ids)
+                or len(set(self.round_ids)) != len(self.round_ids)
+                or any(not isinstance(v, str) or not 1 <= len(v) <= 256 for v in (
+                    self.run_id, self.controller_epoch, self.session_id, self.batch_id))):
+            raise ValueError("预送 manifest 身份、模式或有限窗口无效")
+        preloaded_material_budget(self.layout, self.modulus, len(self.round_ids), self.block_steps)
+
+    def sha256(self) -> str:
+        """启动时计算完整公开清单摘要，不在控制周期重复序列化1000轮清单。"""
+        fields = asdict(self)
+        fields["modulus"] = str(self.modulus)
+        fields["derived"] = self.derived()
+        return sha256(b"control-preloaded-v1-manifest\0" + json.dumps(
+            fields, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+        ).encode("utf-8")).hexdigest()
+
+    def derived(self) -> dict[str, int]:
+        budget = preloaded_material_budget(self.layout, self.modulus, len(self.round_ids), self.block_steps)
+        return {"count": len(self.round_ids), **{name: budget[name] for name in (
+            "products", "truncations", "residue_bytes", "row_bytes")}}
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class PreparedPreloadedResources:
+    """Client 原始预送窗口能力；不进入 wire，不以拷贝替代本机登记。"""
+
+    manifest: PreloadedResourceManifest
+    _owner: object = field(repr=False, compare=False)
+    _token: object = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class PreloadedInputRound:
+    """当前新测量的两份输入及原资源计划；只在 Client 内部同时持有两份。"""
+
+    session_id: str
+    round_id: str
+    step: int
+    p1_input: InputShareMessage
+    p2_input: InputShareMessage
+    plan: StepResourcePlan
+    _owner: object = field(repr=False, compare=False)
+    _token: object = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class ExportedPreloadedStep:
+    """单轮新材料的移交值；不保留原Prepared能力和生命周期。"""
+
+    plan: StepResourcePlan
+    p1_values: tuple[int, ...] = field(repr=False)
+    p2_values: tuple[int, ...] = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class PreloadReceipt:
+    """单方启动清单、连续材料块或完整窗口的确认，协议边界独立校验。"""
+
+    party: PartyIndex
+    manifest_sha256: str
+    phase: Literal["init", "block", "seal"]
+    block_index: int | None
+    first_step: int | None
+    count: int
+
+    def __post_init__(self):
+        if (type(self.party) is not int or self.party not in (0, 1)
+                or not isinstance(self.manifest_sha256, str) or len(self.manifest_sha256) != 64
+                or any(c not in "0123456789abcdef" for c in self.manifest_sha256)
+                or self.phase not in {"init", "block", "seal"}
+                or type(self.count) is not int or not 1 <= self.count <= 1000
+                or self.phase == "block" and (
+                    type(self.block_index) is not int or self.block_index < 0
+                    or type(self.first_step) is not int or self.first_step < 0 or self.count > 32)
+                or self.phase != "block" and (self.block_index is not None or self.first_step is not None)):
+            raise ValueError("预送回执身份、类型或区间无效")
+
+
+def preloaded_material_budget(layout: ControllerLayout, modulus: int, count: int,
+                              block_steps: int | None = None) -> dict[str, int]:
+    """纯公开数据预算，先于身份、随机材料和缓存分配；编码预算不是RSS保证。"""
+    if (not isinstance(layout, ControllerLayout) or type(modulus) is not int or modulus < 3
+            or type(count) is not int or not 1 <= count <= 1000):
+        raise ValueError("预送公开预算参数无效")
+    n, m, p = layout.state_dimension, layout.input_dimension, layout.output_dimension
+    if any(type(v) is not int or v < 1 for v in (n, m, p)):
+        raise ValueError("预送只用于非零秘密状态控制器")
+    products, truncations = n * n + n * m + p * n + p * m, n if layout.scale_ledger.state_truncation_bits else 0
+    width = (modulus.bit_length() + 7) // 8
+    row = width * (3 * products + 2 * truncations)
+    if not 0 < row <= 128 * 1024 or count * row + (2 * 1024 + 256 + 512) * 1024 > 8 * 1024 * 1024:
+        raise ValueError("预送缓存超出公开编码预算")
+    digits = modulus.bit_length() * 30103 // 100000 + 1
+    # 原canonical DTO的公开保守界仅预留当前一轮；块内不累积Prepared对象。
+    generation = 2 * (products * (4096 + 12 * digits) + truncations * (4096 + 8 * digits)
+                      + 4096 + 512 * m)
+    maximum = min(32, 128 * 1024 // row)
+    feasible = [v for v in range(1, maximum + 1)
+                if 12 * v * row + 2 * generation + 128 * 1024 <= 2 * 1024 * 1024]
+    if not feasible or generation > 512 * 1024:
+        raise ValueError("预送临时编码副本超出预算")
+    chosen = max(feasible) if block_steps is None else block_steps
+    if type(chosen) is not int or chosen not in feasible:
+        raise ValueError("预送块大小超出公开预算")
+    return {"row_bytes": row, "residue_bytes": width, "products": products,
+            "truncations": truncations, "block_steps": chosen, "cache_bytes": count * row,
+            "scratch_bound_bytes": 12 * chosen * row + 2 * generation + 128 * 1024,
+            "current_round_bound_bytes": generation}
 
 
 @dataclass(frozen=True, slots=True)

@@ -6,6 +6,7 @@ import os
 import random
 import socket
 from collections.abc import Callable
+from time import perf_counter_ns
 from typing import Literal
 
 import numpy as np
@@ -17,9 +18,9 @@ from secure_control.protocol.coordinator import (
     DirectProtocol3PartyEndpoint,
     LocalProtocol3PartyEndpoint,
     Protocol3Orchestrator,
+    _OnlineMaterialRecovery,
     dispatch_direct_protocol3_command,
     rehydrate_offline_material,
-    rehydrate_online_material,
     stage_protocol3_batch,
 )
 from secure_control.protocol.messages import (
@@ -51,6 +52,7 @@ from .localhost_transport import (
     deadline_after,
     receive_envelope,
     send_envelope,
+    send_frame,
 )
 
 Address = tuple[str, int]
@@ -69,6 +71,7 @@ class _ClientPartyEndpoint:
         limit: int,
         timeout: float,
         deadline: float | None = None,
+        *, activation=None, on_send=None,
     ) -> None:
         self._sock = sock
         self._party = party
@@ -80,6 +83,8 @@ class _ClientPartyEndpoint:
         self._deadline = deadline
         self.share: ControlShareMessage | None = None
         self._pending_batch: WireEnvelope | None = None
+        self._activation = activation
+        self._on_send = on_send
 
     @property
     def party(self) -> int:
@@ -128,7 +133,11 @@ class _ClientPartyEndpoint:
         return result.receipt
 
     def commit(self) -> None:
-        self._command("commit")
+        started = perf_counter_ns()
+        try:
+            self._command("commit")
+        finally:
+            self.commit_duration_ns = perf_counter_ns() - started
 
     def start_stage_batch(self) -> None:
         if self._pending_batch is not None:
@@ -139,7 +148,14 @@ class _ClientPartyEndpoint:
             self._plan.step, None, Protocol3EndpointCommand("stage_batch"),
         )
         deadline = self._deadline if self._deadline is not None else deadline_after(self._timeout)
-        send_envelope(self._sock, request, deadline=deadline, limit=self._limit)
+        if self._activation is None:
+            send_envelope(self._sock, request, deadline=deadline, limit=self._limit)
+        else:
+            request, encoded = self._activation
+            if self._on_send is not None:
+                self._on_send()
+            send_frame(self._sock, encoded, deadline=deadline, limit=self._limit)
+            self._activation = None
         self.sequence += 1
         self._pending_batch = request
 
@@ -476,6 +492,10 @@ def localhost_role_worker(
             role: P1 | P2 = P1(offline)
         else:
             role = P2(offline)
+        recovery = _OnlineMaterialRecovery(
+            offline, modulus=fixed_point.modulus, security_parameter=security_parameter,
+            modulus_evidence=modulus_evidence,
+        )
         session_id = role.session_id
         peer.bind(session_id)
         _send_data(
@@ -530,12 +550,7 @@ def localhost_role_worker(
                         or request.resource_id is not None
                     ):
                         raise ValueError("Server 在线材料信封顺序或 identity 不匹配。")
-                    online = rehydrate_online_material(
-                        request.payload,
-                        modulus=fixed_point.modulus,
-                        security_parameter=security_parameter,
-                        modulus_evidence=modulus_evidence,
-                    )
+                    online = recovery.restore(request.payload)
                     staged_shares: list[ControlShareMessage] = []
                     endpoint = LocalProtocol3PartyEndpoint(
                         role,

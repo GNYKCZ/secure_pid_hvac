@@ -76,6 +76,411 @@ def test_public_layer_plan_keeps_independent_gates_and_empty_program():
     assert build_scalar_layer_plan(ScalarProgram(("kick",), (), (), "kick")).layers == ()
 
 
+def test_session_recovery_reuses_verified_owners_but_never_lifecycles(monkeypatch):
+    from test_two_party_protocol import make_stack
+
+    from secure_control.crypto import truncation
+    from secure_control.protocol.coordinator import _OnlineMaterialRecovery
+
+    client, _, _, _, distribution = make_stack()
+    verify = truncation.verify_prime_modulus
+    verified = []
+
+    def checked(*args, **kwargs):
+        verified.append(args[0])
+        return verify(*args, **kwargs)
+
+    monkeypatch.setattr(truncation, "verify_prime_modulus", checked)
+    recovery = _OnlineMaterialRecovery(
+        distribution.p1, modulus=client.fixed_point.modulus,
+        security_parameter=8, modulus_evidence=None,
+    )
+    restored = []
+    for seed in (10, 11):
+        online = client.prepare_online(distribution, [.25], step=0, rng=random.Random(seed))
+        material = PartyOnlineMaterial.from_round(PartyOnlineRound(
+            online.p1_input, online.p1_resources,
+        ))
+        restored.append(recovery.restore(material))
+    first, second = (item.resources for item in restored)
+    assert len(verified) == 1
+    assert first.product_resources[0].triple._lifecycle.owner is second.product_resources[0].triple._lifecycle.owner
+    assert first.state_truncation_resources[0].truncation._lifecycle.owner is second.state_truncation_resources[0].truncation._lifecycle.owner
+    assert first.product_resources[0].triple._lifecycle is not second.product_resources[0].triple._lifecycle
+    assert first.state_truncation_resources[0].truncation._lifecycle is not second.state_truncation_resources[0].truncation._lifecycle
+    first.product_resources[0]._lifecycle.abort()
+    assert second.aborted_count == 0
+    _OnlineMaterialRecovery(distribution.p1, modulus=client.fixed_point.modulus,
+                            security_parameter=8, modulus_evidence=None)
+    assert len(verified) == 2  # 新 setup 即使 q 相同也重新验证真实证据。
+
+
+def test_session_recovery_rejects_foreign_role_and_noncanonical_last_material():
+    from test_two_party_protocol import make_stack
+
+    from secure_control.protocol.coordinator import _OnlineMaterialRecovery
+
+    client, _, _, _, distribution = make_stack()
+    recovery = _OnlineMaterialRecovery(distribution.p1, modulus=client.fixed_point.modulus,
+                                       security_parameter=8, modulus_evidence=None)
+    online = client.prepare_online(distribution, [.25], step=0)
+    material = PartyOnlineMaterial.from_round(PartyOnlineRound(online.p1_input, online.p1_resources))
+    with pytest.raises(ValueError, match="session/角色"):
+        recovery.restore(replace(material, input_message=replace(material.input_message, recipient=1)))
+    last = replace(material.product_resources[-1], c=AdditiveShare(client.fixed_point.modulus))
+    with pytest.raises(ValueError, match="canonical"):
+        recovery.restore(replace(material, product_resources=(*material.product_resources[:-1], last)))
+
+
+def test_peer_plan_digest_is_cached_without_accepting_mutated_installed_plan(monkeypatch):
+    from test_two_party_protocol import make_stack
+
+    from secure_control.execution import _localhost_peer as peer
+
+    client, _, _, _, distribution = make_stack()
+    prepared = client.precompute_online_resources(distribution, step=0)
+    plan = prepared.p1_resources.plan
+    digests = []
+    original = peer.public_step_plan_sha256
+    monkeypatch.setattr(peer, "public_step_plan_sha256", lambda value: (
+        digests.append(value), original(value)
+    )[1])
+    port = LocalhostProtocol3PeerPort(None, "P1", 100000, 1, batch_enabled=True)
+    port.bind(plan.session_id)
+    port.set_batch_round(plan, modulus=client.fixed_point.modulus)
+    ids = tuple(item.resource_id for item in plan.product_resources)
+    for _ in range(3):
+        assert port._batch_payload(plan, "product_complete", ids).plan_sha256 == original(plan)
+    assert len(digests) == 1
+    # frozen dataclass 的嵌套字段即使被非法原位改变，也不能复用旧摘要通过检查。
+    object.__setattr__(plan.product_resources[-1], "resource_id", "changed")
+    with pytest.raises(ValueError, match="公开身份"):
+        port._batch_payload(plan, "product_complete", ids)
+    client._material_owner(distribution).discard(prepared)
+
+
+def test_preloaded_material_values_are_lossless_and_reject_noncanonical_last_value():
+    from test_two_party_protocol import make_stack
+
+    from secure_control.execution.localhost_codec import (
+        _decode_preloaded_values,
+        _encode_preloaded_values,
+    )
+
+    client, _, _, _, distribution = make_stack()
+    online = client.prepare_online(distribution, [.25], step=0, rng=random.Random(91))
+    q = client.fixed_point.modulus
+    for inp, resources in ((online.p1_input, online.p1_resources),
+                           (online.p2_input, online.p2_resources)):
+        encoded = _encode_preloaded_values(resources, q)
+        material = _decode_preloaded_values(encoded, inp, resources.plan, q)
+        assert material == PartyOnlineMaterial.from_round(PartyOnlineRound(inp, resources))
+        width = (q.bit_length() + 7) // 8
+        assert len(encoded) == width * (3 * resources.plan.triple_count
+                                        + 2 * resources.plan.truncation_count)
+        with pytest.raises(ValueError, match="长度"):
+            _decode_preloaded_values(encoded[:-1], inp, resources.plan, q)
+        with pytest.raises(ValueError, match="residue"):
+            _decode_preloaded_values(encoded[:-width] + q.to_bytes(width, "big"),
+                                     inp, resources.plan, q)
+        last = resources.state_truncation_resources[-1].truncation
+        previous = last.r_prime
+        object.__setattr__(last, "r_prime", AdditiveShare(True))
+        with pytest.raises(ValueError, match="residue"):
+            _encode_preloaded_values(resources, q)
+        object.__setattr__(last, "r_prime", previous)
+    client.abort_round(online)
+
+
+def test_preloaded_client_requires_original_confirmed_capability_and_fresh_current_input(monkeypatch):
+    from copy import copy
+
+    from test_two_party_protocol import make_stack
+
+    from secure_control.protocol.messages import ControlShareMessage, PreloadReceipt
+
+    client, _, _, _, distribution = make_stack()
+    batch = client.begin_preloaded_resources(distribution, run_id="run", controller_epoch="epoch",
+                                             count=2)
+    digest = batch.manifest.sha256()
+    def receipts(phase, count=2, index=None, first=None):
+        return tuple(PreloadReceipt(party, digest, phase, index, first, count) for party in (0, 1))
+    with pytest.raises(ValueError, match="就绪"):
+        client.bind_preloaded_input(distribution, batch, [.25], step=0)
+    with pytest.raises(ValueError, match="复制"):
+        client.export_preloaded_step(distribution, copy(batch), step=0)
+    with pytest.raises(ValueError, match="生成次序"):
+        client.export_preloaded_step(distribution, batch, step=0)
+    client.record_preloaded_receipts(distribution, batch, receipts("init"))
+    with pytest.raises(ValueError):
+        client.record_preloaded_receipts(distribution, batch, receipts("seal"))
+    owner = client._material_owner(distribution)
+    original, held = owner.create, []
+    def create(*args, **kwargs):
+        prepared = original(*args, **kwargs)
+        held.append(prepared)
+        return prepared
+    monkeypatch.setattr(owner, "create", create)
+    for step in range(2):
+        exported = client.export_preloaded_step(distribution, batch, step=step)
+        prepared = held[-1]
+        assert exported.plan.round_id == batch.manifest.round_ids[step]
+        assert not client._issued_rounds
+        assert prepared.p1_resources.aborted_count == prepared.p1_resources.consumed_count == 0
+        assert all(v._lifecycle.status == "exported" for v in (*prepared.p1_resources.product_resources,
+                   *prepared.p1_resources.state_truncation_resources))
+        with pytest.raises(ValueError):
+            client.bind_online_input(distribution, prepared, [.25], step=step)
+        for i in range(exported.plan.triple_count):
+            a, b, c = (sum(pair) % client.fixed_point.modulus for pair in zip(
+                exported.p1_values[3*i:3*i+3], exported.p2_values[3*i:3*i+3], strict=True))
+            assert a * b % client.fixed_point.modulus == c
+    client.record_preloaded_receipts(distribution, batch, receipts("block", index=0, first=0))
+    client.record_preloaded_receipts(distribution, batch, receipts("seal"))
+    with pytest.raises(ValueError, match="input_payload_bounds"):
+        client.bind_preloaded_input(distribution, batch, [1000], step=0)
+    assert not client._issued_rounds
+    for step in range(2):
+        current = client.bind_preloaded_input(distribution, batch, [.25], step=step)
+        with pytest.raises(ValueError, match="重复领取"):
+            client.bind_preloaded_input(distribution, batch, [.25], step=step)
+        assert (current.session_id, current.round_id, step) in client._issued_rounds
+        with pytest.raises(ValueError, match="重构"):
+            client.retire_preloaded_round(current, success=True)
+        import numpy as np
+        messages = tuple(ControlShareMessage(party, current.session_id, current.round_id, step,
+                         current.plan.scale_ledger.output, AdditiveShare(np.array([0], dtype=object)))
+                         for party in (0, 1))
+        client.reconstruct_control(*messages)
+        client.retire_preloaded_round(current, success=True)
+    with pytest.raises(ValueError, match="耗尽"):
+        client.bind_preloaded_input(distribution, batch, [.25], step=2)
+    client.discard_preloaded_resources(distribution, batch)
+    with pytest.raises(ValueError, match="废弃"):
+        client.bind_preloaded_input(distribution, batch, [.25], step=2)
+
+
+def test_segment_begin_sends_both_before_reading_and_closes_on_bad_second_ack(monkeypatch):
+    from secure_control.execution import lan_runtime as lan
+    from secure_control.execution.localhost_codec import SegmentBeginPayload
+
+    runtime = lan.LanContinuousRuntime.__new__(lan.LanContinuousRuntime)
+    runtime._v2, runtime._failed, runtime._finished, runtime._step = True, False, False, 2
+    runtime._sockets, runtime._sequences = ["p1", "p2"], [10, 10]
+    runtime.session_id = "session"
+    runtime.config = SimpleNamespace(shutdown_timeout=1.)
+    runtime._confirmed_steps, runtime._confirmed_plans = ["old"], ["old"]
+    events = []
+
+    def sent(sock, *args, **kwargs):
+        assert kwargs["send_only"]
+        events.append(sock)
+        return sock
+
+    def received(sock, *args, **kwargs):
+        assert events[:2] == ["p1", "p2"]
+        if sock == "p2":
+            raise ValueError("bad second ACK")
+
+    monkeypatch.setattr(lan, "_request", sent)
+    monkeypatch.setattr(lan, "_receive_reply", received)
+    monkeypatch.setattr(runtime, "close", lambda: events.append("closed"))
+    begin = SegmentBeginPayload("run", 1, 2, "a" * 64, "previous-round")
+    with pytest.raises(ValueError, match="second ACK"):
+        runtime.begin_segment(begin)
+    assert runtime._failed and events == ["p1", "p2", "closed"]
+    assert runtime._confirmed_steps == ["old"]
+
+
+def test_online_preflights_both_full_frames_once_and_invalidates_on_bad_second_ack(monkeypatch):
+    """第二帧超限不得先泄出第一帧；发送复用已校验的 canonical 字节。"""
+    from test_two_party_protocol import make_stack
+
+    from secure_control.execution import lan_runtime as lan
+    from secure_control.execution import localhost_codec as codec
+    from secure_control.execution import localhost_transport as transport
+
+    original = codec._encode_value
+    for oversized in (True, False):
+        client, _, _, _, distribution = make_stack()
+        online = client.prepare_online(distribution, [.25], step=0)
+        runtime = lan.LanContinuousRuntime.__new__(lan.LanContinuousRuntime)
+        runtime._v2, runtime._failed, runtime._finished, runtime._step = True, False, False, 0
+        runtime._segment_start, runtime._segment_capacity = 0, 400
+        runtime._material_pool = None
+        runtime._preload_steps = 0
+        runtime._sockets, runtime._sequences = ["p1", "p2"], [4, 4]
+        runtime.client, runtime.distribution = client, distribution
+        runtime.spec, runtime.config = SimpleNamespace(input_dimension=1), SimpleNamespace(step_timeout=1.)
+        runtime.session_id = online.session_id
+        frames = tuple(WireEnvelope(
+            SCHEMA_VERSION, "request", "Client", role, 4, "online", online.session_id,
+            online.round_id, 0, None, PartyOnlineMaterial.from_round(PartyOnlineRound(inp, resources)),
+        ) for role, inp, resources in (
+            ("P1", online.p1_input, online.p1_resources),
+            ("P2", online.p2_input, online.p2_resources),
+        ))
+        canonical = tuple(encode_envelope(frame) for frame in frames)
+        events = []
+
+        def counted(value, events=events):
+            if isinstance(value, PartyOnlineMaterial):
+                events.append("encode")
+            return original(value)
+
+        def encoded(message, oversized=oversized):
+            value = encode_envelope(message)
+            return value + b" " * lan._FRAME_LIMIT if oversized and message.recipient == "P2" else value
+
+        def sent(sock, payload, deadline, events=events, canonical=canonical):
+            assert events[:2] == ["encode", "encode"] and events.count("encode") == 2
+            assert payload[4:] == canonical[0 if sock == "p1" else 1]
+            events.append(sock)
+
+        def received(sock, *args, events=events, **kwargs):
+            assert events[-2:] == ["p1", "p2"]
+            if sock == "p2":
+                raise ValueError("bad second ACK")
+
+        monkeypatch.setattr(client, "prepare_online", lambda *args, online=online, **kwargs: online)
+        monkeypatch.setattr(codec, "_encode_value", counted)
+        monkeypatch.setattr(transport, "encode_envelope", encoded)
+        monkeypatch.setattr(transport, "_send_exact", sent)
+        monkeypatch.setattr(lan, "_receive_reply", received)
+        monkeypatch.setattr(runtime, "close", lambda events=events: events.append("closed"))
+        expected = LocalhostTransportProtocolError if oversized else ValueError
+        with pytest.raises(expected, match="上限" if oversized else "second ACK"):
+            runtime.step([.25])
+        assert events == ["encode", "encode", *([] if oversized else ["p1", "p2"]), "closed"]
+        assert runtime._failed and runtime._step == 0
+        assert runtime._round_started is (not oversized)
+        assert (online.session_id, online.round_id, online.step) not in client._issued_rounds
+        monkeypatch.setattr(codec, "_encode_value", original)
+
+
+@pytest.mark.integration
+def test_continuous_observation_retains_first_failed_attempt_without_error_payload(monkeypatch):
+    from secure_control.experiments.communication_benchmark import run_continuous_observation
+    from secure_control.protocol import Client
+
+    def failed(*args, **kwargs):
+        raise ValueError("private-value-must-not-appear")
+
+    monkeypatch.setattr(Client, "prepare_online", failed)
+    report = run_continuous_observation(steps=2, delay_ms=0, segment_steps=1)
+    assert report["status"] == "failed"
+    assert len(report["steps"]) == 1 and report["steps"][0]["status"] == "failed"
+    assert report["steps"][0]["global_step"] == 0
+    assert report["timing"]["sample_count"] == 1
+    assert "private-value-must-not-appear" not in str(report)
+
+
+def test_finite_diagnostic_same_thread_missing_clock_gc_and_bounded_events(monkeypatch):
+    import gc
+    import json
+    from itertools import count
+    from threading import Thread
+
+    from secure_control.experiments.communication_benchmark import _Diagnostic
+
+    wall, cpu = count(0, 100), count(0, 10)
+    diag = _Diagnostic("Client", wall=lambda: next(wall), cpu=lambda: next(cpu), limit=3)
+    before = list(gc.callbacks), gc.isenabled(), gc.get_threshold()
+    with diag.installed():
+        diag.select(2)
+        with diag.scope("ignored"):
+            pass
+        assert all(slot is None for slot in diag.slots)
+        diag.select(0)
+        for _ in range(2):
+            with diag.scope("input"):
+                pass
+        diag._gc("start", {"generation": 0})
+        diag._gc("stop", {"generation": 0})
+        diag._gc("start", {"generation": 1})
+        with diag.scope("dropped"):
+            pass
+    assert (list(gc.callbacks), gc.isenabled(), gc.get_threshold()) == before
+    report = diag.report()
+    value = next(item for item in report["events"] if item["kind"] == "phase")
+    assert (value["calls"], value["wall_ns"], value["cpu_ns"], value["non_cpu_ns"]) == (2, 200, 20, 180)
+    assert len(report["events"]) == 3 and report["overflow"] == 2
+    assert report["callback_restored"] and report["gc_before"] == report["gc_after"]
+
+    def unavailable():
+        raise NotImplementedError
+
+    missing = _Diagnostic("P1", cpu=unavailable)
+    missing.select(397)
+    with missing.scope("restore"):
+        pass
+    value = missing.report()["events"][0]
+    assert value["cpu_ns"] is None and value["non_cpu_ns"] is None
+    assert value["cpu_missing_calls"] == 1 and missing.cpu_errors > 0
+    token = missing.begin("thread_check")
+    errors = []
+
+    def wrong_thread():
+        try:
+            missing.end(token)
+        except RuntimeError as error:
+            errors.append(type(error).__name__)
+
+    worker = Thread(target=wrong_thread)
+    worker.start()
+    worker.join()
+    assert errors == ["RuntimeError"]
+    missing.end(token)
+
+    large = _Diagnostic("Client")
+    large.select(405)
+    for index in range(600):
+        with large.scope("public_phase_" + str(index)):
+            pass
+    large_report = large.report()
+    assert large_report["overflow"] == 88 and large_report["encoded_overflow"] > 0
+    assert len(json.dumps(large_report, separators=(",", ":")).encode()) < 80 * 1024
+
+
+@pytest.mark.integration
+def test_finite_diagnostic_keeps_failed_null_cycle_and_restores_canonical_hooks(monkeypatch):
+    import gc
+    import json
+    import os
+
+    from secure_control.execution import lan_runtime, localhost_transport
+    from secure_control.experiments import cart_pole_segmented_evidence as evidence
+    from secure_control.experiments.communication_benchmark import run_continuous_observation
+    from secure_control.protocol import Client
+
+    before = (list(gc.callbacks), gc.isenabled(), gc.get_threshold(),
+              evidence._batch_phase, evidence._Spool.record_batch, os.fsync,
+              lan_runtime.receive_envelope, localhost_transport._send_exact)
+
+    def failed(*args, **kwargs):
+        raise ValueError("secret-diagnostic-must-not-appear")
+
+    monkeypatch.setattr(Client, "bind_preloaded_input", failed)
+    report = run_continuous_observation(steps=1, delay_ms=0, segment_steps=2,
+                                       optimized=True, preload_steps=1, diagnostic=True)
+    assert report["diagnostic"] and not report["qualification_pass"]
+    assert not report["stage_pass"] and report["successful_steps"] == 0
+    assert len(report["cycles"]) == 1
+    cycle = report["cycles"][0]
+    assert cycle["device_completed_ns"] is None and cycle["cycle_completed_ns"] is None
+    assert cycle["physically_confirmed_count"] == cycle["protocol_committed_count"] == 0
+    assert report["recording_summary"]["durable_step_count"] == 0
+    assert "secret-diagnostic-must-not-appear" not in json.dumps(report)
+    assert (list(gc.callbacks), gc.isenabled(), gc.get_threshold(),
+            evidence._batch_phase, evidence._Spool.record_batch, os.fsync,
+            lan_runtime.receive_envelope, localhost_transport._send_exact) == before
+    diag = report["diagnostic_report"]
+    assert len(json.dumps(diag, separators=(",", ":"), ensure_ascii=False).encode()) == diag["encoded_bytes"]
+    assert diag["encoded_bytes"] <= 256 * 1024 and len(diag["roles"]) == 3
+    assert all(role["callback_restored"] and role["gc_before"] == role["gc_after"]
+               for role in diag["roles"])
+
+
 def test_swing_up_has_38_products_in_16_public_layers():
     from test_lan_scalar_v3 import _inputs
 
