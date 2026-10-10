@@ -39,10 +39,13 @@ from secure_control.protocol.messages import (
     PartyOfflineMaterial,
     PartyOnlineMaterial,
     PartyOnlineRound,
+    ProductResourceMaterial,
     Protocol3EndpointCommand,
     Protocol3StageReceipt,
+    TruncationResourceMaterial,
 )
 
+from . import localhost_transport
 from ._inputs import normalize_step_input
 from ._localhost_peer import LocalhostProtocol3PeerPort
 from ._localhost_workers import (
@@ -105,6 +108,27 @@ class _OnlineResourcePool:
                       + truncations * (4096 + 8 * digits) + 4096 + 512 * m)
         if 2 * pair_bound > self._slot_limit:
             raise ValueError("单轮公开材料计划超过预准备编码预算。")
+        # 只编码一次公开最大值模板，不生成 triple，也不读取或绑定未来测量。
+        # 本工厂的 round/resource ID 固定 ASCII 长度；同一 session 的其余字段不变。
+        # canonical residue 均在 [0,q)；q-1 的十进制长度覆盖两方所有随机份额。
+        from secure_control.crypto import AdditiveShare
+        plan = Client._resource_plan(layout, self.owner.session_id, "round-" + "0" * 32, 0)
+        q = self.owner.multiplier.sharing.modulus
+        largest = AdditiveShare(q - 1)
+        template = PartyOnlineMaterial(
+            InputShareMessage(0, plan.session_id, plan.round_id, 0,
+                              AdditiveShare(np.full(plan.input_shape, q - 1, dtype=object))),
+            plan,
+            tuple(ProductResourceMaterial(0, item, largest, largest, largest)
+                  for item in plan.product_resources),
+            tuple(TruncationResourceMaterial(0, item, largest, largest)
+                  for item in plan.state_truncation_resources),
+        )
+        self._base_encoded_bound = 2 * len(encode_wire_value(template))
+        # 每方 input/plan 各一次，资源 metadata 在 plan/material 各一次。
+        self._step_occurrences = 2 * (2 + 2 * (products + truncations))
+        if 2 * self._encoded_bound(start + slots - 1) > self._slot_limit:
+            raise ValueError("单轮公开材料计划超过预准备编码预算。")
         try:
             for _ in range(slots):
                 self._produce()
@@ -118,27 +142,16 @@ class _OnlineResourcePool:
 
     def _produce(self):
         started, cpu = time.perf_counter_ns(), time.thread_time_ns()
+        encoded_bound = self._encoded_bound(self._next)
+        if 2 * encoded_bound > self._slot_limit:
+            raise ValueError("单轮预准备材料超出有界编码预留。")
         prepared = self.owner.create(self._next)
         try:
-            # 仅计算编码预算：零值占位不是测量，不参与分享、绑定或签发能力。
-            from secure_control.crypto import AdditiveShare
-            plan = prepared.p1_resources.plan
-            encoded = 0
-            for party, resources in enumerate((prepared.p1_resources, prepared.p2_resources)):
-                placeholder = InputShareMessage(
-                    party, plan.session_id, plan.round_id, plan.step,
-                    AdditiveShare(np.zeros(plan.input_shape, dtype=object)),
-                )
-                encoded += len(encode_wire_value(PartyOnlineMaterial.from_round(
-                    PartyOnlineRound(placeholder, resources),
-                )))
-            if 2 * encoded > self._slot_limit:
-                raise ValueError("单轮预准备材料超出有界编码预留。")
             with self._condition:
                 if self._stop:
                     self.owner.discard(prepared)
                     return
-                self._queue.append((prepared, encoded))
+                self._queue.append((prepared, encoded_bound))
                 self._next += 1
                 self.generated_ns += time.perf_counter_ns() - started
                 self.generated_cpu_ns += time.thread_time_ns() - cpu
@@ -148,6 +161,10 @@ class _OnlineResourcePool:
         except Exception:
             self.owner.discard(prepared)
             raise
+
+    def _encoded_bound(self, step):
+        """同一公开模板仅修正 step 十进制位宽；不是实际已发送字节数。"""
+        return self._base_encoded_bound + self._step_occurrences * (len(str(step)) - 1)
 
     def _run(self):
         try:
@@ -181,7 +198,7 @@ class _OnlineResourcePool:
         """仅公开库存及生产成本，不暴露份额或 RNG。"""
         with self._condition:
             return {"material_slots": len(self._queue), "material_high_water": self.high_water,
-                    "material_encoded_high_water": self.encoded_high_water,
+                    "material_encoded_bound_high_water": self.encoded_high_water,
                     "material_reserved_bytes": self.slots * self._slot_limit,
                     "material_prepare_ns": self.generated_ns,
                     "material_cpu_ns": self.generated_cpu_ns}
@@ -277,25 +294,12 @@ def run_client_single_step(config: LanConfig, trial: Any, *, batch: bool = True)
             current.p1_input if party == 0 else current.p2_input,
             current.p1_resources if party == 0 else current.p2_resources,
         )) for party in (0, 1))
-        # 两份 DTO 都通过既有 wire 校验后才让任一方接触本轮材料。
-        for material in materials:
-            encode_wire_value(material)
+        prepared_requests = _prepare_online_requests(materials, session, plan.round_id, 0, (4, 4))
         pending = []
         for party, sock in enumerate(sockets):
-            role = "P1" if party == 0 else "P2"
-            pending.append(_request(
-                sock,
-                role,
-                4,
-                "online",
-                session,
-                config.step_timeout,
-                materials[party],
-                plan.round_id,
-                0,
-                deadline=step_deadline,
-                send_only=True,
-            ))
+            request, encoded = prepared_requests[party]
+            localhost_transport.send_frame(sock, encoded, deadline=step_deadline, limit=_FRAME_LIMIT)
+            pending.append(request)
             endpoints.append(
                 _ClientPartyEndpoint(
                     sock, party, plan, 5, _FRAME_LIMIT, config.step_timeout, step_deadline
@@ -509,16 +513,16 @@ class LanContinuousRuntime:
                 current.p1_input if party == 0 else current.p2_input,
                 current.p1_resources if party == 0 else current.p2_resources,
             )) for party in (0, 1))
-            for material in materials:
-                encode_wire_value(material)
+            prepared_requests = _prepare_online_requests(
+                materials, self.session_id, plan.round_id, self._step, self._sequences,
+            )
             check_deadline(deadline_ns, "ENCODING")
             pending = []
             for party, sock in enumerate(self._sockets):
                 self._round_started = True
-                pending.append(_request(sock, "P1" if party == 0 else "P2", self._sequences[party],
-                         "online", self.session_id, self.config.step_timeout,
-                         materials[party], plan.round_id,
-                         self._step, deadline=deadline, send_only=True))
+                request, encoded = prepared_requests[party]
+                localhost_transport.send_frame(sock, encoded, deadline=deadline, limit=_FRAME_LIMIT)
+                pending.append(request)
                 endpoints.append(_ClientPartyEndpoint(
                     sock, party, plan, self._sequences[party] + 1, _FRAME_LIMIT,
                     self.config.step_timeout, deadline,
@@ -1463,6 +1467,20 @@ def _accept_hello(
         limit=_FRAME_LIMIT,
     )
     return request.session_id, payload
+
+
+def _prepare_online_requests(materials, session, round_id, step, sequences):
+    """本轮两方完整信封各编码一次、均通过长度检查后才允许首次发送。"""
+    prepared = []
+    for party, material in enumerate(materials):
+        request = WireEnvelope(
+            SCHEMA_VERSION, "request", "Client", "P1" if party == 0 else "P2",
+            sequences[party], "online", session, round_id, step, None, material,
+        )
+        encoded = localhost_transport.encode_envelope(request)
+        localhost_transport._validate_frame_payload(encoded, _FRAME_LIMIT)
+        prepared.append((request, encoded))
+    return prepared
 
 
 def _request(

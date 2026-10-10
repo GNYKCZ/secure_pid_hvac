@@ -1,6 +1,6 @@
 """绝对截止、施力事实与有界库存的短契约测试，不进行默认性能长跑。"""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -73,6 +73,7 @@ def test_unique_runner_rejects_late_command_and_keeps_applied_fact(monkeypatch, 
     time_ns = [0]
     control, session = RunControl(), InteractiveSession()
     applied, timings = [], []
+    startup = []
 
     class Runtime:
         def __init__(self, *args, **kwargs):
@@ -119,9 +120,18 @@ def test_unique_runner_rejects_late_command_and_keeps_applied_fact(monkeypatch, 
 
     monkeypatch.setattr(lan_runner, "LanSegmentedRuntime", Runtime)
     monkeypatch.setattr(lan_runner, "perf_counter_ns", lambda: time_ns[0])
-    monkeypatch.setattr(lan_runner, "AbsoluteCycleClock", lambda period: AbsoluteCycleClock(
-        period, now=lambda: time_ns[0], sleep=lambda seconds: None,
-    ))
+    def clock(period):
+        assert startup == ["collected"]
+        startup.append("clock")
+        return AbsoluteCycleClock(period, now=lambda: time_ns[0], sleep=lambda seconds: None)
+
+    def collect(generation):
+        assert generation == 2
+        startup.append("collected")
+        return 3
+
+    monkeypatch.setattr(lan_runner.gc, "collect", collect)
+    monkeypatch.setattr(lan_runner, "AbsoluteCycleClock", clock)
     monkeypatch.setattr(lan_runner, "check_deadline", lambda deadline, phase: check_deadline(
         deadline, phase, now=lambda: time_ns[0],
     ))
@@ -141,6 +151,8 @@ def test_unique_runner_rejects_late_command_and_keeps_applied_fact(monkeypatch, 
     assert timings[0].physically_confirmed_count == len(applied)
     assert timings[0].status == ("miss_before_apply" if not applied else "miss_after_apply")
     assert timings[0].cycle_completed_ns is None
+    assert startup == ["collected", "clock"]
+    assert report["startup_gc"] == {"duration_ns": 0, "collected": 3}
 
 
 def test_material_pool_shortage_never_generates_on_control_thread_and_close_burns(monkeypatch):
@@ -174,6 +186,74 @@ def test_material_pool_shortage_never_generates_on_control_thread_and_close_burn
         _OnlineResourcePool(client, large, start=0, slots=4)
 
 
+def test_material_pool_budget_uses_public_maxima_and_covers_step_digit_growth(monkeypatch):
+    from secure_control.crypto import AdditiveShare
+    from secure_control.execution import lan_runtime
+    from secure_control.protocol.messages import (
+        InputShareMessage,
+        PartyOnlineMaterial,
+        PartyOnlineRound,
+    )
+
+    client, _, _, _, distribution = make_stack()
+    encode = lan_runtime.encode_wire_value
+    seen = []
+    q = client.fixed_point.modulus
+
+    def public_bound(value):
+        # 预算必须在任何新鲜随机材料创建前，使用公开 q-1（包括输入向量）。
+        assert all(np.all(np.asarray(share.value) == q - 1) for item in value.product_resources
+                   for share in (item.a, item.b, item.c))
+        assert all(np.all(np.asarray(share.value) == q - 1) for item in value.state_truncation_resources
+                   for share in (item.r, item.r_prime))
+        assert np.all(np.asarray(value.input_message.value.value) == q - 1)
+        seen.append(value)
+        return encode(value)
+
+    create = client._material_owner(distribution).create
+    def fresh(step):
+        assert len(seen) == 1
+        return create(step)
+
+    monkeypatch.setattr(lan_runtime, "encode_wire_value", public_bound)
+    monkeypatch.setattr(client._material_owner(distribution), "create", fresh)
+    pool = _OnlineResourcePool(client, distribution, start=99, slots=4)
+    try:
+        with pool._condition:
+            pool._stop = True
+            pool._condition.notify_all()
+        pool._thread.join(timeout=5)
+        total = 0
+        for step in range(99, 103):
+            prepared = pool.take(step)
+            online = client.bind_online_input(distribution, prepared, [.25], step=step)
+            length = sum(len(encode(PartyOnlineMaterial.from_round(PartyOnlineRound(inp, resources))))
+                         for inp, resources in ((online.p1_input, online.p1_resources),
+                                                (online.p2_input, online.p2_resources)))
+            assert length <= pool._encoded_bound(step)
+            # 实际输入份额可能取到最大 residue，预算不得使用零占位缩小这部分。
+            plan = online.p1_resources.plan
+            material = PartyOnlineMaterial.from_round(PartyOnlineRound(online.p1_input, online.p1_resources))
+            largest = AdditiveShare(q - 1)
+            worst = replace(
+                material,
+                input_message=InputShareMessage(0, plan.session_id, plan.round_id, step,
+                                  AdditiveShare(np.full(plan.input_shape, q - 1, dtype=object))),
+                product_resources=tuple(replace(item, a=largest, b=largest, c=largest)
+                                        for item in material.product_resources),
+                state_truncation_resources=tuple(replace(item, r=largest, r_prime=largest)
+                                                 for item in material.state_truncation_resources),
+            )
+            assert 2 * len(encode(worst)) <= pool._encoded_bound(step)
+            total += pool._encoded_bound(step)
+            client.abort_round(online)
+            pool.owner.discard(prepared)
+        assert pool.snapshot()["material_encoded_bound_high_water"] == total
+        assert len(seen) == 1
+    finally:
+        pool.close()
+
+
 def test_scene_rechecks_deadline_immediately_before_device_signal(monkeypatch):
     """advance 内部工作耗尽预算时，真正的 send_control 仍不能发出。"""
     from secure_control.execution import cycle_timing
@@ -188,3 +268,18 @@ def test_scene_rechecks_deadline_immediately_before_device_signal(monkeypatch):
         scene.advance(0, [0], deadline_ns=20_000_000)
     assert caught.value.phase == "BEFORE_DEVICE_SIGNAL" and not sent
     assert scene._step == 0
+
+
+def test_control_and_batch_writer_imports_defer_rendering_dependencies():
+    """冷启动的控制/记录路径不能提前加载停止后才使用的画布。"""
+    import subprocess
+    import sys
+
+    subprocess.run([
+        sys.executable, "-c",
+        ("import sys; from secure_control.experiments import lan_runner, cart_pole_segmented_evidence; "
+         "assert 'matplotlib' not in sys.modules; "
+         "from secure_control.experiments import EvidenceReportArtifacts; "
+         "from secure_control.experiments.evidence_reporting import EvidenceReportArtifacts as actual; "
+         "assert EvidenceReportArtifacts is actual"),
+    ], check=True, timeout=30)

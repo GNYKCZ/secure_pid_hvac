@@ -9,8 +9,6 @@ from math import isfinite
 from pathlib import Path
 
 import numpy as np
-from matplotlib.backends.backend_agg import FigureCanvasAgg
-from matplotlib.figure import Figure
 
 from secure_control.crypto import (
     FixedPointContext,
@@ -600,6 +598,9 @@ def write_cart_pole_evidence(record: object, stage: Path,
 
 def _motion_axes(title):
     """只创建场景运动画布；有限与长结果的 renderer 共享单位/布局。"""
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
     figure = Figure(figsize=(9, 6), layout="constrained")
     FigureCanvasAgg(figure)
     axes = figure.subplots(2, 1, sharex=True)

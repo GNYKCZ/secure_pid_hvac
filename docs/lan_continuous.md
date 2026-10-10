@@ -58,13 +58,24 @@ TCP_NODELAY 试验未显示稳定收益，保持原默认。矩阵 Beaver/预送
 
 动态持续 GUI/headless 默认从 canonical 场景 `period`（当前 0.02 s）建立一次 t0。
 第 k 步始终使用 t0+kT 和 t0+(k+1)T，不跳步、不重设迟到轮的预算。初次 setup、
-配置可靠保存和 16 轮首池填充在 t0 前完成；运行中的 refill、输入、编码/网络、双提交、
+配置可靠保存、16 轮首池填充及一次初始化垃圾收集在 t0 前完成。
+该次收集的耗时/数量由 `startup_gc` 单独报告，之后重新检查取消/停止，才建立 t0。
+运行中保留自动 GC 及原阈值，不保证长期回收无停顿；
+运行中的 refill、输入、编码/网络、双提交、
 设备回执、记录入队和满段维护都受当前 deadline 约束。正常停止确认/drain 单独计时。
 `Client.precompute_online_resources` 只创建输入无关的一次性本机能力，
 `bind_online_input` 在验证本步新测量后分享输入并签发输出；旧 `prepare_online` 保留。
 唯一材料生产者不持 Client 输出签发表、socket 或设备，不替换已有 Mult/Trunc 原语。
 库存上限 16、低水位 4；缺货直接失败，无现场补货或新 deadline。每槽预留 512 KiB，
-含编码副本的总预留不超过 8 MiB，实际编码量和 OS RSS 分别报告。
+含编码副本的总预留不超过 8 MiB。材料预算仅在启动时编码一次公开最大值模板：
+所有 residue（包括输入份额）用 q-1，计划/session/shape/尺度使用本 session 的公开值，
+round 与资源 ID 使用工厂固定长度的 ASCII 格式。每方 input/plan 各一个 step，
+每资源 metadata 在 plan/material 各一个 step；当轮仅按 step 十进制位宽增加预算。
+模板不生成随机材料或签发能力，不提前分享测量，也不发送。补货保留新鲜原语和原 owner。
+`material_encoded_bound_high_water` 是两方 payload 的保守上界高水位，
+与实际 application bytes、512 KiB 槽预留和 OS RSS 分别报告。
+实际在线两方完整 canonical 信封各编码一次、均通过完整帧长度检查后才首次发送；
+原 framing 再检查实际长度，两方先发送后收 ACK，不复用跨轮 bytes。
 
 `step(v, *, deadline_ns=None)` 及段过渡的可选 deadline_ns **属于本机
 `time.perf_counter_ns()` 时钟域**，不得传入另一机器或 `monotonic_ns()` 的绝对值。
@@ -83,6 +94,8 @@ header 和 immutable 协议身份；整段组装和序列化在 writer。活跃�
 每批 journal 与依赖的 spool/config 先 fsync，再原子发布 checkpoint；不再每步执行两次
 fsync/checkpoint。durable_step_count 只表示已发布可靠前缀，可落后于协议/物理确认。
 正常停止保存末段并 drain/join 后，原 replay、完整 reader、图和发布门禁全部仍须通过。
+控制/记录模块冷启动延后加载 Matplotlib 和报告画布，实际绘图/报告调用时再加载；
+公开报告导出仍可用。这减少启动常驻依赖，不保证消除运行中的 GC 或周期超期。
 故障先停止 writer，再由唯一 owner 冻结 failure checkpoint；磁盘持续故障保留旧 checkpoint。
 崩溃可损失 RAM 尾部，8 s 不是积压情况下的最大损失保证，也不能推断缺失尾部未施力或
 据此恢复安全会话。这里比较应用写入次数/字节和 fsync，不宣称 SSD NAND 寿命比例。

@@ -141,11 +141,16 @@ def send_frame(
     limit: int,
 ) -> None:
     """发送 ``4-byte network order length + payload``，全过程共用一个 deadline。"""
+    _validate_frame_payload(payload, limit)
+    _send_exact(sock, _HEADER.pack(len(payload)) + payload, deadline)
+
+
+def _validate_frame_payload(payload: bytes, limit: int) -> None:
+    """预发送检查与真实 framing 共用同一长度契约。"""
     if not isinstance(payload, bytes):
         raise TypeError("frame payload 必须是 bytes。")
     if not 0 < len(payload) <= limit:
         raise LocalhostTransportProtocolError("frame 长度必须为正且不超过上限。")
-    _send_exact(sock, _HEADER.pack(len(payload)) + payload, deadline)
 
 
 def receive_frame(sock: socket.socket, *, deadline: float, limit: int) -> bytes:

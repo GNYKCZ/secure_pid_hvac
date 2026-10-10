@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import logging
 import os
@@ -151,6 +152,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
     attempt = None
     cycle_count = misses = 0
     last_cycle = None
+    startup_gc = None
 
     def emit_cycle(status, failure_phase=None):
         """成功和失败尝试走同一公开出口，失败不能丢掉首步/边界样本。"""
@@ -212,6 +214,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                 "cycle_summary": {"attempts": cycle_count, "misses": misses,
                                   "last_cycle": last_cycle},
                 "material_summary": runtime.cycle_queue_levels,
+                "startup_gc": startup_gc,
             }
         progress("CONNECTING_NEXT")
         experiment.recheck_sources()
@@ -246,7 +249,15 @@ def _run_prepared_segmented(config, experiment, *, control, session,
             if material_slots:
                 runtime.enable_material_preparation(slots=material_slots)
             # 所有固定验证、建连、writer 初始化与首池填充完成后才确定唯一 t0。
-            clock = AbsoluteCycleClock(experiment.scene.period)
+            # 收集初始化暂存垃圾；运行中的自动 GC/阈值保持原样，不转移周期内的工作。
+            started = perf_counter_ns()
+            collected = gc.collect(2)
+            startup_gc = {"duration_ns": perf_counter_ns() - started, "collected": collected}
+            if session.cancelled.is_set():
+                raise RuntimeError("Client 运行已取消。")
+            # 启动期间的正常停止仍关闭零步段，不再建立不需要的控制时钟。
+            if not control.stop_requested:
+                clock = AbsoluteCycleClock(experiment.scene.period)
         progress("RUNNING")
         while True:
             if session.cancelled.is_set():
@@ -357,6 +368,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
             "cycle_summary": {"attempts": cycle_count, "misses": misses,
                               "last_cycle": last_cycle},
             "material_summary": runtime.cycle_queue_levels if runtime is not None else {},
+            "startup_gc": startup_gc,
         }
     finally:
         session.stop_accepting()

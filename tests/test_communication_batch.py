@@ -164,6 +164,71 @@ def test_segment_begin_sends_both_before_reading_and_closes_on_bad_second_ack(mo
     assert runtime._confirmed_steps == ["old"]
 
 
+def test_online_preflights_both_full_frames_once_and_invalidates_on_bad_second_ack(monkeypatch):
+    """第二帧超限不得先泄出第一帧；发送复用已校验的 canonical 字节。"""
+    from test_two_party_protocol import make_stack
+
+    from secure_control.execution import lan_runtime as lan
+    from secure_control.execution import localhost_codec as codec
+    from secure_control.execution import localhost_transport as transport
+
+    original = codec._encode_value
+    for oversized in (True, False):
+        client, _, _, _, distribution = make_stack()
+        online = client.prepare_online(distribution, [.25], step=0)
+        runtime = lan.LanContinuousRuntime.__new__(lan.LanContinuousRuntime)
+        runtime._v2, runtime._failed, runtime._finished, runtime._step = True, False, False, 0
+        runtime._segment_start, runtime._segment_capacity = 0, 400
+        runtime._material_pool = None
+        runtime._sockets, runtime._sequences = ["p1", "p2"], [4, 4]
+        runtime.client, runtime.distribution = client, distribution
+        runtime.spec, runtime.config = SimpleNamespace(input_dimension=1), SimpleNamespace(step_timeout=1.)
+        runtime.session_id = online.session_id
+        frames = tuple(WireEnvelope(
+            SCHEMA_VERSION, "request", "Client", role, 4, "online", online.session_id,
+            online.round_id, 0, None, PartyOnlineMaterial.from_round(PartyOnlineRound(inp, resources)),
+        ) for role, inp, resources in (
+            ("P1", online.p1_input, online.p1_resources),
+            ("P2", online.p2_input, online.p2_resources),
+        ))
+        canonical = tuple(encode_envelope(frame) for frame in frames)
+        events = []
+
+        def counted(value, events=events):
+            if isinstance(value, PartyOnlineMaterial):
+                events.append("encode")
+            return original(value)
+
+        def encoded(message, oversized=oversized):
+            value = encode_envelope(message)
+            return value + b" " * lan._FRAME_LIMIT if oversized and message.recipient == "P2" else value
+
+        def sent(sock, payload, deadline, events=events, canonical=canonical):
+            assert events[:2] == ["encode", "encode"] and events.count("encode") == 2
+            assert payload[4:] == canonical[0 if sock == "p1" else 1]
+            events.append(sock)
+
+        def received(sock, *args, events=events, **kwargs):
+            assert events[-2:] == ["p1", "p2"]
+            if sock == "p2":
+                raise ValueError("bad second ACK")
+
+        monkeypatch.setattr(client, "prepare_online", lambda *args, online=online, **kwargs: online)
+        monkeypatch.setattr(codec, "_encode_value", counted)
+        monkeypatch.setattr(transport, "encode_envelope", encoded)
+        monkeypatch.setattr(transport, "_send_exact", sent)
+        monkeypatch.setattr(lan, "_receive_reply", received)
+        monkeypatch.setattr(runtime, "close", lambda events=events: events.append("closed"))
+        expected = LocalhostTransportProtocolError if oversized else ValueError
+        with pytest.raises(expected, match="上限" if oversized else "second ACK"):
+            runtime.step([.25])
+        assert events == ["encode", "encode", *([] if oversized else ["p1", "p2"]), "closed"]
+        assert runtime._failed and runtime._step == 0
+        assert runtime._round_started is (not oversized)
+        assert (online.session_id, online.round_id, online.step) not in client._issued_rounds
+        monkeypatch.setattr(codec, "_encode_value", original)
+
+
 @pytest.mark.integration
 def test_continuous_observation_retains_first_failed_attempt_without_error_payload(monkeypatch):
     from secure_control.experiments.communication_benchmark import run_continuous_observation
