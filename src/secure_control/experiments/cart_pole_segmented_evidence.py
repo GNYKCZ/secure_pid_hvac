@@ -1743,6 +1743,7 @@ class _BatchWriter:
         self._active_charge = self._held = self._sealed = 0
         self._closing = self._error = False
         self._thread = None
+        self._deferred = None
         self._durable = self._byte_high = self._segment_high = 0
         self._reserved = 4 * HEADER_LIMIT + 2 * INDEX_LINE_LIMIT
         self.drain_ns = 0
@@ -1788,6 +1789,22 @@ class _BatchWriter:
 
     def record(self, segment):
         """非阻塞封段；两段上限包含 worker 已取走但未可靠发布的段。"""
+        self._record(segment, ready=True)
+
+    def record_deferred(self, segment):
+        """立即接管并计预算，等待同一原始段过渡完成后放行。"""
+        self._record(segment, ready=False)
+
+    def release_segment(self, segment):
+        """只放行原始已接管项；不改协议状态，不等待可靠写入。"""
+        with self._condition:
+            if self._deferred is None or self._deferred[0] is not segment:
+                raise ValueError("放行不是当前原始已接管段")
+            self._deferred[1][4] = True
+            self._deferred = None
+            self._condition.notify_all()
+
+    def _record(self, segment, *, ready):
         self.check()
         # 原协议记录本身已 frozen，steps 为 tuple；只在控制线程冻结小 header。
         # 大块逐步证据的组装/序列化由 writer 完成，不在段边界重复 asdict 全段。
@@ -1799,13 +1816,18 @@ class _BatchWriter:
         if len(raw) > HEADER_LIMIT:
             raise ValueError("公开封段 header 超出预留预算。")
         with self._condition:
-            if self._error or self._closing or self._sealed >= 2:
+            if (self._error or self._closing or self._sealed >= 2
+                    or not ready and self._deferred is not None):
                 raise BufferError("后台封段库存已满或 writer 已失效。")
-            self._pending.append((self._rows, self._cycles, (raw, identities), self._active_charge))
+            job = [self._rows, self._cycles, (raw, identities), self._active_charge, ready]
+            self._pending.append(job)
+            if not ready:
+                self._deferred = (segment, job)
             self._rows, self._cycles, self._active_charge = [], [], 0
             self._sealed += 1
             self._segment_high = max(self._segment_high, self._sealed)
-            self._condition.notify()
+            if ready:
+                self._condition.notify()
 
     def snapshot(self):
         """durable 只在 checkpoint 已原子发布后增长，不在队列出队时增长。"""
@@ -1820,9 +1842,10 @@ class _BatchWriter:
             with self.timing_path.open("xb") as timings:
                 while True:
                     with self._condition:
-                        self._condition.wait_for(lambda: self._pending or self._closing)
+                        self._condition.wait_for(lambda: self._closing or (
+                            self._pending and self._pending[0][4]))
                         if self._pending:
-                            rows, cycles, segment, charge = self._pending.popleft()
+                            rows, cycles, segment, charge, _ = self._pending.popleft()
                         elif self._closing:
                             rows, cycles, segment, charge = self._rows, self._cycles, None, self._active_charge
                             self._rows, self._cycles, self._active_charge = [], [], 0
@@ -1853,6 +1876,7 @@ class _BatchWriter:
         started = perf_counter_ns()
         with self._condition:
             self._closing = True
+            self._deferred = None
             self._condition.notify_all()
         if self._thread is not None:
             self._thread.join(timeout=30)
@@ -1893,7 +1917,9 @@ def run_cart_pole_segmented(config, *, control: RunControl, session: Interactive
                 on_step(record)
 
         stopped = _run_prepared_segmented(config, prepared, control=control, session=session,
-                                          on_step=durable_step, on_segment=sink.record,
+                                          on_step=durable_step,
+                                          on_segment=writer.record_deferred if writer else sink.record,
+                                          on_segment_ready=writer.release_segment if writer else None,
                                           on_start=sink.begin, phase=phase, realtime=realtime,
                                           on_cycle=writer.record_cycle if writer else None,
                                           cycle_snapshot=writer.snapshot if writer else None,

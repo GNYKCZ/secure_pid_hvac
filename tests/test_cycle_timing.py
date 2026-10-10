@@ -155,6 +155,132 @@ def test_unique_runner_rejects_late_command_and_keeps_applied_fact(monkeypatch, 
     assert report["startup_gc"] == {"duration_ns": 0, "collected": 3}
 
 
+def test_segment_gate_always_releases_without_hiding_boundary_failure(monkeypatch):
+    """仅执行第400步；覆盖源/握手/回调/取消/放行失败及超期的不同出口。"""
+    for fault in ("source", "begin", "identity", "phase", "cancel", "release_late", "release_error"):
+        _check_gate_boundary(monkeypatch, fault)
+
+
+def _check_gate_boundary(monkeypatch, fault):
+    with monkeypatch.context() as patch:
+        time_ns, events, packets, timings = [0], [], [], []
+        session, control = InteractiveSession(), RunControl()
+
+        class Runtime:
+            def __init__(self, *args, **kwargs):
+                self.phase = "RUNNING"
+                self.confirmed_step_count = self.protocol_committed_count = 399
+                self.run_id, self.public_setup, self.resource_counts = "r", None, {}
+                self.cycle_phase_ns, self.cycle_queue_levels = {}, {}
+
+            def snapshot(self):
+                return LanLifecycleSnapshot(self.phase, "r", "s", "e", 0, 399, 399,
+                                            "round", self.protocol_committed_count,
+                                            self.confirmed_step_count, 0, 0, 0)
+
+            @property
+            def segment_full(self):
+                return self.confirmed_step_count == 400
+
+            def step(self, value, **kwargs):
+                events.append("step")
+                self.protocol_committed_count += 1
+                time_ns[0] += 4_000_000
+                return SimpleNamespace(global_step=399, raw_control=(0.,), round_id="round")
+
+            def confirm_applied(self, identity):
+                self.confirmed_step_count += 1
+
+            def end_segment(self, **kwargs):
+                events.append("end")
+                self.phase = "CONNECTING_NEXT"
+                time_ns[0] += 1_000_000
+                return _Segment(0)
+
+            def next_segment(self, **kwargs):
+                events.append("begin")
+                time_ns[0] += 1_000_000
+                if fault in {"begin", "identity"}:
+                    self.phase = "UNCERTAIN"
+                    if fault == "begin":
+                        raise CycleDeadlineExceeded("BEGIN_SEGMENT")
+                    raise lan_runner.LanIdentityError("injected")
+                self.phase = "RUNNING"
+
+            def close(self):
+                pass
+
+        def source():
+            if "seal" in events:
+                events.append("source")
+                time_ns[0] += 1_000_000
+                if fault in {"source", "release_error"}:
+                    raise CycleDeadlineExceeded("SOURCE_CHECK")
+
+        def seal(packet):
+            events.append("seal")
+            packets.append(packet)
+            time_ns[0] += 1_000_000
+            if fault == "cancel":
+                session.cancelled.set()
+
+        def release(packet):
+            assert packet is packets[0]
+            events.append("release")
+            time_ns[0] += 21_000_000 if fault == "release_late" else 1_000_000
+            if fault == "release_error":
+                raise OSError("injected")
+
+        def phase(value):
+            if value == "RUNNING" and "begin" in events and fault == "phase":
+                raise ValueError("injected callback")
+
+        def advance(*args, **kwargs):
+            time_ns[0] += 1_000_000
+            return {}
+
+        def sleep(seconds):
+            time_ns[0] += round(seconds * 1e9)
+
+        patch.setattr(lan_runner, "LanSegmentedRuntime", Runtime)
+        patch.setattr(lan_runner, "perf_counter_ns", lambda: time_ns[0])
+        patch.setattr(lan_runner.gc, "collect", lambda _: 0)
+        patch.setattr(lan_runner, "AbsoluteCycleClock", lambda period: AbsoluteCycleClock(
+            period, now=lambda: time_ns[0], sleep=sleep,
+        ))
+        patch.setattr(lan_runner, "check_deadline", lambda deadline, phase: check_deadline(
+            deadline, phase, now=lambda: time_ns[0],
+        ))
+        experiment = SimpleNamespace(
+            spec=SimpleNamespace(state_dimension=4), context=None, contract=None,
+            security_parameter=8, evidence=None, segment_capacity=400, recheck_sources=source,
+            scene=SimpleNamespace(period=.02, controller_input=lambda: [0], advance=advance),
+        )
+        report = lan_runner._run_prepared_segmented(
+            None, experiment, control=control, session=session, material_slots=0,
+            on_segment=seal, on_segment_ready=release, on_cycle=timings.append, phase=phase,
+        )
+        assert events.count("step") == events.count("release") == 1
+        assert report["confirmed_step_count"] == report["protocol_committed_count"] == 400
+        assert len(timings) == 1 and timings[0].global_step == 399
+        assert timings[0].cycle_completed_ns is None
+        durations = timings[0].phase_durations_ns
+        assert all("maintenance_" + part in durations for part in ("end", "seal", "release"))
+        assert durations["maintenance"] >= 3_000_000
+        assert ("maintenance_begin" in durations) == (fault in {"begin", "identity", "phase", "release_late"})
+        if fault in {"source", "begin", "release_late", "release_error"}:
+            assert timings[0].status == "miss_after_apply"
+            assert report["failure_phase"] == {
+                "source": "SOURCE_CHECK", "release_error": "SOURCE_CHECK",
+                "begin": "BEGIN_SEGMENT", "release_late": "CYCLE_COMPLETE",
+            }[fault]
+        if fault == "release_error":
+            assert report["category"] == "CycleDeadlineExceeded" and report["recording_error"] == "OSError"
+        if fault == "identity":
+            assert report["status"] == "uncertain" and report["category"] == "LanIdentityError"
+        if fault == "cancel":
+            assert report["status"] == "cancelled" and "begin" not in events and "source" not in events
+
 def test_material_pool_shortage_never_generates_on_control_thread_and_close_burns(monkeypatch):
     client, _, _, _, distribution = make_stack()
     pool = _OnlineResourcePool(client, distribution, start=0, slots=4)

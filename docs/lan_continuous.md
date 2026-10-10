@@ -410,6 +410,13 @@ P1/P2、`LanContinuousRuntime`、crypto/protocol 与 schema v1 writer/reader
 全部周期无 miss；`qualification_pass` 仍要求完整 10000 步，1000 步窗口不能
 据此宣称正式长跑资格通过。
 
+动态记录器在原封段位置接管公开数据并计入原 8 MiB / 两段预算，等来源核查和
+下一段握手完成后才放行当前批次。异常和正常停止均放行已接管数据进入原排空
+流程；来源复核、可靠 checkpoint 和磁盘错误语义保持不变。结束、接管、来源、
+握手和放行仍计入原绝对周期期限，失败样本也保留各实际执行阶段的时长；未执行
+阶段不填零。观察报告分别列出控制线程与记录线程的来源复核累计时长和次数，
+这些累计量不能当作某一次边界读取的耗时。
+
 - `configs/lab-p1.example.yaml`、`lab-p2.example.yaml`、`lab-client-continuous.example.yaml`：三个独立角色入口。
 - `configs/local-deployment.example.yaml`：三条连接的地址和端口；三台电脑内容须一致。
 - `configs/paper_pid_lan.example.yaml`：Client 日常参数，直接读取 `paper_pid_cascade_zoh.yaml` 和共享素数证明；不依赖 Fig3 四点定义，运行声明为 `user-exploration`。

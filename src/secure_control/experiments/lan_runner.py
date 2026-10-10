@@ -144,7 +144,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                             phase=None, realtime=None, material_slots=16,
                             on_cycle=None, cycle_snapshot=None,
                             before_sample=None, preload_steps=0,
-                            preload_execution="fused") -> dict[str, object]:
+                            preload_execution="fused", on_segment_ready=None) -> dict[str, object]:
     """唯一持续循环接收已装配场景；保存/GUI 与 headless 不重复 parse 或创建 plant。"""
     control.bind_stop(session.reject_new)
     if preload_steps and material_slots != 16:
@@ -192,45 +192,69 @@ def _run_prepared_segmented(config, experiment, *, control, session,
 
     def transition(deadline_ns=None):
         """段结束、源核查和段开始同属原周期；正常停止在控制计时之后确认。"""
+        def measured(name, action):
+            started = perf_counter_ns()
+            try:
+                return action()
+            finally:
+                if attempt is not None:
+                    attempt["durations"]["maintenance_" + name] = perf_counter_ns() - started
+
         progress("ENDING_SEGMENT", "STOPPING" if control.stop_requested else None)
-        segment = (runtime.end_segment() if deadline_ns is None
-                   else runtime.end_segment(deadline_ns=deadline_ns))
+        segment = measured("end", lambda: runtime.end_segment() if deadline_ns is None
+                           else runtime.end_segment(deadline_ns=deadline_ns))
         if session.cancelled.is_set():
             raise RuntimeError("Client 运行已取消。")
         progress("RECORDING_SEGMENT")
+        packet = CompletedSegment(segment, tuple(records))
         if on_segment is not None:
-            on_segment(CompletedSegment(segment, tuple(records)))
-        records.clear()
-        check_deadline(deadline_ns, "RECORDING_SEGMENT")
-        if runtime.phase == "STOPPED":
-            experiment.recheck_sources()
+            measured("seal", lambda: on_segment(packet))
+        primary = None
+        try:
+            records.clear()
+            check_deadline(deadline_ns, "RECORDING_SEGMENT")
             if session.cancelled.is_set():
                 raise RuntimeError("Client 运行已取消。")
-            return {
-                "status": "stopped", "stop_reason": (
-                    "preload_exhausted" if preload_steps and runtime.confirmed_step_count == preload_steps
-                    else "user_requested"),
-                "role": "Client", "pid": os.getpid(), "run_id": runtime.run_id,
-                "confirmed_step_count": runtime.confirmed_step_count,
-                "protocol_committed_count": runtime.protocol_committed_count,
-                "next_global_step": runtime.confirmed_step_count,
-                **experiment.scene.terminal_summary(),
-                "resource_counts": runtime.resource_counts,
-                "final_segment": asdict(segment), "transport": config.transport,
-                "cycle_summary": {"attempts": cycle_count, "misses": misses,
-                                  "last_cycle": last_cycle},
-                "material_summary": getattr(runtime, "material_summary", runtime.cycle_queue_levels),
-                "startup_gc": startup_gc,
-            }
-        progress("CONNECTING_NEXT")
-        experiment.recheck_sources()
-        check_deadline(deadline_ns, "SOURCE_CHECK")
-        if deadline_ns is None:
-            runtime.next_segment()
-        else:
-            runtime.next_segment(deadline_ns=deadline_ns)
-        progress("RUNNING")
-        return None
+            if runtime.phase == "STOPPED":
+                measured("source", experiment.recheck_sources)
+                if session.cancelled.is_set():
+                    raise RuntimeError("Client 运行已取消。")
+                return {
+                    "status": "stopped", "stop_reason": (
+                        "preload_exhausted" if preload_steps and runtime.confirmed_step_count == preload_steps
+                        else "user_requested"),
+                    "role": "Client", "pid": os.getpid(), "run_id": runtime.run_id,
+                    "confirmed_step_count": runtime.confirmed_step_count,
+                    "protocol_committed_count": runtime.protocol_committed_count,
+                    "next_global_step": runtime.confirmed_step_count,
+                    **experiment.scene.terminal_summary(),
+                    "resource_counts": runtime.resource_counts,
+                    "final_segment": asdict(segment), "transport": config.transport,
+                    "cycle_summary": {"attempts": cycle_count, "misses": misses,
+                                      "last_cycle": last_cycle},
+                    "material_summary": getattr(runtime, "material_summary", runtime.cycle_queue_levels),
+                    "startup_gc": startup_gc,
+                }
+            progress("CONNECTING_NEXT")
+            measured("source", experiment.recheck_sources)
+            check_deadline(deadline_ns, "SOURCE_CHECK")
+            if session.cancelled.is_set():
+                raise RuntimeError("Client 运行已取消。")
+            measured("begin", lambda: runtime.next_segment() if deadline_ns is None
+                     else runtime.next_segment(deadline_ns=deadline_ns))
+            progress("RUNNING")
+            return None
+        except Exception as error:
+            primary = error
+            raise
+        finally:
+            if on_segment is not None and on_segment_ready is not None:
+                try:
+                    measured("release", lambda: on_segment_ready(packet))
+                except Exception as release_error:
+                    if primary is None:
+                        raise
+                    primary._public_recording_error = type(release_error).__name__
 
     def progress(value, display=None):
         """处理实际进入该阶段后才发通知，失败出口保留同一阶段事实。"""
@@ -336,8 +360,10 @@ def _run_prepared_segmented(config, experiment, *, control, session,
             check_deadline(deadline_ns, "RECORDING_STEP")
             if clock is not None and runtime.segment_full and not control.stop_requested:
                 started = perf_counter_ns()
-                transition(deadline_ns)
-                attempt["durations"]["maintenance"] = perf_counter_ns() - started
+                try:
+                    transition(deadline_ns)
+                finally:
+                    attempt["durations"]["maintenance"] = perf_counter_ns() - started
             check_deadline(deadline_ns, "CYCLE_COMPLETE")
             emit_cycle("confirmed")
             # 公开观测回调自身也受预算约束；不能靠观测出口隐藏一次超期。
@@ -382,6 +408,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                               "last_cycle": last_cycle},
             "material_summary": getattr(runtime, "material_summary", runtime.cycle_queue_levels) if runtime is not None else {},
             "startup_gc": startup_gc,
+            "recording_error": getattr(error, "_public_recording_error", None),
         }
     finally:
         session.stop_accepting()

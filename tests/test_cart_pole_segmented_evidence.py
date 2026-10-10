@@ -6,6 +6,7 @@ import json
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass, replace
 from hashlib import sha256
 from math import pi
 from pathlib import Path
@@ -28,6 +29,129 @@ from secure_control.experiments import cart_pole_segmented_evidence as evidence
 from secure_control.experiments.lan_continuous_profile import load_segmented_experiment
 from secure_control.experiments.lan_runner import CompletedSegment, ConfirmedStep
 from secure_control.scenarios.cart_pole.interactive import InteractiveSession
+
+
+@dataclass(frozen=True)
+class _GateHeader:
+    index: int
+    steps: tuple
+
+
+@dataclass(frozen=True)
+class _GateRecord:
+    protocol: int
+
+
+def _gate_writer(tmp_path, batch):
+    """只替换磁盘接收器，实际队列、条件变量、预算和线程保持原实现。"""
+    spool = SimpleNamespace(root=tmp_path, run_id="gate", end=0, tail_count=0,
+                            begin=lambda *args: None)
+
+    def persist(rows, segment):
+        batch(rows, segment)
+        spool.end += len(rows)
+
+    spool.record_batch = persist
+    return evidence._BatchWriter(spool)
+
+
+def _gate_segment(writer, index):
+    record = _GateRecord(index)
+    writer.record_step(record)
+    return CompletedSegment(_GateHeader(index, (index,)), (record,))
+
+
+def test_deferred_writer_waits_for_original_release_even_when_busy_or_notified(tmp_path):
+    entered, free_first, second, free_second, held_front = (Event() for _ in range(5))
+    calls = []
+
+    def batch(rows, segment):
+        index = json.loads(segment[0])["index"]
+        calls.append(index)
+        if index == 1:
+            entered.set()
+            assert free_first.wait(5)
+        else:
+            second.set()
+            assert free_second.wait(5)
+
+    writer = _gate_writer(tmp_path, batch)
+    original_wait = writer._condition.wait_for
+
+    def wait(predicate):
+        def checked():
+            result = predicate()
+            if writer._pending and not writer._pending[0][4] and not writer._closing:
+                assert not result
+                assert calls == [1]
+                held_front.set()
+            return result
+        return original_wait(checked)
+
+    writer._condition.wait_for = wait
+    writer.begin(None, None)
+    try:
+        writer.record(_gate_segment(writer, 1))
+        assert entered.wait(5)
+        packet = _gate_segment(writer, 2)
+        writer.record_deferred(packet)
+        held = writer.snapshot()["writer_encoded_bytes"]
+        assert writer.snapshot()["writer_sealed_segments"] == 2
+        with pytest.raises(BufferError):
+            writer.record(CompletedSegment(_GateHeader(3, ()), ()))
+        with pytest.raises(ValueError):
+            writer.release_segment(replace(packet))
+        assert writer.snapshot()["writer_encoded_bytes"] == held
+        free_first.set()
+        assert held_front.wait(5)
+        assert writer.snapshot()["durable_step_count"] == 1
+        held_front.clear()
+        with writer._condition:
+            writer._condition.notify_all()  # 唤醒不能绕过 ready 条件。
+        assert held_front.wait(5)
+        assert not second.is_set()
+        writer.release_segment(packet)
+        assert second.wait(5)
+        snapshot = writer.snapshot()
+        assert snapshot["writer_sealed_segments"] == 1
+        assert snapshot["durable_step_count"] == 1 and snapshot["writer_encoded_bytes"] > 0
+        assert snapshot["writer_encoded_high_water"] <= evidence.SEGMENT_LIMIT
+    finally:
+        free_first.set()
+        free_second.set()
+        writer.finish()
+    assert calls == [1, 2]
+    assert writer.snapshot()["durable_step_count"] == 2
+    assert writer.snapshot()["writer_encoded_bytes"] == writer.snapshot()["writer_sealed_segments"] == 0
+
+
+def test_deferred_writer_finish_drains_fifo_without_release(tmp_path):
+    calls, held_front = [], Event()
+    writer = _gate_writer(tmp_path, lambda rows, segment: calls.append(json.loads(segment[0])["index"]))
+    original_wait = writer._condition.wait_for
+
+    def wait(predicate):
+        def checked():
+            result = predicate()
+            if writer._pending and not writer._pending[0][4] and not writer._closing:
+                assert not result and not calls
+                held_front.set()
+            return result
+        return original_wait(checked)
+
+    writer._condition.wait_for = wait
+    writer.begin(None, None)
+    try:
+        writer.record_deferred(_gate_segment(writer, 1))
+        # 第二个 ready 项也不能越过队首尚未 ready 的项。
+        writer.record(_gate_segment(writer, 2))
+        assert held_front.wait(5)
+        assert writer.snapshot()["writer_sealed_segments"] == 2
+    finally:
+        writer.finish()
+    assert calls == [1, 2] and writer.snapshot()["durable_step_count"] == 2
+    assert not writer._thread.is_alive()
+
 
 _CLIENT = r'''
 import json, sys
@@ -284,8 +408,9 @@ def test_dynamic_v2_publishes_verified_continuous_state(dynamic_published):
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("failure", ["disk", "source"])
 def test_batch_writer_counts_inflight_and_preserves_checkpoint_on_disk_failure(
-    dynamic_published, tmp_path, monkeypatch,
+    dynamic_published, tmp_path, monkeypatch, failure,
 ):
     """在真实 v2 记录上冻结 writer，验证两段门禁、可靠批次和写盘失败旧前缀。"""
     source, _ = dynamic_published
@@ -309,10 +434,13 @@ def test_batch_writer_counts_inflight_and_preserves_checkpoint_on_disk_failure(
         if calls[0] == 1:
             entered.set()
             assert release.wait(timeout=5)
-        if calls[0] == 2:
+        if calls[0] == 2 and failure == "disk":
             def failed_checkpoint(*args):
                 raise OSError("injected checkpoint disk failure")
             monkeypatch.setattr(spool, "_checkpoint", failed_checkpoint)
+        elif calls[0] == 2:
+            with config.experiment_config.open("a", encoding="utf-8") as profile:
+                profile.write("\n# changed after deferred handoff\n")
         original_batch(rows, segment)
 
     monkeypatch.setattr(spool, "record_batch", batch)
@@ -338,17 +466,21 @@ def test_batch_writer_counts_inflight_and_preserves_checkpoint_on_disk_failure(
         )
         return CompletedSegment(protocol, records)
 
+    packet = None
     try:
         writer.record(submit(0))
         assert entered.wait(timeout=5)
         assert writer.snapshot()["durable_step_count"] == 0
-        writer.record(submit(1))
+        packet = submit(1)
+        writer.record_deferred(packet)
         assert writer.snapshot()["writer_sealed_segments"] == 2
         with pytest.raises(BufferError):
             writer.record(submit(2))
         assert writer.snapshot()["writer_encoded_high_water"] <= evidence.SEGMENT_LIMIT
     finally:
         release.set()
+        if packet is not None:
+            writer.release_segment(packet)
         with pytest.raises(OSError):
             writer.finish()
     assert not writer._thread.is_alive()
@@ -357,7 +489,10 @@ def test_batch_writer_counts_inflight_and_preserves_checkpoint_on_disk_failure(
     spool.fail({"status": "failed", "category": "OSError", "failure_phase": "WRITER"})
     prefix = evidence.open_verified_cart_pole_segmented_prefix(spool.stage)
     assert prefix["confirmed_step_count"] == 3 and prefix["sealed_segment_count"] == 1
-    assert spool.disk_metrics["fsync_count"] == 8  # 两批数据均 fsync，只有首批 checkpoint 发布
+    if failure == "disk":
+        assert spool.disk_metrics["fsync_count"] == 8  # 两批均 fsync，只有首批 checkpoint 发布
+    else:
+        assert spool.disk_metrics["fsync_count"] < 8  # 来源变化在第二批写盘前拒绝。
 
 
 @pytest.mark.integration

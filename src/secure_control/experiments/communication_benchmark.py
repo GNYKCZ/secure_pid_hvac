@@ -17,6 +17,7 @@ from hashlib import sha256
 from itertools import pairwise
 from pathlib import Path
 from queue import Empty
+from threading import current_thread
 from unittest.mock import patch
 
 import numpy as np
@@ -398,7 +399,9 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
     records, events, outcomes = [], [], []
     cycles = []
     marks, storage = {}, {"fsync_ms": 0., "fsync_count": 0, "checkpoint_ms": 0.,
-                          "source_check_ms": 0.}
+                          "source_check_ms": 0., "source_check_control_ms": 0.,
+                          "source_check_writer_ms": 0., "source_check_control_count": 0,
+                          "source_check_writer_count": 0}
     counts, activity, restore = _meter("Client", ports, delay_ms)
     control, session = RunControl(), InteractiveSession()
     fsync, checkpoint = os.fsync, _Spool._checkpoint
@@ -474,7 +477,11 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                 try:
                     return recheck()
                 finally:
-                    storage["source_check_ms"] += (time.perf_counter_ns() - start) / 1e6
+                    elapsed = (time.perf_counter_ns() - start) / 1e6
+                    storage["source_check_ms"] += elapsed
+                    owner = "writer" if current_thread().name == "segment-evidence-writer" else "control"
+                    storage[f"source_check_{owner}_ms"] += elapsed
+                    storage[f"source_check_{owner}_count"] += 1
 
             prepared = replace(prepared, output_root=Path(folder), recheck_sources=measured_sources)
             transaction = _Spool(prepared, config, session, phase)
@@ -487,7 +494,8 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                   patch.object(_Spool, "_checkpoint", measured_checkpoint)):
                 result = _run_prepared_segmented(
                     config, prepared, control=control, session=session,
-                    on_step=durable_step, on_segment=sink.record,
+                    on_step=durable_step, on_segment=writer.record_deferred if writer else sink.record,
+                    on_segment_ready=writer.release_segment if writer else None,
                     on_start=sink.begin, phase=phase, realtime=optimized,
                     material_slots=material_slots,
                     preload_steps=preload_steps, preload_execution=preload_execution,
