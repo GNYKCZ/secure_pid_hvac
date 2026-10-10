@@ -381,6 +381,35 @@ P1/P2、`LanContinuousRuntime`、crypto/protocol 与 schema v1 writer/reader
 
 ## 当前文件用途
 
+动态 v2 可显式使用有限预送窗口。启动三方后，在倒立摆 Client 的 GUI 或
+`--headless-continuous` 入口增加 `--preload-steps 1000 --preload-execution fused`
+（可选 `staged`，段容量仍为 400）。GUI 与 headless 复用同一持续循环，库存耗尽
+后正常封段、排空记录、核验并发布结果；第 1001 步不会现场生成或自动续送。
+默认 `--preload-steps 0` 保留已有运行方式。该入口只支持动态 v2 同一 epoch，
+不支持静态 v1、有限单段或 full v3。P1/P2 必须使用支持
+`control-preloaded-v1` 的同版本程序，握手不匹配会直接失败。
+
+材料在控制计时开始前逐轮生成和导出，每块至多 32 步及 128 KiB 原始本方数值，
+通过原 schema 3 JSON 信封的规范 base64 传送；启动请求分别限制为 64 KiB
+清单/封存和 256 KiB 块信封。整个预送阶段共用一个 startup timeout，不按块重置。
+两方确认全部库存后才允许用新测量领取当前步。原材料导出即失去本地领取资格，
+导出数量不算实际算术消费；接收方恢复当前轮的原 protocol 生命周期后才计算和提交。
+缓存跨 400/800 段边界保留，断连、停止或异常后废弃剩余库存。
+
+每主机材料编码预算为 8 MiB，包含缓存、2 MiB 临时编码副本、256 KiB 元数据与
+512 KiB 当前轮额度；公开维度和模数在生成/分配前用于保守预检。临时界计入两方
+块、base64/JSON/UTF-8/帧副本及当前生成对象，不是 Python 进程 RSS 上限。
+观察报告分别给出原始缓存、实际应用帧字节和三个角色的 OS 峰值工作集。
+预送期间与在线阶段均不运行旧材料生产线程；显式非默认材料池参数与预送互斥。
+
+使用 `benchmark --case cycle --mode batch --steps 1000 --segment-steps 400
+--preload-steps 1000 --preload-execution fused --output 新文件.json` 观察实际循环。
+`staged` 普通轮 19 个应用帧，`fused` 普通轮 15 个应用帧，均保留双提交 ACK 和
+7 个 peer 帧。`--delay-ms 1` 在每次应用帧发送前等待 1 ms，帧数改变会改变
+注入等待总量，该观察不能解释为固定 Wi-Fi RTT。`stage_pass` 检查所请求阶段
+全部周期无 miss；`qualification_pass` 仍要求完整 10000 步，1000 步窗口不能
+据此宣称正式长跑资格通过。
+
 - `configs/lab-p1.example.yaml`、`lab-p2.example.yaml`、`lab-client-continuous.example.yaml`：三个独立角色入口。
 - `configs/local-deployment.example.yaml`：三条连接的地址和端口；三台电脑内容须一致。
 - `configs/paper_pid_lan.example.yaml`：Client 日常参数，直接读取 `paper_pid_cascade_zoh.yaml` 和共享素数证明；不依赖 Fig3 四点定义，运行声明为 `user-exploration`。

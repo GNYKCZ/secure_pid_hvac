@@ -52,6 +52,7 @@ from .localhost_transport import (
     deadline_after,
     receive_envelope,
     send_envelope,
+    send_frame,
 )
 
 Address = tuple[str, int]
@@ -70,6 +71,7 @@ class _ClientPartyEndpoint:
         limit: int,
         timeout: float,
         deadline: float | None = None,
+        *, activation=None, on_send=None,
     ) -> None:
         self._sock = sock
         self._party = party
@@ -81,6 +83,8 @@ class _ClientPartyEndpoint:
         self._deadline = deadline
         self.share: ControlShareMessage | None = None
         self._pending_batch: WireEnvelope | None = None
+        self._activation = activation
+        self._on_send = on_send
 
     @property
     def party(self) -> int:
@@ -144,7 +148,14 @@ class _ClientPartyEndpoint:
             self._plan.step, None, Protocol3EndpointCommand("stage_batch"),
         )
         deadline = self._deadline if self._deadline is not None else deadline_after(self._timeout)
-        send_envelope(self._sock, request, deadline=deadline, limit=self._limit)
+        if self._activation is None:
+            send_envelope(self._sock, request, deadline=deadline, limit=self._limit)
+        else:
+            request, encoded = self._activation
+            if self._on_send is not None:
+                self._on_send()
+            send_frame(self._sock, encoded, deadline=deadline, limit=self._limit)
+            self._activation = None
         self.sequence += 1
         self._pending_batch = request
 

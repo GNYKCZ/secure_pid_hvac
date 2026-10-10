@@ -123,7 +123,7 @@ def run_client_segmented(config: LanConfig, *, segment_steps: int = 400,
                          on_step: Callable[[ConfirmedStep], None] | None = None,
                          on_segment: Callable[[CompletedSegment], None] | None = None,
                          phase: Callable[[str], None] | None = None,
-                         session=None) -> dict[str, object]:
+                         session=None, preload_steps=0, preload_execution="fused") -> dict[str, object]:
     """运行到正常停止请求或故障；不将后端 stopped 冒充正式 artifact complete。"""
     # 队列与场景选择由装配层拥有；核心仅处理协议身份、双提交及确认前缀。
     from secure_control.scenarios.cart_pole.interactive import InteractiveSession
@@ -135,16 +135,20 @@ def run_client_segmented(config: LanConfig, *, segment_steps: int = 400,
         raise TypeError("持续模式需要 RunControl 和 InteractiveSession。")
     experiment = load_segmented_experiment(config.experiment_config, segment_steps, session)
     return _run_prepared_segmented(config, experiment, control=control, session=session,
-                                   on_step=on_step, on_segment=on_segment, phase=phase)
+                                   on_step=on_step, on_segment=on_segment, phase=phase,
+                                   preload_steps=preload_steps, preload_execution=preload_execution)
 
 
 def _run_prepared_segmented(config, experiment, *, control, session,
                             on_step=None, on_segment=None, on_start=None,
                             phase=None, realtime=None, material_slots=16,
                             on_cycle=None, cycle_snapshot=None,
-                            before_sample=None) -> dict[str, object]:
+                            before_sample=None, preload_steps=0,
+                            preload_execution="fused") -> dict[str, object]:
     """唯一持续循环接收已装配场景；保存/GUI 与 headless 不重复 parse 或创建 plant。"""
     control.bind_stop(session.reject_new)
+    if preload_steps and material_slots != 16:
+        raise ValueError("预送窗口与显式非默认material_slots互斥")
     runtime = None
     records: list[ConfirmedStep] = []
     phase_name = "CONNECTING"
@@ -203,7 +207,9 @@ def _run_prepared_segmented(config, experiment, *, control, session,
             if session.cancelled.is_set():
                 raise RuntimeError("Client 运行已取消。")
             return {
-                "status": "stopped", "stop_reason": "user_requested",
+                "status": "stopped", "stop_reason": (
+                    "preload_exhausted" if preload_steps and runtime.confirmed_step_count == preload_steps
+                    else "user_requested"),
                 "role": "Client", "pid": os.getpid(), "run_id": runtime.run_id,
                 "confirmed_step_count": runtime.confirmed_step_count,
                 "protocol_committed_count": runtime.protocol_committed_count,
@@ -213,7 +219,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                 "final_segment": asdict(segment), "transport": config.transport,
                 "cycle_summary": {"attempts": cycle_count, "misses": misses,
                                   "last_cycle": last_cycle},
-                "material_summary": runtime.cycle_queue_levels,
+                "material_summary": getattr(runtime, "material_summary", runtime.cycle_queue_levels),
                 "startup_gc": startup_gc,
             }
         progress("CONNECTING_NEXT")
@@ -241,12 +247,17 @@ def _run_prepared_segmented(config, experiment, *, control, session,
             experiment.security_parameter, experiment.evidence, control=control,
             segment_capacity=(experiment.segment_capacity
                               if experiment.spec.state_dimension else None),
+            preload_steps=preload_steps, preload_execution=preload_execution,
         )
         if on_start is not None:
             on_start(runtime.snapshot(), runtime.public_setup)
         dynamic_realtime = experiment.spec.state_dimension != 0 if realtime is None else realtime
+        if preload_steps:
+            progress("PRELOADING")
+            runtime.enable_material_preload(cancelled=lambda: session.cancelled.is_set()
+                                           or control.stop_requested)
         if dynamic_realtime:
-            if material_slots:
+            if material_slots and not preload_steps:
                 runtime.enable_material_preparation(slots=material_slots)
             # 所有固定验证、建连、writer 初始化与首池填充完成后才确定唯一 t0。
             # 收集初始化暂存垃圾；运行中的自动 GC/阈值保持原样，不转移周期内的工作。
@@ -308,6 +319,8 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                             identity.global_step, identity.raw_control, deadline_ns=deadline_ns,
                         ))
             runtime.confirm_applied(identity)
+            if preload_steps and runtime.confirmed_step_count == preload_steps:
+                control.request_stop()
             if attempt is not None:
                 attempt["device"] = perf_counter_ns()
                 attempt["durations"]["device"] = attempt["device"] - started
@@ -367,7 +380,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
             "lifecycle": asdict(lifecycle) if lifecycle else None,
             "cycle_summary": {"attempts": cycle_count, "misses": misses,
                               "last_cycle": last_cycle},
-            "material_summary": runtime.cycle_queue_levels if runtime is not None else {},
+            "material_summary": getattr(runtime, "material_summary", runtime.cycle_queue_levels) if runtime is not None else {},
             "startup_gc": startup_gc,
         }
     finally:
@@ -524,6 +537,8 @@ def _run() -> int:
     benchmark.add_argument("--delay-ms", type=float, default=0.)
     benchmark.add_argument("--segment-steps", type=int, default=8)
     benchmark.add_argument("--material-slots", type=int, choices=(0, 4, 16), default=16)
+    benchmark.add_argument("--preload-steps", type=int, default=0)
+    benchmark.add_argument("--preload-execution", choices=("staged", "fused"), default="fused")
     benchmark.add_argument("--role-config", type=Path)
     benchmark.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
@@ -538,9 +553,12 @@ def _run() -> int:
                 report = run_continuous_observation(
                     steps=args.steps, delay_ms=args.delay_ms, segment_steps=args.segment_steps,
                     optimized=args.case == "cycle", material_slots=args.material_slots,
+                    preload_steps=args.preload_steps, preload_execution=args.preload_execution,
                     role_config=args.role_config,
                 )
             else:
+                if args.preload_steps:
+                    raise ValueError("预送观察仅支持cycle动态v2入口")
                 report = run_local_benchmark(
                     args.case, args.mode, steps=args.steps, delay_ms=args.delay_ms,
                 )

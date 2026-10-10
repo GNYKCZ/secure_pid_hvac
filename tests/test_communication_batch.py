@@ -132,6 +132,134 @@ def test_session_recovery_rejects_foreign_role_and_noncanonical_last_material():
         recovery.restore(replace(material, product_resources=(*material.product_resources[:-1], last)))
 
 
+def test_peer_plan_digest_is_cached_without_accepting_mutated_installed_plan(monkeypatch):
+    from test_two_party_protocol import make_stack
+
+    from secure_control.execution import _localhost_peer as peer
+
+    client, _, _, _, distribution = make_stack()
+    prepared = client.precompute_online_resources(distribution, step=0)
+    plan = prepared.p1_resources.plan
+    digests = []
+    original = peer.public_step_plan_sha256
+    monkeypatch.setattr(peer, "public_step_plan_sha256", lambda value: (
+        digests.append(value), original(value)
+    )[1])
+    port = LocalhostProtocol3PeerPort(None, "P1", 100000, 1, batch_enabled=True)
+    port.bind(plan.session_id)
+    port.set_batch_round(plan, modulus=client.fixed_point.modulus)
+    ids = tuple(item.resource_id for item in plan.product_resources)
+    for _ in range(3):
+        assert port._batch_payload(plan, "product_complete", ids).plan_sha256 == original(plan)
+    assert len(digests) == 1
+    # frozen dataclass 的嵌套字段即使被非法原位改变，也不能复用旧摘要通过检查。
+    object.__setattr__(plan.product_resources[-1], "resource_id", "changed")
+    with pytest.raises(ValueError, match="公开身份"):
+        port._batch_payload(plan, "product_complete", ids)
+    client._material_owner(distribution).discard(prepared)
+
+
+def test_preloaded_material_values_are_lossless_and_reject_noncanonical_last_value():
+    from test_two_party_protocol import make_stack
+
+    from secure_control.execution.localhost_codec import (
+        _decode_preloaded_values,
+        _encode_preloaded_values,
+    )
+
+    client, _, _, _, distribution = make_stack()
+    online = client.prepare_online(distribution, [.25], step=0, rng=random.Random(91))
+    q = client.fixed_point.modulus
+    for inp, resources in ((online.p1_input, online.p1_resources),
+                           (online.p2_input, online.p2_resources)):
+        encoded = _encode_preloaded_values(resources, q)
+        material = _decode_preloaded_values(encoded, inp, resources.plan, q)
+        assert material == PartyOnlineMaterial.from_round(PartyOnlineRound(inp, resources))
+        width = (q.bit_length() + 7) // 8
+        assert len(encoded) == width * (3 * resources.plan.triple_count
+                                        + 2 * resources.plan.truncation_count)
+        with pytest.raises(ValueError, match="长度"):
+            _decode_preloaded_values(encoded[:-1], inp, resources.plan, q)
+        with pytest.raises(ValueError, match="residue"):
+            _decode_preloaded_values(encoded[:-width] + q.to_bytes(width, "big"),
+                                     inp, resources.plan, q)
+        last = resources.state_truncation_resources[-1].truncation
+        previous = last.r_prime
+        object.__setattr__(last, "r_prime", AdditiveShare(True))
+        with pytest.raises(ValueError, match="residue"):
+            _encode_preloaded_values(resources, q)
+        object.__setattr__(last, "r_prime", previous)
+    client.abort_round(online)
+
+
+def test_preloaded_client_requires_original_confirmed_capability_and_fresh_current_input(monkeypatch):
+    from copy import copy
+
+    from test_two_party_protocol import make_stack
+
+    from secure_control.protocol.messages import ControlShareMessage, PreloadReceipt
+
+    client, _, _, _, distribution = make_stack()
+    batch = client.begin_preloaded_resources(distribution, run_id="run", controller_epoch="epoch",
+                                             count=2)
+    digest = batch.manifest.sha256()
+    def receipts(phase, count=2, index=None, first=None):
+        return tuple(PreloadReceipt(party, digest, phase, index, first, count) for party in (0, 1))
+    with pytest.raises(ValueError, match="就绪"):
+        client.bind_preloaded_input(distribution, batch, [.25], step=0)
+    with pytest.raises(ValueError, match="复制"):
+        client.export_preloaded_step(distribution, copy(batch), step=0)
+    with pytest.raises(ValueError, match="生成次序"):
+        client.export_preloaded_step(distribution, batch, step=0)
+    client.record_preloaded_receipts(distribution, batch, receipts("init"))
+    with pytest.raises(ValueError):
+        client.record_preloaded_receipts(distribution, batch, receipts("seal"))
+    owner = client._material_owner(distribution)
+    original, held = owner.create, []
+    def create(*args, **kwargs):
+        prepared = original(*args, **kwargs)
+        held.append(prepared)
+        return prepared
+    monkeypatch.setattr(owner, "create", create)
+    for step in range(2):
+        exported = client.export_preloaded_step(distribution, batch, step=step)
+        prepared = held[-1]
+        assert exported.plan.round_id == batch.manifest.round_ids[step]
+        assert not client._issued_rounds
+        assert prepared.p1_resources.aborted_count == prepared.p1_resources.consumed_count == 0
+        assert all(v._lifecycle.status == "exported" for v in (*prepared.p1_resources.product_resources,
+                   *prepared.p1_resources.state_truncation_resources))
+        with pytest.raises(ValueError):
+            client.bind_online_input(distribution, prepared, [.25], step=step)
+        for i in range(exported.plan.triple_count):
+            a, b, c = (sum(pair) % client.fixed_point.modulus for pair in zip(
+                exported.p1_values[3*i:3*i+3], exported.p2_values[3*i:3*i+3], strict=True))
+            assert a * b % client.fixed_point.modulus == c
+    client.record_preloaded_receipts(distribution, batch, receipts("block", index=0, first=0))
+    client.record_preloaded_receipts(distribution, batch, receipts("seal"))
+    with pytest.raises(ValueError, match="input_payload_bounds"):
+        client.bind_preloaded_input(distribution, batch, [1000], step=0)
+    assert not client._issued_rounds
+    for step in range(2):
+        current = client.bind_preloaded_input(distribution, batch, [.25], step=step)
+        with pytest.raises(ValueError, match="重复领取"):
+            client.bind_preloaded_input(distribution, batch, [.25], step=step)
+        assert (current.session_id, current.round_id, step) in client._issued_rounds
+        with pytest.raises(ValueError, match="重构"):
+            client.retire_preloaded_round(current, success=True)
+        import numpy as np
+        messages = tuple(ControlShareMessage(party, current.session_id, current.round_id, step,
+                         current.plan.scale_ledger.output, AdditiveShare(np.array([0], dtype=object)))
+                         for party in (0, 1))
+        client.reconstruct_control(*messages)
+        client.retire_preloaded_round(current, success=True)
+    with pytest.raises(ValueError, match="耗尽"):
+        client.bind_preloaded_input(distribution, batch, [.25], step=2)
+    client.discard_preloaded_resources(distribution, batch)
+    with pytest.raises(ValueError, match="废弃"):
+        client.bind_preloaded_input(distribution, batch, [.25], step=2)
+
+
 def test_segment_begin_sends_both_before_reading_and_closes_on_bad_second_ack(monkeypatch):
     from secure_control.execution import lan_runtime as lan
     from secure_control.execution.localhost_codec import SegmentBeginPayload
@@ -180,6 +308,7 @@ def test_online_preflights_both_full_frames_once_and_invalidates_on_bad_second_a
         runtime._v2, runtime._failed, runtime._finished, runtime._step = True, False, False, 0
         runtime._segment_start, runtime._segment_capacity = 0, 400
         runtime._material_pool = None
+        runtime._preload_steps = 0
         runtime._sockets, runtime._sequences = ["p1", "p2"], [4, 4]
         runtime.client, runtime.distribution = client, distribution
         runtime.spec, runtime.config = SimpleNamespace(input_dimension=1), SimpleNamespace(step_timeout=1.)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import socket
+from copy import deepcopy
 from typing import Literal
 
 from secure_control.protocol.messages import (
@@ -72,8 +73,10 @@ class LocalhostProtocol3PeerPort:
             raise ValueError("peer 未协商批量能力或 session 不匹配")
         if type(modulus) is not int or modulus < 3:
             raise ValueError("批量 peer 模数无效")
-        self._batch_context = (plan, run_id, epoch_id or plan.session_id,
+        self._batch_context = (deepcopy(plan), run_id, epoch_id or plan.session_id,
                                physical_step, modulus)
+        # 独立快照保留每次调用的变化检测；摘要仅计算一次，不信任调用者的对象 identity。
+        self._batch_digest = public_step_plan_sha256(plan)
 
     def exchange_products(
         self, plan: StepResourcePlan, masks: tuple[ProductMaskPayload, ...],
@@ -136,7 +139,7 @@ class LocalhostProtocol3PeerPort:
     ) -> Protocol3BatchPayload:
         run_id, epoch_id, physical_step, _ = self._batch_identity(plan)
         return Protocol3BatchPayload(
-            phase, public_step_plan_sha256(plan), run_id, epoch_id, physical_step,
+            phase, self._batch_digest, run_id, epoch_id, physical_step,
             {"product": 0, "product_complete": 1, "truncation": 2,
              "state_complete": 3}[phase], ids, products, truncations,
         )
@@ -176,7 +179,7 @@ class LocalhostProtocol3PeerPort:
             payload.physical_step, payload.batch_index, payload.resource_ids,
             payload.version,
         ) != (
-            phase, public_step_plan_sha256(plan), run_id, epoch_id,
+            phase, self._batch_digest, run_id, epoch_id,
             physical_step, {"product": 0, "product_complete": 1,
                             "truncation": 2, "state_complete": 3}[phase], ids,
             "control-batch-v1",

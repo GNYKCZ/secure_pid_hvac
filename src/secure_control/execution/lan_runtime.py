@@ -39,10 +39,13 @@ from secure_control.protocol.messages import (
     PartyOfflineMaterial,
     PartyOnlineMaterial,
     PartyOnlineRound,
+    PreloadReceipt,
     ProductResourceMaterial,
     Protocol3EndpointCommand,
     Protocol3StageReceipt,
     TruncationResourceMaterial,
+    preloaded_material_budget,
+    public_step_plan_sha256,
 )
 
 from . import localhost_transport
@@ -66,11 +69,17 @@ from .localhost_codec import (
     LanSegmentedSetupV2Payload,
     LanSetupPayload,
     PartyStageResult,
+    PreloadedBlock,
+    PreloadedHelloPayload,
+    PreloadedInitPayload,
+    PreloadedInputPayload,
+    PreloadedReadyPayload,
     RemoteErrorPayload,
     SegmentBeginPayload,
     SegmentEndPayload,
     SegmentEndReceipt,
     WireEnvelope,
+    _decode_preloaded_values,
     encode_wire_value,
 )
 from .localhost_transport import deadline_after, receive_envelope, send_envelope
@@ -78,6 +87,88 @@ from .localhost_transport import deadline_after, receive_envelope, send_envelope
 _FRAME_LIMIT = 8 * 1024 * 1024
 _MAX_CONTINUOUS_STEPS = 1000
 _LAN_LOG = logging.getLogger("secure_control.lan")
+
+
+class _PreloadMaterialStore:
+    """本方唯一紧凑库存；领取不可逆，当前 DTO 仍由原 recovery 恢复。"""
+
+    def __init__(self, manifest, *, party, session, layout, modulus, run_id, epoch,
+                 count, stage_mode):
+        if (manifest.session_id != session or manifest.layout != layout
+                or manifest.modulus != modulus or manifest.run_id != run_id
+                or manifest.controller_epoch != epoch or len(manifest.round_ids) != count
+                or manifest.stage_mode != stage_mode or type(party) is not int
+                or party not in (0, 1)):
+            raise ValueError("预送 manifest 与已认证 session/setup 不匹配")
+        self.budget = preloaded_material_budget(layout, modulus, count, manifest.block_steps)
+        self.manifest, self.party = manifest, party
+        self.digest = manifest.sha256()
+        self.data = bytearray(self.budget["cache_bytes"])
+        self.loaded = self.next_slot = self.committed = 0
+        self.armed = self.closed = False
+        self.active = None
+
+    def receipt(self, phase, *, first=None, count=None):
+        return PreloadReceipt(self.party, self.digest, phase,
+            first // self.manifest.block_steps if first is not None else None,
+            first, len(self.manifest.round_ids) if count is None else count)
+
+    def load(self, block):
+        if self.closed or self.armed or not isinstance(block, PreloadedBlock):
+            raise ValueError("预送库存不接受当前块")
+        count = min(self.manifest.block_steps, len(self.manifest.round_ids) - self.loaded)
+        expected = self.receipt("block", first=self.loaded, count=count) if count else None
+        row, width = self.budget["row_bytes"], self.budget["residue_bytes"]
+        if block.receipt != expected or len(block.values) != count * row:
+            raise ValueError("预送块不是下一完整前缀或长度错误")
+        if any(int.from_bytes(block.values[i:i + width], "big") >= self.manifest.modulus
+               for i in range(0, len(block.values), width)):
+            raise ValueError("预送块存在非 canonical residue")
+        start = self.loaded * row
+        self.data[start:start + len(block.values)] = block.values
+        self.loaded += count
+        return expected
+
+    def seal(self, payload):
+        if (self.closed or self.armed or self.loaded != len(self.manifest.round_ids)
+                or payload != PreloadedReadyPayload(self.digest, self.loaded)):
+            raise ValueError("预送窗口未完整安装或重复封存")
+        self.armed = True
+        return self.receipt("seal")
+
+    def claim(self, payload):
+        if (self.closed or not self.armed or self.active is not None
+                or not isinstance(payload, PreloadedInputPayload)
+                or payload.manifest_sha256 != self.digest
+                or payload.slot_index != self.next_slot
+                or self.next_slot >= len(self.manifest.round_ids)):
+            raise ValueError("预送窗口未就绪、重复领取或耗尽")
+        step = self.next_slot
+        plan = Client._resource_plan(self.manifest.layout, self.manifest.session_id,
+                                     self.manifest.round_ids[step], step)
+        inp = payload.input_message
+        if (inp.recipient, inp.session_id, inp.round_id, inp.step) != (
+                self.party, plan.session_id, plan.round_id, step
+        ) or payload.plan_sha256 != public_step_plan_sha256(plan):
+            raise ValueError("预送当前输入或本机规范计划摘要不匹配")
+        self.next_slot += 1
+        self.active = plan
+        row = self.budget["row_bytes"]
+        start = step * row
+        data = bytes(self.data[start:start + row])
+        self.data[start:start + row] = bytes(row)
+        return _decode_preloaded_values(data, inp, plan, self.manifest.modulus)
+
+    def commit(self, plan):
+        if self.closed or self.active is not plan or self.committed + 1 != self.next_slot:
+            raise ValueError("预送提交不是当前已领取计划")
+        self.committed += 1
+        self.active = None
+
+    def close(self):
+        self.closed = True
+        self.active = None
+        self.data.clear()
 
 
 class _OnlineResourcePool:
@@ -367,6 +458,7 @@ class LanContinuousRuntime:
         _segment_capacity: int | None = None,
         _controller_epoch: str | None = None,
         batch: bool = True,
+        preload_steps: int = 0, preload_execution: str = "fused",
     ) -> None:
         if config.role != "Client" or config.experiment_config is None:
             raise ValueError("连续运行必须使用 Client experiment 配置。")
@@ -383,6 +475,11 @@ class LanContinuousRuntime:
         elif (range_contract.horizon_steps is None
               or not 1 <= range_contract.horizon_steps <= _MAX_CONTINUOUS_STEPS):
             raise ValueError("LAN 连续会话步数超出有界范围。")
+        if (type(preload_steps) is not int or not 0 <= preload_steps <= 1000
+                or preload_execution not in {"staged", "fused"}
+                or (preload_steps and (not batch or _segment_hello is None
+                    or _segment_hello.mode != "lan-segmented-v2"))):
+            raise ValueError("预送仅允许显式动态v2有限窗口与staged/fused模式")
         self.spec = spec
         self.fixed_point = fixed_point
         self.range_contract = range_contract
@@ -393,6 +490,8 @@ class LanContinuousRuntime:
                              modulus_evidence=modulus_evidence)
         # 所有参数、模数与范围验证在网络拨号及离线分享前完成。
         self.distribution = self.client.distribute_controller(spec, range_contract)
+        if preload_steps:
+            preloaded_material_budget(self.distribution.p1.layout, fixed_point.modulus, preload_steps)
         self.scale_ledger = self.distribution.p1.layout.scale_ledger
         self.range_verification = self.client.range_verification
         self.modulus_verification = self.client.truncation.modulus_verification
@@ -415,6 +514,13 @@ class LanContinuousRuntime:
                       LanHelloPayload(config.topology.digest, secrets.token_hex(32),
                                       "lan-continuous-v1"))
         hello = BatchHelloPayload(base_hello) if batch else base_hello
+        if preload_steps:
+            hello = PreloadedHelloPayload(hello, preload_steps, preload_execution)
+        self._preload_steps, self._preload_execution = preload_steps, preload_execution
+        self._preloaded = None
+        self._preload_digest = None
+        self._preload_statistics = {}
+        self.setup_run_id = base_hello.run_id if preload_steps else None
         self._last_result = None
         self._round_started = False
         self._material_pool = None
@@ -460,6 +566,77 @@ class LanContinuousRuntime:
             self.close()
             raise
 
+    def enable_material_preload(self, *, cancelled=None):
+        """同一总启动deadline，双信封先编码后发送；每轮导出立即释放原材料。"""
+        if not self._preload_steps or self._preloaded is not None or self._material_pool is not None or self._step:
+            raise RuntimeError("预送必须在指定窗口的初始准备期执行一次")
+        started = time.perf_counter_ns()
+        deadline = deadline_after(self.config.startup_timeout)
+        batch = self.client.begin_preloaded_resources(self.distribution,
+            run_id=self.setup_run_id, controller_epoch=self.setup.controller_epoch,
+            count=self._preload_steps, stage_mode=self._preload_execution)
+        self._preloaded = batch
+        manifest = batch.manifest
+        self._preload_digest = manifest.sha256()
+        budget = preloaded_material_budget(manifest.layout, manifest.modulus,
+                                          self._preload_steps, manifest.block_steps)
+        encoded_bytes = 0
+
+        def check():
+            if time.monotonic() >= deadline or (cancelled is not None and cancelled()):
+                raise RuntimeError("预送启动超时或已取消")
+
+        def exchange(operation, payloads, receipts, *, step=None, limit=64 * 1024):
+            nonlocal encoded_bytes
+            check()
+            prepared = _prepare_requests(payloads, operation, self.session_id, None, step,
+                                         self._sequences, limit)
+            for sock, (request, encoded) in zip(self._sockets, prepared, strict=True):
+                localhost_transport.send_frame(sock, encoded, deadline=deadline, limit=limit)
+                encoded_bytes += len(encoded) + 4
+            got = tuple(_receive_reply(sock, request, deadline=deadline, expected_payload=receipt,
+                                       limit=64 * 1024)
+                        for sock, (request, _), receipt in zip(self._sockets, prepared, receipts, strict=True))
+            self.client.record_preloaded_receipts(self.distribution, batch, got)
+            self._sequences = [v + 1 for v in self._sequences]
+
+        def receipts(phase, first=None, count=None):
+            return tuple(PreloadReceipt(party, self._preload_digest, phase,
+                first // manifest.block_steps if first is not None else None, first,
+                self._preload_steps if count is None else count) for party in (0, 1))
+
+        try:
+            init = PreloadedInitPayload(manifest, self._preload_digest)
+            exchange("preload_init", (init, init), receipts("init"))
+            width = budget["residue_bytes"]
+            for first in range(0, self._preload_steps, manifest.block_steps):
+                buffers = (bytearray(), bytearray())
+                count = min(manifest.block_steps, self._preload_steps - first)
+                for step in range(first, first + count):
+                    check()
+                    exported = self.client.export_preloaded_step(self.distribution, batch, step=step)
+                    for buffer, values in zip(buffers, (exported.p1_values, exported.p2_values), strict=True):
+                        for value in values:
+                            buffer.extend(value.to_bytes(width, "big"))
+                    del exported
+                expected = receipts("block", first, count)
+                payloads = tuple(PreloadedBlock(receipt, bytes(buffer))
+                                 for receipt, buffer in zip(expected, buffers, strict=True))
+                del buffers
+                exchange("preload_block", payloads, expected, step=first, limit=256 * 1024)
+                del payloads
+            ready = PreloadedReadyPayload(self._preload_digest, self._preload_steps)
+            exchange("preload_seal", (ready, ready), receipts("seal"))
+            self._preload_statistics = {"material_mode": "control-preloaded-v1",
+                "preload_steps": self._preload_steps, "preload_execution": self._preload_execution,
+                "startup_duration_ns": time.perf_counter_ns() - started,
+                "startup_client_sent_bytes": encoded_bytes, "raw_bytes_per_party": budget["cache_bytes"],
+                "budget": budget, "capacity": self._preload_steps, "producer_present": False}
+        except Exception:
+            self._failed = True
+            self.close()
+            raise
+
     @property
     def resource_counts(self) -> dict[str, int]:
         return {"products_consumed": self._products,
@@ -492,7 +669,12 @@ class LanContinuousRuntime:
             started = time.perf_counter_ns()
             check_deadline(deadline_ns, "MATERIAL_BIND")
             value = normalize_step_input(v, self.spec.input_dimension)
-            if self._material_pool is None:
+            if self._preload_steps:
+                if self._preloaded is None:
+                    raise RuntimeError("显式预送窗口尚未安装")
+                current = self.client.bind_preloaded_input(self.distribution, self._preloaded,
+                                                          value, step=self._step)
+            elif self._material_pool is None:
                 current = self.client.prepare_online(self.distribution, value, step=self._step)
             else:
                 prepared = self._material_pool.take(self._step)
@@ -500,8 +682,8 @@ class LanContinuousRuntime:
                                                         step=self._step)
             self._last_phase_ns["material_bind"] = time.perf_counter_ns() - started
             check_deadline(deadline_ns, "MATERIAL_BIND")
-            plan = current.p1_resources.plan
-            if current.p2_resources.plan != plan:
+            plan = current.plan if self._preload_steps else current.p1_resources.plan
+            if not self._preload_steps and current.p2_resources.plan != plan:
                 raise ValueError("两方在线资源计划不一致。")
             self._last_plan = plan
             if deadline is None:
@@ -509,26 +691,39 @@ class LanContinuousRuntime:
                 deadline = deadline_after(self.config.step_timeout)
             online_started = time.perf_counter_ns()
             endpoints: list[_ClientPartyEndpoint] = []
-            materials = tuple(PartyOnlineMaterial.from_round(PartyOnlineRound(
-                current.p1_input if party == 0 else current.p2_input,
-                current.p1_resources if party == 0 else current.p2_resources,
-            )) for party in (0, 1))
-            prepared_requests = _prepare_online_requests(
-                materials, self.session_id, plan.round_id, self._step, self._sequences,
-            )
+            fused = self._preload_steps and self._preload_execution == "fused"
+            if self._preload_steps:
+                digest = public_step_plan_sha256(plan)
+                materials = tuple(PreloadedInputPayload(self._preload_digest, inp,
+                    self._step, digest) for inp in (current.p1_input, current.p2_input))
+                prepared_requests = _prepare_requests(materials,
+                    "activate_stage" if fused else "activate", self.session_id,
+                    plan.round_id, self._step, self._sequences, _FRAME_LIMIT)
+            else:
+                materials = tuple(PartyOnlineMaterial.from_round(PartyOnlineRound(
+                    current.p1_input if party == 0 else current.p2_input,
+                    current.p1_resources if party == 0 else current.p2_resources,
+                )) for party in (0, 1))
+                prepared_requests = _prepare_online_requests(
+                    materials, self.session_id, plan.round_id, self._step, self._sequences,
+                )
             check_deadline(deadline_ns, "ENCODING")
             pending = []
             for party, sock in enumerate(self._sockets):
-                self._round_started = True
                 request, encoded = prepared_requests[party]
-                localhost_transport.send_frame(sock, encoded, deadline=deadline, limit=_FRAME_LIMIT)
-                pending.append(request)
+                if not fused:
+                    self._round_started = True
+                    localhost_transport.send_frame(sock, encoded, deadline=deadline, limit=_FRAME_LIMIT)
+                    pending.append(request)
                 endpoints.append(_ClientPartyEndpoint(
-                    sock, party, plan, self._sequences[party] + 1, _FRAME_LIMIT,
+                    sock, party, plan, self._sequences[party] + (0 if fused else 1), _FRAME_LIMIT,
                     self.config.step_timeout, deadline,
+                    activation=(request, encoded) if fused else None,
+                    on_send=lambda: setattr(self, "_round_started", True),
                 ))
-            for sock, request in zip(self._sockets, pending, strict=True):
-                _receive_reply(sock, request, deadline=deadline)
+            if not fused:
+                for sock, request in zip(self._sockets, pending, strict=True):
+                    _receive_reply(sock, request, deadline=deadline)
             self._last_phase_ns["online_distribution"] = time.perf_counter_ns() - online_started
             check_deadline(deadline_ns, "ONLINE_DISTRIBUTION")
             stamps = {"start": time.perf_counter_ns()}
@@ -544,6 +739,9 @@ class LanContinuousRuntime:
                 self.client, endpoints[0], endpoints[1], plan, batch=self._batch,
                 on_phase=record_phase,
             )
+            if self._preload_steps:
+                self.client.retire_preloaded_round(current, success=True)
+                current = None
             for name, begin in (("stage", "start"), ("reconstruct", "stage"),
                                 ("commit", "reconstruct")):
                 if name in stamps and begin in stamps:
@@ -573,7 +771,9 @@ class LanContinuousRuntime:
                     self._last_phase_ns[f"p{party + 1}_commit"] = endpoint.commit_duration_ns
             if current is not None:
                 identity = (current.session_id, current.round_id, current.step)
-                if identity in self.client._issued_rounds:
+                if self._preload_steps:
+                    self.client.retire_preloaded_round(current, success=False)
+                elif identity in self.client._issued_rounds:
                     self.client.abort_round(current)
             if prepared is not None:
                 self._material_pool.owner.discard(prepared)
@@ -628,6 +828,8 @@ class LanContinuousRuntime:
         for sock in self._sockets:
             sock.close()
         self._sockets.clear()
+        if self._preloaded is not None:
+            self.client.discard_preloaded_resources(self.distribution, self._preloaded)
         if self._material_pool is not None:
             pool, self._material_pool = self._material_pool, None
             self._material_statistics = pool.snapshot()
@@ -723,9 +925,15 @@ class LanSegmentedRuntime:
                  security_parameter: int, modulus_evidence: PrimeModulusEvidence | None,
                  *, control: RunControl, segment_capacity: int | None = None,
                  full_run_id: str | None = None,
-                 previous_epoch_session: str | None = None) -> None:
+                 previous_epoch_session: str | None = None,
+                 preload_steps: int = 0, preload_execution: str = "fused") -> None:
         self._v2 = spec.state_dimension != 0
         self._full_v3 = full_run_id is not None
+        if (type(preload_steps) is not int or not 0 <= preload_steps <= 1000
+                or preload_execution not in {"staged", "fused"}
+                or (preload_steps and (not self._v2 or self._full_v3))):
+            raise ValueError("预送仅用于动态v2有限窗口")
+        self.preload_steps, self.preload_execution = preload_steps, preload_execution
         if self._full_v3 and (
             not self._v2 or not previous_epoch_session or not full_run_id
         ):
@@ -775,6 +983,7 @@ class LanSegmentedRuntime:
             self.security_parameter, self.evidence, _segment_hello=self.hello,
             _segment_capacity=self.segment_capacity if self._v2 else None,
             _controller_epoch=self.controller_epoch,
+            preload_steps=self.preload_steps, preload_execution=self.preload_execution,
         )
         self.connection_seconds = time.monotonic() - started
         self.phase = "RUNNING"
@@ -817,13 +1026,19 @@ class LanSegmentedRuntime:
 
     def enable_material_preparation(self, *, slots: int = 16) -> None:
         """只在动态初始准备期填充库存；计时开始后禁止重新填充初始池。"""
-        if not self._v2 or self.confirmed_step_count or self.phase != "RUNNING":
+        if (self.preload_steps or not self._v2 or self.confirmed_step_count
+                or self.phase != "RUNNING"):
             raise RuntimeError("材料池仅用于动态 session 的初始准备。")
         segment = self._segment
         if segment is None or segment._material_pool is not None:
             raise RuntimeError("材料池不存在或已经安装。")
         segment._material_pool = _OnlineResourcePool(segment.client, segment.distribution,
                                                    start=segment._step, slots=slots)
+
+    def enable_material_preload(self, *, cancelled=None):
+        if self.phase != "RUNNING" or self.confirmed_step_count or self._segment is None:
+            raise RuntimeError("预送只可在初始准备期安装")
+        self._segment.enable_material_preload(cancelled=cancelled)
 
     @property
     def cycle_phase_ns(self):
@@ -835,8 +1050,17 @@ class LanSegmentedRuntime:
         """当前 session 的有界库存与生产成本，也保留停止时的末次摘要。"""
         if self._segment is None:
             return {}
+        if self.preload_steps:
+            return {"capacity": self.preload_steps,
+                    "level": max(0, self.preload_steps - self._segment._step)}
         pool = self._segment._material_pool
         return pool.snapshot() if pool is not None else getattr(self._segment, "_material_statistics", {})
+
+    @property
+    def material_summary(self):
+        if self.preload_steps and self._segment is not None:
+            return {**self._segment._preload_statistics, **self.cycle_queue_levels}
+        return self.cycle_queue_levels
 
     def step(self, v: Any, *, deadline_ns: int | None = None) -> SegmentedStep | None:
         """轮发起门禁成功后只完成该轮；停止请求不会中断 commit I/O。"""
@@ -1061,6 +1285,8 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
     role = config.role
     party = 0 if role == "P1" else 1
     client_socket = peer_socket = peer_port = None
+    preload_store = None
+    endpoint = None
     try:
         startup_deadline = deadline_after(config.startup_timeout)
         _LAN_LOG.info("%s 已启动，正在等待 Client（最多 %.0f 秒）。", role,
@@ -1073,10 +1299,12 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
             config,
             startup_deadline,
         )
-        batch = isinstance(wire_hello, BatchHelloPayload)
+        preload_hello = wire_hello if isinstance(wire_hello, PreloadedHelloPayload) else None
+        inner_hello = preload_hello.base if preload_hello is not None else wire_hello
+        batch = isinstance(inner_hello, BatchHelloPayload)
         if batch != expected_batch:
             raise ValueError("LAN Client 与 Party 批量能力不一致；旧协议须双方显式诊断启用")
-        hello = wire_hello.base if batch else wire_hello
+        hello = inner_hello.base if batch else inner_hello
         if isinstance(hello, LanSegmentedHelloPayload):
             if isinstance(tail, _ScalarRunTail):
                 if (
@@ -1204,6 +1432,33 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
         )
         _party_reply(client_socket, offline_request, None, config.startup_timeout)
         sequence = 4
+        if preload_hello is not None:
+            request = receive_envelope(client_socket, deadline=startup_deadline, limit=64 * 1024)
+            _check_request(request, role, sequence, "preload_init", session)
+            if not isinstance(request.payload, PreloadedInitPayload):
+                raise TypeError("预送清单类型错误")
+            preload_store = _PreloadMaterialStore(request.payload.manifest,
+                party=party, session=session, layout=material.layout, modulus=fixed.modulus,
+                run_id=hello.run_id, epoch=setup.controller_epoch,
+                count=preload_hello.count, stage_mode=preload_hello.stage_mode)
+            _party_reply(client_socket, request, preload_store.receipt("init"),
+                         config.startup_timeout, deadline=startup_deadline)
+            sequence += 1
+            while preload_store.loaded < preload_hello.count:
+                request = receive_envelope(client_socket, deadline=startup_deadline, limit=256 * 1024)
+                _check_request(request, role, sequence, "preload_block", session)
+                receipt = preload_store.load(request.payload)
+                if request.step != receipt.first_step:
+                    raise ValueError("预送块信封步数错误")
+                _party_reply(client_socket, request, receipt, config.startup_timeout,
+                             deadline=startup_deadline)
+                sequence += 1
+            request = receive_envelope(client_socket, deadline=startup_deadline, limit=64 * 1024)
+            _check_request(request, role, sequence, "preload_seal", session)
+            receipt = preload_store.seal(request.payload)
+            _party_reply(client_socket, request, receipt, config.startup_timeout,
+                         deadline=startup_deadline)
+            sequence += 1
         peer_port = LocalhostProtocol3PeerPort(
             peer_socket, role, _FRAME_LIMIT, config.step_timeout, batch_enabled=batch
         )
@@ -1278,15 +1533,22 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                 summary = {"status": "closed", "role": role, "pid": os.getpid(),
                            "steps_committed": receipt.cumulative_committed_count,
                            "final_receipt": asdict(receipt), "transport": config.transport}
+                if preload_store is not None:
+                    summary["material_summary"] = {"material_mode": "control-preloaded-v1",
+                        "budget": preload_store.budget, "claimed": preload_store.next_slot,
+                        "committed": preload_store.committed, "exported_count": preload_store.loaded}
                 return summary, tail
-            _check_request(online_request, role, sequence, "online", session)
+            fused = preload_hello is not None and preload_hello.stage_mode == "fused"
+            operation = "activate_stage" if fused else "activate" if preload_store is not None else "online"
+            _check_request(online_request, role, sequence, operation, session)
             expected_step = global_committed if v2 else committed
             if committed >= steps:
                 raise ValueError("当前有限段已耗尽，必须先确认段结束。")
             if (online_request.step != expected_step or online_request.round_id is None
                     or online_request.resource_id is not None):
                 raise ValueError("LAN online step 必须连续递增。")
-            online_material = online_request.payload
+            online_material = (preload_store.claim(online_request.payload)
+                               if preload_store is not None else online_request.payload)
             if not isinstance(online_material, PartyOnlineMaterial):
                 raise TypeError("在线单方材料类型错误。")
             online = recovery.restore(online_material)
@@ -1312,7 +1574,13 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                                    and isinstance(tail, _ScalarRunTail) else None),
                 )
             direct = DirectProtocol3PartyEndpoint(endpoint, peer_port)
-            _party_reply(client_socket, online_request, None, config.step_timeout,
+            activation_result = None
+            if fused:
+                receipt = stage_protocol3_batch(endpoint, peer_port)
+                if not isinstance(receipt, Protocol3StageReceipt) or len(staged) != 1:
+                    raise ValueError("融合暂存回执与输出份额不完整")
+                activation_result = PartyStageResult(receipt, staged[0])
+            _party_reply(client_socket, online_request, activation_result, config.step_timeout,
                          deadline=step_deadline)
             sequence += 1
             while True:
@@ -1326,6 +1594,8 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                     raise ValueError("endpoint command 与当前 round 不匹配。")
                 try:
                     command = command_request.payload.operation
+                    if fused and command != "commit":
+                        raise ValueError("融合激活后只允许原双提交命令")
                     if batch and command == "stage_batch":
                         result = stage_protocol3_batch(endpoint, peer_port)
                     elif (batch and command != "commit") or (not batch and command == "stage_batch"):
@@ -1343,6 +1613,8 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                     raise
                 sequence += 1
                 if command == "commit":
+                    if preload_store is not None:
+                        preload_store.commit(endpoint.plan)
                     committed += 1
                     if v2:
                         global_committed += 1
@@ -1367,6 +1639,10 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
             })
         return summary, None
     finally:
+        if preload_store is not None:
+            preload_store.close()
+            if endpoint is not None:
+                endpoint.abort()
         if client_socket is not None:
             client_socket.close()
         if peer_port is not None:
@@ -1380,7 +1656,7 @@ def _hello(
     sender: Role,
     recipient: Role,
     session: str,
-    hello: LanHelloPayload | LanSegmentedHelloPayload | BatchHelloPayload,
+    hello: LanHelloPayload | LanSegmentedHelloPayload | BatchHelloPayload | PreloadedHelloPayload,
     timeout: float,
 ) -> None:
     envelope = WireEnvelope(
@@ -1426,11 +1702,13 @@ def _accept_hello(
     config: LanConfig,
     deadline: float,
     *,
-    expected: tuple[str, LanHelloPayload | LanSegmentedHelloPayload | BatchHelloPayload]
+    expected: tuple[str, LanHelloPayload | LanSegmentedHelloPayload | BatchHelloPayload | PreloadedHelloPayload]
     | None = None,
 ) -> tuple[str, LanHelloPayload | LanSegmentedHelloPayload | BatchHelloPayload]:
     request = receive_envelope(sock, deadline=deadline, limit=_FRAME_LIMIT)
     payload = request.payload
+    base = payload.base if isinstance(payload, PreloadedHelloPayload) else payload
+    base = base.base if isinstance(base, BatchHelloPayload) else base
     if (
         request.kind != "hello"
         or request.sender != sender
@@ -1442,9 +1720,8 @@ def _accept_hello(
         or request.step is not None
         or request.resource_id is not None
         or not isinstance(payload, (LanHelloPayload, LanSegmentedHelloPayload,
-                                    BatchHelloPayload))
-        or (payload.base.profile_sha256 if isinstance(payload, BatchHelloPayload)
-            else payload.profile_sha256) != config.topology.digest
+                                    BatchHelloPayload, PreloadedHelloPayload))
+        or base.profile_sha256 != config.topology.digest
         or (expected is not None and (request.session_id, payload) != expected)
     ):
         raise ValueError("LAN hello 的身份、模式、拓扑或 session 不匹配。")
@@ -1471,14 +1748,19 @@ def _accept_hello(
 
 def _prepare_online_requests(materials, session, round_id, step, sequences):
     """本轮两方完整信封各编码一次、均通过长度检查后才允许首次发送。"""
+    return _prepare_requests(materials, "online", session, round_id, step, sequences, _FRAME_LIMIT)
+
+
+def _prepare_requests(materials, operation, session, round_id, step, sequences, limit):
+    """共享完整信封预检；两方编码均成功之后调用者才可开始发送。"""
     prepared = []
     for party, material in enumerate(materials):
         request = WireEnvelope(
             SCHEMA_VERSION, "request", "Client", "P1" if party == 0 else "P2",
-            sequences[party], "online", session, round_id, step, None, material,
+            sequences[party], operation, session, round_id, step, None, material,
         )
         encoded = localhost_transport.encode_envelope(request)
-        localhost_transport._validate_frame_payload(encoded, _FRAME_LIMIT)
+        localhost_transport._validate_frame_payload(encoded, limit)
         prepared.append((request, encoded))
     return prepared
 
@@ -1520,9 +1802,9 @@ def _request(
 
 
 def _receive_reply(sock: socket.socket, request: WireEnvelope, *, deadline: float,
-                   expected_payload: object = None) -> object:
+                   expected_payload: object = None, limit: int = _FRAME_LIMIT) -> object:
     """单 socket 只有一个读者；两方独立请求先发送，回执仍逐一完整校验。"""
-    response = receive_envelope(sock, deadline=deadline, limit=_FRAME_LIMIT)
+    response = receive_envelope(sock, deadline=deadline, limit=limit)
     _validate_party_reply(response, request)
     if response.payload != expected_payload:
         raise ValueError("LAN 准备或关闭回执不得携带私有 payload。")

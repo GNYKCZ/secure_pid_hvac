@@ -37,6 +37,7 @@ def _source_fingerprints():
         "src/secure_control/execution/localhost_transport.py",
         "src/secure_control/execution/localhost_codec.py",
         "src/secure_control/execution/_localhost_workers.py",
+        "src/secure_control/execution/_localhost_peer.py",
         "src/secure_control/execution/lan_transport.py",
         "src/secure_control/experiments/communication_benchmark.py",
         "src/secure_control/experiments/lan_runner.py",
@@ -212,7 +213,7 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
                                    "activity_ms": {k: activity[k] - v for k, v in previous.items()},
                                    "sent": {k: {field: v[field] - previous_counts.get(k, {}).get(field, 0)
                                                 for field in v} for k, v in counts.items()}})
-            if request.operation == "offline" or (request.operation == "endpoint"
+            if request.operation in {"offline", "preload_seal"} or (request.operation == "endpoint"
                     and getattr(request.payload, "operation", None) == "commit"):
                 previous = dict(activity)
                 previous_counts = {k: dict(v) for k, v in counts.items()}
@@ -240,11 +241,12 @@ def _party_job(
     try:
         result = run_party_single_step(config, batch=batch)
         queue.put({"role": config.role, "status": result.get("status", "closed"),
-                   "directions": counts, "activity_ms": activity, "steps": role_steps})
+                   "directions": counts, "activity_ms": activity, "steps": role_steps,
+                   "memory": _process_memory(), "material_summary": result.get("material_summary")})
     except Exception as error:  # noqa: BLE001 - 基准仅导出公开错误类别
         queue.put({"role": config.role, "status": "failed",
                    "error_type": type(error).__name__, "directions": counts,
-                   "activity_ms": activity, "steps": role_steps})
+                   "activity_ms": activity, "steps": role_steps, "memory": _process_memory()})
     finally:
         restore()
 
@@ -297,6 +299,7 @@ def _observe_dynamic(marks):
 
     prepare, complete = Client.prepare_online, lan_runtime._complete_client_round
     bind = Client.bind_online_input
+    preload_bind = Client.bind_preloaded_input
     commit = _ClientPartyEndpoint.commit
 
     def measured_prepare(self, *args, **kwargs):
@@ -340,8 +343,17 @@ def _observe_dynamic(marks):
         finally:
             marks[f"p{self.party + 1}_commit_ms"] = (time.perf_counter_ns() - started) / 1e6
 
+    def measured_preload_bind(self, *args, **kwargs):
+        started = time.perf_counter_ns()
+        try:
+            return preload_bind(self, *args, **kwargs)
+        finally:
+            marks["material_bind_ms"] = (time.perf_counter_ns() - started) / 1e6
+            marks["prepare_end_ns"] = time.perf_counter_ns()
+
     with (patch.object(Client, "prepare_online", measured_prepare),
           patch.object(Client, "bind_online_input", measured_bind),
+          patch.object(Client, "bind_preloaded_input", measured_preload_bind),
           patch.object(lan_runtime, "_complete_client_round", measured_complete),
           patch.object(_ClientPartyEndpoint, "commit", measured_commit)):
         yield
@@ -349,7 +361,8 @@ def _observe_dynamic(marks):
 
 def run_continuous_observation(*, steps: int, delay_ms: float,
                                segment_steps: int, optimized=False, material_slots=16,
-                               role_config: Path | None = None) -> dict[str, object]:
+                               role_config: Path | None = None, preload_steps=0,
+                               preload_execution="fused") -> dict[str, object]:
     """实际持续动态循环及原同步 writer；退出后报告观察，不发布图或更改调度。"""
     from secure_control.execution.lan_runtime import RunControl
     from secure_control.scenarios.cart_pole.interactive import InteractiveSession
@@ -363,6 +376,10 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
         raise ValueError(f"观察步数必须在2..{maximum}，首步不剔除。")
     if material_slots not in (0, 4, 16) or isinstance(material_slots, bool):
         raise ValueError("资格观察材料库存只可显式选择 0/4/16。")
+    if (type(preload_steps) is not int or not 0 <= preload_steps <= 1000
+            or preload_execution not in {"staged", "fused"}
+            or (preload_steps and (not optimized or steps > preload_steps or material_slots != 16))):
+        raise ValueError("预送cycle观察必须在有限库存内，且与显式非默认材料池互斥")
     if type(segment_steps) is not int or not 1 <= segment_steps <= 1000:
         raise ValueError("段容量必须在1..1000")
     if not isinstance(delay_ms, (int, float)) or not 0 <= delay_ms <= 3:
@@ -473,6 +490,7 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                     on_step=durable_step, on_segment=sink.record,
                     on_start=sink.begin, phase=phase, realtime=optimized,
                     material_slots=material_slots,
+                    preload_steps=preload_steps, preload_execution=preload_execution,
                     on_cycle=observed_cycle if optimized else None,
                     cycle_snapshot=writer.snapshot if writer else None,
                     before_sample=writer.check if writer else None,
@@ -549,7 +567,8 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                             "input_dimension": prepared.spec.input_dimension,
                             "output_dimension": prepared.spec.output_dimension},
         "segment_capacity": segment_steps, "requested_steps": steps,
-        "material_slots": material_slots if optimized else 0,
+        "material_slots": material_slots if optimized and not preload_steps else 0,
+        "preload_steps": preload_steps, "preload_execution": preload_execution if preload_steps else None,
         "status": result["status"], "failed_phase": result.get("failure_phase"),
         "failure_category": result.get("category"),
         "successful_steps": sum(row["status"] == "confirmed" for row in records),
@@ -583,6 +602,10 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                                and all(row["status"] == "confirmed" and row["cycle_completed_ns"] is not None
                                        and row["cycle_completed_ns"] < row["deadline_ns"]
                                        for row in cycles)),
+        "stage_pass": (optimized and result["status"] == "stopped" and len(cycles) == steps
+                       and result.get("cycle_summary", {}).get("misses") == 0
+                       and all(row["status"] == "confirmed" and row["cycle_completed_ns"] is not None
+                               and row["cycle_completed_ns"] < row["deadline_ns"] for row in cycles)),
         "limits": ("actual sustained simulation runner; observation overhead included and guarded; "
                    "local frame delay is not Wi-Fi or real hardware evidence; no plots published; "
                    "spool I/O excludes timing sidecar and stop-time replay/plots; "

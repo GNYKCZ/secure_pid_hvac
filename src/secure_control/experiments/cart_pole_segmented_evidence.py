@@ -1870,7 +1870,8 @@ class _BatchWriter:
 
 def run_cart_pole_segmented(config, *, control: RunControl, session: InteractiveSession,
                            segment_steps=400, prepared: PreparedSegmentedExperiment | None = None,
-                           on_step=None, phase=None, realtime=None) -> dict:
+                           on_step=None, phase=None, realtime=None,
+                           preload_steps=0, preload_execution="fused") -> dict:
     """Client 专用发布协调；安全循环只有一份，后端失败不会进入成功出版。"""
     if not isinstance(control, RunControl) or not isinstance(session, InteractiveSession):
         raise TypeError("持续发布需要原 RunControl/InteractiveSession。")
@@ -1896,7 +1897,9 @@ def run_cart_pole_segmented(config, *, control: RunControl, session: Interactive
                                           on_start=sink.begin, phase=phase, realtime=realtime,
                                           on_cycle=writer.record_cycle if writer else None,
                                           cycle_snapshot=writer.snapshot if writer else None,
-                                          before_sample=writer.check if writer else None)
+                                          before_sample=writer.check if writer else None,
+                                          preload_steps=preload_steps,
+                                          preload_execution=preload_execution)
         if writer is not None:
             try:
                 writer.finish()
