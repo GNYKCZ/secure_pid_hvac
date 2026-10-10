@@ -6,6 +6,7 @@ import os
 import random
 import socket
 from collections.abc import Callable
+from time import perf_counter_ns
 from typing import Literal
 
 import numpy as np
@@ -128,7 +129,11 @@ class _ClientPartyEndpoint:
         return result.receipt
 
     def commit(self) -> None:
-        self._command("commit")
+        started = perf_counter_ns()
+        try:
+            self._command("commit")
+        finally:
+            self.commit_duration_ns = perf_counter_ns() - started
 
     def start_stage_batch(self) -> None:
         if self._pending_batch is not None:

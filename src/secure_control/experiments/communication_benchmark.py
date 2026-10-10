@@ -21,7 +21,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from secure_control.execution.lan_config import LanConfig, LanEndpoint, LanTopology
+from secure_control.execution.lan_config import LanConfig, LanEndpoint, LanTopology, load_lan_config
 from secure_control.execution.lan_runtime import LanContinuousRuntime, run_party_single_step
 from secure_control.execution.lan_scalar_runtime import LanScalarRuntime
 
@@ -32,13 +32,43 @@ def _source_fingerprints():
     """区分同一 HEAD 上的观察补丁和优化补丁；只保存内容摘要。"""
     paths = (
         "src/secure_control/protocol/coordinator.py",
+        "src/secure_control/protocol/roles.py", "src/secure_control/protocol/messages.py",
         "src/secure_control/execution/lan_runtime.py",
         "src/secure_control/execution/_localhost_workers.py",
         "src/secure_control/execution/lan_transport.py",
         "src/secure_control/experiments/communication_benchmark.py",
+        "src/secure_control/experiments/lan_runner.py",
+        "src/secure_control/experiments/cart_pole_segmented_evidence.py",
+        "src/secure_control/execution/cycle_timing.py",
         "configs/cart_pole_observer_lan.example.yaml", "configs/cart_pole_observer.yaml",
     )
     return {name: sha256((_ROOT / name).read_bytes()).hexdigest() for name in paths}
+
+
+def _process_memory():
+    """读取本进程 OS 峰值 RSS/working set；不把 canonical 编码预算当成 RSS。"""
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        class Counters(ctypes.Structure):
+            _fields_ = [("cb", wintypes.DWORD), ("faults", wintypes.DWORD),
+                        *((name, ctypes.c_size_t) for name in (
+                            "peak", "current", "peak_paged", "paged", "peak_nonpaged",
+                            "nonpaged", "pagefile", "peak_pagefile"))]
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        api = ctypes.WinDLL("psapi", use_last_error=True)
+        kernel.GetCurrentProcess.restype = wintypes.HANDLE
+        api.GetProcessMemoryInfo.argtypes = (wintypes.HANDLE, ctypes.POINTER(Counters), wintypes.DWORD)
+        value = Counters()
+        value.cb = ctypes.sizeof(value)
+        if not api.GetProcessMemoryInfo(kernel.GetCurrentProcess(), ctypes.byref(value), value.cb):
+            return {"peak_rss_bytes": None, "scope": "unavailable"}
+        return {"peak_rss_bytes": value.peak, "current_rss_bytes": value.current,
+                "scope": "Client OS working set, includes libraries and observation arrays"}
+    import resource
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return {"peak_rss_bytes": peak if sys.platform == "darwin" else peak * 1024,
+            "scope": "Client OS peak RSS, includes libraries and observation arrays"}
 
 
 def _ports() -> tuple[int, int, int]:
@@ -261,6 +291,7 @@ def _observe_dynamic(marks):
     from secure_control.protocol import Client
 
     prepare, complete = Client.prepare_online, lan_runtime._complete_client_round
+    bind = Client.bind_online_input
     commit = _ClientPartyEndpoint.commit
 
     def measured_prepare(self, *args, **kwargs):
@@ -275,14 +306,27 @@ def _observe_dynamic(marks):
         started = time.perf_counter_ns()
         marks["online_distribution_ms"] = (started - marks["prepare_end_ns"]) / 1e6
         stamps = {"start": started}
+        original_phase = kwargs.pop("on_phase", None)
+        def measured_phase(name):
+            stamps[name] = time.perf_counter_ns()
+            if original_phase is not None:
+                original_phase(name)
         try:
             return complete(client, p1, p2, plan, **kwargs,
-                            on_phase=lambda name: stamps.__setitem__(name, time.perf_counter_ns()))
+                            on_phase=measured_phase)
         finally:
             for label, begin, end in (("stage_ms", "start", "stage"),
                                       ("reconstruct_ms", "stage", "reconstruct")):
                 if end in stamps:
                     marks[label] = (stamps[end] - stamps[begin]) / 1e6
+
+    def measured_bind(self, *args, **kwargs):
+        started = time.perf_counter_ns()
+        try:
+            return bind(self, *args, **kwargs)
+        finally:
+            marks["material_bind_ms"] = (time.perf_counter_ns() - started) / 1e6
+            marks["prepare_end_ns"] = time.perf_counter_ns()
 
     def measured_commit(self):
         started = time.perf_counter_ns()
@@ -292,35 +336,45 @@ def _observe_dynamic(marks):
             marks[f"p{self.party + 1}_commit_ms"] = (time.perf_counter_ns() - started) / 1e6
 
     with (patch.object(Client, "prepare_online", measured_prepare),
+          patch.object(Client, "bind_online_input", measured_bind),
           patch.object(lan_runtime, "_complete_client_round", measured_complete),
           patch.object(_ClientPartyEndpoint, "commit", measured_commit)):
         yield
 
 
 def run_continuous_observation(*, steps: int, delay_ms: float,
-                               segment_steps: int) -> dict[str, object]:
+                               segment_steps: int, optimized=False, material_slots=16,
+                               role_config: Path | None = None) -> dict[str, object]:
     """实际持续动态循环及原同步 writer；退出后报告观察，不发布图或更改调度。"""
     from secure_control.execution.lan_runtime import RunControl
     from secure_control.scenarios.cart_pole.interactive import InteractiveSession
 
-    from .cart_pole_segmented_evidence import _Spool
+    from .cart_pole_segmented_evidence import _BatchWriter, _Spool
     from .lan_continuous_profile import load_segmented_experiment
     from .lan_runner import _run_prepared_segmented
 
-    if type(steps) is not int or not 2 <= steps <= 400:
-        raise ValueError("观察步数必须在2..400；不是长时资格测试")
+    maximum = 10000 if optimized else 400
+    if type(steps) is not int or not 2 <= steps <= maximum:
+        raise ValueError(f"观察步数必须在2..{maximum}，首步不剔除。")
+    if material_slots not in (0, 4, 16) or isinstance(material_slots, bool):
+        raise ValueError("资格观察材料库存只可显式选择 0/4/16。")
     if type(segment_steps) is not int or not 1 <= segment_steps <= 1000:
         raise ValueError("段容量必须在1..1000")
     if not isinstance(delay_ms, (int, float)) or not 0 <= delay_ms <= 3:
         raise ValueError("单帧注入等待必须在0..3ms")
     ports = _ports()
-    config = _config("Client", ports)
+    config = _config("Client", ports) if role_config is None else load_lan_config(role_config, "Client")
+    if role_config is not None:
+        ports = tuple(endpoint.port for endpoint in (
+            config.topology.p1_client, config.topology.p2_client, config.topology.p1_peer,
+        ))
     context = mp.get_context("spawn")
     queue = context.Queue()
     parties = [context.Process(target=_party_job, args=(
         _config(role, ports), ports, delay_ms, True, queue,
-    )) for role in ("P1", "P2")]
+    )) for role in ("P1", "P2")] if role_config is None else []
     records, events, outcomes = [], [], []
+    cycles = []
     marks, storage = {}, {"fsync_ms": 0., "fsync_count": 0, "checkpoint_ms": 0.,
                           "source_check_ms": 0.}
     counts, activity, restore = _meter("Client", ports, delay_ms)
@@ -346,7 +400,7 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
 
     def durable_step(record):
         nonlocal attempt
-        transaction.record_step(record)
+        sink.record_step(record)
         now = time.perf_counter_ns()
         records.append({"global_step": record.protocol.global_step,
                         "segment_index": record.protocol.segment_index,
@@ -361,6 +415,16 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
         attempt = None
         if len(records) >= steps:
             control.request_stop()
+
+    def observed_cycle(timing):
+        sent = {k: v["frames"] - before_counts.get(k, {}).get("frames", 0)
+                for k, v in counts.items()}
+        byte_counts = {k: v["application_bytes"] - before_counts.get(k, {}).get("application_bytes", 0)
+                       for k, v in counts.items()}
+        timing = replace(timing, public_frame_counts=sent, public_byte_counts=byte_counts)
+        cycles.append(asdict(timing))
+        if writer is not None:
+            writer.record_cycle(timing)
 
     def measured_fsync(fd):
         start = time.perf_counter_ns()
@@ -392,6 +456,8 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
 
             prepared = replace(prepared, output_root=Path(folder), recheck_sources=measured_sources)
             transaction = _Spool(prepared, config, session, phase)
+            writer = _BatchWriter(transaction) if optimized else None
+            sink = writer if writer is not None else transaction
             initial_assembly_ms = (time.perf_counter_ns() - assembly_start) / 1e6
             for party in parties:
                 party.start()
@@ -399,11 +465,25 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                   patch.object(_Spool, "_checkpoint", measured_checkpoint)):
                 result = _run_prepared_segmented(
                     config, prepared, control=control, session=session,
-                    on_step=durable_step, on_segment=transaction.record,
-                    on_start=transaction.begin, phase=phase,
+                    on_step=durable_step, on_segment=sink.record,
+                    on_start=sink.begin, phase=phase, realtime=optimized,
+                    material_slots=material_slots,
+                    on_cycle=observed_cycle if optimized else None,
+                    cycle_snapshot=writer.snapshot if writer else None,
+                    before_sample=writer.check if writer else None,
                 )
+                active_storage = dict(storage)
+                if writer is not None:
+                    try:
+                        writer.finish()
+                    except OSError:
+                        result = {**result, "status": "failed", "category": "OSError",
+                                  "failure_phase": "WRITER_DRAIN"}
                 if result["status"] != "stopped":
-                    transaction.fail(result)
+                    try:
+                        transaction.fail(result)
+                    except OSError:
+                        result["checkpoint_error"] = "OSError"
             if attempt is not None:
                 records.append({"global_step": len(records), "status": "failed",
                                 "duration_ms": (time.perf_counter_ns() - attempt) / 1e6,
@@ -417,7 +497,7 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
             events.append({"phase": current_phase,
                            "duration_ms": (time.perf_counter_ns() - phase_start) / 1e6,
                            "attempt": None})
-            outcomes = _party_outcomes(queue)
+            outcomes = _party_outcomes(queue) if parties else []
             for party in parties:
                 party.join(timeout=10)
     finally:
@@ -430,34 +510,78 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
     directions = dict(counts)
     for item in outcomes:
         directions.update(item["directions"])
+    cycle_timing = _timing([(row["cycle_completed_ns"] - row["scheduled_start_ns"]) / 1e6
+                            for row in cycles if row["cycle_completed_ns"] is not None])
+    device_timing = _timing([(row["device_completed_ns"] - row["scheduled_start_ns"]) / 1e6
+                             for row in cycles if row["device_completed_ns"] is not None])
     return {
-        "schema": "continuous-observation-v1", "case": "continuous", "mode": "batch",
+        "schema": "cycle-qualification-v1" if optimized else "continuous-observation-v1",
+        "case": "cycle" if optimized else "continuous", "mode": "batch",
         "code_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=_ROOT, text=True).strip(),
         "dirty": bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=_ROOT, text=True)),
         "source_sha256": _source_fingerprints(),
         "environment": {"os": platform.platform(), "python": sys.version.split()[0],
-                        "roles": "three local processes", "transport": config.transport,
+                        "roles": "three local processes" if parties else "Client with externally started roles",
+                        "transport": config.transport,
                         "cpu_count": mp.cpu_count(), "timer": "local perf_counter_ns",
                         "delay_model": "sleep before each application frame send",
                         "one_way_delay_ms": delay_ms},
-        "configuration_reference": "configs/cart_pole_observer_lan.example.yaml",
+        "clock_info": {name: {field: getattr(time.get_clock_info(name), field)
+                              for field in ("implementation", "monotonic", "adjustable", "resolution")}
+                       for name in ("monotonic", "perf_counter")},
+        "configuration_reference": ("configs/cart_pole_observer_lan.example.yaml"
+                                    if role_config is None else "external Client profile"),
+        "configuration_sha256": {name: prepared.effective_config.get(name)
+                                  for name in ("profile_sha256", "plant_source_sha256",
+                                               "observer_source_sha256", "prime_source_sha256")},
+        "input_policy": "fresh device two-measurement local chart at each scheduled attempt",
+        "initial_state": prepared.effective_config["plant_contract"]["initial_state"],
         "numeric_profile": {"fractional_bits": prepared.context.fractional_bits,
+                            "security_parameter": prepared.security_parameter,
+                            "period_s": prepared.scene.period,
                             "modulus_bits": prepared.context.modulus.bit_length(),
                             "state_dimension": prepared.spec.state_dimension,
                             "input_dimension": prepared.spec.input_dimension,
                             "output_dimension": prepared.spec.output_dimension},
         "segment_capacity": segment_steps, "requested_steps": steps,
+        "material_slots": material_slots if optimized else 0,
         "status": result["status"], "failed_phase": result.get("failure_phase"),
+        "failure_category": result.get("category"),
         "successful_steps": sum(row["status"] == "confirmed" for row in records),
         "failed_attempts": sum(row["status"] == "failed" for row in records),
         "steps": records, "events": events, "party_outcomes": outcomes,
+        "cycles": cycles, "cycle_summary": result.get("cycle_summary"),
+        "cycle_timing": cycle_timing, "device_timing": device_timing,
+        "startup_jitter_ms": [(row["actual_sample_start_ns"] - row["scheduled_start_ns"]) / 1e6
+                              if row["actual_sample_start_ns"] is not None else None for row in cycles],
+        "material_summary": result.get("material_summary"),
+        "recording_summary": writer.snapshot() if writer else None,
+        "stop_drain_ns": writer.drain_ns if writer else 0,
+        "spool_io": dict(transaction.disk_metrics),
+        "storage_active": active_storage, "storage_all": storage,
+        "client_memory": _process_memory(),
         "resource_counts": result["resource_counts"], "directions_all_session": directions,
         "timing": _timing([row["duration_ms"] for row in records]),
+        "timing_scope": ("timing: work attempt input through record callback (failure includes cleanup); "
+                         "cycle_timing: completed scheduled-start through maintenance, before timing export; "
+                         "device_timing: scheduled-start through confirmed device receipt; "
+                         "unfinished attempts remain in cycles with null endpoints and miss status; "
+                         "timing export is separately guarded and cycle_summary is authoritative"),
         "all_observation_ms": (time.perf_counter_ns() - started) / 1e6,
         "initial_assembly_ms": initial_assembly_ms,
         "activity_scope": "local arithmetic excludes peer calls; peer_exchange includes I/O, encoding and waits; send/receive/codec overlap; checkpoint includes its fsync",
         "byte_scope": "application payload plus 4-byte header; excludes TCP/TLS overhead",
-        "limits": "actual sustained simulation runner with synchronous journal/checkpoint; initial connection, source checks, segment sealing/begin separately in events; no scheduled sample timestamps, device acknowledgement, TLS/Wi-Fi, GUI render or 20ms qualification; no plots published",
+        "qualification_pass": (optimized and steps == 10000 and result["status"] == "stopped"
+                               and len(cycles) == steps
+                               and result.get("cycle_summary", {}).get("misses") == 0
+                               and all(row["status"] == "confirmed" and row["cycle_completed_ns"] is not None
+                                       and row["cycle_completed_ns"] < row["deadline_ns"]
+                                       for row in cycles)),
+        "limits": ("actual sustained simulation runner; observation overhead included and guarded; "
+                   "local frame delay is not Wi-Fi or real hardware evidence; no plots published; "
+                   "spool I/O excludes timing sidecar and stop-time replay/plots; "
+                   "memory is Client OS peak RSS/working set, not encoded-budget size; "
+                   "baseline continuous mode explicitly has no absolute scheduling"),
     }
 
 
@@ -529,10 +653,13 @@ def run_local_benchmark(
                 marks["prepare_end"] = time.perf_counter_ns()
                 return result
 
-            def measured_complete(client, p1, p2, plan, *, batch):
+            def measured_complete(client, p1, p2, plan, *, batch, on_phase=None):
                 marks["stage_start"] = time.perf_counter_ns()
-                return complete(client, p1, p2, plan, on_phase=lambda name: marks.__setitem__(
-                    name, time.perf_counter_ns()), batch=batch)
+                def measured_phase(name):
+                    marks[name] = time.perf_counter_ns()
+                    if on_phase is not None:
+                        on_phase(name)
+                return complete(client, p1, p2, plan, on_phase=measured_phase, batch=batch)
 
             with (patch.object(Client, "prepare_online", measured_prepare),
                   patch.object(lan_runtime, "_complete_client_round", measured_complete)):

@@ -9,7 +9,8 @@ import sys
 from hashlib import sha256
 from math import pi
 from pathlib import Path
-from types import MappingProxyType
+from threading import Event
+from types import MappingProxyType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -20,7 +21,13 @@ from test_lan_continuous import _plain_deployment
 from test_lan_segmented import _PARTY
 from test_lan_single_step import _finish, deployment
 
+from secure_control.execution.lan_config import load_lan_config
+from secure_control.execution.lan_runtime import SegmentedStep, SegmentRecord
+from secure_control.execution.localhost_codec import decode_wire_value
 from secure_control.experiments import cart_pole_segmented_evidence as evidence
+from secure_control.experiments.lan_continuous_profile import load_segmented_experiment
+from secure_control.experiments.lan_runner import CompletedSegment, ConfirmedStep
+from secure_control.scenarios.cart_pole.interactive import InteractiveSession
 
 _CLIENT = r'''
 import json, sys
@@ -143,7 +150,7 @@ def step(record):
 try:
     result = run_cart_pole_segmented(config, control=control, session=session,
                                      segment_steps=capacity, on_step=step, phase=phase,
-                                     prepared=prepared)
+                                     prepared=prepared, realtime=False)
 except Exception as error:
     import traceback
     result = {'status':'failed', 'category':type(error).__name__, 'traceback':traceback.format_exc()}
@@ -274,6 +281,83 @@ def test_dynamic_v2_publishes_verified_continuous_state(dynamic_published):
         "products_consumed": 210, "truncations_consumed": 28,
     }
     assert len({item["session"] for item in report["boundaries"]}) == 1
+
+
+@pytest.mark.integration
+def test_batch_writer_counts_inflight_and_preserves_checkpoint_on_disk_failure(
+    dynamic_published, tmp_path, monkeypatch,
+):
+    """在真实 v2 记录上冻结 writer，验证两段门禁、可靠批次和写盘失败旧前缀。"""
+    source, _ = dynamic_published
+    paths = _plain_deployment(tmp_path)
+    _observer_profile_for(paths)
+    config = load_lan_config(paths["Client"], "Client")
+    session = InteractiveSession()
+    prepared = load_segmented_experiment(config.experiment_config, 3, session)
+    spool = evidence._Spool(prepared, config, session, lambda _: None)
+    definition = json.loads((source / "config.json").read_bytes())
+    spool.config = definition
+    manifest = json.loads((source / "run.json").read_bytes())
+    setup = decode_wire_value(evidence._bytes(definition["setup"]))
+    entered, release = Event(), Event()
+    original_batch = spool.record_batch
+    calls = [0]
+    original_checkpoint = spool._checkpoint
+
+    def batch(rows, segment):
+        calls[0] += 1
+        if calls[0] == 1:
+            entered.set()
+            assert release.wait(timeout=5)
+        if calls[0] == 2:
+            def failed_checkpoint(*args):
+                raise OSError("injected checkpoint disk failure")
+            monkeypatch.setattr(spool, "_checkpoint", failed_checkpoint)
+        original_batch(rows, segment)
+
+    monkeypatch.setattr(spool, "record_batch", batch)
+    writer = evidence._BatchWriter(spool)
+    writer.begin(SimpleNamespace(run_id=manifest["backend_run_id"],
+                                 controller_epoch=setup.controller_epoch), setup)
+
+    # 只重建公开 immutable 协议身份，秘密材料不进入 writer 测试。
+    def submit(index):
+        data = json.loads((source / "segments" / str(index) / "protocol.json").read_bytes())
+        identities = tuple(SegmentedStep(**{**row, "raw_control": tuple(row["raw_control"]),
+                                            "resource_ids": tuple(row["resource_ids"])})
+                           for row in data["protocol"]["steps"])
+        records = tuple(ConfirmedStep(identity, row["snapshot"])
+                        for identity, row in zip(identities, data["steps"], strict=True))
+        for record in records:
+            writer.record_step(record)
+        public = data["protocol"]
+        protocol = SegmentRecord(
+            public["hello"], public["session_id"], identities, tuple(public["receipts"]),
+            public["setup"], public["connection_seconds"], public["scale_ledger"],
+            public["range_verification"], public["modulus_verification"],
+        )
+        return CompletedSegment(protocol, records)
+
+    try:
+        writer.record(submit(0))
+        assert entered.wait(timeout=5)
+        assert writer.snapshot()["durable_step_count"] == 0
+        writer.record(submit(1))
+        assert writer.snapshot()["writer_sealed_segments"] == 2
+        with pytest.raises(BufferError):
+            writer.record(submit(2))
+        assert writer.snapshot()["writer_encoded_high_water"] <= evidence.SEGMENT_LIMIT
+    finally:
+        release.set()
+        with pytest.raises(OSError):
+            writer.finish()
+    assert not writer._thread.is_alive()
+    assert writer.snapshot()["durable_step_count"] == 3
+    monkeypatch.setattr(spool, "_checkpoint", original_checkpoint)
+    spool.fail({"status": "failed", "category": "OSError", "failure_phase": "WRITER"})
+    prefix = evidence.open_verified_cart_pole_segmented_prefix(spool.stage)
+    assert prefix["confirmed_step_count"] == 3 and prefix["sealed_segment_count"] == 1
+    assert spool.disk_metrics["fsync_count"] == 8  # 两批数据均 fsync，只有首批 checkpoint 发布
 
 
 @pytest.mark.integration

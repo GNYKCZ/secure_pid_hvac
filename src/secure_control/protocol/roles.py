@@ -10,7 +10,9 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from fractions import Fraction
 from numbers import Integral
+from threading import Lock
 from typing import Any
+from weakref import WeakValueDictionary
 
 import numpy as np
 
@@ -49,6 +51,7 @@ from .messages import (
     OnlineRound,
     PartyIndex,
     PartyResources,
+    PreparedOnlineResources,
     ProductResourceShare,
     ResourceMetadata,
     StateTruncationResourceShare,
@@ -232,6 +235,7 @@ class Client:
         # 测试 RNG 每次 online 预处理都分配不同域，避免重新播种导致辅助材料复用。
         self._test_material_epoch = 0
         self._range_verification: ControllerRangeVerification | None = None
+        self._resource_owners: dict[str, _PreparedResourceOwner] = {}
 
     @property
     def range_verification(self) -> ControllerRangeVerification:
@@ -288,6 +292,9 @@ class Client:
         distribution = OfflineDistribution(
             session_id, range_contract, first_message, second_message
         )
+        self._resource_owners[session_id] = _PreparedResourceOwner(
+            distribution, self.multiplier, self.truncation,
+        )
         self._range_verification = verification
         return distribution
 
@@ -313,40 +320,62 @@ class Client:
         )
         self._validate_input_bound(input_payload, distribution.range_contract)
         round_id = self._identifier("round")
-        identity = (distribution.session_id, round_id, step)
-        if identity in self._issued_rounds:
+        if (distribution.session_id, round_id, step) in self._issued_rounds:
             raise ValueError("同一 controller session 内的 round_id 不能复用。")
         material_rng = self._online_material_rng(rng)
         input_shares = self.sharing.share(
             self.fixed_point.to_residue(input_payload), rng=material_rng
         )
-        plan = self._resource_plan(layout, distribution.session_id, round_id, step)
-        first_products: list[ProductResourceShare] = []
-        second_products: list[ProductResourceShare] = []
-        for metadata in plan.product_resources:
-            triple = self.multiplier.create_triple(rng=material_rng)
-            lifecycle = _ResourceLifecycle()
-            first_products.append(ProductResourceShare(0, metadata, triple[0], lifecycle))
-            second_products.append(ProductResourceShare(1, metadata, triple[1], lifecycle))
-        first_truncations: list[StateTruncationResourceShare] = []
-        second_truncations: list[StateTruncationResourceShare] = []
-        for metadata in plan.state_truncation_resources:
-            auxiliary = self.truncation.create_auxiliary(rng=material_rng)
-            lifecycle = _ResourceLifecycle()
-            first_truncations.append(
-                StateTruncationResourceShare(0, metadata, auxiliary[0], lifecycle)
-            )
-            second_truncations.append(
-                StateTruncationResourceShare(1, metadata, auxiliary[1], lifecycle)
-            )
+        prepared = self._material_owner(distribution).create(step, rng=material_rng, round_id=round_id)
+        return self._bind_online_input(distribution, prepared, input_shares, step, layout)
+
+    def _material_owner(self, distribution: OfflineDistribution) -> _PreparedResourceOwner:
+        """控制线程取得受限创建入口；生产者只持此入口，不持 Client 签发表。"""
+        layout = self._distribution_layout(distribution)
+        owner = self._resource_owners.get(distribution.session_id)
+        if (owner is None or owner.layout != layout
+                or owner.contract != distribution.range_contract):
+            raise ValueError("预准备要求当前 Client 的已验证 session/layout/范围契约。")
+        return owner
+
+    def precompute_online_resources(self, distribution: OfflineDistribution, *, step: int,
+                                    rng: random.Random | None = None) -> PreparedOnlineResources:
+        """在测量之前创建本步新资源；不分享未来输入、不签发输出能力。"""
+        return self._material_owner(distribution).create(step, rng=self._online_material_rng(rng))
+
+    def bind_online_input(self, distribution: OfflineDistribution,
+                          prepared: PreparedOnlineResources, v: Any, *, step: int,
+                          rng: random.Random | None = None) -> OnlineRound:
+        """核验本次新测量并一次性领取本机资源，只有控制线程签发输出能力。"""
+        layout = self._distribution_layout(distribution)
+        owner = self._material_owner(distribution)
+        owner.validate(prepared, step)
+        values = self._normalize_input(v, layout)
+        payload = np.asarray(
+            self._fixed_point_at_scale(layout.scale_ledger.input).encode(values), dtype=object,
+        )
+        self._validate_input_bound(payload, distribution.range_contract)
+        shares = self.sharing.share(self.fixed_point.to_residue(payload),
+                                    rng=self._online_material_rng(rng))
+        return self._bind_online_input(distribution, prepared, shares, step, layout)
+
+    def _bind_online_input(self, distribution, prepared, input_shares, step, layout):
+        owner = self._material_owner(distribution)
+        owner.claim(prepared, step)
+        plan = prepared.p1_resources.plan
+        round_id = plan.round_id
+        identity = (distribution.session_id, round_id, step)
+        if identity in self._issued_rounds:
+            owner.discard(prepared)
+            raise ValueError("同一 controller session 内的 round_id 不能复用。")
         online = OnlineRound(
             distribution.session_id,
             round_id,
             step,
             InputShareMessage(0, distribution.session_id, round_id, step, input_shares[0]),
             InputShareMessage(1, distribution.session_id, round_id, step, input_shares[1]),
-            PartyResources(0, plan, tuple(first_products), tuple(first_truncations)),
-            PartyResources(1, plan, tuple(second_products), tuple(second_truncations)),
+            prepared.p1_resources,
+            prepared.p2_resources,
         )
         # 只有整轮 input 与资源全部准备成功后才签发输出 capability。
         self._issued_rounds[identity] = layout
@@ -1083,8 +1112,9 @@ class Client:
         """以三角不等式计算每行 ledger accumulator 的公开绝对上界，不读取 shares。"""
         return _row_bounds_integer(first, first_bounds, second, second_bounds)
 
+    @staticmethod
     def _resource_plan(
-        self, layout: ControllerLayout, session_id: str, round_id: str, step: int
+        layout: ControllerLayout, session_id: str, round_id: str, step: int
     ) -> StepResourcePlan:
         """按 ledger 分配所有乘法 triple，以及零份或逐 state 行一份 Trunc mask。"""
         shapes = {
@@ -1167,6 +1197,82 @@ class Client:
         domain = epoch.to_bytes(16, "big")
         seed = hashlib.sha256(b"secure_control.protocol.online_material.v1" + domain + source_seed)
         return random.Random(int.from_bytes(seed.digest(), "big"))
+
+
+class _PreparedResourceOwner:
+    """本 session 受限材料工厂；不持 Client、测量、秘密 state 或输出签发表。"""
+
+    def __init__(self, distribution, multiplier, truncation):
+        self.layout = distribution.p1.layout
+        self.session_id = distribution.session_id
+        self.contract = distribution.range_contract
+        self.horizon = distribution.range_contract.horizon_steps
+        self.multiplier, self.truncation = multiplier, truncation
+        self._tokens = WeakValueDictionary()
+        self._lock = Lock()
+
+    def create(self, step: int, *, rng=None, round_id=None) -> PreparedOnlineResources:
+        """复用 canonical 原语生成全新 owner/lifecycle；仅创建入口可登记能力。"""
+        step = _require_step(step)
+        horizon = self.horizon
+        if horizon is not None and step >= horizon:
+            raise ValueError("step 超出已证明的 finite horizon。")
+        plan = Client._resource_plan(self.layout, self.session_id,
+                                    f"round-{secrets.token_hex(16)}" if round_id is None else round_id, step)
+        products = ([], [])
+        truncations = ([], [])
+        for metadata in plan.product_resources:
+            pair = self.multiplier.create_triple(rng=rng)
+            lifecycle = _ResourceLifecycle()
+            for party in (0, 1):
+                products[party].append(ProductResourceShare(party, metadata, pair[party], lifecycle))
+        for metadata in plan.state_truncation_resources:
+            pair = self.truncation.create_auxiliary(rng=rng)
+            lifecycle = _ResourceLifecycle()
+            for party in (0, 1):
+                truncations[party].append(
+                    StateTruncationResourceShare(party, metadata, pair[party], lifecycle),
+                )
+        token = object()
+        prepared = PreparedOnlineResources(
+            *(PartyResources(party, plan, tuple(products[party]), tuple(truncations[party]))
+              for party in (0, 1)), self, token,
+        )
+        with self._lock:
+            self._tokens[token] = prepared
+        return prepared
+
+    def _validate(self, prepared, step):
+        if (not isinstance(prepared, PreparedOnlineResources)
+                or prepared._owner is not self
+                or self._tokens.get(prepared._token) is not prepared
+                or prepared.p1_resources.plan.step != _require_step(step)):
+            raise ValueError("资源不是本 Client/session/step 的尚未领取原始能力。")
+
+    def validate(self, prepared, step):
+        """先验证身份；复制、错步、跨 Client 和已领取能力均不得分享输入。"""
+        with self._lock:
+            self._validate(prepared, step)
+
+    def claim(self, prepared, step):
+        """原子领取一次，未绑定能力不会使 Client 接受输出。"""
+        with self._lock:
+            self._validate(prepared, step)
+            del self._tokens[prepared._token]
+
+    def discard(self, prepared):
+        """停止或准备失败永久废弃资源；不把尚未使用材料移交新会话。"""
+        if not isinstance(prepared, PreparedOnlineResources) or prepared._owner is not self:
+            raise ValueError("不能废弃其他 owner 的能力。")
+        with self._lock:
+            self._tokens.pop(prepared._token, None)
+        for resources in (prepared.p1_resources, prepared.p2_resources):
+            for item in resources.product_resources:
+                item._lifecycle.abort()
+                item.triple._lifecycle.consumed = True
+            for item in resources.state_truncation_resources:
+                item._lifecycle.abort()
+                item.truncation._lifecycle.consumed = True
 
 
 @dataclass(slots=True)

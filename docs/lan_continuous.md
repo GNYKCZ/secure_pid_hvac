@@ -51,9 +51,58 @@ checkpoint 含自己的 fsync。角色 commit 间隔的 receive 还含等待 Cli
 不使用跨进程绝对时间相减。跨段成本在 events 单列，不能从普通步分布推导完整周期达标。
 `source_sha256` 区分同一 HEAD 上的观察/优化补丁，比较时同时核对配置和传输条件。
 
-本阶段未改变默认调度、未增加材料队列或公开 CycleTiming/deadline API，未改为后台写入，
-未实现矩阵 Beaver/PRF/PCF。TCP_NODELAY 试验未显示稳定收益，保持原默认。
-无绝对计划采样时刻、真实设备确认和三机 Wi-Fi 证据，报告不代表 50 Hz 或 20 ms 资格通过。
+上述 `continuous` 是显式同步、非实时基准，便于对照；其报告不能代表 20 ms 资格通过。
+TCP_NODELAY 试验未显示稳定收益，保持原默认。矩阵 Beaver/预送协议/PRF/PCF 仍未实施。
+
+### 获批周期、预准备和按段保存（#121 A1/A2/A4）
+
+动态持续 GUI/headless 默认从 canonical 场景 `period`（当前 0.02 s）建立一次 t0。
+第 k 步始终使用 t0+kT 和 t0+(k+1)T，不跳步、不重设迟到轮的预算。初次 setup、
+配置可靠保存和 16 轮首池填充在 t0 前完成；运行中的 refill、输入、编码/网络、双提交、
+设备回执、记录入队和满段维护都受当前 deadline 约束。正常停止确认/drain 单独计时。
+`Client.precompute_online_resources` 只创建输入无关的一次性本机能力，
+`bind_online_input` 在验证本步新测量后分享输入并签发输出；旧 `prepare_online` 保留。
+唯一材料生产者不持 Client 输出签发表、socket 或设备，不替换已有 Mult/Trunc 原语。
+库存上限 16、低水位 4；缺货直接失败，无现场补货或新 deadline。每槽预留 512 KiB，
+含编码副本的总预留不超过 8 MiB，实际编码量和 OS RSS 分别报告。
+
+`step(v, *, deadline_ns=None)` 及段过渡的可选 deadline_ns **属于本机
+`time.perf_counter_ns()` 时钟域**，不得传入另一机器或 `monotonic_ns()` 的绝对值。
+本机 Python 3.11/Windows 的 `monotonic` 可为 15.625 ms 分辨率的 GetTickCount64，
+新周期使用高精度且单调的 QPC；旧 timeout/普通 float deadline 保留原 monotonic 语义。
+新内部 deadline 标记在两个 canonical transport 剩余时间入口识别，网络保护 timeout
+与周期上限在同一高精度时钟内取更早者，绝对钟不进入 wire。CPU/设备 send_control 前
+再次检查。迟到且尚未施力时拒绝发送；已发出/完成的设备命令不伪造回滚。提交不确定
+保持 UNCERTAIN 并关闭，禁止重连重试。高精度计时不保证 OS 唤醒、网络或硬实时。
+
+动态结果由唯一 writer 按原逻辑段批量保存（默认 400 步，名义约 8 s），仍采用原 v2
+journal/hash/checkpoint/封段/完整 reader。控制线程逐步冻结 public bytes，只交接小封段
+header 和 immutable 协议身份；整段组装和序列化在 writer。活跃段、最多两个未可靠发布
+的封段（含在途段）、metadata 和编码副本共用 8 MiB 预算，出队不提前释放预算。
+已有 1…1000 段容量仍有效，但过大记录或后台积压耗尽字节预算时失败，不丢正式记录。
+每批 journal 与依赖的 spool/config 先 fsync，再原子发布 checkpoint；不再每步执行两次
+fsync/checkpoint。durable_step_count 只表示已发布可靠前缀，可落后于协议/物理确认。
+正常停止保存末段并 drain/join 后，原 replay、完整 reader、图和发布门禁全部仍须通过。
+故障先停止 writer，再由唯一 owner 冻结 failure checkpoint；磁盘持续故障保留旧 checkpoint。
+崩溃可损失 RAM 尾部，8 s 不是积压情况下的最大损失保证，也不能推断缺失尾部未施力或
+据此恢复安全会话。这里比较应用写入次数/字节和 fsync，不宣称 SSD NAND 寿命比例。
+
+公开 CycleTiming v1 记录本机绝对端点、阶段时长、身份、库存、协议/物理/durable 计数及
+首步/失败 attempt。端点未到达用 null；施力后必要工作超期为 miss_after_apply 并终止。
+公开计时 sidecar 保存为输出根目录的 `.timing-<artifact-run-id>.jsonl`，位于严格正式 run
+目录之外。最终返回的 cycle_summary 保留观测出口自身超期/记录失败的事实，资格判断
+同时核验运行状态和该 summary，不能只取 sidecar 中的成功行。GUI 渲染不冒充设备确认。
+
+```powershell
+uv run secure-control benchmark --case cycle --mode batch --steps 10000 --segment-steps 400 --material-slots 16 --delay-ms 0 --output results/diagnostics/cycle-qualification.json
+```
+
+默认启动本机三进程、实际仿真循环和批量 writer；`--material-slots 0/4/16` 为显式对照。
+已有真实三机角色监听时可加 `--role-config <Client配置>`，只运行 Client，不自动创建远端
+角色；配置决定 TCP/mTLS，注入延迟此时仅作用于 Client 发送。报告保留 clock_info、
+全部 cycle/阶段事件、startup jitter、失败、OS 内存、活动保存及停止 drain 成本。
+qualification_pass 仅在完整 10k、零 miss、所有完整周期在 deadline 内且正常停止时成立；
+一旦迟到即终止并保留失败证据。真实 Wi-Fi/硬件、不同网络尾延迟仍须实机验证。
 
 ## 持续分段后端（#100）
 

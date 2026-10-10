@@ -8,10 +8,11 @@ import os
 import secrets
 import socket
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from hashlib import sha256
-from threading import RLock
+from threading import Condition, RLock, Thread
 from typing import Any, Literal
 
 import numpy as np
@@ -34,6 +35,7 @@ from secure_control.protocol.coordinator import (
 )
 from secure_control.protocol.messages import (
     ControlShareMessage,
+    InputShareMessage,
     PartyOfflineMaterial,
     PartyOnlineMaterial,
     PartyOnlineRound,
@@ -49,6 +51,7 @@ from ._localhost_workers import (
     _complete_client_round,
     _validate_party_reply,
 )
+from .cycle_timing import check_deadline, network_deadline
 from .lan_config import LanConfig, Role
 from .lan_transport import accept_role, connect_role, listener
 from .localhost_codec import (
@@ -72,6 +75,129 @@ from .localhost_transport import deadline_after, receive_envelope, send_envelope
 _FRAME_LIMIT = 8 * 1024 * 1024
 _MAX_CONTINUOUS_STEPS = 1000
 _LAN_LOG = logging.getLogger("secure_control.lan")
+
+
+class _OnlineResourcePool:
+    """一个 session 的有界材料库存；唯一生产者不接触 socket、输入或签发表。"""
+
+    def __init__(self, client, distribution, *, start: int, slots: int = 16):
+        if type(slots) is not int or not 1 <= slots <= 16:
+            raise ValueError("材料库存须为 1…16 轮。")
+        self.owner = client._material_owner(distribution)
+        self.slots, self.low_water = slots, min(4, slots - 1)
+        self._condition = Condition()
+        self._queue = deque()
+        self._stop = False
+        self._error = None
+        self._next = start
+        self.generated_ns = self.generated_cpu_ns = self.high_water = self.encoded_high_water = 0
+        # 每槽预留 512 KiB，涵盖本轮两方 canonical 编码及瞬时编码副本。
+        # 16 槽（含正在生产的一槽）总预留不超过 8 MiB；不是 RSS 上界。
+        self._slot_limit = _FRAME_LIMIT // 16
+        layout = self.owner.layout
+        n, m, p = layout.state_dimension, layout.input_dimension, layout.output_dimension
+        products = n * n + n * m + p * n + p * m
+        truncations = n if layout.scale_ledger.state_truncation_bits else 0
+        digits = self.owner.multiplier.sharing.modulus.bit_length() * 30103 // 100000 + 1
+        # 在创建任何材料前以公开 shape/q 预留 canonical 上界；巨大计划不能先生成再拒绝。
+        # 每资源固定余量覆盖双份 metadata/ID/JSON，变量项覆盖 canonical residue 十进制。
+        pair_bound = (products * (4096 + 12 * digits)
+                      + truncations * (4096 + 8 * digits) + 4096 + 512 * m)
+        if 2 * pair_bound > self._slot_limit:
+            raise ValueError("单轮公开材料计划超过预准备编码预算。")
+        try:
+            for _ in range(slots):
+                self._produce()
+        except Exception:
+            while self._queue:
+                prepared, _ = self._queue.popleft()
+                self.owner.discard(prepared)
+            raise
+        self._thread = Thread(target=self._run, name="online-material-producer")
+        self._thread.start()
+
+    def _produce(self):
+        started, cpu = time.perf_counter_ns(), time.thread_time_ns()
+        prepared = self.owner.create(self._next)
+        try:
+            # 仅计算编码预算：零值占位不是测量，不参与分享、绑定或签发能力。
+            from secure_control.crypto import AdditiveShare
+            plan = prepared.p1_resources.plan
+            encoded = 0
+            for party, resources in enumerate((prepared.p1_resources, prepared.p2_resources)):
+                placeholder = InputShareMessage(
+                    party, plan.session_id, plan.round_id, plan.step,
+                    AdditiveShare(np.zeros(plan.input_shape, dtype=object)),
+                )
+                encoded += len(encode_wire_value(PartyOnlineMaterial.from_round(
+                    PartyOnlineRound(placeholder, resources),
+                )))
+            if 2 * encoded > self._slot_limit:
+                raise ValueError("单轮预准备材料超出有界编码预留。")
+            with self._condition:
+                if self._stop:
+                    self.owner.discard(prepared)
+                    return
+                self._queue.append((prepared, encoded))
+                self._next += 1
+                self.generated_ns += time.perf_counter_ns() - started
+                self.generated_cpu_ns += time.thread_time_ns() - cpu
+                self.high_water = max(self.high_water, len(self._queue))
+                self.encoded_high_water = max(self.encoded_high_water,
+                                              sum(size for _, size in self._queue))
+        except Exception:
+            self.owner.discard(prepared)
+            raise
+
+    def _run(self):
+        try:
+            while True:
+                with self._condition:
+                    self._condition.wait_for(lambda: self._stop or len(self._queue) <= self.low_water)
+                    if self._stop:
+                        return
+                while True:
+                    with self._condition:
+                        if self._stop or len(self._queue) >= self.slots:
+                            break
+                    self._produce()
+        except Exception as error:  # noqa: BLE001 - 主线程只公开类别，不能透传材料载荷
+            with self._condition:
+                self._error = type(error).__name__
+
+    def take(self, step):
+        """只领取本步，不等待补货，不在短缺时现场生成或改 deadline。"""
+        with self._condition:
+            if self._error is not None or not self._queue:
+                raise RuntimeError("预准备材料供给失败或库存短缺。")
+            prepared, _ = self._queue.popleft()
+            if prepared.p1_resources.plan.step != step:
+                self.owner.discard(prepared)
+                raise ValueError("预准备材料步号不匹配。")
+            self._condition.notify()
+            return prepared
+
+    def snapshot(self):
+        """仅公开库存及生产成本，不暴露份额或 RNG。"""
+        with self._condition:
+            return {"material_slots": len(self._queue), "material_high_water": self.high_water,
+                    "material_encoded_high_water": self.encoded_high_water,
+                    "material_reserved_bytes": self.slots * self._slot_limit,
+                    "material_prepare_ns": self.generated_ns,
+                    "material_cpu_ns": self.generated_cpu_ns}
+
+    def close(self):
+        """停止唯一生产者并废弃所有未使用能力，不能跨 run 复用。"""
+        with self._condition:
+            self._stop = True
+            self._condition.notify_all()
+        self._thread.join(timeout=5)
+        if self._thread.is_alive():
+            raise RuntimeError("材料生产者尚未退出。")
+        with self._condition:
+            while self._queue:
+                prepared, _ = self._queue.popleft()
+                self.owner.discard(prepared)
 
 
 def _public_reachability_digest(contract: ControllerRangeContract,
@@ -287,6 +413,8 @@ class LanContinuousRuntime:
         hello = BatchHelloPayload(base_hello) if batch else base_hello
         self._last_result = None
         self._round_started = False
+        self._material_pool = None
+        self._last_phase_ns = {}
         try:
             for role, address in (("P1", config.topology.p1_client),
                                   ("P2", config.topology.p2_client)):
@@ -343,21 +471,39 @@ class LanContinuousRuntime:
         """只公开已双提交轮次的身份与资源索引，不暴露随机材料。"""
         return tuple(dict(item) for item in self._confirmed_plans)
 
-    def step(self, v: Any) -> np.ndarray:
+    def step(self, v: Any, *, deadline_ns: int | None = None) -> np.ndarray:
         """同一 session 逐轮推进；任何未确认回执使整个运行时失效。"""
         if (self._failed or self._finished
                 or (not self._v2 and self._step >= self.range_contract.horizon_steps)
                 or (self._v2 and self._step - self._segment_start >= self._segment_capacity)):
             raise RuntimeError("LAN session 已失败、结束或超出配置步数。")
         self._round_started = False
+        current = None
+        prepared = None
+        endpoints = []
+        self._last_phase_ns = {}
         try:
+            deadline = (network_deadline(self.config.step_timeout, deadline_ns)
+                        if deadline_ns is not None else None)
+            started = time.perf_counter_ns()
+            check_deadline(deadline_ns, "MATERIAL_BIND")
             value = normalize_step_input(v, self.spec.input_dimension)
-            current = self.client.prepare_online(self.distribution, value, step=self._step)
+            if self._material_pool is None:
+                current = self.client.prepare_online(self.distribution, value, step=self._step)
+            else:
+                prepared = self._material_pool.take(self._step)
+                current = self.client.bind_online_input(self.distribution, prepared, value,
+                                                        step=self._step)
+            self._last_phase_ns["material_bind"] = time.perf_counter_ns() - started
+            check_deadline(deadline_ns, "MATERIAL_BIND")
             plan = current.p1_resources.plan
             if current.p2_resources.plan != plan:
                 raise ValueError("两方在线资源计划不一致。")
             self._last_plan = plan
-            deadline = deadline_after(self.config.step_timeout)
+            if deadline is None:
+                # 旧有限/非实时调用保留原先从 online 分发开始计算保护 timeout 的语义。
+                deadline = deadline_after(self.config.step_timeout)
+            online_started = time.perf_counter_ns()
             endpoints: list[_ClientPartyEndpoint] = []
             materials = tuple(PartyOnlineMaterial.from_round(PartyOnlineRound(
                 current.p1_input if party == 0 else current.p2_input,
@@ -365,6 +511,7 @@ class LanContinuousRuntime:
             )) for party in (0, 1))
             for material in materials:
                 encode_wire_value(material)
+            check_deadline(deadline_ns, "ENCODING")
             pending = []
             for party, sock in enumerate(self._sockets):
                 self._round_started = True
@@ -378,9 +525,28 @@ class LanContinuousRuntime:
                 ))
             for sock, request in zip(self._sockets, pending, strict=True):
                 _receive_reply(sock, request, deadline=deadline)
+            self._last_phase_ns["online_distribution"] = time.perf_counter_ns() - online_started
+            check_deadline(deadline_ns, "ONLINE_DISTRIBUTION")
+            stamps = {"start": time.perf_counter_ns()}
+            def record_phase(name):
+                stamps[name] = time.perf_counter_ns()
+                previous = {"stage": "start", "reconstruct": "stage", "commit": "reconstruct"}[name]
+                if previous in stamps:
+                    self._last_phase_ns[name] = stamps[name] - stamps[previous]
+                # commit 回调在双方 ACK 后：先登记已双提交事实，再由 runner 拒绝迟到施力。
+                if name != "commit":
+                    check_deadline(deadline_ns, name.upper())
             result = _complete_client_round(
                 self.client, endpoints[0], endpoints[1], plan, batch=self._batch,
+                on_phase=record_phase,
             )
+            for name, begin in (("stage", "start"), ("reconstruct", "stage"),
+                                ("commit", "reconstruct")):
+                if name in stamps and begin in stamps:
+                    self._last_phase_ns[name] = stamps[name] - stamps[begin]
+            for party, endpoint in enumerate(endpoints):
+                if hasattr(endpoint, "commit_duration_ns"):
+                    self._last_phase_ns[f"p{party + 1}_commit"] = endpoint.commit_duration_ns
             self._sequences = [endpoint.sequence for endpoint in endpoints]
             self._step += 1
             self._products += result.products
@@ -398,17 +564,26 @@ class LanContinuousRuntime:
             self._last_result = result
             return np.array(result.output, dtype=float, copy=True)
         except Exception:
+            for party, endpoint in enumerate(endpoints):
+                if hasattr(endpoint, "commit_duration_ns"):
+                    self._last_phase_ns[f"p{party + 1}_commit"] = endpoint.commit_duration_ns
+            if current is not None:
+                identity = (current.session_id, current.round_id, current.step)
+                if identity in self.client._issued_rounds:
+                    self.client.abort_round(current)
+            if prepared is not None:
+                self._material_pool.owner.discard(prepared)
             self._failed = True
             self.close()
             raise
 
-    def begin_segment(self, begin: SegmentBeginPayload) -> None:
+    def begin_segment(self, begin: SegmentBeginPayload, *, deadline_ns: int | None = None) -> None:
         """v2 保留同一 controller/session 与全局 step，只确认新的逻辑段。"""
         if (not self._v2 or self._failed or self._finished
                 or begin.global_start != self._step):
             raise RuntimeError("v2 段开始身份或状态无效")
         try:
-            deadline = deadline_after(self.config.shutdown_timeout)
+            deadline = network_deadline(self.config.shutdown_timeout, deadline_ns)
             pending = []
             for party, sock in enumerate(self._sockets):
                 pending.append(_request(sock, "P1" if party == 0 else "P2", self._sequences[party],
@@ -420,6 +595,7 @@ class LanContinuousRuntime:
             self._segment_start = self._step
             self._confirmed_steps.clear()
             self._confirmed_plans.clear()
+            check_deadline(deadline_ns, "SEGMENT_BEGIN")
         except Exception:
             self._failed = True
             self.close()
@@ -448,6 +624,10 @@ class LanContinuousRuntime:
         for sock in self._sockets:
             sock.close()
         self._sockets.clear()
+        if self._material_pool is not None:
+            pool, self._material_pool = self._material_pool, None
+            self._material_statistics = pool.snapshot()
+            pool.close()
 
 
 class RunControl:
@@ -631,7 +811,30 @@ class LanSegmentedRuntime:
     def segment_full(self) -> bool:
         return self.confirmed_step_count - self.global_start == self.segment_capacity
 
-    def step(self, v: Any) -> SegmentedStep | None:
+    def enable_material_preparation(self, *, slots: int = 16) -> None:
+        """只在动态初始准备期填充库存；计时开始后禁止重新填充初始池。"""
+        if not self._v2 or self.confirmed_step_count or self.phase != "RUNNING":
+            raise RuntimeError("材料池仅用于动态 session 的初始准备。")
+        segment = self._segment
+        if segment is None or segment._material_pool is not None:
+            raise RuntimeError("材料池不存在或已经安装。")
+        segment._material_pool = _OnlineResourcePool(segment.client, segment.distribution,
+                                                   start=segment._step, slots=slots)
+
+    @property
+    def cycle_phase_ns(self):
+        """当前轮的 Client 本机阶段时长；不跨主机相减。"""
+        return dict(self._segment._last_phase_ns) if self._segment is not None else {}
+
+    @property
+    def cycle_queue_levels(self):
+        """当前 session 的有界库存与生产成本，也保留停止时的末次摘要。"""
+        if self._segment is None:
+            return {}
+        pool = self._segment._material_pool
+        return pool.snapshot() if pool is not None else getattr(self._segment, "_material_statistics", {})
+
+    def step(self, v: Any, *, deadline_ns: int | None = None) -> SegmentedStep | None:
         """轮发起门禁成功后只完成该轮；停止请求不会中断 commit I/O。"""
         if self.phase != "RUNNING" or self._pending is not None or self.segment_full:
             raise RuntimeError("当前状态不能发起下一轮。")
@@ -642,7 +845,8 @@ class LanSegmentedRuntime:
             self._attempted_round = self.confirmed_step_count
         assert self._segment is not None
         try:
-            raw = self._segment.step(v)
+            raw = (self._segment.step(v) if deadline_ns is None
+                   else self._segment.step(v, deadline_ns=deadline_ns))
             result = self._segment._last_result
             # 资源身份由 Client 的原计划产生；不另造身份或重新生成材料。
             plan = self._segment._last_plan
@@ -675,7 +879,8 @@ class LanSegmentedRuntime:
         self._attempted_round = None
         self.phase = "RUNNING"
 
-    def end_segment(self, *, switch_epoch: bool = False) -> SegmentRecord:
+    def end_segment(self, *, switch_epoch: bool = False,
+                    deadline_ns: int | None = None) -> SegmentRecord:
         """向双方先发送同一个 action，再于共享 deadline 验证独立计数回执。"""
         if self.phase != "RUNNING" or self._pending is not None:
             raise RuntimeError("未确认物理推进或失败状态不得正常结束。")
@@ -693,7 +898,7 @@ class LanSegmentedRuntime:
             self.confirmed_step_count,
             self._records[-1].round_id if self._records else None, action,
         )
-        deadline = deadline_after(self.config.shutdown_timeout)
+        deadline = network_deadline(self.config.shutdown_timeout, deadline_ns)
         requests = []
         completed = False
         try:
@@ -729,6 +934,7 @@ class LanSegmentedRuntime:
             self._last_closed_segment_count = self.confirmed_step_count
             self.phase = ("SWITCHED" if action == "switch" else
                           "STOPPED" if action == "stop" else "CONNECTING_NEXT")
+            check_deadline(deadline_ns, "SEGMENT_END")
             completed = True
             return record
         except Exception:
@@ -738,7 +944,7 @@ class LanSegmentedRuntime:
             if not self._v2 or action in {"stop", "switch"} or not completed:
                 segment.close()
 
-    def next_segment(self) -> None:
+    def next_segment(self, *, deadline_ns: int | None = None) -> None:
         """只有双方 continue 已确认才能计划重连；停止位贯穿新握手。"""
         if self.phase != "CONNECTING_NEXT":
             raise RuntimeError("段过渡未确认，禁止重连。")
@@ -751,7 +957,10 @@ class LanSegmentedRuntime:
                 self.controller_epoch, self._last_end_round_id,
             )
             try:
-                self._segment.begin_segment(begin)
+                if deadline_ns is None:
+                    self._segment.begin_segment(begin)
+                else:
+                    self._segment.begin_segment(begin, deadline_ns=deadline_ns)
                 self.hello = LanSegmentedHelloPayload(
                     self.hello.profile_sha256, self.hello.nonce, self.run_id,
                     self.segment_index, self.global_start, self._segment.session_id,

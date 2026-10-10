@@ -74,6 +74,30 @@ def share_values(share: AdditiveShare) -> list[int]:
     return np.asarray(share.value, dtype=object).tolist()
 
 
+def test_prepared_resources_bind_only_fresh_input_once_and_reject_foreign_copies():
+    """预创建本身不签发输出，合法新测量才领取；保留真实算术与一次性生命周期。"""
+    client, p1, p2, coordinator, distribution = make_stack()
+    prepared = client.precompute_online_resources(distribution, step=0, rng=random.Random(91))
+    assert not client._issued_rounds
+    other = make_stack(seed=11)[0]
+    for owner, token, step in ((client, replace(prepared), 0), (client, prepared, 1),
+                               (other, prepared, 0)):
+        with pytest.raises(ValueError):
+            owner.bind_online_input(distribution, token, [.25], step=step)
+    with pytest.raises(ValueError, match="input_payload_bounds"):
+        client.bind_online_input(distribution, prepared, [10], step=0)
+    online = client.bind_online_input(replace(distribution), prepared, [.25], step=0)
+    with pytest.raises(ValueError):
+        client.bind_online_input(distribution, prepared, [.25], step=0)
+    output = coordinator.execute(p1, p2, online)
+    np.testing.assert_allclose(client.reconstruct_control(*output), [.625])
+    abandoned = client.precompute_online_resources(distribution, step=1)
+    client._material_owner(distribution).discard(abandoned)
+    assert abandoned.p1_resources.aborted_count == 11
+    with pytest.raises(ValueError):
+        client.bind_online_input(distribution, abandoned, [.25], step=1)
+
+
 def test_client_cannot_bypass_large_modulus_evidence_contract() -> None:
     """Client 必须把大模数交给 Protocol 2 验证，不能仅建立一般模环后继续。"""
     modulus = 18_446_744_073_709_554_719

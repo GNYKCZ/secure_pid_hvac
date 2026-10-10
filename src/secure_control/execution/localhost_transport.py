@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from math import isfinite
 
+from .cycle_timing import remaining_seconds
 from .localhost_codec import WireEnvelope, decode_envelope, encode_envelope
 
 _HEADER = struct.Struct("!I")
@@ -204,7 +205,7 @@ def _receive_exact(sock: socket.socket, length: int, deadline: float) -> bytes:
 
 
 def _set_remaining_timeout(sock: socket.socket, deadline: float) -> None:
-    remaining = deadline - time.monotonic()
+    remaining = remaining_seconds(deadline)
     if remaining <= 0:
         raise LocalhostTransportTimeout("localhost socket 操作超过绝对 deadline。")
     sock.settimeout(remaining)

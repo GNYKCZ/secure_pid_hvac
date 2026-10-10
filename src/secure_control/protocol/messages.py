@@ -547,6 +547,16 @@ class PartyResources:
         return sum(resource._lifecycle.status == "aborted" for resource in resources)
 
 
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class PreparedOnlineResources:
+    """输入无关的本机一次性能力；不属于 wire 类型，不能作为输出签发凭据。"""
+
+    p1_resources: PartyResources
+    p2_resources: PartyResources
+    _owner: object = field(repr=False, compare=False)
+    _token: object = field(repr=False, compare=False)
+
+
 @dataclass(frozen=True, slots=True)
 class OnlineRound:
     """Client 准备的唯一在线 round；不得整体交给任一 Server。"""

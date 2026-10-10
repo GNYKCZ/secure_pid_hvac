@@ -12,8 +12,14 @@ from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from threading import Event
-from time import perf_counter
+from time import perf_counter, perf_counter_ns
 
+from secure_control.execution.cycle_timing import (
+    AbsoluteCycleClock,
+    CycleDeadlineExceeded,
+    CycleTiming,
+    check_deadline,
+)
 from secure_control.execution.lan_config import LanConfig, load_lan_config
 from secure_control.execution.lan_runtime import (
     LanContinuousRuntime,
@@ -133,12 +139,89 @@ def run_client_segmented(config: LanConfig, *, segment_steps: int = 400,
 
 def _run_prepared_segmented(config, experiment, *, control, session,
                             on_step=None, on_segment=None, on_start=None,
-                            phase=None) -> dict[str, object]:
+                            phase=None, realtime=None, material_slots=16,
+                            on_cycle=None, cycle_snapshot=None,
+                            before_sample=None) -> dict[str, object]:
     """唯一持续循环接收已装配场景；保存/GUI 与 headless 不重复 parse 或创建 plant。"""
     control.bind_stop(session.reject_new)
     runtime = None
     records: list[ConfirmedStep] = []
     phase_name = "CONNECTING"
+    clock = None
+    attempt = None
+    cycle_count = misses = 0
+    last_cycle = None
+
+    def emit_cycle(status, failure_phase=None):
+        """成功和失败尝试走同一公开出口，失败不能丢掉首步/边界样本。"""
+        nonlocal attempt, cycle_count, misses, last_cycle
+        if attempt is None:
+            return
+        lifecycle = runtime.snapshot()
+        external = cycle_snapshot() if cycle_snapshot is not None else {}
+        timing = CycleTiming(
+            run_id=attempt["run_id"], session_id=attempt["session_id"],
+            controller_epoch=attempt["controller_epoch"],
+            segment_index=attempt["segment_index"], global_step=attempt["step"],
+            round_id=attempt.get("round_id") or lifecycle.attempted_round_id,
+            period_ns=clock.period_ns, scheduled_start_ns=attempt["scheduled"],
+            actual_sample_start_ns=attempt.get("sample"), deadline_ns=attempt["deadline"],
+            device_completed_ns=attempt.get("device"),
+            bookkeeping_completed_ns=attempt.get("bookkeeping"),
+            cycle_completed_ns=perf_counter_ns() if status == "confirmed" else None,
+            status=status, failure_phase=failure_phase,
+            protocol_committed_count=lifecycle.protocol_committed_count,
+            physically_confirmed_count=lifecycle.physically_confirmed_count,
+            durable_step_count=external.get("durable_step_count", 0),
+            phase_durations_ns=attempt["durations"],
+            queue_levels={**runtime.cycle_queue_levels,
+                          **{k: v for k, v in external.items() if k != "durable_step_count"}},
+        )
+        cycle_count += 1
+        misses += status in {"miss_before_apply", "miss_after_apply"}
+        last_cycle = asdict(timing)
+        attempt = None
+        if on_cycle is not None:
+            on_cycle(timing)
+
+    def transition(deadline_ns=None):
+        """段结束、源核查和段开始同属原周期；正常停止在控制计时之后确认。"""
+        progress("ENDING_SEGMENT", "STOPPING" if control.stop_requested else None)
+        segment = (runtime.end_segment() if deadline_ns is None
+                   else runtime.end_segment(deadline_ns=deadline_ns))
+        if session.cancelled.is_set():
+            raise RuntimeError("Client 运行已取消。")
+        progress("RECORDING_SEGMENT")
+        if on_segment is not None:
+            on_segment(CompletedSegment(segment, tuple(records)))
+        records.clear()
+        check_deadline(deadline_ns, "RECORDING_SEGMENT")
+        if runtime.phase == "STOPPED":
+            experiment.recheck_sources()
+            if session.cancelled.is_set():
+                raise RuntimeError("Client 运行已取消。")
+            return {
+                "status": "stopped", "stop_reason": "user_requested",
+                "role": "Client", "pid": os.getpid(), "run_id": runtime.run_id,
+                "confirmed_step_count": runtime.confirmed_step_count,
+                "protocol_committed_count": runtime.protocol_committed_count,
+                "next_global_step": runtime.confirmed_step_count,
+                **experiment.scene.terminal_summary(),
+                "resource_counts": runtime.resource_counts,
+                "final_segment": asdict(segment), "transport": config.transport,
+                "cycle_summary": {"attempts": cycle_count, "misses": misses,
+                                  "last_cycle": last_cycle},
+                "material_summary": runtime.cycle_queue_levels,
+            }
+        progress("CONNECTING_NEXT")
+        experiment.recheck_sources()
+        check_deadline(deadline_ns, "SOURCE_CHECK")
+        if deadline_ns is None:
+            runtime.next_segment()
+        else:
+            runtime.next_segment(deadline_ns=deadline_ns)
+        progress("RUNNING")
+        return None
 
     def progress(value, display=None):
         """处理实际进入该阶段后才发通知，失败出口保留同一阶段事实。"""
@@ -158,61 +241,108 @@ def _run_prepared_segmented(config, experiment, *, control, session,
         )
         if on_start is not None:
             on_start(runtime.snapshot(), runtime.public_setup)
+        dynamic_realtime = experiment.spec.state_dimension != 0 if realtime is None else realtime
+        if dynamic_realtime:
+            if material_slots:
+                runtime.enable_material_preparation(slots=material_slots)
+            # 所有固定验证、建连、writer 初始化与首池填充完成后才确定唯一 t0。
+            clock = AbsoluteCycleClock(experiment.scene.period)
         progress("RUNNING")
         while True:
             if session.cancelled.is_set():
                 raise RuntimeError("Client 运行已取消。")
             if control.stop_requested or runtime.segment_full:
-                progress("ENDING_SEGMENT", "STOPPING" if control.stop_requested else None)
-                segment = runtime.end_segment()
+                stopped = transition()
+                if stopped is not None:
+                    return stopped
+                continue
+            deadline_ns = None
+            if clock is not None:
+                scheduled, deadline_ns = clock.wait(runtime.confirmed_step_count)
+                lifecycle = runtime.snapshot()
+                attempt = {"scheduled": scheduled, "deadline": deadline_ns,
+                           "run_id": lifecycle.run_id, "session_id": lifecycle.session_id,
+                           "controller_epoch": lifecycle.controller_epoch,
+                           "segment_index": lifecycle.segment_index,
+                           "step": lifecycle.physically_confirmed_count, "durations": {}}
+                check_deadline(deadline_ns, "SAMPLE_START")
                 if session.cancelled.is_set():
                     raise RuntimeError("Client 运行已取消。")
-                progress("RECORDING_SEGMENT")
-                if on_segment is not None:
-                    on_segment(CompletedSegment(segment, tuple(records)))
-                records.clear()
-                if runtime.phase == "STOPPED":
-                    experiment.recheck_sources()
-                    if session.cancelled.is_set():
-                        raise RuntimeError("Client 运行已取消。")
-                    return {
-                        "status": "stopped", "stop_reason": "user_requested",
-                        "role": "Client", "pid": os.getpid(), "run_id": runtime.run_id,
-                        "confirmed_step_count": runtime.confirmed_step_count,
-                        "protocol_committed_count": runtime.protocol_committed_count,
-                        "next_global_step": runtime.confirmed_step_count,
-                        **experiment.scene.terminal_summary(),
-                        "resource_counts": runtime.resource_counts,
-                        "final_segment": asdict(segment), "transport": config.transport,
-                    }
-                # 发布公开段后不保留它；握手/材料重建期间场景状态及停止位继续有效。
-                del segment
-                progress("CONNECTING_NEXT")
-                experiment.recheck_sources()
-                runtime.next_segment()
-                progress("RUNNING")
-                continue
+            if before_sample is not None:
+                before_sample()
             progress("INPUT")
+            started = perf_counter_ns()
+            if attempt is not None:
+                attempt["sample"] = started
             value = experiment.scene.controller_input()
+            check_deadline(deadline_ns, "INPUT")
+            if attempt is not None:
+                attempt["durations"]["input"] = perf_counter_ns() - started
             progress("ROUND_IN_FLIGHT")
-            identity = runtime.step(value)
+            identity = (runtime.step(value) if deadline_ns is None
+                        else runtime.step(value, deadline_ns=deadline_ns))
             if identity is None:
+                attempt = None
                 continue
+            if attempt is not None:
+                attempt["round_id"] = identity.round_id
+                attempt["durations"].update(runtime.cycle_phase_ns)
             progress("AWAITING_PLANT")
-            snapshot = experiment.scene.advance(identity.global_step, identity.raw_control)
+            check_deadline(deadline_ns, "BEFORE_DEVICE")
+            started = perf_counter_ns()
+            if attempt is not None:
+                attempt["device_started"] = started
+            snapshot = (experiment.scene.advance(identity.global_step, identity.raw_control)
+                        if deadline_ns is None else experiment.scene.advance(
+                            identity.global_step, identity.raw_control, deadline_ns=deadline_ns,
+                        ))
             runtime.confirm_applied(identity)
+            if attempt is not None:
+                attempt["device"] = perf_counter_ns()
+                attempt["durations"]["device"] = attempt["device"] - started
             record = ConfirmedStep(identity, snapshot)
             records.append(record)
             progress("RECORDING_STEP")
+            started = perf_counter_ns()
             if on_step is not None:
                 on_step(record)
+            if attempt is not None:
+                attempt["bookkeeping"] = perf_counter_ns()
+                attempt["durations"]["recording"] = attempt["bookkeeping"] - started
+            check_deadline(deadline_ns, "RECORDING_STEP")
+            if clock is not None and runtime.segment_full and not control.stop_requested:
+                started = perf_counter_ns()
+                transition(deadline_ns)
+                attempt["durations"]["maintenance"] = perf_counter_ns() - started
+            check_deadline(deadline_ns, "CYCLE_COMPLETE")
+            emit_cycle("confirmed")
+            # 公开观测回调自身也受预算约束；不能靠观测出口隐藏一次超期。
+            if deadline_ns is not None and perf_counter_ns() >= deadline_ns:
+                misses += 1
+                last_cycle["status"] = "miss_after_apply"
+                last_cycle["failure_phase"] = "CYCLE_OBSERVATION"
+                last_cycle["cycle_completed_ns"] = None
+                raise CycleDeadlineExceeded("CYCLE_OBSERVATION")
     except Exception as error:  # noqa: BLE001 - 生命周期出口不披露协议秘密或异常载荷
         lifecycle = runtime.snapshot() if runtime is not None else None
         uncertain = lifecycle is not None and lifecycle.phase == "UNCERTAIN"
+        failure_phase = getattr(error, "phase", phase_name)
+        if attempt is not None:
+            attempt["durations"].update(runtime.cycle_phase_ns)
+            applied = "device_started" in attempt and failure_phase != "BEFORE_DEVICE_SIGNAL"
+            missed = isinstance(error, CycleDeadlineExceeded)
+            # 网络 timeout 只有实际超出本周期才归入 miss，仍保留 UNCERTAIN 生命周期。
+            missed = missed or perf_counter_ns() >= attempt["deadline"]
+            try:
+                emit_cycle(("miss_after_apply" if applied else "miss_before_apply")
+                           if missed else "failed", failure_phase)
+            except Exception as recording_error:  # noqa: BLE001 - 只保留公开类别
+                if last_cycle is not None:
+                    last_cycle["recording_error"] = type(recording_error).__name__
         return {
             "status": ("cancelled" if session.cancelled.is_set() else
                        "uncertain" if uncertain else "failed"),
-            "category": type(error).__name__, "failure_phase": phase_name,
+            "category": type(error).__name__, "failure_phase": failure_phase,
             "run_id": lifecycle.run_id if lifecycle else None,
             "segment_index": lifecycle.segment_index if lifecycle else 0,
             "session_id": lifecycle.session_id if lifecycle else None,
@@ -224,6 +354,9 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                                  "truncations_consumed": lifecycle.truncations_consumed}
                                 if lifecycle else {}),
             "lifecycle": asdict(lifecycle) if lifecycle else None,
+            "cycle_summary": {"attempts": cycle_count, "misses": misses,
+                              "last_cycle": last_cycle},
+            "material_summary": runtime.cycle_queue_levels if runtime is not None else {},
         }
     finally:
         session.stop_accepting()
@@ -373,11 +506,13 @@ def _run() -> int:
     redraw.add_argument("--run-dir", required=True, type=Path)
     redraw.add_argument("--output", required=True, type=Path)
     benchmark = commands.add_parser("benchmark")
-    benchmark.add_argument("--case", required=True, choices=("dynamic", "scalar", "continuous"))
+    benchmark.add_argument("--case", required=True, choices=("dynamic", "scalar", "continuous", "cycle"))
     benchmark.add_argument("--mode", required=True, choices=("legacy", "batch"))
     benchmark.add_argument("--steps", required=True, type=int)
     benchmark.add_argument("--delay-ms", type=float, default=0.)
     benchmark.add_argument("--segment-steps", type=int, default=8)
+    benchmark.add_argument("--material-slots", type=int, choices=(0, 4, 16), default=16)
+    benchmark.add_argument("--role-config", type=Path)
     benchmark.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     _enable_terminal_progress()
@@ -385,11 +520,13 @@ def _run() -> int:
         from .communication_benchmark import run_continuous_observation, run_local_benchmark
 
         try:
-            if args.case == "continuous":
+            if args.case in {"continuous", "cycle"}:
                 if args.mode != "batch":
                     raise ValueError("实际持续观察只使用默认批量协议")
                 report = run_continuous_observation(
                     steps=args.steps, delay_ms=args.delay_ms, segment_steps=args.segment_steps,
+                    optimized=args.case == "cycle", material_slots=args.material_slots,
+                    role_config=args.role_config,
                 )
             else:
                 report = run_local_benchmark(
@@ -400,9 +537,10 @@ def _run() -> int:
         except (OSError, ValueError, RuntimeError) as error:
             return _failure("Client", 5, "communication_benchmark", error)
         observed_ok = report.get("status", "complete") in {"complete", "stopped"}
+        display_timing = report["cycle_timing"] if args.case == "cycle" else report["timing"]
         print(json.dumps({"status": "complete" if observed_ok else "failed", "report": str(args.output),
                           "case": args.case, "mode": args.mode,
-                          "p50_ms": report["timing"]["p50_ms"]},
+                          "p50_ms": display_timing["p50_ms"]},
                          ensure_ascii=False, sort_keys=True))
         return 0 if observed_ok else 5
     if args.role == "redraw":
