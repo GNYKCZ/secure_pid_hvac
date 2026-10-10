@@ -25,6 +25,36 @@ uv run python -m secure_control.experiments.lan_runner benchmark --case scalar -
 配置引用和环境字段需要与具体结论一起阅读。真实三台机器上的时延、超时与
 可达性须在实际部署后另行测量。
 
+### 材料分发与持续观察（#121 阶段 P0+A3）
+
+动态 `online` 和 v2 `segment_begin` 先发送两方请求，再分别完整核验 ACK；
+P1→P2 双提交和两个 peer 完成屏障保持不变。角色安装 setup 后持有 session
+专属 sharing/Mult/Trunc owner，新 setup 重新验证素数证据；每轮仍新建 triple、mask
+及 lifecycle，并核验身份、角色、计划、数量和 canonical residue。
+
+`--case continuous --mode batch` 复用 GUI/headless 的唯一持续动态循环，以及现有同步
+journal/checkpoint writer。它在指定步数后请求正常停止，临时日志随观察结束清理，
+不发布图。段容量只是诊断工作负载，不能据此替代跨 1000 步的长时资格测试。
+
+```powershell
+uv run secure-control benchmark --case continuous --mode batch --steps 40 --segment-steps 8 --delay-ms 0 --output results/diagnostics/continuous-observation.json
+```
+
+报告保留首步、失败尝试和所有阶段事件：初次连接/预检、输入、网络计算、仿真推进、
+逐步可靠写入、段结束/封段与下一段连接。Client 分别记录材料准备、分发、重构和两方
+commit；角色记录本地算术、材料恢复、peer 交换、编码/解码、公开 plan 摘要的本机时长。
+写入记录包含 source recheck、checkpoint 和 fsync 成本/次数；正常动态步仍有两次 fsync。
+统计不剔除首步。失败报告只包含错误类型和公开阶段，CLI 保存报告后返回失败状态。
+
+各项不是可相加的独立 CPU 时间：send/receive 含等待，peer_exchange 含编码与传输，
+checkpoint 含自己的 fsync。角色 commit 间隔的 receive 还含等待 Client 下一步的时间；
+不使用跨进程绝对时间相减。跨段成本在 events 单列，不能从普通步分布推导完整周期达标。
+`source_sha256` 区分同一 HEAD 上的观察/优化补丁，比较时同时核对配置和传输条件。
+
+本阶段未改变默认调度、未增加材料队列或公开 CycleTiming/deadline API，未改为后台写入，
+未实现矩阵 Beaver/PRF/PCF。TCP_NODELAY 试验未显示稳定收益，保持原默认。
+无绝对计划采样时刻、真实设备确认和三机 Wi-Fi 证据，报告不代表 50 Hz 或 20 ms 资格通过。
+
 ## 持续分段后端（#100）
 
 三个终端仍分别启动原 P1、P2、Client 文件；持续模式由 Client 显式选择：

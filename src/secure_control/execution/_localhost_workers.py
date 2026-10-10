@@ -17,9 +17,9 @@ from secure_control.protocol.coordinator import (
     DirectProtocol3PartyEndpoint,
     LocalProtocol3PartyEndpoint,
     Protocol3Orchestrator,
+    _OnlineMaterialRecovery,
     dispatch_direct_protocol3_command,
     rehydrate_offline_material,
-    rehydrate_online_material,
     stage_protocol3_batch,
 )
 from secure_control.protocol.messages import (
@@ -476,6 +476,10 @@ def localhost_role_worker(
             role: P1 | P2 = P1(offline)
         else:
             role = P2(offline)
+        recovery = _OnlineMaterialRecovery(
+            offline, modulus=fixed_point.modulus, security_parameter=security_parameter,
+            modulus_evidence=modulus_evidence,
+        )
         session_id = role.session_id
         peer.bind(session_id)
         _send_data(
@@ -530,12 +534,7 @@ def localhost_role_worker(
                         or request.resource_id is not None
                     ):
                         raise ValueError("Server 在线材料信封顺序或 identity 不匹配。")
-                    online = rehydrate_online_material(
-                        request.payload,
-                        modulus=fixed_point.modulus,
-                        security_parameter=security_parameter,
-                        modulus_evidence=modulus_evidence,
-                    )
+                    online = recovery.restore(request.payload)
                     staged_shares: list[ControlShareMessage] = []
                     endpoint = LocalProtocol3PartyEndpoint(
                         role,

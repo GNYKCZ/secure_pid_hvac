@@ -76,6 +76,111 @@ def test_public_layer_plan_keeps_independent_gates_and_empty_program():
     assert build_scalar_layer_plan(ScalarProgram(("kick",), (), (), "kick")).layers == ()
 
 
+def test_session_recovery_reuses_verified_owners_but_never_lifecycles(monkeypatch):
+    from test_two_party_protocol import make_stack
+
+    from secure_control.crypto import truncation
+    from secure_control.protocol.coordinator import _OnlineMaterialRecovery
+
+    client, _, _, _, distribution = make_stack()
+    verify = truncation.verify_prime_modulus
+    verified = []
+
+    def checked(*args, **kwargs):
+        verified.append(args[0])
+        return verify(*args, **kwargs)
+
+    monkeypatch.setattr(truncation, "verify_prime_modulus", checked)
+    recovery = _OnlineMaterialRecovery(
+        distribution.p1, modulus=client.fixed_point.modulus,
+        security_parameter=8, modulus_evidence=None,
+    )
+    restored = []
+    for seed in (10, 11):
+        online = client.prepare_online(distribution, [.25], step=0, rng=random.Random(seed))
+        material = PartyOnlineMaterial.from_round(PartyOnlineRound(
+            online.p1_input, online.p1_resources,
+        ))
+        restored.append(recovery.restore(material))
+    first, second = (item.resources for item in restored)
+    assert len(verified) == 1
+    assert first.product_resources[0].triple._lifecycle.owner is second.product_resources[0].triple._lifecycle.owner
+    assert first.state_truncation_resources[0].truncation._lifecycle.owner is second.state_truncation_resources[0].truncation._lifecycle.owner
+    assert first.product_resources[0].triple._lifecycle is not second.product_resources[0].triple._lifecycle
+    assert first.state_truncation_resources[0].truncation._lifecycle is not second.state_truncation_resources[0].truncation._lifecycle
+    first.product_resources[0]._lifecycle.abort()
+    assert second.aborted_count == 0
+    _OnlineMaterialRecovery(distribution.p1, modulus=client.fixed_point.modulus,
+                            security_parameter=8, modulus_evidence=None)
+    assert len(verified) == 2  # 新 setup 即使 q 相同也重新验证真实证据。
+
+
+def test_session_recovery_rejects_foreign_role_and_noncanonical_last_material():
+    from test_two_party_protocol import make_stack
+
+    from secure_control.protocol.coordinator import _OnlineMaterialRecovery
+
+    client, _, _, _, distribution = make_stack()
+    recovery = _OnlineMaterialRecovery(distribution.p1, modulus=client.fixed_point.modulus,
+                                       security_parameter=8, modulus_evidence=None)
+    online = client.prepare_online(distribution, [.25], step=0)
+    material = PartyOnlineMaterial.from_round(PartyOnlineRound(online.p1_input, online.p1_resources))
+    with pytest.raises(ValueError, match="session/角色"):
+        recovery.restore(replace(material, input_message=replace(material.input_message, recipient=1)))
+    last = replace(material.product_resources[-1], c=AdditiveShare(client.fixed_point.modulus))
+    with pytest.raises(ValueError, match="canonical"):
+        recovery.restore(replace(material, product_resources=(*material.product_resources[:-1], last)))
+
+
+def test_segment_begin_sends_both_before_reading_and_closes_on_bad_second_ack(monkeypatch):
+    from secure_control.execution import lan_runtime as lan
+    from secure_control.execution.localhost_codec import SegmentBeginPayload
+
+    runtime = lan.LanContinuousRuntime.__new__(lan.LanContinuousRuntime)
+    runtime._v2, runtime._failed, runtime._finished, runtime._step = True, False, False, 2
+    runtime._sockets, runtime._sequences = ["p1", "p2"], [10, 10]
+    runtime.session_id = "session"
+    runtime.config = SimpleNamespace(shutdown_timeout=1.)
+    runtime._confirmed_steps, runtime._confirmed_plans = ["old"], ["old"]
+    events = []
+
+    def sent(sock, *args, **kwargs):
+        assert kwargs["send_only"]
+        events.append(sock)
+        return sock
+
+    def received(sock, *args, **kwargs):
+        assert events[:2] == ["p1", "p2"]
+        if sock == "p2":
+            raise ValueError("bad second ACK")
+
+    monkeypatch.setattr(lan, "_request", sent)
+    monkeypatch.setattr(lan, "_receive_reply", received)
+    monkeypatch.setattr(runtime, "close", lambda: events.append("closed"))
+    begin = SegmentBeginPayload("run", 1, 2, "a" * 64, "previous-round")
+    with pytest.raises(ValueError, match="second ACK"):
+        runtime.begin_segment(begin)
+    assert runtime._failed and events == ["p1", "p2", "closed"]
+    assert runtime._confirmed_steps == ["old"]
+
+
+@pytest.mark.integration
+def test_continuous_observation_retains_first_failed_attempt_without_error_payload(monkeypatch):
+    from secure_control.experiments.communication_benchmark import run_continuous_observation
+    from secure_control.protocol import Client
+
+    def failed(*args, **kwargs):
+        raise ValueError("private-value-must-not-appear")
+
+    monkeypatch.setattr(Client, "prepare_online", failed)
+    report = run_continuous_observation(steps=2, delay_ms=0, segment_steps=1)
+    assert report["status"] == "failed"
+    assert len(report["steps"]) == 1 and report["steps"][0]["status"] == "failed"
+    assert report["steps"][0]["global_step"] == 0
+    assert report["timing"]["sample_count"] == 1
+    assert "private-value-must-not-appear" not in str(report)
+
+
 def test_swing_up_has_38_products_in_16_public_layers():
     from test_lan_scalar_v3 import _inputs
 

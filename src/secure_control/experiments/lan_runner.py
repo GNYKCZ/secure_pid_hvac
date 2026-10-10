@@ -373,29 +373,38 @@ def _run() -> int:
     redraw.add_argument("--run-dir", required=True, type=Path)
     redraw.add_argument("--output", required=True, type=Path)
     benchmark = commands.add_parser("benchmark")
-    benchmark.add_argument("--case", required=True, choices=("dynamic", "scalar"))
+    benchmark.add_argument("--case", required=True, choices=("dynamic", "scalar", "continuous"))
     benchmark.add_argument("--mode", required=True, choices=("legacy", "batch"))
     benchmark.add_argument("--steps", required=True, type=int)
     benchmark.add_argument("--delay-ms", type=float, default=0.)
+    benchmark.add_argument("--segment-steps", type=int, default=8)
     benchmark.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     _enable_terminal_progress()
     if args.role == "benchmark":
-        from .communication_benchmark import run_local_benchmark
+        from .communication_benchmark import run_continuous_observation, run_local_benchmark
 
         try:
-            report = run_local_benchmark(
-                args.case, args.mode, steps=args.steps, delay_ms=args.delay_ms,
-            )
+            if args.case == "continuous":
+                if args.mode != "batch":
+                    raise ValueError("实际持续观察只使用默认批量协议")
+                report = run_continuous_observation(
+                    steps=args.steps, delay_ms=args.delay_ms, segment_steps=args.segment_steps,
+                )
+            else:
+                report = run_local_benchmark(
+                    args.case, args.mode, steps=args.steps, delay_ms=args.delay_ms,
+                )
             with args.output.open("x", encoding="utf-8") as stream:
                 json.dump(report, stream, ensure_ascii=False, indent=2, allow_nan=False)
         except (OSError, ValueError, RuntimeError) as error:
             return _failure("Client", 5, "communication_benchmark", error)
-        print(json.dumps({"status": "complete", "report": str(args.output),
+        observed_ok = report.get("status", "complete") in {"complete", "stopped"}
+        print(json.dumps({"status": "complete" if observed_ok else "failed", "report": str(args.output),
                           "case": args.case, "mode": args.mode,
                           "p50_ms": report["timing"]["p50_ms"]},
                          ensure_ascii=False, sort_keys=True))
-        return 0
+        return 0 if observed_ok else 5
     if args.role == "redraw":
         try:
             if (args.run_dir / "run.json").exists():

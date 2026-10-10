@@ -27,9 +27,9 @@ from secure_control.protocol import P1, P2, Client, ControllerRangeContract
 from secure_control.protocol.coordinator import (
     DirectProtocol3PartyEndpoint,
     LocalProtocol3PartyEndpoint,
+    _OnlineMaterialRecovery,
     dispatch_direct_protocol3_command,
     rehydrate_offline_material,
-    rehydrate_online_material,
     stage_protocol3_batch,
 )
 from secure_control.protocol.messages import (
@@ -65,6 +65,7 @@ from .localhost_codec import (
     SegmentEndPayload,
     SegmentEndReceipt,
     WireEnvelope,
+    encode_wire_value,
 )
 from .localhost_transport import deadline_after, receive_envelope, send_envelope
 
@@ -146,29 +147,36 @@ def run_client_single_step(config: LanConfig, trial: Any, *, batch: bool = True)
             raise ValueError("两方在线资源计划不一致。")
         stamps["prepared"] = time.perf_counter_ns()
         endpoints: list[_ClientPartyEndpoint] = []
+        materials = tuple(PartyOnlineMaterial.from_round(PartyOnlineRound(
+            current.p1_input if party == 0 else current.p2_input,
+            current.p1_resources if party == 0 else current.p2_resources,
+        )) for party in (0, 1))
+        # 两份 DTO 都通过既有 wire 校验后才让任一方接触本轮材料。
+        for material in materials:
+            encode_wire_value(material)
+        pending = []
         for party, sock in enumerate(sockets):
             role = "P1" if party == 0 else "P2"
-            online = PartyOnlineRound(
-                current.p1_input if party == 0 else current.p2_input,
-                current.p1_resources if party == 0 else current.p2_resources,
-            )
-            _request(
+            pending.append(_request(
                 sock,
                 role,
                 4,
                 "online",
                 session,
                 config.step_timeout,
-                PartyOnlineMaterial.from_round(online),
+                materials[party],
                 plan.round_id,
                 0,
                 deadline=step_deadline,
-            )
+                send_only=True,
+            ))
             endpoints.append(
                 _ClientPartyEndpoint(
                     sock, party, plan, 5, _FRAME_LIMIT, config.step_timeout, step_deadline
                 )
             )
+        for sock, request in zip(sockets, pending, strict=True):
+            _receive_reply(sock, request, deadline=step_deadline)
         stamps["distributed"] = time.perf_counter_ns()
         result = _complete_client_round(
             client,
@@ -351,20 +359,25 @@ class LanContinuousRuntime:
             self._last_plan = plan
             deadline = deadline_after(self.config.step_timeout)
             endpoints: list[_ClientPartyEndpoint] = []
+            materials = tuple(PartyOnlineMaterial.from_round(PartyOnlineRound(
+                current.p1_input if party == 0 else current.p2_input,
+                current.p1_resources if party == 0 else current.p2_resources,
+            )) for party in (0, 1))
+            for material in materials:
+                encode_wire_value(material)
+            pending = []
             for party, sock in enumerate(self._sockets):
                 self._round_started = True
-                online = PartyOnlineRound(
-                    current.p1_input if party == 0 else current.p2_input,
-                    current.p1_resources if party == 0 else current.p2_resources,
-                )
-                _request(sock, "P1" if party == 0 else "P2", self._sequences[party],
+                pending.append(_request(sock, "P1" if party == 0 else "P2", self._sequences[party],
                          "online", self.session_id, self.config.step_timeout,
-                         PartyOnlineMaterial.from_round(online), plan.round_id,
-                         self._step, deadline=deadline)
+                         materials[party], plan.round_id,
+                         self._step, deadline=deadline, send_only=True))
                 endpoints.append(_ClientPartyEndpoint(
                     sock, party, plan, self._sequences[party] + 1, _FRAME_LIMIT,
                     self.config.step_timeout, deadline,
                 ))
+            for sock, request in zip(self._sockets, pending, strict=True):
+                _receive_reply(sock, request, deadline=deadline)
             result = _complete_client_round(
                 self.client, endpoints[0], endpoints[1], plan, batch=self._batch,
             )
@@ -396,10 +409,13 @@ class LanContinuousRuntime:
             raise RuntimeError("v2 段开始身份或状态无效")
         try:
             deadline = deadline_after(self.config.shutdown_timeout)
+            pending = []
             for party, sock in enumerate(self._sockets):
-                _request(sock, "P1" if party == 0 else "P2", self._sequences[party],
+                pending.append(_request(sock, "P1" if party == 0 else "P2", self._sequences[party],
                          "segment_begin", self.session_id, self.config.shutdown_timeout,
-                         begin, deadline=deadline, expected_payload=begin)
+                         begin, deadline=deadline, send_only=True))
+            for party, (sock, request) in enumerate(zip(self._sockets, pending, strict=True)):
+                _receive_reply(sock, request, deadline=deadline, expected_payload=begin)
                 self._sequences[party] += 1
             self._segment_start = self._step
             self._confirmed_steps.clear()
@@ -969,6 +985,10 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
             raise ValueError("v2 仅允许首段建立非零秘密状态 session")
         offline = rehydrate_offline_material(material, range_contract)
         role_object = P1(offline) if party == 0 else P2(offline)
+        recovery = _OnlineMaterialRecovery(
+            offline, modulus=fixed.modulus, security_parameter=setup.security_parameter,
+            modulus_evidence=modulus_evidence,
+        )
         _party_reply(client_socket, offline_request, None, config.startup_timeout)
         sequence = 4
         peer_port = LocalhostProtocol3PeerPort(
@@ -1056,11 +1076,7 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
             online_material = online_request.payload
             if not isinstance(online_material, PartyOnlineMaterial):
                 raise TypeError("在线单方材料类型错误。")
-            online = rehydrate_online_material(
-                online_material, modulus=fixed.modulus,
-                security_parameter=setup.security_parameter,
-                modulus_evidence=modulus_evidence,
-            )
+            online = recovery.restore(online_material)
             staged: list[ControlShareMessage] = []
             endpoint = LocalProtocol3PartyEndpoint(
                 role_object, online,
@@ -1254,6 +1270,7 @@ def _request(
     shutdown: bool = False,
     deadline: float | None = None,
     expected_payload: object = None,
+    send_only: bool = False,
 ) -> object:
     request = WireEnvelope(
         SCHEMA_VERSION,
@@ -1270,6 +1287,14 @@ def _request(
     )
     deadline = deadline_after(timeout) if deadline is None else deadline
     send_envelope(sock, request, deadline=deadline, limit=_FRAME_LIMIT)
+    if send_only:
+        return request
+    return _receive_reply(sock, request, deadline=deadline, expected_payload=expected_payload)
+
+
+def _receive_reply(sock: socket.socket, request: WireEnvelope, *, deadline: float,
+                   expected_payload: object = None) -> object:
+    """单 socket 只有一个读者；两方独立请求先发送，回执仍逐一完整校验。"""
     response = receive_envelope(sock, deadline=deadline, limit=_FRAME_LIMIT)
     _validate_party_reply(response, request)
     if response.payload != expected_payload:

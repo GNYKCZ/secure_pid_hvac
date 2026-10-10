@@ -1,18 +1,22 @@
-"""#116 本机三进程公开通信基准；只保存帧、字节与墙钟时间。"""
+"""#116/#121 本机三进程公开观察；只保存身份、计数和本机时长。"""
 
 from __future__ import annotations
 
 import json
 import multiprocessing as mp
+import os
 import platform
 import socket
 import subprocess
 import sys
+import tempfile
 import time
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, replace
 from hashlib import sha256
 from itertools import pairwise
 from pathlib import Path
+from queue import Empty
 from unittest.mock import patch
 
 import numpy as np
@@ -22,6 +26,19 @@ from secure_control.execution.lan_runtime import LanContinuousRuntime, run_party
 from secure_control.execution.lan_scalar_runtime import LanScalarRuntime
 
 _ROOT = Path(__file__).resolve().parents[3]
+
+
+def _source_fingerprints():
+    """区分同一 HEAD 上的观察补丁和优化补丁；只保存内容摘要。"""
+    paths = (
+        "src/secure_control/protocol/coordinator.py",
+        "src/secure_control/execution/lan_runtime.py",
+        "src/secure_control/execution/_localhost_workers.py",
+        "src/secure_control/execution/lan_transport.py",
+        "src/secure_control/experiments/communication_benchmark.py",
+        "configs/cart_pole_observer_lan.example.yaml", "configs/cart_pole_observer.yaml",
+    )
+    return {name: sha256((_ROOT / name).read_bytes()).hexdigest() for name in paths}
 
 
 def _ports() -> tuple[int, int, int]:
@@ -53,12 +70,15 @@ def _config(role: str, ports: tuple[int, int, int]) -> LanConfig:
     )
 
 
-def _meter(role: str, ports: tuple[int, int, int], delay_ms: float):
+def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=None):
     """包住既有 framing 最外层，只数发送次数/字节，不解码或保存 payload。"""
     from secure_control.execution import lan_scalar_runtime, localhost_transport
 
     counts: dict[str, dict[str, int]] = {}
-    activity = {name: 0. for name in ("send_ms", "receive_ms", "encode_ms", "decode_ms")}
+    activity = {name: 0. for name in (
+        "send_ms", "receive_ms", "encode_ms", "decode_ms", "recovery_ms",
+        "local_arithmetic_ms", "peer_exchange_ms", "plan_digest_ms", "dto_validation_ms",
+    )}
     originals = {
         "send": localhost_transport._send_exact,
         "receive": localhost_transport._receive_exact,
@@ -104,8 +124,69 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float):
     localhost_transport.decode_envelope = timed("decode_ms", originals["decode"])
     lan_scalar_runtime.encode_scalar_frame_v3 = timed("encode_ms", originals["scalar_encode"])
     lan_scalar_runtime.decode_scalar_frame_v3 = timed("decode_ms", originals["scalar_decode"])
+    from secure_control.execution._localhost_peer import LocalhostProtocol3PeerPort
+    from secure_control.protocol.coordinator import LocalProtocol3PartyEndpoint
+
+    # 只在基准进程包住现有方法；不输出参数、返回值或任意秘密 payload。
+    observations = ExitStack()
+    from secure_control.execution import _localhost_peer, lan_runtime
+    from secure_control.protocol import coordinator
+
+    observations.enter_context(patch.object(
+        _localhost_peer, "public_step_plan_sha256",
+        timed("plan_digest_ms", _localhost_peer.public_step_plan_sha256),
+    ))
+    if hasattr(lan_runtime, "encode_wire_value"):
+        observations.enter_context(patch.object(
+            lan_runtime, "encode_wire_value", timed("dto_validation_ms", lan_runtime.encode_wire_value),
+        ))
+
+    recovery_name = ("_rehydrate_online_material" if hasattr(coordinator, "_rehydrate_online_material")
+                     else "rehydrate_online_material")
+    observations.enter_context(patch.object(
+        coordinator, recovery_name, timed("recovery_ms", getattr(coordinator, recovery_name)),
+    ))
+    if recovery_name == "rehydrate_online_material":
+        observations.enter_context(patch.object(
+            lan_runtime, recovery_name, timed("recovery_ms", getattr(lan_runtime, recovery_name)),
+        ))
+    for owner, names, category in (
+        (LocalProtocol3PartyEndpoint, (
+            "mask_product", "finish_product", "complete_product", "finish_products",
+            "mask_truncation", "p2_truncation_message_direct", "finish_truncation_p1_direct",
+            "finish_truncation_p2", "complete_truncation", "stage_output", "commit",
+        ), "local_arithmetic_ms"),
+        (LocalhostProtocol3PeerPort, (
+            "exchange_products", "product_complete", "send_truncations",
+            "receive_truncations", "state_complete",
+        ), "peer_exchange_ms"),
+    ):
+        for name in names:
+            observations.enter_context(patch.object(owner, name, timed(category, getattr(owner, name))))
+    if role_steps is not None:
+        reply = lan_runtime._party_reply
+        previous = dict(activity)
+        previous_counts = {}
+
+        def observed_reply(sock, request, *args, **kwargs):
+            nonlocal previous, previous_counts
+            value = reply(sock, request, *args, **kwargs)
+            if (request.operation == "endpoint"
+                    and getattr(request.payload, "operation", None) == "commit"):
+                role_steps.append({"step": request.step, "round_id": request.round_id,
+                                   "activity_ms": {k: activity[k] - v for k, v in previous.items()},
+                                   "sent": {k: {field: v[field] - previous_counts.get(k, {}).get(field, 0)
+                                                for field in v} for k, v in counts.items()}})
+            if request.operation == "offline" or (request.operation == "endpoint"
+                    and getattr(request.payload, "operation", None) == "commit"):
+                previous = dict(activity)
+                previous_counts = {k: dict(v) for k, v in counts.items()}
+            return value
+
+        observations.enter_context(patch.object(lan_runtime, "_party_reply", observed_reply))
 
     def restore():
+        observations.close()
         localhost_transport._send_exact = originals["send"]
         localhost_transport._receive_exact = originals["receive"]
         localhost_transport.encode_envelope = originals["encode"]
@@ -119,15 +200,16 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float):
 def _party_job(
     config: LanConfig, ports: tuple[int, int, int], delay_ms: float, batch: bool, queue,
 ) -> None:
-    counts, activity, restore = _meter(config.role, ports, delay_ms)
+    role_steps = []
+    counts, activity, restore = _meter(config.role, ports, delay_ms, role_steps)
     try:
         result = run_party_single_step(config, batch=batch)
         queue.put({"role": config.role, "status": result.get("status", "closed"),
-                   "directions": counts, "activity_ms": activity})
+                   "directions": counts, "activity_ms": activity, "steps": role_steps})
     except Exception as error:  # noqa: BLE001 - 基准仅导出公开错误类别
         queue.put({"role": config.role, "status": "failed",
                    "error_type": type(error).__name__, "directions": counts,
-                   "activity_ms": activity})
+                   "activity_ms": activity, "steps": role_steps})
     finally:
         restore()
 
@@ -140,19 +222,242 @@ def _quantile(values: list[float], fraction: float) -> float:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
 
+def _party_outcomes(queue):
+    outcomes = []
+    for _ in range(2):
+        try:
+            outcomes.append(queue.get(timeout=10))
+        except Empty:
+            break
+    for role in sorted({"P1", "P2"} - {item["role"] for item in outcomes}):
+        outcomes.append({"role": role, "status": "not_reported", "directions": {},
+                         "activity_ms": {}, "steps": []})
+    return outcomes
+
+
 def _timing(values: list[float]) -> dict[str, object]:
-    samples = values[1:]
+    samples = values
+    if not samples:
+        return {"warmup_steps": 0, "sample_count": 0, "samples_ms": [], "p50_ms": None}
     jitter = [abs(current - previous) for previous, current in pairwise(samples)]
     return {
-        "warmup_steps": 1, "sample_count": len(samples),
+        "warmup_steps": 0, "sample_count": len(samples),
         "quantile_method": "linear interpolation at (n-1)*p",
         "p50_ms": _quantile(samples, .5), "p95_ms": _quantile(samples, .95),
         "p99_ms": _quantile(samples, .99), "max_ms": max(samples),
-        "jitter_definition": "absolute difference of adjacent successful step times",
+        "jitter_definition": "absolute difference of adjacent observed step attempt times",
         "jitter_p95_ms": _quantile(jitter, .95) if jitter else None,
         "jitter_max_ms": max(jitter) if jitter else None,
         "over_20_ms": sum(value > 20 for value in samples),
-        "timeouts": 0, "samples_ms": samples,
+        "samples_ms": samples,
+    }
+
+
+@contextmanager
+def _observe_dynamic(marks):
+    """复用内核的阶段回调和既有方法；仅保存本机时长和公开角色号。"""
+    from secure_control.execution import lan_runtime
+    from secure_control.execution._localhost_workers import _ClientPartyEndpoint
+    from secure_control.protocol import Client
+
+    prepare, complete = Client.prepare_online, lan_runtime._complete_client_round
+    commit = _ClientPartyEndpoint.commit
+
+    def measured_prepare(self, *args, **kwargs):
+        started = time.perf_counter_ns()
+        try:
+            return prepare(self, *args, **kwargs)
+        finally:
+            marks["material_prepare_ms"] = (time.perf_counter_ns() - started) / 1e6
+            marks["prepare_end_ns"] = time.perf_counter_ns()
+
+    def measured_complete(client, p1, p2, plan, **kwargs):
+        started = time.perf_counter_ns()
+        marks["online_distribution_ms"] = (started - marks["prepare_end_ns"]) / 1e6
+        stamps = {"start": started}
+        try:
+            return complete(client, p1, p2, plan, **kwargs,
+                            on_phase=lambda name: stamps.__setitem__(name, time.perf_counter_ns()))
+        finally:
+            for label, begin, end in (("stage_ms", "start", "stage"),
+                                      ("reconstruct_ms", "stage", "reconstruct")):
+                if end in stamps:
+                    marks[label] = (stamps[end] - stamps[begin]) / 1e6
+
+    def measured_commit(self):
+        started = time.perf_counter_ns()
+        try:
+            return commit(self)
+        finally:
+            marks[f"p{self.party + 1}_commit_ms"] = (time.perf_counter_ns() - started) / 1e6
+
+    with (patch.object(Client, "prepare_online", measured_prepare),
+          patch.object(lan_runtime, "_complete_client_round", measured_complete),
+          patch.object(_ClientPartyEndpoint, "commit", measured_commit)):
+        yield
+
+
+def run_continuous_observation(*, steps: int, delay_ms: float,
+                               segment_steps: int) -> dict[str, object]:
+    """实际持续动态循环及原同步 writer；退出后报告观察，不发布图或更改调度。"""
+    from secure_control.execution.lan_runtime import RunControl
+    from secure_control.scenarios.cart_pole.interactive import InteractiveSession
+
+    from .cart_pole_segmented_evidence import _Spool
+    from .lan_continuous_profile import load_segmented_experiment
+    from .lan_runner import _run_prepared_segmented
+
+    if type(steps) is not int or not 2 <= steps <= 400:
+        raise ValueError("观察步数必须在2..400；不是长时资格测试")
+    if type(segment_steps) is not int or not 1 <= segment_steps <= 1000:
+        raise ValueError("段容量必须在1..1000")
+    if not isinstance(delay_ms, (int, float)) or not 0 <= delay_ms <= 3:
+        raise ValueError("单帧注入等待必须在0..3ms")
+    ports = _ports()
+    config = _config("Client", ports)
+    context = mp.get_context("spawn")
+    queue = context.Queue()
+    parties = [context.Process(target=_party_job, args=(
+        _config(role, ports), ports, delay_ms, True, queue,
+    )) for role in ("P1", "P2")]
+    records, events, outcomes = [], [], []
+    marks, storage = {}, {"fsync_ms": 0., "fsync_count": 0, "checkpoint_ms": 0.,
+                          "source_check_ms": 0.}
+    counts, activity, restore = _meter("Client", ports, delay_ms)
+    control, session = RunControl(), InteractiveSession()
+    fsync, checkpoint = os.fsync, _Spool._checkpoint
+    before_activity, before_storage = dict(activity), dict(storage)
+    before_counts = {}
+    current_phase, phase_start, started = None, time.perf_counter_ns(), time.perf_counter_ns()
+    attempt = None
+
+    def phase(name):
+        nonlocal current_phase, phase_start, attempt, before_activity, before_storage, before_counts
+        now = time.perf_counter_ns()
+        if current_phase is not None:
+            events.append({"phase": current_phase, "duration_ms": (now - phase_start) / 1e6,
+                           "attempt": len(records) if attempt is not None else None})
+        if name == "INPUT":
+            attempt = now
+            marks.clear()
+            before_activity, before_storage = dict(activity), dict(storage)
+            before_counts = {k: dict(v) for k, v in counts.items()}
+        current_phase, phase_start = name, now
+
+    def durable_step(record):
+        nonlocal attempt
+        transaction.record_step(record)
+        now = time.perf_counter_ns()
+        records.append({"global_step": record.protocol.global_step,
+                        "segment_index": record.protocol.segment_index,
+                        "session_id": record.protocol.session_id,
+                        "round_id": record.protocol.round_id, "status": "confirmed",
+                        "duration_ms": (now - attempt) / 1e6,
+                        "components_ms": {k: v for k, v in marks.items() if k.endswith("_ms")},
+                        "activity": {k: activity[k] - v for k, v in before_activity.items()},
+                        "sent": {k: {field: v[field] - before_counts.get(k, {}).get(field, 0)
+                                     for field in v} for k, v in counts.items()},
+                        "storage": {k: storage[k] - v for k, v in before_storage.items()}})
+        attempt = None
+        if len(records) >= steps:
+            control.request_stop()
+
+    def measured_fsync(fd):
+        start = time.perf_counter_ns()
+        try:
+            return fsync(fd)
+        finally:
+            storage["fsync_ms"] += (time.perf_counter_ns() - start) / 1e6
+            storage["fsync_count"] += 1
+
+    def measured_checkpoint(self, *args, **kwargs):
+        start = time.perf_counter_ns()
+        try:
+            return checkpoint(self, *args, **kwargs)
+        finally:
+            storage["checkpoint_ms"] += (time.perf_counter_ns() - start) / 1e6
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="secure-control-observation-") as folder:
+            assembly_start = time.perf_counter_ns()
+            prepared = load_segmented_experiment(config.experiment_config, segment_steps, session)
+            recheck = prepared.recheck_sources
+
+            def measured_sources():
+                start = time.perf_counter_ns()
+                try:
+                    return recheck()
+                finally:
+                    storage["source_check_ms"] += (time.perf_counter_ns() - start) / 1e6
+
+            prepared = replace(prepared, output_root=Path(folder), recheck_sources=measured_sources)
+            transaction = _Spool(prepared, config, session, phase)
+            initial_assembly_ms = (time.perf_counter_ns() - assembly_start) / 1e6
+            for party in parties:
+                party.start()
+            with (_observe_dynamic(marks), patch.object(os, "fsync", measured_fsync),
+                  patch.object(_Spool, "_checkpoint", measured_checkpoint)):
+                result = _run_prepared_segmented(
+                    config, prepared, control=control, session=session,
+                    on_step=durable_step, on_segment=transaction.record,
+                    on_start=transaction.begin, phase=phase,
+                )
+                if result["status"] != "stopped":
+                    transaction.fail(result)
+            if attempt is not None:
+                records.append({"global_step": len(records), "status": "failed",
+                                "duration_ms": (time.perf_counter_ns() - attempt) / 1e6,
+                                "failure_phase": result.get("failure_phase"),
+                                "error_type": result.get("category"),
+                                "components_ms": {k: v for k, v in marks.items() if k.endswith("_ms")},
+                                "activity": {k: activity[k] - v for k, v in before_activity.items()},
+                                "sent": {k: {field: v[field] - before_counts.get(k, {}).get(field, 0)
+                                             for field in v} for k, v in counts.items()},
+                                "storage": {k: storage[k] - v for k, v in before_storage.items()}})
+            events.append({"phase": current_phase,
+                           "duration_ms": (time.perf_counter_ns() - phase_start) / 1e6,
+                           "attempt": None})
+            outcomes = _party_outcomes(queue)
+            for party in parties:
+                party.join(timeout=10)
+    finally:
+        restore()
+        for party in parties:
+            if party.is_alive():
+                party.terminate()
+                party.join(timeout=5)
+        queue.close()
+    directions = dict(counts)
+    for item in outcomes:
+        directions.update(item["directions"])
+    return {
+        "schema": "continuous-observation-v1", "case": "continuous", "mode": "batch",
+        "code_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=_ROOT, text=True).strip(),
+        "dirty": bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=_ROOT, text=True)),
+        "source_sha256": _source_fingerprints(),
+        "environment": {"os": platform.platform(), "python": sys.version.split()[0],
+                        "roles": "three local processes", "transport": config.transport,
+                        "cpu_count": mp.cpu_count(), "timer": "local perf_counter_ns",
+                        "delay_model": "sleep before each application frame send",
+                        "one_way_delay_ms": delay_ms},
+        "configuration_reference": "configs/cart_pole_observer_lan.example.yaml",
+        "numeric_profile": {"fractional_bits": prepared.context.fractional_bits,
+                            "modulus_bits": prepared.context.modulus.bit_length(),
+                            "state_dimension": prepared.spec.state_dimension,
+                            "input_dimension": prepared.spec.input_dimension,
+                            "output_dimension": prepared.spec.output_dimension},
+        "segment_capacity": segment_steps, "requested_steps": steps,
+        "status": result["status"], "failed_phase": result.get("failure_phase"),
+        "successful_steps": sum(row["status"] == "confirmed" for row in records),
+        "failed_attempts": sum(row["status"] == "failed" for row in records),
+        "steps": records, "events": events, "party_outcomes": outcomes,
+        "resource_counts": result["resource_counts"], "directions_all_session": directions,
+        "timing": _timing([row["duration_ms"] for row in records]),
+        "all_observation_ms": (time.perf_counter_ns() - started) / 1e6,
+        "initial_assembly_ms": initial_assembly_ms,
+        "activity_scope": "local arithmetic excludes peer calls; peer_exchange includes I/O, encoding and waits; send/receive/codec overlap; checkpoint includes its fsync",
+        "byte_scope": "application payload plus 4-byte header; excludes TCP/TLS overhead",
+        "limits": "actual sustained simulation runner with synchronous journal/checkpoint; initial connection, source checks, segment sealing/begin separately in events; no scheduled sample timestamps, device acknowledgement, TLS/Wi-Fi, GUI render or 20ms qualification; no plots published",
     }
 
 
@@ -163,7 +468,7 @@ def run_local_benchmark(
     if case not in {"dynamic", "scalar"} or mode not in {"legacy", "batch"}:
         raise ValueError("基准 case/mode 无效")
     if type(steps) is not int or not 2 <= steps <= 400:
-        raise ValueError("基准须含1个warmup和1..399个样本")
+        raise ValueError("基准须含2..400个观测步骤，首步不剔除")
     if not isinstance(delay_ms, (int, float)) or not 0 <= delay_ms <= 3:
         raise ValueError("单向注入延迟必须在0..3ms")
     ports = _ports()
@@ -179,6 +484,24 @@ def run_local_benchmark(
     timings: list[float] = []
     per_step_activity: list[dict[str, float]] = []
     phase_samples: list[dict[str, float]] = []
+    attempts = []
+    outcomes = []
+    numeric_profile = {}
+    failure = None
+    initial_setup_ms = None
+
+    def measured_step(call):
+        started = time.perf_counter_ns()
+        status = "confirmed"
+        try:
+            return call()
+        except Exception:
+            status = "failed"
+            raise
+        finally:
+            elapsed = (time.perf_counter_ns() - started) / 1e6
+            timings.append(elapsed)
+            attempts.append({"step": len(attempts), "status": status, "duration_ms": elapsed})
     try:
         config = _config("Client", ports)
         if case == "dynamic":
@@ -213,17 +536,17 @@ def run_local_benchmark(
 
             with (patch.object(Client, "prepare_online", measured_prepare),
                   patch.object(lan_runtime, "_complete_client_round", measured_complete)):
+                setup_start = time.perf_counter_ns()
                 runtime = LanContinuousRuntime(
                     config, prepared.spec, prepared.context, contract,
                     prepared.security_parameter, prepared.evidence, batch=mode == "batch",
                 )
+                initial_setup_ms = (time.perf_counter_ns() - setup_start) / 1e6
                 try:
                     for _ in range(steps):
                         marks.clear()
                         before = dict(activity)
-                        start = time.perf_counter_ns()
-                        runtime.step(np.zeros(prepared.spec.input_dimension))
-                        timings.append((time.perf_counter_ns() - start) / 1e6)
+                        measured_step(lambda: runtime.step(np.zeros(prepared.spec.input_dimension)))
                         per_step_activity.append({name: activity[name] - value
                                                   for name, value in before.items()})
                         phase_samples.append({
@@ -292,20 +615,20 @@ def run_local_benchmark(
             with (patch.object(lan_scalar_runtime, "prepare_scalar_round", measured_prepare),
                   patch.object(lan_scalar_runtime, "_send", measured_send),
                   patch.object(lan_scalar_runtime, "_receive", measured_receive)):
+                setup_start = time.perf_counter_ns()
                 runtime = LanScalarRuntime(
                     config, program, certificate, modulus=modulus,
                     modulus_evidence=evidence, run_id="public-communication-benchmark",
                     epoch_id="synthetic-step", start_physical_step=0,
                     batch=mode == "batch",
                 )
+                initial_setup_ms = (time.perf_counter_ns() - setup_start) / 1e6
                 try:
                     values = {"p": .2, "v": -.4, "beta": .31, "omega": 1.7}
                     for step in range(steps):
                         marks.clear()
                         before = dict(activity)
-                        start = time.perf_counter_ns()
-                        runtime.step(values, step)
-                        timings.append((time.perf_counter_ns() - start) / 1e6)
+                        measured_step(lambda current_step=step: runtime.step(values, current_step))
                         per_step_activity.append({name: activity[name] - value
                                                   for name, value in before.items()})
                         phase_samples.append({
@@ -323,13 +646,17 @@ def run_local_benchmark(
                     runtime.end()
                 finally:
                     runtime.close()
-        outcomes = [queue.get(timeout=10) for _ in parties]
+        outcomes = _party_outcomes(queue)
         for party in parties:
             party.join(timeout=10)
         if any(party.exitcode != 0 for party in parties) or any(
             item["status"] not in {"closed", "complete"} for item in outcomes
         ):
             raise RuntimeError("角色未成功完成基准会话")
+    except Exception as error:  # noqa: BLE001 - 原始失败只保留公开错误类别及已观测尝试
+        failure = type(error).__name__
+        if not outcomes:
+            outcomes = _party_outcomes(queue)
     finally:
         restore()
         for party in parties:
@@ -345,6 +672,8 @@ def run_local_benchmark(
     overhead.update({"P1->P2": 1, "P2->P1": 1})
     online_frames = {}
     for direction, fixed_frames in overhead.items():
+        if failure is not None:
+            break
         actual = directions[direction]["frames"] - fixed_frames
         if actual < 0 or actual % steps:
             raise RuntimeError("公开帧数不符合固定会话 setup/结束边界")
@@ -355,7 +684,9 @@ def run_local_benchmark(
                                          cwd=_ROOT, text=True).strip())
     return {
         "schema": "communication-benchmark-v1", "case": case, "mode": mode,
+        "status": "failed" if failure else "complete", "failure_type": failure,
         "code_sha": sha, "dirty": dirty,
+        "source_sha256": _source_fingerprints(),
         "command": ["secure-control", "benchmark", "--case", case, "--mode", mode,
                     "--steps", str(steps), "--delay-ms", str(delay_ms)],
         "environment": {"os": platform.platform(), "python": sys.version.split()[0],
@@ -368,27 +699,32 @@ def run_local_benchmark(
         if case == "dynamic" else "configs/cart_pole_swing_up.yaml",
         "public_topology_sha256": config.topology.digest,
         "numeric_profile": numeric_profile,
-        "steps": steps, "successful_steps": steps, "failed_steps": 0,
+        "steps": steps, "successful_steps": sum(item["status"] == "confirmed" for item in attempts),
+        "failed_steps": sum(item["status"] == "failed" for item in attempts),
+        "raw_attempts": attempts, "initial_setup_ms": initial_setup_ms,
         "resources_per_step": {"products": 30 if case == "dynamic" else 38,
                                "truncations": 4 if case == "dynamic" else 38},
         "timing": _timing(timings), "directions_all_session": directions,
         "online_frames_per_step": online_frames,
         "client_request_reply_groups_per_step": (
-            online_frames["Client->P1"] + online_frames["Client->P2"]
+            online_frames["Client->P1"] + online_frames["Client->P2"] if not failure else None
         ),
-        "peer_frames_per_step": online_frames["P1->P2"] + online_frames["P2->P1"],
+        "peer_frames_per_step": online_frames["P1->P2"] + online_frames["P2->P1"] if not failure else None,
         "online_frame_derivation": "whole-session directional frames minus fixed setup/end frames (Client 5 dynamic or 4 scalar per direction; peer 1 per direction), divided by steps",
         "client_phase_p50_ms": {
-            name: _quantile([item[name] for item in phase_samples[1:]], .5)
-            for name in phase_samples[0]
+            name: _quantile([item[name] for item in phase_samples], .5)
+            for name in (phase_samples[0] if phase_samples else {})
         },
         "client_step_activity_p50_ms": {
-            name: _quantile([item[name] for item in per_step_activity[1:]], .5)
+            name: _quantile([item[name] for item in per_step_activity], .5) if per_step_activity else None
             for name in activity
         },
         "party_activity_all_session_ms": {
             item["role"]: item["activity_ms"] for item in outcomes
         },
+        "party_steps": {item["role"]: item["steps"] for item in outcomes},
+        "raw_step_phases_ms": phase_samples,
+        "raw_step_activity_ms": per_step_activity,
         "activity_scope": "Client activity is within step; send includes injected delay, receive includes waiting; encode/decode and wall phases overlap, stage includes remote compute and peer I/O",
         "byte_scope": "application frame payload plus 4-byte header; includes setup/end; excludes TCP/TLS overhead",
         "limits": "synthetic kernel benchmark, no plant, GUI, three-machine network or 20ms guarantee",
