@@ -126,6 +126,88 @@ def test_finite_window_initial_replay_remains_finite_and_stop_disabled(tmp_path,
     gc.collect()
 
 
+@pytest.mark.gui
+def test_dynamic_recording_windows_keep_light_frame_and_full_verified_reader(tmp_path, tk_root, monkeypatch):
+    from test_cart_pole_lan import _observer_profile_for
+    from test_lan_continuous import _plain_deployment
+
+    from secure_control.scenarios.cart_pole import gui
+    paths = _plain_deployment(tmp_path)
+    _observer_profile_for(paths)
+    window = CartPoleWindow(tk_root, paths["Client"])
+    assert window.recording_mode == "light" and window.stop.cget("text") == "停止"
+    def run(config, **kwargs):
+        assert kwargs["recording_mode"] == "light"
+        return {"recording_mode": "light", "status": "stopped", "confirmed_step_count": 7,
+                "stop_reason": "user_requested"}
+    monkeypatch.setattr(gui, "run_cart_pole_segmented", run)
+    monkeypatch.setattr(gui, "open_verified_cart_pole_segmented_run",
+                        lambda *args, **kwargs: pytest.fail("light must not use formal reader"))
+    window._notify("frame", {"step": 7, "time_s": .14, "state": (0., 0., .001, 0.),
+                             "status": "balancing", "applied_force_n": 0., "disturbance_force_n": 0.})
+    window._run_worker()
+    window._poll()
+    assert window._final_count == 7 and "step=7" in window.values.get()
+    assert window._verified is None and "未保存完整" in window.location.get()
+    for widget in (window.replay, window.seek_button, window.charts):
+        assert str(widget.cget("state")) == "disabled"
+
+
+    # 两种选择复用本测试拥有的 Tcl root，避免重复初始化同一界面资源。
+    window = gui.CartPoleWindow(tk_root, paths["Client"], recording_mode="full")
+    assert window.stop.cget("text") == "停止并保存"
+    verified = object()
+    calls = []
+    def run(config, **kwargs):
+        assert kwargs["recording_mode"] == "full"
+        return {"recording_mode": "full", "status": "complete", "run_dir": "verified-run"}
+    def reader(path, **kwargs):
+        calls.append(path)
+        return verified
+    monkeypatch.setattr(gui, "run_cart_pole_segmented", run)
+    monkeypatch.setattr(gui, "open_verified_cart_pole_segmented_run", reader)
+    window._run_worker()
+    assert calls == ["verified-run"] and window._terminal == ("complete", verified)
+
+
+def test_headless_recording_selection_and_rejection_precede_network(tmp_path, monkeypatch):
+    import runpy
+    import sys
+
+    from test_cart_pole_lan import ROOT, _observer_profile_for, _profile_for
+    from test_lan_continuous import _plain_deployment
+
+    from secure_control.experiments import cart_pole_segmented_evidence as evidence
+
+    paths = _plain_deployment(tmp_path)
+    _observer_profile_for(paths)
+    received = []
+    def run(config, **kwargs):
+        received.append(kwargs["recording_mode"])
+        return {"status": "stopped", "confirmed_step_count": 0}
+    monkeypatch.setattr(evidence, "run_cart_pole_segmented", run)
+    entry = ROOT / "scripts/run_cart_pole_client.py"
+    for selector in (None, "full"):
+        argv = [str(entry), str(paths["Client"]), "--headless-continuous"]
+        if selector:
+            argv += ["--recording", selector]
+        monkeypatch.setattr(sys, "argv", argv)
+        with pytest.raises(SystemExit) as exit:
+            runpy.run_path(str(entry), run_name="__main__")
+        assert exit.value.code == 0
+    assert received == [None, "full"]
+    for route in (["--finite"], ["--full-route", "secure"], ["--full-gui-route", "secure"]):
+        monkeypatch.setattr(sys, "argv", [str(entry), str(paths["Client"]), *route, "--recording", "light"])
+        with pytest.raises(SystemExit) as exit:
+            runpy.run_path(str(entry), run_name="__main__")
+        assert exit.value.code == 2
+    _profile_for(paths)
+    monkeypatch.setattr(sys, "argv", [str(entry), str(paths["Client"]), "--headless-continuous", "--recording", "full"])
+    with pytest.raises(SystemExit) as exit:
+        runpy.run_path(str(entry), run_name="__main__")
+    assert exit.value.code == 2 and received == [None, "full"]
+
+
 _CLOSE = r'''
 import json, sys, threading, tkinter as tk
 from pathlib import Path

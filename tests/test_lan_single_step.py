@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import subprocess
 import sys
 import time
@@ -24,6 +25,63 @@ from secure_control.execution.localhost_codec import (
     WireEnvelope,
     decode_envelope,
 )
+
+
+@pytest.mark.parametrize("transport", ["insecure_tcp", "mutual_tls"])
+def test_all_lan_tcp_links_enable_nodelay_and_close_failed_options(deployment, monkeypatch, transport):
+    from dataclasses import replace
+    from threading import Thread
+
+    from secure_control.execution import lan_transport, localhost_transport
+
+    configs = {r: replace(load_lan_config(deployment[r], r), transport=transport)
+               for r in ("Client", "P1", "P2")}
+    topology = configs["Client"].topology
+    for dialer, acceptor, endpoint in (("Client", "P1", topology.p1_client),
+                                      ("Client", "P2", topology.p2_client),
+                                      ("P2", "P1", topology.p1_peer)):
+        server = listener(endpoint)
+        accepted, errors = [], []
+        def accept(dialer=dialer, acceptor=acceptor, server=server, accepted=accepted, errors=errors):
+            try:
+                accepted.append(lan_transport.accept_role(server, configs[acceptor], dialer,
+                                                         time.monotonic() + 5))
+            except (LanConnectionError, LanIdentityError, TimeoutError) as error:
+                errors.append(error)
+        thread = Thread(target=accept)
+        thread.start()
+        client = None
+        try:
+            client = lan_transport.connect_role(endpoint, configs[dialer], acceptor,
+                                                time.monotonic() + 5)
+            thread.join(5)
+            assert not thread.is_alive() and not errors and len(accepted) == 1
+            assert all(s.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) == 1
+                       for s in (client, accepted[0]))
+        finally:
+            if client is not None:
+                client.close()
+            for connection in accepted:
+                connection.close()
+            server.close()
+            thread.join(5)
+    tracked = []
+    def failed(sock, **kwargs):
+        tracked.append(sock)
+        raise OSError("option failure")
+    monkeypatch.setattr(localhost_transport, "_configure_tcp", failed)
+    server = listener(topology.p1_client)
+    raw = socket.create_connection((topology.p1_client.host, topology.p1_client.port))
+    try:
+        with pytest.raises(LanConnectionError):
+            lan_transport.accept_role(server, configs["P1"], "Client", time.monotonic() + 5)
+        with pytest.raises(LanConnectionError):
+            lan_transport.connect_role(topology.p1_client, configs["Client"], "P1",
+                                       time.monotonic() + 5)
+        assert len(tracked) == 2 and all(s.fileno() == -1 for s in tracked)
+    finally:
+        raw.close()
+        server.close()
 
 ROOT = Path(__file__).resolve().parents[1]
 NAMES = {

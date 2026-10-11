@@ -1,6 +1,6 @@
 """绝对截止、施力事实与有界库存的短契约测试，不进行默认性能长跑。"""
 
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -68,7 +68,7 @@ class _Segment:
     index: int
 
 
-@pytest.mark.parametrize("late_phase", ["before_device", "after_device", "maintenance"])
+@pytest.mark.parametrize("late_phase", ["before_device", "after_device", "maintenance", "observation"])
 def test_unique_runner_rejects_late_command_and_keeps_applied_fact(monkeypatch, late_phase):
     time_ns = [0]
     control, session = RunControl(), InteractiveSession()
@@ -140,17 +140,39 @@ def test_unique_runner_rejects_late_command_and_keeps_applied_fact(monkeypatch, 
         security_parameter=8, evidence=None, segment_capacity=1, recheck_sources=lambda: None,
         scene=SimpleNamespace(period=.02, controller_input=lambda: [0], advance=advance),
     )
+    def observe(timing):
+        timings.append(timing)
+        if late_phase == "observation":
+            time_ns[0] += 21_000_000
+
     report = lan_runner._run_prepared_segmented(
         None, experiment, control=control, session=session, realtime=True,
-        material_slots=0, on_cycle=timings.append,
+        material_slots=0, on_cycle=observe,
     )
     assert report["status"] == "failed"
     assert len(timings) == 1 and timings[0].global_step == 0
     assert timings[0].protocol_committed_count == 1
     assert applied == ([] if late_phase == "before_device" else [0])
     assert timings[0].physically_confirmed_count == len(applied)
-    assert timings[0].status == ("miss_before_apply" if not applied else "miss_after_apply")
-    assert timings[0].cycle_completed_ns is None
+    if late_phase == "observation":
+        from secure_control.experiments.cart_pole_segmented_evidence import (
+            _correct_cycle_tail,
+            _LightRecording,
+        )
+        assert timings[0].status == "confirmed"  # 回调当时的 provisional 事实。
+        recent = _LightRecording()
+        recent.record_cycle(timings[0])
+        window = recent.summary(report)
+        samples = [asdict(timings[0])]
+        _correct_cycle_tail(samples, report, project=dict)
+        assert len(samples) == window["recent_count"] == report["cycle_summary"]["attempts"] == 1
+        for row in (samples[-1], window["recent_cycles"][-1]):
+            assert row["status"] == "miss_after_apply" and row["cycle_completed_ns"] is None
+            assert row["failure_phase"] == "CYCLE_OBSERVATION"
+        assert report["cycle_summary"]["misses"] == 1
+    else:
+        assert timings[0].status == ("miss_before_apply" if not applied else "miss_after_apply")
+        assert timings[0].cycle_completed_ns is None
     assert startup == ["collected", "clock"]
     assert report["startup_gc"] == {"duration_ns": 0, "collected": 3}
 

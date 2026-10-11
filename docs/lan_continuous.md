@@ -119,6 +119,44 @@ qualification_pass 仅在完整 10k、零 miss、所有完整周期在 deadline 
 
 ## 持续分段后端（#100）
 
+### 动态持续控制的记录模式与通信（#120）
+
+动态 observer 的专用 GUI 与 `--headless-continuous` 默认使用轻量记录；
+显式 `--recording full` 才启用完整留证。静态、有限步和完整起摆路线维持原服务，
+不接受这个模式选择参数。记录模式不修改协议、材料、安全检查、设备确认或20 ms截止时间。
+
+light 只在内存保留首周期、最近256个公开周期和失败摘要，停止后才整理窗口统计；
+窗口分位数不代表全程。正常停止返回 `status=stopped`、`recording_mode=light`、
+`evidence_state=not_recorded`，run_dir/prefix_dir为空，durable_step_count为0。
+没有轨迹/哈希链/读回/写盘/图或正式回放。GUI按钮为“停止”，保留最后确认画面与计数，
+显示“未保存完整实验轨迹”；failed/uncertain/cancelled仍显示真实失败类别。
+full 继续原严格记录、可靠前缀、读回、停止保存与正式回放契约；磁盘失败不降级成light。
+静态入口的默认记录服务不变。
+
+所有真实TCP拨号和接受连接在建连期设置TCP_NODELAY，TLS包装保留该设置；设置失败关闭
+连接。它减少可能的小消息等待，不减少应用帧，也不保证操作系统/无线网络尾延迟。
+只有batch、非零秘密状态、lan-segmented-v2的独立动态持续路径先发送P1/P2原commit请求，
+再依次核验两方ACK；full-v3、有限/静态和旧后端保持串行提交。两份有效ACK是出力门槛，
+未知提交不重试、不回滚、不继续下一轮。last_commit_observation的false只表示未收到有效ACK，
+不能推断远端未提交。协议双确认、物理确认与可靠前缀仍是不同事实。
+
+overlap的公开阶段键为p1/p2_commit_send、commit_ack_wait、commit_latency；两方latency
+存在重叠，不可相加当总耗时或称网络RTT。原serial的p1/p2_commit含义保持。
+
+benchmark cycle为兼容历史负载仍默认full，需显式 `--recording light` 测量轻量控制。
+light的writer/drain/fsync/checkpoint指标为null（未执行），来源检查仍实际执行并计时。
+基准保存至多10000个周期用于停止后单次输出，区别于生产256窗口；最终周期以runner终止
+事实校正，不能用回调中临时的confirmed覆盖回调后超期。
+仅内部三进程cycle接受 `--tcp-nodelay off` 或 `--commit-policy serial` 的受控对照；
+外部role-config及其他case拒绝非默认策略。报告各角色建连期实测socket选项、实际提交策略、
+comparison_only和来源摘要。非默认对照不能取得production qualification_pass。
+
+本轮同SHA各一次A（light/off/serial）、B（light/default/serial）、C（light/default/default）
+1000步、segment400/preload1000/fused/delay0，新run/new材料、首次失败停止。C零超期才运行
+默认16槽无预送1000；再通过且长期条件合法才10000。首个C/默认供料失败最多一次原有限
+诊断，steps=min(首次失败尝试数+5,1000)。不重复挑绿，不用预送库存冒充持续供应资格；
+本机仿真通过也不代表完整起摆或真实三机Wi-Fi/硬件资格。
+
 三个终端仍分别启动原 P1、P2、Client 文件；持续模式由 Client 显式选择：
 
 ```powershell

@@ -506,6 +506,9 @@ class LanContinuousRuntime:
         self._segment_capacity = _segment_capacity if v2 else range_contract.horizon_steps
         self._v2 = v2
         self._batch = batch
+        self._overlap_commit = bool(batch and spec.state_dimension and _segment_hello is not None
+                                    and _segment_hello.mode == "lan-segmented-v2")
+        self.last_commit_observation = None
         self._products = 0
         self._truncations = 0
         self._confirmed_steps: list[dict[str, int | str]] = []
@@ -673,6 +676,7 @@ class LanContinuousRuntime:
         prepared = None
         endpoints = []
         self._last_phase_ns = {}
+        self.last_commit_observation = None
         try:
             deadline = (network_deadline(self.config.step_timeout, deadline_ns)
                         if deadline_ns is not None else None)
@@ -748,6 +752,7 @@ class LanContinuousRuntime:
             result = _complete_client_round(
                 self.client, endpoints[0], endpoints[1], plan, batch=self._batch,
                 on_phase=record_phase,
+                **({"overlap_commit": True} if self._overlap_commit else {}),
             )
             if self._preload_steps:
                 self.client.retire_preloaded_round(current, success=True)
@@ -756,9 +761,7 @@ class LanContinuousRuntime:
                                 ("commit", "reconstruct")):
                 if name in stamps and begin in stamps:
                     self._last_phase_ns[name] = stamps[name] - stamps[begin]
-            for party, endpoint in enumerate(endpoints):
-                if hasattr(endpoint, "commit_duration_ns"):
-                    self._last_phase_ns[f"p{party + 1}_commit"] = endpoint.commit_duration_ns
+            self._observe_commits(endpoints)
             self._sequences = [endpoint.sequence for endpoint in endpoints]
             self._step += 1
             self._products += result.products
@@ -776,9 +779,9 @@ class LanContinuousRuntime:
             self._last_result = result
             return np.array(result.output, dtype=float, copy=True)
         except Exception:
-            for party, endpoint in enumerate(endpoints):
-                if hasattr(endpoint, "commit_duration_ns"):
-                    self._last_phase_ns[f"p{party + 1}_commit"] = endpoint.commit_duration_ns
+            self._observe_commits(endpoints)
+            for endpoint in endpoints:
+                endpoint._commit_state = "failed"
             if current is not None:
                 identity = (current.session_id, current.round_id, current.step)
                 if self._preload_steps:
@@ -790,6 +793,22 @@ class LanContinuousRuntime:
             self._failed = True
             self.close()
             raise
+
+    def _observe_commits(self, endpoints):
+        if not endpoints:
+            return
+        self.last_commit_observation = {
+            "session_id": endpoints[0].session_id, "round_id": endpoints[0].plan.round_id,
+            "step": endpoints[0].plan.step,
+            "parties": {f"P{party + 1}": dict(endpoint.commit_observation)
+                        for party, endpoint in enumerate(endpoints)},
+        }
+        for party, endpoint in enumerate(endpoints):
+            if hasattr(endpoint, "commit_duration_ns"):
+                self._last_phase_ns[f"p{party + 1}_commit"] = endpoint.commit_duration_ns
+            else:
+                for key, value in endpoint.commit_timings.items():
+                    self._last_phase_ns[f"p{party + 1}_commit_{key}"] = value
 
     def begin_segment(self, begin: SegmentBeginPayload, *, deadline_ns: int | None = None) -> None:
         """v2 保留同一 controller/session 与全局 step，只确认新的逻辑段。"""
@@ -1010,6 +1029,12 @@ class LanSegmentedRuntime:
         if self._segment is None:
             return self.global_start
         return self._segment._step if self._v2 else self.global_start + self._segment._step
+
+    @property
+    def last_commit_observation(self):
+        observation = self._segment.last_commit_observation if self._segment is not None else None
+        return ({**observation, "run_id": self.run_id, "controller_epoch": self.controller_epoch,
+                 "global_step": observation["step"]} if observation is not None else None)
 
     @property
     def resource_counts(self) -> dict[str, int]:

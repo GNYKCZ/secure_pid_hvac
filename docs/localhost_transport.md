@@ -28,6 +28,12 @@ masked share。localhost worker 只负责 Client 编排、framing、严格 codec
 
 ## Wire 契约
 
+真实TCP拨号端与接受端在建连期设置并核验TCP_NODELAY=1；LAN连接工厂复用同一内部函数，
+双向TLS在包装后核验选项仍有效。设置错误由连接owner关闭并报原连接错误，无认证降级。
+监听socket和AF_UNIX/socketpair不设置该选项；framing、sequence和绝对deadline不变。
+此旧localhost运行时仍按原P1/P2串行commit确认；仅独立动态LAN v2重叠提交等待，详见
+[持续控制](lan_continuous.md)。TCP包数和无线网络效果需另行实测。
+
 - schema version 固定为 `3`，未知版本直接失败，不协商降级；v2 的父进程逐阶段调度信封不可混用；
 - envelope 明确 kind、sender、recipient、单调 sequence、operation、session、round、step 与
   resource identity，并拒绝未知、重复、缺失字段和非法组合；

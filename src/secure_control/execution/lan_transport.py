@@ -7,6 +7,7 @@ import ssl
 import threading
 from queue import Empty, Queue
 
+from . import localhost_transport
 from .cycle_timing import remaining_seconds
 from .lan_config import LanConfig, LanEndpoint, Role
 
@@ -61,7 +62,14 @@ def accept_role(sock: socket.socket, config: LanConfig, peer: Role, deadline: fl
         raise LanConnectionError("接受 TCP 连接失败。") from error
     try:
         raw.settimeout(_remaining(deadline))
+        localhost_transport._configure_tcp(raw)
         return raw
+    except LanTimeoutError:
+        raw.close()
+        raise
+    except OSError as error:
+        raw.close()
+        raise LanConnectionError("设置 TCP 连接失败。") from error
     except Exception:
         raw.close()
         raise
@@ -76,11 +84,14 @@ def connect_tls(
     raw = _dial(addresses, deadline)
     secure = None
     try:
+        raw_nodelay = raw.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY)
         identity = config.topology.identities[peer]
         secure = context.wrap_socket(raw, server_hostname=identity, do_handshake_on_connect=False)
         secure.settimeout(_remaining(deadline))
         secure.do_handshake()
         _verify_identity(secure, identity)
+        if secure.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) != raw_nodelay:
+            raise OSError("TLS 包装丢失 TCP_NODELAY 设置。")
         return secure
     except Exception as error:  # noqa: BLE001 - 握手异常必须关闭 socket
         (secure or raw).close()
@@ -101,10 +112,14 @@ def accept_tls(
     except OSError as error:
         raise LanConnectionError("接受 TCP 连接失败。") from error
     try:
+        localhost_transport._configure_tcp(raw)
+        raw_nodelay = raw.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY)
         secure = context.wrap_socket(raw, server_side=True, do_handshake_on_connect=False)
         secure.settimeout(_remaining(deadline))
         secure.do_handshake()
         _verify_identity(secure, config.topology.identities[peer])
+        if secure.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) != raw_nodelay:
+            raise OSError("TLS 包装丢失 TCP_NODELAY 设置。")
         return secure
     except Exception as error:  # noqa: BLE001 - 握手异常必须关闭 socket
         (secure or raw).close()
@@ -166,6 +181,7 @@ def _dial(addresses: list[tuple], deadline: float) -> socket.socket:
         try:
             sock.settimeout(_remaining(deadline))
             sock.connect(sockaddr)
+            localhost_transport._configure_tcp(sock)
             return sock
         except TimeoutError as error:
             sock.close()

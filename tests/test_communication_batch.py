@@ -54,6 +54,154 @@ from secure_control.protocol.messages import (
 )
 
 
+@pytest.mark.parametrize(("actor", "fault"), [
+    (None, None), (0, "send"), (1, "send"), (0, "missing"), (1, "missing"),
+    (0, "identity"), (1, "payload"),
+])
+def test_overlapping_commit_requires_both_original_acks_and_rejects_reuse(monkeypatch, actor, fault):
+    """真实 framing：P2 可先提交；任一未知 ACK 不能签发输出或继续 endpoint。"""
+    import numpy as np
+    from test_two_party_protocol import make_stack
+
+    from secure_control.execution import _localhost_workers as workers
+    from secure_control.execution.localhost_transport import receive_envelope
+    from secure_control.protocol.messages import ControlShareMessage, Protocol3StageReceipt
+
+    client, _, _, _, distribution = make_stack()
+    online = client.prepare_online(distribution, [.25], step=0)
+    plan = online.p1_resources.plan
+    pairs = [socket.socketpair() for _ in range(2)]
+    deadline = time.monotonic() + .1
+    endpoints = [workers._ClientPartyEndpoint(pair[0], party, plan, 7, 4096, 1., deadline)
+                 for party, pair in enumerate(pairs)]
+    events, committed, budgets = [], [], []
+    original_send, original_receive = workers.send_envelope, workers.receive_envelope
+
+    def send(sock, request, **kwargs):
+        party = 0 if sock is pairs[0][0] else 1
+        events.append(f"send{party}")
+        budgets.append(kwargs["deadline"])
+        original_send(sock, request, **kwargs)
+        actual = receive_envelope(pairs[party][1], deadline=deadline, limit=4096)
+        assert actual.sequence == 7 and actual.payload.operation == "commit"
+        committed.append(party)  # 远端已提交后，send/ACK 仍可能未知。
+        if actor == party and fault == "send":
+            raise OSError("partial send is uncertain")
+        if actor == party and fault == "missing":
+            pairs[party][1].close()
+            return
+        response = replace(actual, kind="reply", sender=actual.recipient, recipient="Client", payload=None)
+        if actor == party and fault == "identity":
+            response = replace(response, sequence=6, session_id="old-session")
+        if actor == party and fault == "payload":
+            response = replace(response, payload=Protocol3StageReceipt(party, plan.session_id,
+                               plan.round_id, plan.step, plan.triple_count, plan.truncation_count))
+        original_send(pairs[party][1], response, deadline=deadline, limit=4096)
+
+    def receive(sock, **kwargs):
+        party = 0 if sock is pairs[0][0] else 1
+        events.append(f"ack{party}")
+        budgets.append(kwargs["deadline"])
+        assert committed == [0, 1]
+        return original_receive(sock, **kwargs)
+
+    def stage(first, second, current):
+        events.append("stage")
+        assert current == plan
+        for endpoint in endpoints:
+            endpoint.share = ControlShareMessage(endpoint.party, plan.session_id, plan.round_id,
+                                                  plan.step, plan.scale_ledger.output,
+                                                  AdditiveShare(np.array([0], dtype=object)))
+        return tuple(Protocol3StageReceipt(p, plan.session_id, plan.round_id, plan.step,
+                                           plan.triple_count, plan.truncation_count) for p in (0, 1))
+
+    def reconstruct(*args):
+        events.append("reconstruct")
+        return np.array([.5])
+
+    monkeypatch.setattr(workers, "send_envelope", send)
+    monkeypatch.setattr(workers, "receive_envelope", receive)
+    monkeypatch.setattr(Protocol3Orchestrator, "stage_batch", lambda _, *args: stage(*args))
+    monkeypatch.setattr(client, "reconstruct_control", reconstruct)
+    try:
+        if fault is None:
+            output = workers._complete_client_round(client, *endpoints, plan, batch=True,
+                                                     overlap_commit=True)
+            assert output.output.tolist() == [.5]
+            assert events == ["stage", "reconstruct", "send0", "send1", "ack0", "ack1"]
+        else:
+            with pytest.raises((OSError, ValueError, RuntimeError)):
+                workers._complete_client_round(client, *endpoints, plan, batch=True,
+                                                overlap_commit=True)
+            assert not all(e.commit_observation["valid_ack_received"] for e in endpoints)
+            if fault in ("missing", "identity") and actor == 0:
+                assert committed == [0, 1] and "ack1" not in events
+                assert "ack_wait" not in endpoints[1].commit_timings
+        assert all(value == deadline for value in budgets)
+        for endpoint in endpoints:
+            if endpoint._commit_state != "not_started":
+                assert endpoint.sequence == 8
+                for method in (endpoint.start_commit, endpoint.finish_commit,
+                               endpoint.start_stage_batch, endpoint.commit):
+                    if method == endpoint.finish_commit and endpoint._commit_state == "in_flight":
+                        continue  # 整轮 owner 负责关闭未读通道；本测试不补收 ACK 恢复成功。
+                    with pytest.raises(RuntimeError):
+                        method()
+        assert len([e for e in events if e.startswith("send")]) <= 2
+    finally:
+        for pair in pairs:
+            for sock in pair:
+                sock.close()
+
+
+def test_light_benchmark_corrects_provisional_success_and_never_opens_recording(tmp_path, monkeypatch):
+    from dataclasses import asdict
+
+    from test_cart_pole_lan import _observer_profile_for
+    from test_lan_continuous import _plain_deployment
+
+    from secure_control.execution.cycle_timing import CycleTiming
+    from secure_control.experiments import cart_pole_segmented_evidence as evidence
+    from secure_control.experiments import lan_runner
+    from secure_control.experiments.communication_benchmark import run_continuous_observation
+
+    paths = _plain_deployment(tmp_path)
+    _observer_profile_for(paths)
+    def forbidden(*args, **kwargs):
+        pytest.fail("light constructed recording I/O")
+    for name in ("_Spool", "_BatchWriter", "open_verified_cart_pole_segmented_run"):
+        monkeypatch.setattr(evidence, name, forbidden)
+    def run(config, prepared, **kwargs):
+        prepared.recheck_sources()
+        assert not any(kwargs[k] for k in ("on_start", "on_segment", "before_sample", "cycle_snapshot"))
+        kwargs["phase"]("INPUT")
+        kwargs["on_step"](SimpleNamespace(protocol=SimpleNamespace(
+            global_step=0, segment_index=0, session_id="session", round_id="round")))
+        timing = CycleTiming("run", "session", "epoch", 0, 0, "round", 20, 0, 0, 20,
+                             cycle_completed_ns=19, status="confirmed")
+        kwargs["on_cycle"](timing)
+        return {"status": "failed", "category": "CycleDeadlineExceeded", "resource_counts": {},
+                "failure_phase": "CYCLE_OBSERVATION", "cycle_summary": {"attempts": 1, "misses": 1,
+                    "last_cycle": asdict(replace(timing, status="miss_after_apply",
+                        cycle_completed_ns=None, failure_phase="CYCLE_OBSERVATION"))}}
+    monkeypatch.setattr(lan_runner, "_run_prepared_segmented", run)
+    before = set(tmp_path.rglob("*"))
+    report = run_continuous_observation(steps=2, segment_steps=1, delay_ms=0, optimized=True,
+                                       recording_mode="light", role_config=paths["Client"])
+    assert len(report["cycles"]) == 1 and report["cycles"][0]["status"] == "miss_after_apply"
+    assert report["cycles"][0]["cycle_completed_ns"] is None
+    assert not report["stage_pass"] and not report["qualification_pass"]
+    assert report["writer_batches"] is report["stop_drain_ns"] is report["spool_io"] is None
+    assert report["storage_all"]["fsync_ms"] is None
+    assert report["storage_all"]["source_check_control_count"] > 0
+    assert before == set(tmp_path.rglob("*"))
+    for options in ({"tcp_nodelay": 0}, {"commit_policy": "unknown"},
+                    {"tcp_nodelay": False}, {"commit_policy": "serial"}):
+        with pytest.raises((ValueError, TypeError)):
+            run_continuous_observation(steps=2, segment_steps=1, delay_ms=0, optimized=True,
+                                       role_config=paths["Client"], **options)
+
+
 def test_public_layer_plan_keeps_independent_gates_and_empty_program():
     program = ScalarProgram(
         ("a", "b", "c"), (("secret_constant", Fraction(3, 2)),),

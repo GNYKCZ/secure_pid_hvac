@@ -15,6 +15,13 @@ _HEADER = struct.Struct("!I")
 _LOOPBACK = "127.0.0.1"
 
 
+def _configure_tcp(sock: socket.socket, *, enabled: bool = True) -> None:
+    """建连 owner 在正式时钟前设置；失败时由 owner 关闭连接。"""
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, int(enabled))
+    if sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) != int(enabled):
+        raise OSError("TCP_NODELAY 设置未生效。")
+
+
 class LocalhostTransportError(RuntimeError):
     """localhost framing、连接或 socket 状态错误。"""
 
@@ -112,6 +119,11 @@ def accept_loopback(listener: socket.socket, *, deadline: float) -> socket.socke
     if address[0] != _LOOPBACK:
         connection.close()
         raise LocalhostTransportProtocolError("只接受 127.0.0.1 peer。")
+    try:
+        _configure_tcp(connection)
+    except OSError as error:
+        connection.close()
+        raise LocalhostTransportError("设置 localhost TCP 连接失败。") from error
     return connection
 
 
@@ -124,6 +136,7 @@ def connect_loopback(address: tuple[str, int], *, deadline: float) -> socket.soc
     try:
         _set_remaining_timeout(sock, deadline)
         sock.connect((host, port))
+        _configure_tcp(sock)
         return sock
     except TimeoutError as error:
         sock.close()

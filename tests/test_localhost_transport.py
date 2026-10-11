@@ -77,6 +77,48 @@ from secure_control.simulation.telemetry import (
 _DEFAULT_TRANSPORT = LocalhostTransportConfig()
 
 
+def test_loopback_tcp_options_restore_after_benchmark_and_close_failed_owner(monkeypatch):
+    from contextlib import nullcontext
+
+    from secure_control.execution import localhost_transport as transport
+    from secure_control.experiments.communication_benchmark import _observe_tcp
+
+    rows = []
+    for enabled in (False, True):
+        listener = transport.create_listener("127.0.0.1", 0)
+        dial = accepted = None
+        try:
+            with _observe_tcp(rows, False) if not enabled else nullcontext():
+                deadline = deadline_after(1.)
+                dial = transport.connect_loopback(listener.getsockname(), deadline=deadline)
+                accepted = transport.accept_loopback(listener, deadline=deadline)
+            assert all(s.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) == int(enabled)
+                       for s in (dial, accepted))
+        finally:
+            if dial is not None:
+                dial.close()
+            if accepted is not None:
+                accepted.close()
+            listener.close()
+    assert len(rows) == 2 and all(row["tcp_nodelay"] == 0 for row in rows)
+    tracked = []
+    def fail(sock, **kwargs):
+        tracked.append(sock)
+        raise OSError("option failed")
+    monkeypatch.setattr(transport, "_configure_tcp", fail)
+    listener = transport.create_listener("127.0.0.1", 0)
+    dial = socket.create_connection(listener.getsockname())
+    try:
+        with pytest.raises(transport.LocalhostTransportError):
+            transport.accept_loopback(listener, deadline=deadline_after(1.))
+        with pytest.raises(transport.LocalhostTransportError):
+            transport.connect_loopback(listener.getsockname(), deadline=deadline_after(1.))
+        assert len(tracked) == 2 and all(s.fileno() == -1 for s in tracked)
+    finally:
+        dial.close()
+        listener.close()
+
+
 def _general_spec() -> ControllerSpec:
     return ControllerSpec(
         A=np.array([[0.5]]),

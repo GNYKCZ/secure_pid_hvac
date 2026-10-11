@@ -206,7 +206,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
         if session.cancelled.is_set():
             raise RuntimeError("Client 运行已取消。")
         progress("RECORDING_SEGMENT")
-        packet = CompletedSegment(segment, tuple(records))
+        packet = CompletedSegment(segment, tuple(records)) if on_segment is not None else None
         if on_segment is not None:
             measured("seal", lambda: on_segment(packet))
         primary = None
@@ -234,6 +234,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                                       "last_cycle": last_cycle},
                     "material_summary": getattr(runtime, "material_summary", runtime.cycle_queue_levels),
                     "startup_gc": startup_gc,
+                    "last_commit_observation": getattr(runtime, "last_commit_observation", None),
                 }
             progress("CONNECTING_NEXT")
             measured("source", experiment.recheck_sources)
@@ -348,8 +349,9 @@ def _run_prepared_segmented(config, experiment, *, control, session,
             if attempt is not None:
                 attempt["device"] = perf_counter_ns()
                 attempt["durations"]["device"] = attempt["device"] - started
-            record = ConfirmedStep(identity, snapshot)
-            records.append(record)
+            record = ConfirmedStep(identity, snapshot) if on_step is not None or on_segment is not None else None
+            if on_segment is not None:
+                records.append(record)
             progress("RECORDING_STEP")
             started = perf_counter_ns()
             if on_step is not None:
@@ -408,6 +410,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                               "last_cycle": last_cycle},
             "material_summary": getattr(runtime, "material_summary", runtime.cycle_queue_levels) if runtime is not None else {},
             "startup_gc": startup_gc,
+            "last_commit_observation": getattr(runtime, "last_commit_observation", None),
             "recording_error": getattr(error, "_public_recording_error", None),
         }
     finally:
@@ -566,6 +569,10 @@ def _run() -> int:
     benchmark.add_argument("--material-slots", type=int, choices=(0, 4, 16), default=16)
     benchmark.add_argument("--preload-steps", type=int, default=0)
     benchmark.add_argument("--preload-execution", choices=("staged", "fused"), default="fused")
+    benchmark.add_argument("--recording", choices=("light", "full"),
+                           help="仅cycle：轻量控制/完整留证对照；默认full保持原观察负载")
+    benchmark.add_argument("--tcp-nodelay", choices=("default", "off"), default="default")
+    benchmark.add_argument("--commit-policy", choices=("default", "serial"), default="default")
     benchmark.add_argument("--diagnostic", action="store_true",
                            help="本机cycle有限CPU/GC观测，不作为正式资格")
     benchmark.add_argument("--fixed-proof-cache", action="store_true",
@@ -582,6 +589,10 @@ def _run() -> int:
         )
 
         try:
+            if args.recording is not None and args.case != "cycle":
+                raise ValueError("--recording 只适用于cycle动态持续观察")
+            if (args.tcp_nodelay != "default" or args.commit_policy != "default") and args.case != "cycle":
+                raise ValueError("通信策略对照只适用于cycle。")
             if args.fixed_proof_cache and args.case != "full-observation":
                 raise ValueError("固定证明对照只适用于full-observation")
             if args.case == "full-observation":
@@ -599,6 +610,9 @@ def _run() -> int:
                     preload_steps=args.preload_steps, preload_execution=args.preload_execution,
                     role_config=args.role_config,
                     diagnostic=args.diagnostic,
+                    recording_mode=args.recording if args.recording is not None else "full",
+                    tcp_nodelay=False if args.tcp_nodelay == "off" else None,
+                    commit_policy=args.commit_policy,
                 )
             else:
                 if args.preload_steps or args.diagnostic:

@@ -93,6 +93,10 @@ class Protocol3BatchPartyEndpoint(Protocol3PartyEndpoint, Protocol):
 
     def finish_stage_batch(self) -> Protocol3StageReceipt: ...
 
+    def start_commit(self) -> None: ...
+
+    def finish_commit(self) -> None: ...
+
 
 class Protocol3Orchestrator:
     """唯一的 transport-neutral Protocol 3 操作与消息顺序。"""
@@ -166,6 +170,15 @@ class Protocol3Orchestrator:
         """在调用方完成输出验证后按固定 P1/P2 顺序提交两方 state。"""
         p1.commit()
         p2.commit()
+
+    def commit_batch(self, p1: Protocol3BatchPartyEndpoint,
+                     p2: Protocol3BatchPartyEndpoint, plan: StepResourcePlan) -> None:
+        """同一 Client 先发送两方原请求；仍需两份有效 ACK 才能返回。"""
+        self._validate_endpoints(p1, p2, plan)
+        p1.start_commit()
+        p2.start_commit()
+        p1.finish_commit()
+        p2.finish_commit()
 
     @staticmethod
     def _validate_endpoints(

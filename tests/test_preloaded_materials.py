@@ -235,7 +235,7 @@ def test_fused_activation_preflights_both_frames_and_burns_window_on_partial_fai
         runtime.__dict__.update(_v2=True, _failed=False, _finished=False, _step=0,
             _segment_start=0, _segment_capacity=400, _preload_steps=1, _preload_execution=mode,
             _preloaded=batch, _preload_digest=manifest.sha256(), _material_pool=None,
-            _sockets=["p1", "p2"], _sequences=[7, 7], _batch=True,
+            _sockets=["p1", "p2"], _sequences=[7, 7], _batch=True, _overlap_commit=True,
             client=client, distribution=distribution, spec=SimpleNamespace(input_dimension=1),
             config=SimpleNamespace(step_timeout=1.), session_id=manifest.session_id)
         events = []
@@ -293,6 +293,15 @@ def test_preloaded_real_three_party_staged_and_fused_keep_commits_and_cross_segm
         assert report["status"] == "stopped", report["failed_phase"]
         assert report["stage_pass"] and not report["qualification_pass"]
         assert report["successful_steps"] == 3
+        assert report["commit_policy"] == "overlap" and not report["comparison_only"]
+        assert set(report["tcp_socket_options"]) == {"Client", "P1", "P2"}
+        assert all(len(rows) == 2 and all(row["tcp_nodelay"] == 1 for row in rows)
+                   for rows in report["tcp_socket_options"].values())
+        phases = report["cycles"][0]["phase_durations_ns"]
+        for party in (1, 2):
+            assert phases[f"p{party}_commit_latency"] >= (phases[f"p{party}_commit_send"]
+                                                         + phases[f"p{party}_commit_ack_wait"])
+            assert f"p{party}_commit" not in phases
         assert report["material_summary"]["producer_present"] is False
         # 非边界轮包含 Client、两方回执与 peer 的实际发送帧，保持原commit ACK。
         count = sum(item["frames"] for item in report["steps"][0]["sent"].values())
@@ -306,7 +315,7 @@ def test_preloaded_real_three_party_staged_and_fused_keep_commits_and_cross_segm
             assert any(item.get("owner") == "writer" and item.get("phase") == "row_validation"
                        and item["calls"] == 2 for item in events)
             assert any(item.get("phase") == "journal_flush_fsync" for item in events)
-            for name in ("p1_commit", "p2_commit"):
+            for name in ("p1_commit_send", "p2_commit_send", "p1_commit_ack_wait", "p2_commit_ack_wait"):
                 assert any(item.get("phase") == name and item["global_step"] == 0
                            and item["calls"] == 1 for item in events)
             assert all(any(event.get("phase") == "local_arithmetic_ms.commit"
