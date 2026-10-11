@@ -1665,6 +1665,9 @@ def _check_json_budget(value: object, depth: int) -> None:
 
 
 def _encode_integer_value(value: object) -> object:
+    # 标量直接保留任意精度十进制；bool 仍由同一验证器拒绝。
+    if isinstance(value, (int, np.integer)):
+        return {"type": "bigint", "decimal": _decimal(value)}
     array = np.asarray(value, dtype=object)
     if array.ndim == 0:
         return {"type": "bigint", "decimal": _decimal(array.item())}

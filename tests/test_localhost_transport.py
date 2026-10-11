@@ -120,6 +120,25 @@ def test_bigint_scalar_and_object_array_round_trip_without_fixed_width_conversio
     assert np.asarray(decoded.value).dtype == object
 
 
+def test_integer_share_wire_bytes_match_original_scalar_and_array_encoding() -> None:
+    """旧数组转换方式独立确定 wire 期望，覆盖标量快路径和保留的数组路径。"""
+    for value in (0, -(1 << 200), np.int64(-(1 << 63)), np.uint64((1 << 64) - 1),
+                  np.array(1 << 200, dtype=object), np.empty((0, 2), dtype=object),
+                  np.array([[1, -(1 << 190)]], dtype=object), [1, 2]):
+        array = np.asarray(value, dtype=object)
+        if array.ndim == 0:
+            integer = {"type": "bigint", "decimal": str(int(array.item()))}
+        else:
+            integer = {"type": "bigint_array", "shape": list(array.shape),
+                       "values": [str(int(item)) for item in array.flat]}
+        expected = json.dumps({"type": "share", "value": integer}, ensure_ascii=False,
+                              sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+        assert encode_wire_value(AdditiveShare(value)) == expected
+    for invalid in (True, np.bool_(True), np.array(False), [True], 1.5):
+        with pytest.raises(TypeError):
+            encode_wire_value(AdditiveShare(invalid))
+
+
 def test_public_int64_input_array_round_trip_preserves_low_bits() -> None:
     vector = np.array([(1 << 60) - 1, -((1 << 60) - 1)], dtype=np.int64)
 

@@ -1596,7 +1596,7 @@ class _Spool:
         self._append_step(data)
         self._checkpoint("running")
 
-    def _append_step(self, data, *, output=None):
+    def _append_step(self, data, *, output=None, canonical_row=None):
         """canonical 身份/哈希校验共用；batch 的文件由唯一 writer 一次 flush/fsync。"""
         identity = data["protocol"]
         if (identity["run_id"] != self.backend_id
@@ -1604,22 +1604,40 @@ class _Spool:
                 or identity["global_step"] != self.end + self.tail_count
                 or identity["local_step"] != self.tail_count):
             raise ValueError("动态公开步骤不连续。")
-        entry = {"step": data, "prev_sha256": self.tail_hash}
-        digest = sha256(_bytes(entry)).hexdigest()
-        raw = _bytes({**entry, "sha256": digest})
-        if len(raw) > INDEX_LINE_LIMIT:
+        if canonical_row is None:
+            entry = {"step": data, "prev_sha256": self.tail_hash}
+            digest = sha256(_bytes(entry)).hexdigest()
+            raw = _bytes({**entry, "sha256": digest})
+            chunks, size = (raw,), len(raw)
+        else:
+            # 仅 batch 在严格解析、canonical/身份比对后传入原始 immutable 行。
+            # 去掉恰好一个已验证 LF；保留 UTF-8、负零和数字原字节，不复制行体。
+            body = memoryview(canonical_row)[:-1]
+            prefix = b'{"prev_sha256":' + _bytes(self.tail_hash)[:-1]
+            # sort_keys 下的两个 wrapper 次序不同；哈希原像仍包含最终 LF。
+            size = len(prefix) + len(b',"sha256":"') + 64 + len(b'","step":') + len(body) + 2
+            if size > INDEX_LINE_LIMIT:
+                raise ValueError("动态步骤记录超出行界。")
+            chain = sha256()
+            for chunk in (prefix, b',"step":', body, b'}\n'):
+                chain.update(chunk)
+            digest = chain.hexdigest()
+            chunks = (prefix, b',"sha256":"', digest.encode("ascii"), b'","step":', body, b'}\n')
+        if size > INDEX_LINE_LIMIT:
             raise ValueError("动态步骤记录超出行界。")
         if output is None:
             with (self.stage / "journal" / f"{self.count}.jsonl").open("ab") as stream:
-                stream.write(raw)
+                for chunk in chunks:
+                    stream.write(chunk)
                 self.disk_metrics["write_calls"] += 1
-                self.disk_metrics["write_bytes"] += len(raw)
+                self.disk_metrics["write_bytes"] += size
                 stream.flush()
                 os.fsync(stream.fileno())
                 self.disk_metrics["fsync_count"] += 1
         else:
-            output.write(raw)
-        self.tail_bytes += len(raw)
+            for chunk in chunks:
+                output.write(chunk)
+        self.tail_bytes += size
         self.tail_count += 1
         self.tail_hash = digest
 
@@ -1668,7 +1686,7 @@ class _Spool:
                         stats["row_validation_ns"] += perf_counter_ns() - started
                         if observer is not None:
                             observer.end(token)
-                    self._append_step(data, output=buffer)
+                    self._append_step(data, output=buffer, canonical_row=raw)
                     del data
                 buffer.finish()
                 with _batch_phase(stats, "journal_flush_fsync"):

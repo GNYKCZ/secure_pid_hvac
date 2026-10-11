@@ -8,6 +8,7 @@ import subprocess
 import sys
 from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
+from io import BytesIO
 from math import pi
 from pathlib import Path
 from threading import Event
@@ -528,6 +529,45 @@ def test_batch_writer_counts_inflight_and_preserves_checkpoint_on_disk_failure(
         assert spool.disk_metrics["fsync_count"] == 8  # 两批均 fsync，只有首批 checkpoint 发布
     else:
         assert spool.disk_metrics["fsync_count"] < 8  # 来源变化在第二批写盘前拒绝。
+
+
+def test_batch_journal_reuses_canonical_rows_with_identical_bytes_and_line_limit():
+    """独立旧 JSON 编码 oracle 覆盖首行/续行、UTF-8 及完整 wrapper 行界。"""
+    def old_bytes(value):
+        return (json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False,
+                           separators=(",", ":")) + "\n").encode("utf-8")
+
+    for previous in (None, "a" * 64):
+        spool = evidence._Spool.__new__(evidence._Spool)
+        spool.backend_id, spool.count, spool.end = "run", 2, 10
+        spool.tail_count, spool.tail_bytes, spool.tail_hash = 0, 0, previous
+        data = {"protocol": {"run_id": "run", "segment_index": 2,
+                             "global_step": 10, "local_step": 0},
+                "snapshot": {"文本": "引号\"与换行\n", "values": [-0.0, 1e-12, 1 << 200]},
+                "padding": ""}
+        digest = sha256(old_bytes({"prev_sha256": previous, "step": data})).hexdigest()
+        wrapped = old_bytes({"prev_sha256": previous, "sha256": digest, "step": data})
+        data["padding"] = "x" * (evidence.INDEX_LINE_LIMIT - len(wrapped))
+        raw = old_bytes(data)
+        digest = sha256(old_bytes({"prev_sha256": previous, "step": data})).hexdigest()
+        expected = old_bytes({"prev_sha256": previous, "sha256": digest, "step": data})
+        assert len(expected) == evidence.INDEX_LINE_LIMIT
+        stream = BytesIO()
+        buffer = evidence._BufferedChunks(stream)
+        spool._append_step(data, output=buffer, canonical_row=raw)
+        buffer.finish()
+        assert stream.getvalue() == expected
+        assert (spool.tail_count, spool.tail_bytes, spool.tail_hash) == (1, len(expected), digest)
+
+        # 输入行本身合法但加 wrapper 后超限，不能写入或推进任何计数。
+        spool.tail_count, spool.tail_bytes, spool.tail_hash = 0, 0, previous
+        data["padding"] += "x"
+        rejected = BytesIO()
+        buffer = evidence._BufferedChunks(rejected)
+        with pytest.raises(ValueError, match="行界"):
+            spool._append_step(data, output=buffer, canonical_row=old_bytes(data))
+        assert rejected.getvalue() == b"" and not buffer.buffer
+        assert (spool.tail_count, spool.tail_bytes, spool.tail_hash) == (0, 0, previous)
 
 
 def test_stream_batch_rejects_invalid_data_and_partial_io_without_promoting_prefix(
