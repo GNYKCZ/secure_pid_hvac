@@ -1154,7 +1154,7 @@ class _FullObservation:
 
 
 def run_full_observation(*, steps: int, delay_ms: float, segment_steps: int = 400,
-                         role_config: Path | None = None) -> dict[str, object]:
+                         role_config: Path | None = None, fixed_proof_cache: bool = False) -> dict[str, object]:
     """有界P0完整路线观察；原非实时循环、提前测量与失败契约保持。"""
     from secure_control.scenarios.cart_pole.observer import load_cart_pole_observer_design
     from secure_control.scenarios.cart_pole.secure_full_experiment import run_secure_full_experiment
@@ -1163,6 +1163,8 @@ def run_full_observation(*, steps: int, delay_ms: float, segment_steps: int = 40
     from .lan_profile import _load_prime
 
     started = time.perf_counter_ns()
+    if type(fixed_proof_cache) is not bool:
+        raise ValueError("fixed_proof_cache必须是显式bool")
     if type(steps) is not int or not 1 <= steps <= 1500:
         raise ValueError("full观察只允许原有限范围内1..1500步，不自动运行10k")
     if type(segment_steps) is not int or not 1 <= segment_steps <= 1000:
@@ -1193,7 +1195,8 @@ def run_full_observation(*, steps: int, delay_ms: float, segment_steps: int = 40
         with observer.installed():
             result = run_secure_full_experiment(design.plant, design.balance, swing, design, config,
                        modulus=modulus, modulus_evidence=evidence, segment_capacity=segment_steps,
-                       on_step=observer.confirmed)
+                       on_step=observer.confirmed,
+                       **({"fixed_proof_cache": True} if fixed_proof_cache else {}))
         if observer.current:
             terminal = (observer.current["physical_step"] == steps and result.physical.failure_reason is None)
             observer.finish("terminal_observation" if terminal else "failed")
@@ -1230,6 +1233,7 @@ def run_full_observation(*, steps: int, delay_ms: float, segment_steps: int = 40
             "configs/cart_pole_swing_up.yaml", "configs/shared_prime_256_pocklington.yaml",
             "configs/cart_pole_plant.yaml", "configs/cart_pole_balance.yaml")),
         "configuration": {"horizon_steps": steps, "segment_steps": segment_steps,
+                          "fixed_proof_cache": fixed_proof_cache,
                           "profile_sha256": config.topology.digest, "period_s": design.plant.sample_period_s,
                           "role_config_sha256": sha256(role_config.read_bytes()).hexdigest() if role_config else None},
         "environment": {"os": platform.platform(), "python": platform.python_version(),
@@ -1254,6 +1258,7 @@ def run_full_observation(*, steps: int, delay_ms: float, segment_steps: int = 40
                                    if observer.rows else None),
         "role_exit_codes": [p.exitcode for p in parties],
         "qualification_pass": False, "absolute_scheduling": False,
+        "proof_cache": result.proof_cache_summary if result else None,
         "observation_limits": {"step_capacity": steps+1, "event_capacity": 256, "step_detail_bytes": 4096,
                                "event_overflow": observer.event_overflow, "detail_overflow": observer.detail_overflow,
                                "step_encoded_charge_bytes": observer.encoded_charge},

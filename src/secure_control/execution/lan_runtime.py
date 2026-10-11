@@ -459,7 +459,9 @@ class LanContinuousRuntime:
         _controller_epoch: str | None = None,
         batch: bool = True,
         preload_steps: int = 0, preload_execution: str = "fused",
+        deadline_ns: int | None = None,
     ) -> None:
+        check_deadline(deadline_ns, "DYNAMIC_SETUP")
         if config.role != "Client" or config.experiment_config is None:
             raise ValueError("连续运行必须使用 Client experiment 配置。")
         v2 = _segment_hello is not None and _segment_hello.mode in {
@@ -490,6 +492,7 @@ class LanContinuousRuntime:
                              modulus_evidence=modulus_evidence)
         # 所有参数、模数与范围验证在网络拨号及离线分享前完成。
         self.distribution = self.client.distribute_controller(spec, range_contract)
+        check_deadline(deadline_ns, "DYNAMIC_SETUP")
         if preload_steps:
             preloaded_material_budget(self.distribution.p1.layout, fixed_point.modulus, preload_steps)
         self.scale_ledger = self.distribution.p1.layout.scale_ledger
@@ -529,13 +532,17 @@ class LanContinuousRuntime:
             for role, address in (("P1", config.topology.p1_client),
                                   ("P2", config.topology.p2_client)):
                 _LAN_LOG.info("Client 正在连接 %s…", role)
-                sock = connect_role(address, config, role, deadline_after(config.startup_timeout))
+                sock = connect_role(address, config, role,
+                                    network_deadline(config.startup_timeout, deadline_ns))
                 self._sockets.append(sock)
-                _hello(sock, "Client", role, self.session_id, hello, config.startup_timeout)
+                _hello(sock, "Client", role, self.session_id, hello, config.startup_timeout,
+                       **({"deadline": network_deadline(config.startup_timeout, deadline_ns)}
+                          if deadline_ns is not None else {}))
                 _LAN_LOG.info("Client 与 %s 的协议连接已建立。", role)
             for party, sock in enumerate(self._sockets):
                 _request(sock, "P1" if party == 0 else "P2", 1, "lan_ready",
-                         self.session_id, config.startup_timeout)
+                         self.session_id, config.startup_timeout,
+                         deadline=network_deadline(config.startup_timeout, deadline_ns))
             _LAN_LOG.info("三方已就绪，开始连续计算。")
             if v2:
                 setup = LanSegmentedSetupV2Payload(
@@ -557,10 +564,13 @@ class LanContinuousRuntime:
             for party, sock in enumerate(self._sockets):
                 role = "P1" if party == 0 else "P2"
                 _request(sock, role, 2, "lan_setup", self.session_id,
-                         config.startup_timeout, setup)
+                         config.startup_timeout, setup,
+                         deadline=network_deadline(config.startup_timeout, deadline_ns))
                 material = self.distribution.p1 if party == 0 else self.distribution.p2
                 _request(sock, role, 3, "offline", self.session_id,
-                         config.startup_timeout, PartyOfflineMaterial.from_message(material))
+                         config.startup_timeout, PartyOfflineMaterial.from_message(material),
+                         deadline=network_deadline(config.startup_timeout, deadline_ns))
+            check_deadline(deadline_ns, "DYNAMIC_SETUP")
         except Exception:
             self._failed = True
             self.close()
@@ -926,7 +936,9 @@ class LanSegmentedRuntime:
                  *, control: RunControl, segment_capacity: int | None = None,
                  full_run_id: str | None = None,
                  previous_epoch_session: str | None = None,
-                 preload_steps: int = 0, preload_execution: str = "fused") -> None:
+                 preload_steps: int = 0, preload_execution: str = "fused",
+                 deadline_ns: int | None = None) -> None:
+        check_deadline(deadline_ns, "DYNAMIC_SETUP")
         self._v2 = spec.state_dimension != 0
         self._full_v3 = full_run_id is not None
         if (type(preload_steps) is not int or not 0 <= preload_steps <= 1000
@@ -965,11 +977,15 @@ class LanSegmentedRuntime:
         self._products = self._truncations = 0
         self._last_end_round_id: str | None = None
         self._last_closed_segment_count = 0
+        self.last_sealed_record: SegmentRecord | None = None
         self._attempted_round: int | None = None
         self.phase = "CONNECTING"
-        self._connect()
+        if deadline_ns is None:
+            self._connect()
+        else:
+            self._connect(deadline_ns=deadline_ns)
 
-    def _connect(self) -> None:
+    def _connect(self, *, deadline_ns: int | None = None) -> None:
         self.phase = "CONNECTING" if self.segment_index == 0 else "CONNECTING_NEXT"
         self.hello = LanSegmentedHelloPayload(
             self.config.topology.digest, secrets.token_hex(32), self.run_id,
@@ -984,6 +1000,7 @@ class LanSegmentedRuntime:
             _segment_capacity=self.segment_capacity if self._v2 else None,
             _controller_epoch=self.controller_epoch,
             preload_steps=self.preload_steps, preload_execution=self.preload_execution,
+            **({"deadline_ns": deadline_ns} if deadline_ns is not None else {}),
         )
         self.connection_seconds = time.monotonic() - started
         self.phase = "RUNNING"
@@ -1160,6 +1177,9 @@ class LanSegmentedRuntime:
             self._records.clear()
             self._last_end_round_id = end.last_round_id
             self._last_closed_segment_count = self.confirmed_step_count
+            # 双方密封是独立事实；周期出口超期也不能丢掉刚收到的真实回执。
+            if self._full_v3:
+                self.last_sealed_record = record
             self.phase = ("SWITCHED" if action == "switch" else
                           "STOPPED" if action == "stop" else "CONNECTING_NEXT")
             check_deadline(deadline_ns, "SEGMENT_END")
@@ -1658,6 +1678,7 @@ def _hello(
     session: str,
     hello: LanHelloPayload | LanSegmentedHelloPayload | BatchHelloPayload | PreloadedHelloPayload,
     timeout: float,
+    *, deadline: float | None = None,
 ) -> None:
     envelope = WireEnvelope(
         SCHEMA_VERSION,
@@ -1672,7 +1693,7 @@ def _hello(
         None,
         hello,
     )
-    deadline = deadline_after(timeout)
+    deadline = deadline_after(timeout) if deadline is None else deadline
     send_envelope(sock, envelope, deadline=deadline, limit=_FRAME_LIMIT)
     response = receive_envelope(sock, deadline=deadline, limit=_FRAME_LIMIT)
     if (

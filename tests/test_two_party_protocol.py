@@ -74,6 +74,84 @@ def share_values(share: AdditiveShare) -> list[int]:
     return np.asarray(share.value, dtype=object).tolist()
 
 
+def test_fixed_reachability_cache_matches_independent_nilpotent_formula():
+    """F²=0时用手算(I+|F|)d，独立验证冷/热及新x0/B/输入/误差仍现场绑定。"""
+    from fractions import Fraction
+
+    from secure_control.protocol.roles import (
+        _bounded_input_reachability,
+        _reachability_basis_scope,
+        _reachability_fixed_basis,
+    )
+    def ceil(value):
+        return -(-value.numerator // value.denominator)
+    with _reachability_basis_scope() as cache:
+        for ell in (1, 4, 32):
+            scale = 1 << ell
+            payloads = {"A": np.array([[scale // 2, scale // 2], [-scale // 2, -scale // 2]], dtype=object),
+                        "B": np.array([[1], [-2]], dtype=object), "x0": np.array([0, 0], dtype=object)}
+            with pytest.raises(ValueError, match="不收缩"):
+                _bounded_input_reachability(payloads, (3,), ell, 1)
+            for x0 in ((0, 0), (4, -5), (-2, 11)):
+                for input_bound in (0, 7):
+                    for error in (Fraction(0), Fraction(3, 2)):
+                        payloads["x0"] = np.array(x0, dtype=object)
+                        d0 = abs(x0[0]) + error + Fraction(input_bound, scale)
+                        d1 = abs(x0[1]) + error + Fraction(2 * input_bound, scale)
+                        expected = (ceil(Fraction(3, 2) * d0 + d1 / 2),
+                                    ceil(d0 / 2 + Fraction(3, 2) * d1))
+                        assert _bounded_input_reachability(payloads, (input_bound,), ell, 2,
+                                                          additive_error=error) == expected
+            basis = _reachability_fixed_basis(payloads["A"], ell, 2)
+            with pytest.raises(TypeError):
+                basis[1][0][0] = Fraction(100)
+            with pytest.raises(ValueError, match="不得为负"):
+                _bounded_input_reachability(payloads, (3,), ell, 2, additive_error=Fraction(-1))
+            # 同shape/ell/block但矩阵内容变化时不能误命中；对角F=I/2，精确界为2d。
+            payloads["A"] = np.eye(2, dtype=object) * (scale // 2)
+            payloads["B"] = np.array([[3], [1]], dtype=object)
+            payloads["x0"] = np.array([-1, 2], dtype=object)
+            assert _bounded_input_reachability(payloads, (5,), ell, 1, additive_error=Fraction(0)) == (
+                ceil(2 + Fraction(30, scale)), ceil(4 + Fraction(10, scale)))
+        assert cache.summary()["hits"] > 0 and cache.summary()["entries"] <= 128
+    assert cache.closed and not cache.plans
+
+
+def test_fixed_reachability_cache_capacity_scope_and_concurrent_pure_calls():
+    """缓存逐出只影响性能；当前run范围退出释放，纯函数并发无共享状态或随机材料。"""
+    from concurrent.futures import ThreadPoolExecutor
+    from contextvars import copy_context
+
+    from secure_control.protocol.roles import (
+        _REACHABILITY_BASIS,
+        _bounded_input_reachability,
+        _reachability_basis_scope,
+        _ReachabilityBasisCache,
+    )
+    with _reachability_basis_scope() as owner:
+        tiny = _ReachabilityBasisCache(capacity=2, byte_limit=16 * 1024)
+        token = _REACHABILITY_BASIS.set(tiny)
+        try:
+            for value in range(8):
+                payloads = {"A": np.array([[value]], dtype=object), "B": np.array([[0]], dtype=object),
+                            "x0": np.array([16], dtype=object)}
+                assert _bounded_input_reachability(payloads, (0,), 4, 1, additive_error=0) == (-(-256 // (16 - value)),)
+                assert tiny.summary()["entries"] <= 2
+                assert tiny.summary()["charged_bytes"] <= tiny.byte_limit
+            assert tiny.evictions > 0
+            contexts = [copy_context() for _ in range(4)]
+            with ThreadPoolExecutor(max_workers=2) as threads:
+                results = list(threads.map(lambda ctx: ctx.run(_bounded_input_reachability,
+                                       payloads, (0,), 4, 1, additive_error=0), contexts))
+            assert results == [results[0]] * 4
+            assert tiny.summary()["charged_bytes"] <= tiny.byte_limit
+        finally:
+            _REACHABILITY_BASIS.reset(token)
+            tiny.clear()
+        assert _REACHABILITY_BASIS.get() is owner
+    assert _REACHABILITY_BASIS.get() is None and owner.closed
+
+
 def test_prepared_resources_bind_only_fresh_input_once_and_reject_foreign_copies():
     """预创建本身不签发输出，合法新测量才领取；保留真实算术与一次性生命周期。"""
     client, p1, p2, coordinator, distribution = make_stack()

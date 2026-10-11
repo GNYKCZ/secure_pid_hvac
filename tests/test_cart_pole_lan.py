@@ -321,12 +321,20 @@ def test_bounded_input_reachability_uses_encoded_block_contraction() -> None:
     client = Client(profile.context, TwoPartySharing(profile.q),
                     security_parameter=profile.security_parameter,
                     modulus_evidence=profile.evidence)
-    client.distribute_controller(profile.spec, contract)
-    assert client.range_verification.proof_mode == "bounded_input_reachability"
-    with pytest.raises(ValueError, match="未覆盖"):
-        client.distribute_controller(profile.spec, replace(
-            contract, state_payload_bounds=(bounds[0] - 1, *bounds[1:])
-        ))
+    from secure_control.protocol.roles import _reachability_basis_scope, _warm_reachability_basis
+    with _reachability_basis_scope() as cache:
+        # 固定收缩首次发生在19；完整状态界的22候选仍逐次代入当前x0。
+        assert _warm_reachability_basis(encoded["A"], profile.ell) == 19
+        with pytest.raises(ValueError, match="不收缩"):
+            _bounded_input_reachability(encoded, contract.input_payload_bounds, profile.ell, 18)
+        assert _bounded_input_reachability(encoded, contract.input_payload_bounds, profile.ell, 22) == bounds
+        client.distribute_controller(profile.spec, contract)
+        assert client.range_verification.proof_mode == "bounded_input_reachability"
+        with pytest.raises(ValueError, match="未覆盖"):
+            client.distribute_controller(profile.spec, replace(
+                contract, state_payload_bounds=(bounds[0] - 1, *bounds[1:])
+            ))
+        assert cache.summary()["hits"] >= 3
 
 
 @pytest.mark.integration

@@ -568,6 +568,8 @@ def _run() -> int:
     benchmark.add_argument("--preload-execution", choices=("staged", "fused"), default="fused")
     benchmark.add_argument("--diagnostic", action="store_true",
                            help="本机cycle有限CPU/GC观测，不作为正式资格")
+    benchmark.add_argument("--fixed-proof-cache", action="store_true",
+                           help="full-observation固定精确矩阵计算的显式候选对照")
     benchmark.add_argument("--role-config", type=Path)
     benchmark.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
@@ -580,12 +582,14 @@ def _run() -> int:
         )
 
         try:
+            if args.fixed_proof_cache and args.case != "full-observation":
+                raise ValueError("固定证明对照只适用于full-observation")
             if args.case == "full-observation":
                 if args.mode != "batch" or args.preload_steps or args.diagnostic:
                     raise ValueError("full-observation只观察原batch完整路线，不支持预送或cycle诊断")
                 report = run_full_observation(steps=args.steps, delay_ms=args.delay_ms,
                                              segment_steps=args.segment_steps,
-                                             role_config=args.role_config)
+                                             role_config=args.role_config, fixed_proof_cache=args.fixed_proof_cache)
             elif args.case in {"continuous", "cycle"}:
                 if args.mode != "batch":
                     raise ValueError("实际持续观察只使用默认批量协议")

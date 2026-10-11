@@ -6,12 +6,16 @@ import hashlib
 import math
 import random
 import secrets
+import sys
+from collections import OrderedDict
 from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
 from fractions import Fraction
 from numbers import Integral
-from threading import Lock
+from threading import Lock, RLock
 from typing import Any
 from weakref import WeakValueDictionary
 
@@ -132,34 +136,106 @@ def _finite_horizon_encoded_trace(payloads: dict[str, np.ndarray],
                  for row in range(dimension)]
 
 
-def _bounded_input_reachability(
-    payloads: dict[str, np.ndarray], input_bounds: tuple[int, ...],
-    scale_bits: int, block_steps: int,
-    *, additive_error: Fraction | None = None,
-) -> tuple[int, ...]:
-    """从实际编码矩阵精确证明所有轮次的 controller state payload 界。
+class _ReachabilityBasisCache:
+    """当前run的固定Fraction计算；不存x0/结论/材料，容量不足只导致重算。"""
 
-    使用 |F^m| 的收缩而非 |F| 的逐步收缩，保留矩阵幂中的符号抵消。
-    返回的向上取整界同时覆盖初态、有界输入和每次 Trunc 的误差。
-    """
-    if type(block_steps) is not int or not 1 <= block_steps <= 128:
-        raise ValueError("reachability block_steps 必须是 1…128 的整数")
-    n = payloads["A"].shape[0]
+    def __init__(self, *, capacity=128, byte_limit=4 * 1024 * 1024):
+        if type(capacity) is not int or not 1 <= capacity <= 128 or type(byte_limit) is not int or not 2048 <= byte_limit <= 4 * 1024 * 1024:
+            raise ValueError("固定证明缓存只能使用1..128项及2KiB..4MiB预算")
+        self.capacity, self.byte_limit = capacity, byte_limit
+        self.plans = OrderedDict()
+        self.charge = self.hits = self.misses = self.evictions = 0
+        self.closed = False
+        self.lock = RLock()
+
+    def get(self, key):
+        with self.lock:
+            if not self.closed and key in self.plans:
+                self.hits += 1
+                self.plans.move_to_end(key)
+                return self.plans[key][0]
+            self.misses += 1
+            return None
+
+    def put(self, key, basis):
+        # 收费实际Python对象大小；跨entry共享对象重复收费，保守于缓存拥有的堆空间。
+        seen = set()
+        def size(value):
+            if id(value) in seen:
+                return 0
+            seen.add(id(value))
+            total = sys.getsizeof(value)
+            if isinstance(value, Fraction):
+                total += size(value.numerator) + size(value.denominator)
+            elif isinstance(value, tuple):
+                total += sum(size(v) for v in value)
+            return total
+        charge = size((key, basis)) + sys.getsizeof((basis, 0)) + sys.getsizeof(0)
+        with self.lock:
+            if self.closed or key in self.plans or charge + sys.getsizeof(self.plans) + 1024 > self.byte_limit:
+                return
+            while self.plans and (len(self.plans) >= self.capacity
+                    or self.charge + charge + 2 * sys.getsizeof(self.plans) + 1536 > self.byte_limit):
+                _, (_, old_charge) = self.plans.popitem(last=False)
+                self.charge -= old_charge
+                self.evictions += 1
+            if self.charge + charge + 2 * sys.getsizeof(self.plans) + 1536 > self.byte_limit:
+                return
+            self.plans[key] = (basis, charge)
+            self.charge += charge
+            while len(self.plans) > self.capacity or self.charge + sys.getsizeof(self.plans) + 1024 > self.byte_limit:
+                _, (_, old_charge) = self.plans.popitem(last=False)
+                self.charge -= old_charge
+                self.evictions += 1
+
+    def summary(self):
+        with self.lock:
+            return {"capacity": self.capacity, "byte_limit": self.byte_limit,
+                    "entries": len(self.plans), "charged_bytes": self.charge + sys.getsizeof(self.plans) + 1024,
+                    "hits": self.hits, "misses": self.misses, "evictions": self.evictions}
+
+    def clear(self):
+        with self.lock:
+            self.plans.clear()
+            self.charge = 0
+            self.closed = True
+
+
+_REACHABILITY_BASIS = ContextVar("reachability_fixed_basis", default=None)
+
+
+@contextmanager
+def _reachability_basis_scope(*, enabled=True):
+    """同一控制线程的scenario搜索和Client独立复核共享固定计算，出口立即释放。"""
+    cache = _ReachabilityBasisCache() if enabled else None
+    token = _REACHABILITY_BASIS.set(cache)
+    try:
+        yield cache
+    finally:
+        _REACHABILITY_BASIS.reset(token)
+        if cache is not None:
+            cache.clear()
+
+
+def _compute_reachability_basis(encoded_a, scale_bits, block_steps, previous=None):
+    """保留原有符号矩阵幂与Gauss–Jordan次序；不收缩结果也可安全复用。"""
+    n = len(encoded_a)
     scale = 1 << scale_bits
-    f = [[Fraction(int(payloads["A"][row, col]), scale)
-          for col in range(n)] for row in range(n)]
+    f = [[Fraction(encoded_a[row][col], scale) for col in range(n)] for row in range(n)]
     identity = [[Fraction(int(row == col)) for col in range(n)] for row in range(n)]
-    power = identity
-    sum_abs = [[Fraction(0) for _ in range(n)] for _ in range(n)]
-    for _ in range(block_steps):
+    power = [list(row) for row in previous[0]] if previous else identity
+    sum_abs = ([list(row) for row in previous[1]] if previous else
+               [[Fraction(0) for _ in range(n)] for _ in range(n)])
+    for _ in range(1 if previous else block_steps):
         for row in range(n):
             for col in range(n):
                 sum_abs[row][col] += abs(power[row][col])
         power = [[sum(power[row][mid] * f[mid][col] for mid in range(n))
                   for col in range(n)] for row in range(n)]
     t = [[abs(value) for value in row] for row in power]
+    frozen = tuple(tuple(row) for row in power), tuple(tuple(row) for row in sum_abs)
     if max((sum(row) for row in t), default=Fraction(0)) >= 1:
-        raise ValueError("编码 controller 的 block power 不收缩，不能证明持续界")
+        return (*frozen, None)
 
     # Gauss-Jordan 在有理数上解 (I-|F^m|)^-1 b；严格收缩保证可逆。
     augmented = [[identity[row][col] - t[row][col] for col in range(n)]
@@ -176,7 +252,48 @@ def _bounded_input_reachability(
                 factor = augmented[row][col]
                 augmented[row] = [value - factor * base
                                   for value, base in zip(augmented[row], augmented[col], strict=True)]
-    inverse = [row[n:] for row in augmented]
+    return (*frozen, tuple(tuple(row[n:]) for row in augmented))
+
+
+def _reachability_fixed_basis(matrix, scale_bits, block_steps):
+    """确切编码内容/shape/ell/block绑定不可变固定部分；不会输出缓存key。"""
+    encoded = tuple(tuple(int(value) for value in row) for row in matrix)
+    cache = _REACHABILITY_BASIS.get()
+    key = (matrix.shape, scale_bits, block_steps, encoded)
+    basis = cache.get(key) if cache is not None else None
+    if basis is None:
+        previous = cache.get((matrix.shape, scale_bits, block_steps - 1, encoded)) if cache is not None and block_steps > 1 else None
+        basis = _compute_reachability_basis(encoded, scale_bits, block_steps, previous)
+        if cache is not None:
+            cache.put(key, basis)
+    return basis
+
+
+def _warm_reachability_basis(matrix, scale_bits):
+    """从固定设计顺序准备到首个收缩候选；实际x0可能需要更高block，届时仍现场算。"""
+    for block in range(1, 129):
+        if _reachability_fixed_basis(matrix, scale_bits, block)[2] is not None:
+            return block
+    return 128
+
+
+def _bounded_input_reachability(
+    payloads: dict[str, np.ndarray], input_bounds: tuple[int, ...],
+    scale_bits: int, block_steps: int,
+    *, additive_error: Fraction | None = None,
+) -> tuple[int, ...]:
+    """从实际编码矩阵精确证明所有轮次的 controller state payload 界。
+
+    使用 |F^m| 的收缩而非 |F| 的逐步收缩，保留矩阵幂中的符号抵消。
+    返回的向上取整界同时覆盖初态、有界输入和每次 Trunc 的误差。
+    """
+    if type(block_steps) is not int or not 1 <= block_steps <= 128:
+        raise ValueError("reachability block_steps 必须是 1…128 的整数")
+    n = payloads["A"].shape[0]
+    scale = 1 << scale_bits
+    _, sum_abs, inverse = _reachability_fixed_basis(payloads["A"], scale_bits, block_steps)
+    if inverse is None:
+        raise ValueError("编码 controller 的 block power 不收缩，不能证明持续界")
     error = ((Fraction(3, 2) if scale_bits else Fraction(0))
              if additive_error is None else additive_error)
     if error < 0:
