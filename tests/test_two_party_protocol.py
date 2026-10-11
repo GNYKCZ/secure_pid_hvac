@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import random
+from copy import copy, deepcopy
 from dataclasses import fields, replace
+from weakref import ref
 
 import numpy as np
 import pytest
@@ -156,9 +158,25 @@ def test_prepared_resources_bind_only_fresh_input_once_and_reject_foreign_copies
     """预创建本身不签发输出，合法新测量才领取；保留真实算术与一次性生命周期。"""
     client, p1, p2, coordinator, distribution = make_stack()
     prepared = client.precompute_online_resources(distribution, step=0, rng=random.Random(91))
+    first_resources = (*prepared.p1_resources.product_resources,
+                       *prepared.p1_resources.state_truncation_resources)
+    second_resources = (*prepared.p2_resources.product_resources,
+                        *prepared.p2_resources.state_truncation_resources)
+    lifecycles = [first._lifecycle for first in first_resources]
+    assert len({id(state) for state in lifecycles}) == len(first_resources)
+    assert len({id(state.claimed_by) for state in lifecycles}) == len(first_resources)
+    lifecycle_refs = [ref(state) for state in lifecycles]
+    for first, second in zip(first_resources, second_resources, strict=True):
+        state = first._lifecycle
+        assert state is second._lifecycle and not hasattr(state, "__dict__")
+        assert copy(state).claimed_by is state.claimed_by
+        state_copy = deepcopy(state)
+        assert state_copy.status == "prepared" and state_copy.claimed_by == set()
+        assert state_copy.claimed_by is not state.claimed_by
     assert not client._issued_rounds
     other = make_stack(seed=11)[0]
-    for owner, token, step in ((client, replace(prepared), 0), (client, prepared, 1),
+    for owner, token, step in ((client, replace(prepared), 0), (client, copy(prepared), 0),
+                               (client, prepared, 1),
                                (other, prepared, 0)):
         with pytest.raises(ValueError):
             owner.bind_online_input(distribution, token, [.25], step=step)
@@ -169,6 +187,8 @@ def test_prepared_resources_bind_only_fresh_input_once_and_reject_foreign_copies
         client.bind_online_input(distribution, prepared, [.25], step=0)
     output = coordinator.execute(p1, p2, online)
     np.testing.assert_allclose(client.reconstruct_control(*output), [.625])
+    assert all(pointer() is state and state.status == "consumed" and state.claimed_by == {0, 1}
+               for pointer, state in zip(lifecycle_refs, lifecycles, strict=True))
     abandoned = client.precompute_online_resources(distribution, step=1)
     client._material_owner(distribution).discard(abandoned)
     assert abandoned.p1_resources.aborted_count == 11

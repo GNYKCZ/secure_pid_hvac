@@ -483,6 +483,9 @@ class Protocol3BatchPayload:
 class _ResourceLifecycle:
     """绑定同一逻辑资源的两份局部材料，阻止跨会话、跨轮次或失败后的重放。"""
 
+    # 每个逻辑资源仍拥有独立状态；固定字段只省实例字典，保留弱引用。
+    __slots__ = ("__weakref__", "claimed_by", "status")
+
     def __init__(self) -> None:
         self.claimed_by: set[int] = set()
         self.status = "prepared"

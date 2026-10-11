@@ -19,6 +19,12 @@ def _centered_mod(value: int, modulus: int) -> int:
 class _MaskLifecycle:
     """记录 Protocol 2 辅助随机量的单次遮蔽、发送、重构和完成顺序。"""
 
+    # 只减少实例字典，不复用随机量或状态，也不改变 GC 跟踪及弱引用能力。
+    __slots__ = (
+        "__weakref__", "consumed", "finished_parties", "masked_parties",
+        "owner", "p1_reconstructed", "p2_sent",
+    )
+
     def __init__(self, owner: object) -> None:
         self.owner = owner
         self.masked_parties: set[int] = set()
