@@ -950,3 +950,65 @@ def test_real_three_process_benchmark_counts_public_frames(
     assert report["peer_frames_per_step"] == peer_frames
     assert report["client_phase_p50_ms"]["stage_ms"] > 0
     assert report["client_step_activity_p50_ms"]["receive_ms"] > 0
+
+
+def test_full_observation_bounds_public_rows_and_restores_wrappers():
+    from secure_control.experiments.communication_benchmark import _FullObservation
+    from secure_control.scenarios.cart_pole import secure_full_experiment as full
+
+    observer = _FullObservation(2, {}, {})
+    original = full.CausalVelocityEstimator.observe
+    with pytest.raises(OSError), observer.installed():
+        observer.begin()
+        observer.current["control_started"] = True
+        observer.current["protocol_completed"] = True
+        observer.current["device_confirmed"] = True
+        observer.components["large_ms"] = 1
+        for _ in range(300):
+            observer.event("scalar_epoch_setup", 1, 2, "complete")
+        observer.finish("failed")
+        raise OSError("secret sentinel must never be part of evidence")
+    assert full.CausalVelocityEstimator.observe is original
+    assert len(observer.events) == 256 and observer.event_overflow == 44
+    assert observer.rows[0]["duration_ms"] is None
+    assert observer.rows[0]["device_confirmed"]  # 失败不能抹掉已经确认的设备事实。
+    assert observer.encoded_charge < 4096
+    observer.begin()
+    observer.confirmed()
+    assert observer.rows[-1]["duration_ms"] is not None
+
+
+@pytest.mark.integration
+def test_full_observation_real_switch_failure_keeps_attempt_and_public_whitelist(monkeypatch):
+    import json
+
+    from secure_control.experiments.communication_benchmark import run_full_observation
+    from secure_control.scenarios.cart_pole import swing_up
+
+    load = swing_up.load_cart_pole_swing_up_config
+    from secure_control.execution.lan_scalar_runtime import LanScalarRuntime
+
+    original = LanScalarRuntime.step
+    monkeypatch.setattr(swing_up, "load_cart_pole_swing_up_config", lambda *a, **k:
+                        replace(load(*a, **k), horizon_steps=20, acquisition_deadline_steps=20))
+
+    def fail(runtime, values, physical_step):
+        if physical_step == 11:
+            raise OSError("secret sentinel")
+        return original(runtime, values, physical_step)
+
+    monkeypatch.setattr(LanScalarRuntime, "step", fail)
+    report = run_full_observation(steps=20, delay_ms=0, segment_steps=2)
+    assert report["successful_steps"] == 11
+    assert report["failed_attempts"] == 1
+    assert report["steps"][-1]["status"] == "failed"
+    assert report["steps"][-1]["duration_ms"] is None
+    assert report["steps"][-1]["phase"] == "energy"
+    assert report["steps"][0]["measurement_read"]["end_ns"] < report["steps"][0]["consumption_start_ns"]
+    assert report["qualification_pass"] is False and report["absolute_scheduling"] is False
+    assert any(e["phase"] == "scalar_epoch_setup" and e["physical_step"] == 10 for e in report["events"])
+    assert LanScalarRuntime.step is fail
+    assert "secret sentinel" not in json.dumps(report)
+    assert "raw_force" not in json.dumps(report) and "output_share" not in json.dumps(report)
+    with pytest.raises(ValueError):
+        run_full_observation(steps=10000, delay_ms=0)

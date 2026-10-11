@@ -558,8 +558,8 @@ def _run() -> int:
     redraw.add_argument("--run-dir", required=True, type=Path)
     redraw.add_argument("--output", required=True, type=Path)
     benchmark = commands.add_parser("benchmark")
-    benchmark.add_argument("--case", required=True, choices=("dynamic", "scalar", "continuous", "cycle"))
-    benchmark.add_argument("--mode", required=True, choices=("legacy", "batch"))
+    benchmark.add_argument("--case", required=True, choices=("dynamic", "scalar", "continuous", "cycle", "full-observation"))
+    benchmark.add_argument("--mode", default="batch", choices=("legacy", "batch"))
     benchmark.add_argument("--steps", required=True, type=int)
     benchmark.add_argument("--delay-ms", type=float, default=0.)
     benchmark.add_argument("--segment-steps", type=int, default=8)
@@ -573,10 +573,20 @@ def _run() -> int:
     args = parser.parse_args()
     _enable_terminal_progress()
     if args.role == "benchmark":
-        from .communication_benchmark import run_continuous_observation, run_local_benchmark
+        from .communication_benchmark import (
+            run_continuous_observation,
+            run_full_observation,
+            run_local_benchmark,
+        )
 
         try:
-            if args.case in {"continuous", "cycle"}:
+            if args.case == "full-observation":
+                if args.mode != "batch" or args.preload_steps or args.diagnostic:
+                    raise ValueError("full-observation只观察原batch完整路线，不支持预送或cycle诊断")
+                report = run_full_observation(steps=args.steps, delay_ms=args.delay_ms,
+                                             segment_steps=args.segment_steps,
+                                             role_config=args.role_config)
+            elif args.case in {"continuous", "cycle"}:
                 if args.mode != "batch":
                     raise ValueError("实际持续观察只使用默认批量协议")
                 report = run_continuous_observation(

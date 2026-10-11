@@ -21,3 +21,19 @@ uv run python scripts/run_cart_pole_client.py --full-route secure --full-output 
 安全起摆使用固定 38 个 Beaver 乘法/Protocol 2 截断门，`ell=80`、`lambda=80`；全声明输入盒的整数/有理界在连接前验证。进入动态捕获后使用原有四维秘密 observer、`ell=32`，逻辑段续跑保持同一秘密状态；跨阶段切换必须等双方结束回执。每个物理区间记录来源、raw/applied/外扰、epoch、轮次、资源身份和物理确认。v3 reader 重放因果观测、阶段、独立理想控制和 canonical plant，并核对双方关闭前缀、资源唯一性、数值精度与配置派生门拓扑。结果摘要用于完整性检查，不提供恶意参与方安全认证。
 
 数值证书覆盖允许输入盒内的算术误差，不声称整个盒子都物理可行；边界状态仍可能在任何允许力下越轨。当前验收是本机三进程仿真，不代表真三机、真实设备、20 ms 墙钟实时、恶意方安全或全局稳定性。
+
+## #120 P0：完整安全路线的非实时基线观察
+
+以下入口调用同一个 `run_secure_full_experiment`，使用 canonical 配置及原安全材料/计算/提交顺序，不发布正式 v3 产物，也不启用新的周期保护：
+
+```powershell
+uv run secure-control benchmark --case full-observation --steps 1500 --segment-steps 400 --delay-ms 0 --output .tmp/full-baseline.json
+```
+
+默认 `--mode batch`，本入口不支持 legacy、动态预送或 `--diagnostic`。默认启动测试拥有的回环 P1/P2；指定 `--role-config` 时仅运行 Client，使用现有外部角色，不自行部署。此时注入等待只施加在 Client 的应用发送，P1/P2 内部没有观测数据。每应用 send 前的等待不是链路 RTT；失败 send 的帧/字节计数是尝试值，不能当完整传输事实。
+
+步数上限1500，段上限1000；原 acquisition 与 horizon 等合法约束仍成立，不能仅缩短 horizon 就放宽证明或控制参数。观察最多1501个测量消费记录、256个生命周期事件，每步编码细节上限4KiB；溢出明确计数。只输出公开阶段、身份、时刻、时长、资源计数、流量和环境/源码摘要，不输出测量值、份额、材料、控制数值、秘密状态或异常原文。采集有开销，wall含等待；嵌套分项不能相加当纯CPU。
+
+原路线初始及每步尾部会提前读取下一测量。报告分开保存读取/消费时刻和测量年龄，完成步的时长是“消费到已确认回调结束”，含该步内真实 epoch 结束/重建及段维护；终点观察和失败单列，失败时长不伪填0或20ms。初次准备单列，首步不剔除。kick/energy/dynamic分别统计；过程已有设备回执的事实不因之后失败抹掉。`qualification_pass`恒false，无绝对计划时钟或调度启动偏差，超过20ms的耗时统计不等于正式 deadline 资格。
+
+P0只是测量基线；结果v4、正式安全CLI/GUI的20ms保护及优化须按当前#120已批准的后续设计完成并独立验证。软件阶段完成不能自动关闭#120，缺三机/认证/硬件和长期资格时继续明确未验证。

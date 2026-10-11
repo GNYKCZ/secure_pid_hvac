@@ -203,7 +203,7 @@ class _Diagnostic:
                 "callback_restored": self._gc not in gc.callbacks}
 
 
-def _source_fingerprints():
+def _source_fingerprints(extra=()):
     """区分同一 HEAD 上的观察补丁和优化补丁；只保存内容摘要。"""
     paths = (
         "src/secure_control/protocol/coordinator.py",
@@ -223,7 +223,7 @@ def _source_fingerprints():
         "src/secure_control/execution/cycle_timing.py",
         "configs/cart_pole_observer_lan.example.yaml", "configs/cart_pole_observer.yaml",
     )
-    return {name: sha256((_ROOT / name).read_bytes()).hexdigest() for name in paths}
+    return {name: sha256((_ROOT / name).read_bytes()).hexdigest() for name in (*paths, *extra)}
 
 
 def _process_memory():
@@ -282,7 +282,7 @@ def _config(role: str, ports: tuple[int, int, int]) -> LanConfig:
 
 
 def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=None,
-           diagnostic=None):
+           diagnostic=None, full_observation=False):
     """包住既有 framing 最外层，只数发送次数/字节，不解码或保存 payload。"""
     from secure_control.execution import lan_scalar_runtime, localhost_transport
 
@@ -404,6 +404,38 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
             observations.enter_context(patch.object(
                 owner, name, timed(category, getattr(owner, name), category + "." + name),
             ))
+    if full_observation:
+        from secure_control.protocol.arithmetic import ScalarPartyExecutor
+
+        for owner, names, category in (
+            (ScalarPartyExecutor, ("_prepare_product", "_finish_product", "_p2_truncation_message",
+                                  "_finish_truncation", "_complete_gate"), "local_arithmetic_ms"),
+            (lan_scalar_runtime._SocketScalarPeer,
+             ("exchange_layer_products", "send_layer_truncations", "receive_layer_truncations",
+              "complete_layer"), "peer_exchange_ms"),
+        ):
+            for name in names:
+                observations.enter_context(patch.object(owner, name, timed(category, getattr(owner, name))))
+        if role_steps is not None:
+            scalar_send = lan_scalar_runtime._send
+            scalar_previous, scalar_counts = dict(activity), {}
+
+            def scalar_reply(sock, frame, deadline):
+                nonlocal scalar_previous, scalar_counts
+                result = scalar_send(sock, frame, deadline)
+                if (frame.sender != "Client" and frame.operation == "committed"
+                        and len(role_steps) < 1500):
+                    role_steps.append({"physical_step": frame.physical_step,
+                                           "local_step": frame.local_step, "epoch_id": frame.epoch_id,
+                                           "session_id": frame.session_id, "round_id": frame.round_id,
+                                           "activity_ms": {k: v-scalar_previous[k] for k, v in activity.items()},
+                                           "sent": {k: {f: n-scalar_counts.get(k, {}).get(f, 0)
+                                                        for f, n in v.items()} for k, v in counts.items()}})
+                if frame.operation == "committed" or (frame.operation == "ready" and frame.round_id == "setup"):
+                    scalar_previous = dict(activity)
+                    scalar_counts = {k: dict(v) for k, v in counts.items()}
+                return result
+            observations.enter_context(patch.object(lan_scalar_runtime, "_send", scalar_reply))
     if role_steps is not None:
         reply = lan_runtime._party_reply
         previous = dict(activity)
@@ -440,14 +472,15 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
 
 def _party_job(
     config: LanConfig, ports: tuple[int, int, int], delay_ms: float, batch: bool, queue,
-    diagnostic_enabled=False,
+    diagnostic_enabled=False, full_observation=False,
 ) -> None:
     role_steps = []
     diagnostic = _Diagnostic(config.role) if diagnostic_enabled else None
     observations = ExitStack()
     if diagnostic:
         observations.enter_context(diagnostic.installed())
-    counts, activity, restore = _meter(config.role, ports, delay_ms, role_steps, diagnostic)
+    counts, activity, restore = _meter(config.role, ports, delay_ms, role_steps, diagnostic,
+                                       full_observation=full_observation)
     outcome = {"role": config.role}
     try:
         result = run_party_single_step(config, batch=batch)
@@ -938,6 +971,295 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                    "spool I/O excludes timing sidecar and stop-time replay/plots; "
                    "memory is Client OS peak RSS/working set, not encoded-budget size; "
                    "baseline continuous mode explicitly has no absolute scheduling"),
+    }
+
+
+class _FullObservation:
+    """P0只记录公开边界；有界观察不改变完整路线的调度或失败语义。"""
+
+    def __init__(self, capacity, counts, activity):
+        self.capacity = capacity
+        self.counts, self.activity = counts, activity
+        self.rows, self.events = [], []
+        self.current = None
+        self.read_stamp = None
+        self.components = {}
+        self.event_overflow = 0
+        self.detail_overflow = 0
+        self.encoded_charge = 0
+        self.observations = 0
+        self.started = time.perf_counter_ns()
+
+    def event(self, name, start, end, status):
+        row = {"phase": name, "start_ns": start, "end_ns": end, "status": status,
+               "physical_step": self.current["physical_step"] if self.current else None}
+        if len(self.events) < 256:
+            self.events.append(row)
+        else:
+            self.event_overflow += 1
+
+    def begin(self):
+        # 初始及上一步尾部提前读取的测量只保存时刻，不保存其值或对象。
+        if self.current is not None:
+            self.finish("observation_only")
+        self.current = {"physical_step": self.observations, "phase": None,
+                        "consumption_start_ns": time.perf_counter_ns(),
+                        "measurement_read": self.read_stamp, "status": "observing",
+                        "duration_ms": None, "protocol_completed": False,
+                        "device_confirmed": False, "control_started": False}
+        self.current["measurement_age_at_consumption_ms"] = (
+            (self.current["consumption_start_ns"]-self.read_stamp["end_ns"])/1e6
+            if self.read_stamp else None)
+        self.observations += 1
+        self.components.clear()
+        self.before_activity = dict(self.activity)
+        self.before_counts = {k: dict(v) for k, v in self.counts.items()}
+
+    def finish(self, status):
+        row = self.current
+        if row is None:
+            return
+        row["status"] = status
+        row["components_ms"] = {k: v for k, v in self.components.items() if k.endswith("_ms")}
+        row["activity_ms"] = {k: v - self.before_activity[k] for k, v in self.activity.items()}
+        row["sent"] = {k: {f: n - self.before_counts.get(k, {}).get(f, 0)
+                          for f, n in v.items()} for k, v in self.counts.items()}
+        # 每项至多4KiB细节；核心失败事实不因细节超限丢弃。+128预留最后时戳。
+        charge = len(json.dumps(row, allow_nan=False).encode()) + 128
+        if charge > 4096:
+            for key in ("components_ms", "activity_ms", "sent"):
+                row.pop(key, None)
+            self.detail_overflow += 1
+            charge = len(json.dumps(row, allow_nan=False).encode()) + 128
+        if len(self.rows) < self.capacity + 1:
+            self.rows.append(row)
+            self.encoded_charge += charge
+        else:
+            self.detail_overflow += 1
+        end = time.perf_counter_ns()
+        row["observation_end_ns"] = end
+        if status == "confirmed":
+            row["duration_ms"] = (end - row["consumption_start_ns"]) / 1e6
+        else:
+            row["failure_or_terminal_observed_ms"] = (end - row["consumption_start_ns"]) / 1e6
+        self.current = None
+
+    def confirmed(self, *_args):
+        self.finish("confirmed")
+
+    @contextmanager
+    def installed(self):
+        from secure_control.execution import lan_runtime, lan_scalar_runtime, lan_transport
+        from secure_control.scenarios.cart_pole import secure_full_experiment as full
+
+        stack = ExitStack()
+
+        def wrap(owner, name, label, *, lifecycle=False, control=False):
+            original = getattr(owner, name)
+            def call(*args, **kwargs):
+                start, status = time.perf_counter_ns(), "failed"
+                if control and self.current:
+                    self.current["control_started"] = True
+                    self.current["epoch_id"] = getattr(args[0], "epoch_id", None) or getattr(args[0], "controller_epoch", None)
+                    self.current["phase"] = ("dynamic" if label == "dynamic_step" else
+                                             "kick" if args[0].epoch_id.startswith("kick-") else "energy")
+                try:
+                    result = original(*args, **kwargs)
+                    status = "complete"
+                    if control and self.current:
+                        self.current.update({"protocol_completed": True,
+                                             "round_id": result.round_id,
+                                             "session_id": args[0].session_id if hasattr(args[0], "session_id")
+                                             else result.session_id,
+                                             "products": result.products, "truncations": result.truncations})
+                    return result
+                finally:
+                    end = time.perf_counter_ns()
+                    if self.current:
+                        key = label + "_ms"
+                        self.components[key] = self.components.get(key, 0.) + (end-start)/1e6
+                    if lifecycle:
+                        self.event(label, start, end, status)
+            stack.enter_context(patch.object(owner, name, call))
+
+        read = full.CartPoleObserverSimulation.read_measurement
+        consume = full.CausalVelocityEstimator.observe
+        observe = full.SwingUpSupervisor.observe
+        send = full.CartPoleObserverSimulation.send_control
+
+        def measured_read(*args, **kwargs):
+            start = time.perf_counter_ns()
+            result = read(*args, **kwargs)
+            self.read_stamp = {"start_ns": start, "end_ns": time.perf_counter_ns()}
+            return result
+
+        def measured_consume(*args, **kwargs):
+            self.begin()
+            return consume(*args, **kwargs)
+
+        def measured_observe(*args, **kwargs):
+            result = observe(*args, **kwargs)
+            if self.current:
+                self.current["phase"] = result.phase
+                self.current["supervision_phase"] = result.phase
+            return result
+
+        def measured_send(*args, **kwargs):
+            result = send(*args, **kwargs)
+            if self.current:
+                self.current["device_confirmed"] = result.disposition == "simulated_interval_completed"
+                self.current["device_return_ns"] = time.perf_counter_ns()
+            return result
+
+        try:
+            stack.enter_context(patch.object(full.CartPoleObserverSimulation, "read_measurement", measured_read))
+            stack.enter_context(patch.object(full.CausalVelocityEstimator, "observe", measured_consume))
+            stack.enter_context(patch.object(full.SwingUpSupervisor, "observe", measured_observe))
+            stack.enter_context(patch.object(full.CartPoleObserverSimulation, "send_control", measured_send))
+            stack.enter_context(_observe_dynamic(self.components))
+            for owner, name, label in (
+                (full, "certify_swing_up_arithmetic", "energy_certificate"),
+                (full, "certify_scalar_program", "kick_certificate"),
+                (full, "sustained_observer_numeric_contract", "dynamic_numeric_proof"),
+                (LanScalarRuntime, "__init__", "scalar_epoch_setup"),
+                (lan_runtime.LanSegmentedRuntime, "__init__", "dynamic_epoch_setup"),
+                (LanScalarRuntime, "end", "scalar_epoch_end"),
+                (lan_runtime.LanSegmentedRuntime, "end_segment", "dynamic_segment_end"),
+                (lan_runtime.LanSegmentedRuntime, "next_segment", "dynamic_segment_begin"),
+                (lan_scalar_runtime, "connect_role", "scalar_connect"),
+                (lan_runtime, "connect_role", "dynamic_connect"),
+                (lan_transport, "connect_tls", "authentication_connect"),
+            ):
+                wrap(owner, name, label, lifecycle=True)
+            wrap(LanScalarRuntime, "step", "scalar_step", control=True)
+            wrap(lan_runtime.LanSegmentedRuntime, "step", "dynamic_step", control=True)
+            wrap(lan_scalar_runtime, "prepare_scalar_round", "scalar_material_prepare")
+            wrap(lan_scalar_runtime.FixedPointContext, "decode_residue", "scalar_reconstruct")
+            for name in ("_send", "_receive"):
+                original = getattr(lan_scalar_runtime, name)
+                def io(sock, frame, deadline, *, _call=original, _name=name):
+                    label = {"material": "scalar_distribution", "ready": "scalar_distribution",
+                             "compute": "scalar_stage", "result": "scalar_stage",
+                             "commit": "scalar_commit", "committed": "scalar_commit"}.get(frame.operation)
+                    start = time.perf_counter_ns()
+                    try:
+                        return _call(sock, frame, deadline)
+                    finally:
+                        if label and self.current:
+                            self.components[label+"_ms"] = self.components.get(label+"_ms", 0.) + (time.perf_counter_ns()-start)/1e6
+                stack.enter_context(patch.object(lan_scalar_runtime, name, io))
+            yield self
+        finally:
+            stack.close()
+
+
+def run_full_observation(*, steps: int, delay_ms: float, segment_steps: int = 400,
+                         role_config: Path | None = None) -> dict[str, object]:
+    """有界P0完整路线观察；原非实时循环、提前测量与失败契约保持。"""
+    from secure_control.scenarios.cart_pole.observer import load_cart_pole_observer_design
+    from secure_control.scenarios.cart_pole.secure_full_experiment import run_secure_full_experiment
+    from secure_control.scenarios.cart_pole.swing_up import load_cart_pole_swing_up_config
+
+    from .lan_profile import _load_prime
+
+    started = time.perf_counter_ns()
+    if type(steps) is not int or not 1 <= steps <= 1500:
+        raise ValueError("full观察只允许原有限范围内1..1500步，不自动运行10k")
+    if type(segment_steps) is not int or not 1 <= segment_steps <= 1000:
+        raise ValueError("段容量必须在1..1000")
+    if isinstance(delay_ms, bool) or not isinstance(delay_ms, (int, float)) or not 0 <= delay_ms <= 3:
+        raise ValueError("每应用帧注入等待必须在0..3ms")
+    design = load_cart_pole_observer_design(_ROOT / "configs/cart_pole_observer.yaml")
+    swing = load_cart_pole_swing_up_config(_ROOT / "configs/cart_pole_swing_up.yaml", design.plant, design.balance)
+    # 不调整acquisition或其他控制参数来凑短horizon；非法组合在建连前拒绝。
+    swing = replace(swing, horizon_steps=steps)
+    swing.validate(design.plant, design.balance)
+    modulus, evidence, _ = _load_prime(_ROOT / "configs/shared_prime_256_pocklington.yaml")
+    ports = _ports()
+    config = _config("Client", ports) if role_config is None else load_lan_config(role_config, "Client")
+    if role_config is not None:
+        ports = tuple(e.port for e in (config.topology.p1_client, config.topology.p2_client, config.topology.p1_peer))
+    context = mp.get_context("spawn")
+    queue = context.Queue()
+    parties = [context.Process(target=_party_job, args=(_config(role, ports), ports, delay_ms, True, queue, False, True))
+               for role in ("P1", "P2")] if role_config is None else []
+    counts, activity, restore = _meter("Client", ports, delay_ms)
+    observer = _FullObservation(steps, counts, activity)
+    observer.started = started
+    result, failure, outcomes = None, None, []
+    try:
+        for party in parties:
+            party.start()
+        with observer.installed():
+            result = run_secure_full_experiment(design.plant, design.balance, swing, design, config,
+                       modulus=modulus, modulus_evidence=evidence, segment_capacity=segment_steps,
+                       on_step=observer.confirmed)
+        if observer.current:
+            terminal = (observer.current["physical_step"] == steps and result.physical.failure_reason is None)
+            observer.finish("terminal_observation" if terminal else "failed")
+        failure = result.physical.failure_reason
+    except Exception as error:  # noqa: BLE001 - 失败只导出类别，不导出消息/payload
+        failure = type(error).__name__
+        observer.finish("failed")
+    finally:
+        restore()
+        # Queue先读后join，避免较大公开汇总占满管道；异常也回收已有子进程。
+        if parties:
+            outcomes = _party_outcomes(queue)
+        for party in parties:
+            if party.pid is not None:
+                party.join(timeout=5)
+                if party.is_alive():
+                    party.terminate()
+                    party.join(timeout=5)
+        queue.close()
+    attempts = [r for r in observer.rows if r["status"] != "terminal_observation"]
+    complete = [r for r in attempts if r["status"] == "confirmed"]
+    directions = dict(counts)
+    for item in outcomes:
+        directions.update(item["directions"])
+    return {
+        "schema": "communication-benchmark-v1", "case": "full-observation", "mode": "batch",
+        "code_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=_ROOT, text=True).strip(),
+        "dirty": bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=_ROOT, text=True).strip()),
+        "source_sha256": _source_fingerprints((
+            "src/secure_control/scenarios/cart_pole/secure_full_experiment.py",
+            "src/secure_control/scenarios/cart_pole/swing_up.py",
+            "src/secure_control/scenarios/cart_pole/swing_up_numeric.py",
+            "src/secure_control/execution/lan_scalar_runtime.py", "src/secure_control/protocol/arithmetic.py",
+            "configs/cart_pole_swing_up.yaml", "configs/shared_prime_256_pocklington.yaml",
+            "configs/cart_pole_plant.yaml", "configs/cart_pole_balance.yaml")),
+        "configuration": {"horizon_steps": steps, "segment_steps": segment_steps,
+                          "profile_sha256": config.topology.digest, "period_s": design.plant.sample_period_s,
+                          "role_config_sha256": sha256(role_config.read_bytes()).hexdigest() if role_config else None},
+        "environment": {"os": platform.platform(), "python": platform.python_version(),
+                        "cpu_count": os.cpu_count(), "roles": "three local processes" if parties else "external parties",
+                        "transport": config.transport, "delay_model": "sleep before each application frame send",
+                        "injected_delay_ms": delay_ms, "injection_roles": ["Client", "P1", "P2"] if parties else ["Client"]},
+        "status": "failed" if failure else "complete", "failure_type": failure,
+        "termination": result.physical.termination if result else "failed",
+        "goal_met": result.physical.goal_met if result else False,
+        "successful_steps": len(complete), "failed_attempts": sum(r["status"] == "failed" for r in attempts),
+        "canonical_physical_confirmed_steps": result.physical.completed_steps if result else 0,
+        "epochs": [{k: e.get(k) for k in ("physical_start", "phase", "epoch_id", "session_id",
+                                         "previous_session_id", "program_sha256", "fractional_bits")}
+                   for e in result.epoch_events] if result else [],
+        "steps": attempts, "terminal_observation": [r for r in observer.rows if r["status"] == "terminal_observation"],
+        "events": observer.events, "party_outcomes": outcomes, "directions_all_session": directions,
+        "client_memory": _process_memory(), "activity_all_session_ms": activity,
+        "timing": _timing([r["duration_ms"] for r in complete]),
+        "phase_timing": {p: _timing([r["duration_ms"] for r in complete if r["phase"] == p])
+                         for p in sorted({r["phase"] for r in complete})},
+        "initial_preparation_ms": ((observer.rows[0]["consumption_start_ns"]-observer.started)/1e6
+                                   if observer.rows else None),
+        "role_exit_codes": [p.exitcode for p in parties],
+        "qualification_pass": False, "absolute_scheduling": False,
+        "observation_limits": {"step_capacity": steps+1, "event_capacity": 256, "step_detail_bytes": 4096,
+                               "event_overflow": observer.event_overflow, "detail_overflow": observer.detail_overflow,
+                               "step_encoded_charge_bytes": observer.encoded_charge},
+        "timing_scope": "measurement consumption through confirmed callback; measurement was read earlier; failed elapsed includes unwind; nested costs cannot be summed; no scheduled jitter/deadline or real hardware evidence",
+        "byte_scope": "attempted application sends including 4-byte framing; failed sends may be partial; not TCP packet or actual failed wire-byte counts",
+        "party_scope": "local per-role wall includes socket waits; no uncalibrated cross-host subtraction; external party internals not observed",
     }
 
 
