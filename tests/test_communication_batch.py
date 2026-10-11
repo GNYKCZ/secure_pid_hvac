@@ -629,6 +629,195 @@ def test_finite_diagnostic_keeps_failed_null_cycle_and_restores_canonical_hooks(
                for role in diag["roles"])
 
 
+def test_supply_diagnostic_windows_gc_pairing_missing_cpu_and_fixed_budgets():
+    import gc
+    import json
+    from itertools import count
+
+    from secure_control.experiments.communication_benchmark import _Diagnostic
+
+    def unavailable():
+        raise NotImplementedError
+
+    wall = count(0, 100)
+    diag = _Diagnostic("Client", supply=True, wall=lambda: next(wall), cpu=unavailable)
+    selected = [step for step in range(406) if diag._selected_step(step)]
+    assert selected == [0, 1, 165, 166, 167, 168, 176, 177, 178, 179, 180]
+    before = list(gc.callbacks), gc.isenabled(), gc.get_threshold()
+    with diag.installed():
+        diag.select(164)
+        diag._gc("start", {"generation": 1})
+        diag.select(165)
+        diag._gc("stop", {"generation": 1})
+        diag._gc("stop", {"generation": 2})
+        diag._gc("start", {"generation": 0})
+        diag._gc("stop", {"generation": 2})
+        for _ in range(600):
+            with diag.scope("public_task"):
+                pass
+    assert (list(gc.callbacks), gc.isenabled(), gc.get_threshold()) == before
+    report = diag.report()
+    assert report["overflow"] == 92 and report["encoded_overflow"] > 0
+    assert len(json.dumps(report, separators=(",", ":")).encode()) < 80 * 1024
+    events = report["events"]
+    paired = events[0]
+    assert paired["pairing"] == "complete" and paired["generation"] == 1
+    assert paired["control_global_step"] == 164 and paired["control_global_step_end"] == 165
+    assert paired["start_ns"] < paired["end_ns"] and paired["cpu_delta_ns"] is None
+    assert {item["pairing"] for item in events if item["kind"] == "gc_interval"} == {
+        "complete", "missing_start", "missing_stop",
+    }
+    assert all(item.get("cpu_delta_ns") is None for item in events)
+    # report不消费overflow状态；默认诊断仍使用原跨段窗口。
+    assert diag.report() == report
+    legacy = _Diagnostic("Client")
+    assert legacy._selected_step(397) and not legacy._selected_step(179)
+    party = _Diagnostic("P1", supply=True)
+    party.select(167)
+    with party.scope("party_stage"):
+        pass
+    event = party.report()["events"][0]
+    assert event["control_global_step"] == 167
+    assert event["control_active"] is event["control_active_end"] is None
+
+
+def test_supply_diagnostic_real_producer_labels_original_owner_and_exception_cleanup(monkeypatch):
+    import gc
+    from threading import Event, get_native_id
+
+    from test_two_party_protocol import make_stack
+
+    from secure_control.execution.lan_runtime import _OnlineResourcePool
+    from secure_control.experiments.communication_benchmark import _Diagnostic, _observe_diagnostic
+    from secure_control.protocol.roles import _PreparedResourceOwner
+
+    client, _, _, _, distribution = make_stack()
+    diag = _Diagnostic("Client", supply=True)
+    ready, release = Event(), Event()
+    create, produce = _PreparedResourceOwner.create, _OnlineResourcePool._produce
+    before = list(gc.callbacks), gc.isenabled(), gc.get_threshold()
+
+    def gated(owner, step, **kwargs):
+        if step == 172:
+            diag._gc("start", {"generation": 1})
+            ready.set()
+            assert release.wait(3)
+            diag._gc("stop", {"generation": 1})
+        return create(owner, step, **kwargs)
+
+    monkeypatch.setattr(_PreparedResourceOwner, "create", gated)
+    with pytest.raises(ValueError, match="private-error"), diag.installed(), _observe_diagnostic(diag):
+        pool = _OnlineResourcePool(client, distribution, start=168, slots=4)
+        try:
+            assert pool.low_water == 3 and not any(diag.slots)
+            diag.select(167)
+            taken = pool.take(168)
+            assert taken._owner is pool.owner and ready.wait(3)
+            diag.select(168)
+            release.set()
+        finally:
+            release.set()
+            pool.close()
+            pool.owner.discard(taken)
+        assert not client._issued_rounds
+        assert taken.p1_resources.aborted_count == 11
+        assert pool.snapshot()["material_reserved_bytes"] <= 8 * 1024 * 1024
+        raise ValueError("private-error")
+    assert _PreparedResourceOwner.create is gated and _OnlineResourcePool._produce is produce
+    assert (list(gc.callbacks), gc.isenabled(), gc.get_threshold()) == before
+    report = diag.report()
+    assert "private-error" not in str(report)
+    tasks = [item for item in report["events"] if item["kind"] == "interval"]
+    assert {item["phase"] for item in tasks} == {"material_produce", "material_create"}
+    assert all(item["owner"] == "Client producer" and item["prepared_step"] == 172
+               and item["control_global_step"] == 167 and item["control_global_step_end"] == 168
+               and item["native_thread_id"] != get_native_id() for item in tasks)
+    collection = next(item for item in report["events"] if item["kind"] == "gc_interval"
+                      and item["generation"] == 1)
+    assert collection["pairing"] == "complete" and collection["owner"] == "Client producer"
+    assert collection["prepared_step"] == 172 and collection["control_global_step_end"] == 168
+    diag.select(179)
+    with diag.scope("control_cycle"):
+        pass
+    control = next(item for item in diag.report()["events"] if item.get("phase") == "control_cycle")
+    assert control["owner"] == "Client control"
+
+
+def test_supply_diagnostic_canonical_send_encode_public_metadata_and_cleanup(monkeypatch):
+    import json
+
+    from secure_control.execution import localhost_transport
+    from secure_control.experiments.communication_benchmark import _Diagnostic, _meter
+
+    calls = []
+    def sending(sock, payload, deadline):
+        calls.append((sock, payload, deadline))
+        raise TimeoutError("private-socket-message")
+
+    monkeypatch.setattr(localhost_transport, "_send_exact", sending)
+    original_encode = localhost_transport.encode_envelope
+    diag = _Diagnostic("Client", supply=True)
+    diag.select(179)
+    counts, activity, restore = _meter("Client", (101, 102, 103), 0, diagnostic=diag)
+    try:
+        frame = WireEnvelope(SCHEMA_VERSION, "shutdown", "Client", "P1", 1, "shutdown",
+                             "private-session", None, None, None, None)
+        encoded = localhost_transport.encode_envelope(frame)
+        sock = SimpleNamespace(getsockname=lambda: ("localhost", 104),
+                               getpeername=lambda: ("localhost", 101))
+        with pytest.raises(TimeoutError, match="private-socket"):
+            localhost_transport._send_exact(sock, encoded, 123)
+    finally:
+        restore()
+    assert calls == [(sock, encoded, 123)]
+    assert localhost_transport._send_exact is sending
+    assert localhost_transport.encode_envelope is original_encode
+    assert activity["send_ms"] >= 0 and counts["Client->P1"]["frames"] == 1
+    events = diag.report()["events"]
+    assert len(events) == 2 and {item["phase"] for item in events} == {"encode_ms", "send_ms"}
+    assert all(item["direction"] == "Client->P1" and item["public_bytes"] == len(encoded)
+               and item["control_global_step"] == 179 for item in events)
+    assert next(item for item in events if item["phase"] == "send_ms")["status"] == "TimeoutError"
+    assert "private-" not in json.dumps(events) and getattr(diag.state, "phase", None) is None
+
+
+@pytest.mark.integration
+def test_supply_diagnostic_mode_keeps_failed_cycle_and_restores_all_hooks(monkeypatch):
+    import gc
+    import json
+
+    from secure_control.execution import lan_runtime, localhost_transport
+    from secure_control.experiments.communication_benchmark import run_continuous_observation
+    from secure_control.protocol import Client
+    from secure_control.protocol.roles import _PreparedResourceOwner
+
+    before = (list(gc.callbacks), gc.isenabled(), gc.get_threshold(),
+              lan_runtime._OnlineResourcePool._produce, _PreparedResourceOwner.create,
+              localhost_transport._send_exact, localhost_transport.encode_envelope)
+    def failed(*args, **kwargs):
+        raise ValueError("private-supply-input")
+
+    monkeypatch.setattr(Client, "bind_online_input", failed)
+    report = run_continuous_observation(steps=1, delay_ms=0, segment_steps=400,
+                                       optimized=True, diagnostic=True, recording_mode="light")
+    assert not report["qualification_pass"] and report["successful_steps"] == 0
+    assert report["cycles"][0]["device_completed_ns"] is None
+    assert report["cycles"][0]["cycle_completed_ns"] is None
+    assert (list(gc.callbacks), gc.isenabled(), gc.get_threshold(),
+            lan_runtime._OnlineResourcePool._produce, _PreparedResourceOwner.create,
+            localhost_transport._send_exact, localhost_transport.encode_envelope) == before
+    diag = report["diagnostic_report"]
+    assert diag["supply_diagnostic"] and "176..180" in diag["selected_global_steps"]
+    assert len(json.dumps(diag, separators=(",", ":"), ensure_ascii=False).encode()) == diag["encoded_bytes"]
+    assert diag["encoded_bytes"] <= diag["encoded_limit"] == 256 * 1024
+    assert all(role["event_limit"] == 512 and role["encoded_events_limit"] == 72 * 1024
+               and role["callback_restored"] and role["gc_before"] == role["gc_after"]
+               for role in diag["roles"])
+    control = next(item for item in diag["roles"][0]["events"] if item["phase"] == "control_cycle")
+    assert control["status"] == report["cycles"][0]["status"]
+    assert "private-supply" not in json.dumps(report)
+
+
 def test_swing_up_has_38_products_in_16_public_layers():
     from test_lan_scalar_v3 import _inputs
 

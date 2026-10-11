@@ -35,7 +35,7 @@ class _Diagnostic:
 
     LIMIT = 512
 
-    def __init__(self, role, *, wall=None, cpu=None, limit=LIMIT):
+    def __init__(self, role, *, wall=None, cpu=None, limit=LIMIT, supply=False):
         self.role = role
         self.wall = wall or time.perf_counter_ns
         self.cpu = cpu or getattr(time, "thread_time_ns", None)
@@ -47,6 +47,9 @@ class _Diagnostic:
         self.state = local()
         self.cpu_errors = 0
         self.gc_before = None
+        self.supply = supply
+        self.control = (None, False)
+        self.gc_pending = None
         samples = []
         for _ in range(16):
             started = self.wall()
@@ -76,27 +79,53 @@ class _Diagnostic:
 
     def select(self, step):
         self.state.step = step
+        if self.supply:
+            self.control = (step, True if self.role == "Client" else None)
+
+    def finish_control(self):
+        self.control = (self.control[0], False if self.role == "Client" else None)
+
+    def _selected_step(self, step):
+        if self.supply:
+            return type(step) is int and (0 <= step <= 1 or 165 <= step <= 168 or 176 <= step <= 180)
+        return type(step) is int and (0 <= step <= 1 or 397 <= step <= 405)
+
+    def _label(self):
+        """诊断标签不参与供料/调度；未来材料步号与控制回调标签分开。"""
+        owner = getattr(self.state, "owner", None) or (self.role + " control" if self.role == "Client" else self.role)
+        step, active = self.control
+        return owner, step, active, getattr(self.state, "prepared_step", None)
 
     def selected(self):
-        step = getattr(self.state, "step", None)
-        return type(step) is int and (0 <= step <= 1 or 397 <= step <= 405)
+        step = self.control[0] if self.supply else getattr(self.state, "step", None)
+        return self._selected_step(step)
 
     def begin(self, phase):
         if not self.selected():
             return None
         previous = getattr(self.state, "phase", None)
         self.state.phase = phase
-        return (get_ident(), get_native_id(), self.state.step, phase, previous,
-                self.wall(), self._cpu())
+        token = (get_ident(), get_native_id(), getattr(self.state, "step", None), phase, previous,
+                 self.wall(), self._cpu())
+        return token + self._label() if self.supply else token
 
-    def end(self, token):
+    def end(self, token, *, status="complete", direction=None, public_bytes=None):
         if token is None:
             return
         ended, cpu = self.wall(), self._cpu()
-        thread, native, step, phase, previous, started, initial_cpu = token
+        thread, native, step, phase, previous, started, initial_cpu = token[:7]
         if thread != get_ident():
             raise RuntimeError("CPU时钟区间必须在同一线程结束。")
         self.state.phase = previous
+        if self.supply:
+            index = self.reserve()
+            if index is not None:
+                owner, control_step, active, prepared_step = token[7:]
+                self.slots[index] = ("interval", owner, native, control_step, active, prepared_step,
+                                     phase, started, ended,
+                                     None if cpu is None or initial_cpu is None else cpu - initial_cpu,
+                                     *self.control, status, direction, public_bytes)
+            return
         owner = "writer" if current_thread().name == "segment-evidence-writer" else self.role
         key = (owner, thread, step, phase)
         index = self.keys.get(key)
@@ -122,12 +151,19 @@ class _Diagnostic:
     @contextmanager
     def scope(self, phase):
         token = self.begin(phase)
+        status = "complete"
         try:
             yield
+        except BaseException as error:
+            status = type(error).__name__
+            raise
         finally:
-            self.end(token)
+            self.end(token, status=status)
 
     def wrap(self, phase, original):
+        # S0保留关键区间，避免无关嵌套事件挤掉末轮任务/GC；原meter仍完整累计。
+        if self.supply and phase not in {"encode_ms", "material_restore", "party_stage"}:
+            return original
         def measured(*args, **kwargs):
             if not self.selected():
                 return original(*args, **kwargs)
@@ -137,6 +173,9 @@ class _Diagnostic:
 
     def _gc(self, phase, info):
         # callback只存定长公共tuple；不查看对象、不调用JSON/I/O或主动GC。
+        if self.supply:
+            self._supply_gc(phase, info.get("generation"))
+            return
         if not self.selected():
             return
         index = self.reserve()
@@ -145,6 +184,52 @@ class _Diagnostic:
         self.slots[index] = ("gc", phase, info.get("generation"), self.wall(),
                                  self._cpu(), get_ident(), get_native_id(),
                                  self.state.step, getattr(self.state, "phase", None))
+
+    def _supply_gc(self, phase, generation):
+        thread = get_ident()
+        stamp = ("gc_interval", *self._label(), get_native_id(), thread, generation,
+                 getattr(self.state, "phase", None), self.wall(), self._cpu())
+        if phase == "start":
+            self.gc_pending = stamp
+            return
+        if phase != "stop":
+            return
+        initial, self.gc_pending = self.gc_pending, None
+        paired = initial is not None and initial[6:8] == stamp[6:8]
+        if initial is not None and not paired and self._selected_step(initial[2]):
+            index = self.reserve()
+            if index is not None:
+                self.slots[index] = (initial, None, "missing_stop")
+        if self._selected_step(stamp[2]) or (paired and self._selected_step(initial[2])):
+            index = self.reserve()
+            if index is not None:
+                self.slots[index] = (initial if paired else None, stamp,
+                                     "complete" if paired else "missing_start")
+
+    def _supply_event(self, slot):
+        """停止后才展开固定tuple；不把嵌套区间或非CPU差值作为唯一归因。"""
+        if slot[0] == "interval":
+            (_, owner, native, step, active, prepared, phase, started, ended,
+             cpu, end_step, end_active, status, direction, size) = slot
+            value = {"kind": "interval", "owner": owner, "native_thread_id": native,
+                     "control_global_step": step, "control_active": active,
+                     "prepared_step": prepared, "phase": phase, "start_ns": started,
+                     "end_ns": ended, "cpu_delta_ns": cpu, "status": status,
+                     "control_global_step_end": end_step, "control_active_end": end_active}
+            if direction is not None:
+                value.update(direction=direction, public_bytes=size)
+            return value
+        initial, final, pairing = slot
+        item = initial if initial is not None else final
+        return {"kind": "gc_interval", "owner": item[1], "control_global_step": item[2],
+                "control_active": item[3], "prepared_step": item[4], "native_thread_id": item[5],
+                "generation": item[7], "active_phase": item[8], "pairing": pairing,
+                "start_ns": None if initial is None else initial[9],
+                "end_ns": None if final is None else final[9],
+                "cpu_delta_ns": (None if initial is None or final is None
+                                 or initial[10] is None or final[10] is None else final[10] - initial[10]),
+                "control_global_step_end": None if final is None else final[2],
+                "control_active_end": None if final is None else final[3]}
 
     @contextmanager
     def installed(self):
@@ -162,7 +247,9 @@ class _Diagnostic:
         for slot in self.slots:
             if slot is None:
                 continue
-            if isinstance(slot, tuple):
+            if self.supply:
+                events.append(self._supply_event(slot))
+            elif isinstance(slot, tuple):
                 _, phase, generation, wall, cpu, thread, native, step, active = slot
                 events.append({"kind": "gc", "phase": phase, "generation": generation,
                                "wall_ns": wall, "cpu_ns": cpu, "thread_id": thread,
@@ -175,6 +262,11 @@ class _Diagnostic:
                 value["non_cpu_ns"] = (None if value["cpu_ns"] is None else
                                        value["wall_ns"] - value["cpu_ns"])
                 events.append(value)
+        if self.supply and self.gc_pending is not None and self._selected_step(self.gc_pending[2]):
+            if len(events) < len(self.slots):
+                events.append(self._supply_event((self.gc_pending, None, "missing_stop")))
+            else:
+                overflow += 1
         clocks = {}
         for name in ("perf_counter", "thread_time"):
             try:
@@ -184,6 +276,13 @@ class _Diagnostic:
             except ValueError:
                 clocks[name] = None
         # 三角色总编码上界；退出后才计算长度，超过的尾事件显式计数。
+        if self.supply:
+            # 仅停止后按保留优先级稳定排序：预算紧张时先省嵌套细项，保护失败轮。
+            priority = {"control_cycle": 0, "material_produce": 0, "send_ms": 0,
+                        "encode_ms": 1, "material_create": 2, "party_stage": 3,
+                        "material_restore": 4, "receive_request": 5}
+            events.sort(key=lambda item: -1 if item["kind"] == "gc_interval"
+                        else priority.get(item["phase"], 6))
         bounded, encoded, omitted = [], 0, 0
         for event in events:
             size = len(json.dumps(event, separators=(",", ":"), ensure_ascii=False).encode()) + 1
@@ -309,6 +408,26 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
                 activity[name] += (time.perf_counter_ns() - started) / 1e6
         return diagnostic.wrap(label or name, call) if diagnostic else call
 
+    def encoded(*args, **kwargs):
+        token = diagnostic.begin("encode_ms")
+        started = time.perf_counter_ns()
+        value, status = None, "complete"
+        try:
+            value = originals["encode"](*args, **kwargs)
+            return value
+        except BaseException as error:
+            status = type(error).__name__
+            raise
+        finally:
+            activity["encode_ms"] += (time.perf_counter_ns() - started) / 1e6
+            # 仅公开信封方向及返回bytes长度；不访问payload/材料或异常文本。
+            message = args[0] if args else kwargs.get("message")
+            sender, recipient = getattr(message, "sender", None), getattr(message, "recipient", None)
+            direction = (sender + "->" + recipient if sender in {"Client", "P1", "P2"}
+                         and recipient in {"Client", "P1", "P2"} else None)
+            diagnostic.end(token, status=status, direction=direction,
+                           public_bytes=len(value) if isinstance(value, bytes) else None)
+
     def measured(sock, payload, deadline):
         started = time.perf_counter_ns()
         if delay_ms:
@@ -325,15 +444,24 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
         entry = counts.setdefault(direction, {"frames": 0, "application_bytes": 0})
         entry["frames"] += 1
         entry["application_bytes"] += len(payload)
+        # S0区间包住原_send_exact；原meter另含公开计数/注入等待，不声称纯OS耗时。
+        token = diagnostic.begin("send_ms") if diagnostic and diagnostic.supply else None
+        status = "complete"
         try:
             return originals["send"](sock, payload, deadline)
+        except BaseException as error:
+            status = type(error).__name__
+            raise
         finally:
             activity["send_ms"] += (time.perf_counter_ns() - started) / 1e6
+            if token is not None:
+                diagnostic.end(token, status=status, direction=direction, public_bytes=len(payload))
 
     localhost_transport._send_exact = (diagnostic.wrap("send_ms", measured)
                                        if diagnostic else measured)
     localhost_transport._receive_exact = timed("receive_ms", originals["receive"])
-    localhost_transport.encode_envelope = timed("encode_ms", originals["encode"])
+    localhost_transport.encode_envelope = (encoded if diagnostic and diagnostic.supply
+                                          else timed("encode_ms", originals["encode"]))
     localhost_transport.decode_envelope = timed("decode_ms", originals["decode"])
     lan_scalar_runtime.encode_scalar_frame_v3 = timed("encode_ms", originals["scalar_encode"])
     lan_scalar_runtime.decode_scalar_frame_v3 = timed("decode_ms", originals["scalar_decode"])
@@ -354,8 +482,12 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
             if request.sender == "Client" and request.step is not None:
                 diagnostic.select(request.step)
                 if diagnostic.selected():
-                    diagnostic.end((get_ident(), get_native_id(), request.step, "receive_request",
-                                    getattr(diagnostic.state, "phase", None), started, cpu))
+                    if diagnostic.supply:
+                        token = diagnostic.begin("receive_request")
+                        diagnostic.end((*token[:5], started, cpu, *token[7:]))
+                    else:
+                        diagnostic.end((get_ident(), get_native_id(), request.step, "receive_request",
+                                        getattr(diagnostic.state, "phase", None), started, cpu))
             return request
 
         observations.enter_context(patch.object(lan_runtime, "receive_envelope", observed_request))
@@ -472,10 +604,10 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
 
 def _party_job(
     config: LanConfig, ports: tuple[int, int, int], delay_ms: float, batch: bool, queue,
-    diagnostic_enabled=False, full_observation=False, tcp_nodelay=None,
+    diagnostic_enabled=False, full_observation=False, tcp_nodelay=None, supply_diagnostic=False,
 ) -> None:
     role_steps = []
-    diagnostic = _Diagnostic(config.role) if diagnostic_enabled else None
+    diagnostic = _Diagnostic(config.role, supply=supply_diagnostic) if diagnostic_enabled else None
     observations = ExitStack()
     socket_options = []
     observations.enter_context(_observe_tcp(socket_options, tcp_nodelay))
@@ -660,6 +792,32 @@ def _observe_diagnostic(diagnostic, *, recording=True):
 
     from . import cart_pole_segmented_evidence as evidence
 
+    if diagnostic.supply:
+        from secure_control.protocol.roles import _PreparedResourceOwner
+
+        produce, create = lan_runtime._OnlineResourcePool._produce, _PreparedResourceOwner.create
+
+        def produced(self):
+            previous = (getattr(diagnostic.state, "owner", None),
+                        getattr(diagnostic.state, "prepared_step", None))
+            diagnostic.state.owner, diagnostic.state.prepared_step = "Client producer", self._next
+            try:
+                with diagnostic.scope("material_produce"):
+                    return produce(self)
+            finally:
+                diagnostic.state.owner, diagnostic.state.prepared_step = previous
+
+        def created(self, *args, **kwargs):
+            if getattr(diagnostic.state, "owner", None) != "Client producer":
+                return create(self, *args, **kwargs)
+            with diagnostic.scope("material_create"):
+                return create(self, *args, **kwargs)
+
+        with (patch.object(lan_runtime._OnlineResourcePool, "_produce", produced),
+              patch.object(_PreparedResourceOwner, "create", created)):
+            yield
+        return
+
     original_phase = evidence._batch_phase
     original_batch = evidence._Spool.record_batch
     original_commit = _ClientPartyEndpoint.commit
@@ -762,6 +920,8 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
         raise ValueError("段容量必须在1..1000")
     if not isinstance(delay_ms, (int, float)) or not 0 <= delay_ms <= 3:
         raise ValueError("单帧注入等待必须在0..3ms")
+    supply_diagnostic = (diagnostic and light and not preload_steps and material_slots == 16
+                         and not comparison_only)
     ports = _ports()
     config = _config("Client", ports) if role_config is None else load_lan_config(role_config, "Client")
     if role_config is not None:
@@ -772,6 +932,7 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
     queue = context.Queue()
     parties = [context.Process(target=_party_job, args=(
         _config(role, ports), ports, delay_ms, True, queue, diagnostic, False, tcp_nodelay,
+        supply_diagnostic,
     )) for role in ("P1", "P2")] if role_config is None else []
     records, events, outcomes, writer_batches = [], [], [], []
     socket_options = []
@@ -780,7 +941,7 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                           "source_check_ms": 0., "source_check_control_ms": 0.,
                           "source_check_writer_ms": 0., "source_check_control_count": 0,
                           "source_check_writer_count": 0}
-    diagnostic_observer = _Diagnostic("Client") if diagnostic else None
+    diagnostic_observer = _Diagnostic("Client", supply=supply_diagnostic) if diagnostic else None
     counts, activity, restore = _meter("Client", ports, delay_ms, diagnostic=diagnostic_observer)
     control, session = RunControl(), InteractiveSession()
     fsync, checkpoint = os.fsync, None if light else _Spool._checkpoint
@@ -794,10 +955,12 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
         nonlocal current_phase, phase_start, attempt, before_activity, before_storage, before_counts
         nonlocal diagnostic_phase
         if diagnostic_observer:
-            diagnostic_observer.end(diagnostic_phase)
+            if not supply_diagnostic or name == "INPUT":
+                diagnostic_observer.end(diagnostic_phase)
             if name == "INPUT":
                 diagnostic_observer.select(len(records))
-            diagnostic_phase = diagnostic_observer.begin(name)
+            if not supply_diagnostic or name == "INPUT":
+                diagnostic_phase = diagnostic_observer.begin("control_cycle" if supply_diagnostic else name)
         now = time.perf_counter_ns()
         if current_phase is not None:
             events.append({"phase": current_phase, "duration_ms": (now - phase_start) / 1e6,
@@ -832,8 +995,10 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
     def observed_cycle(timing):
         nonlocal diagnostic_phase
         if diagnostic_observer:
-            diagnostic_observer.end(diagnostic_phase)
+            diagnostic_observer.end(diagnostic_phase, status=timing.status)
             diagnostic_phase = None
+            if supply_diagnostic:
+                diagnostic_observer.finish_control()
         sent = {k: v["frames"] - before_counts.get(k, {}).get("frames", 0)
                 for k, v in counts.items()}
         byte_counts = {k: v["application_bytes"] - before_counts.get(k, {}).get("application_bytes", 0)
@@ -943,6 +1108,7 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
         restore()
         if diagnostic_observer:
             diagnostic_observer.end(diagnostic_phase)
+            diagnostic_observer.finish_control()
         diagnostic_context.close()
         for party in parties:
             if party.is_alive():
@@ -962,9 +1128,17 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
     if diagnostic_observer:
         diagnostic_report = {"diagnostic": True, "roles": [diagnostic_observer.report()] +
             [item.pop("diagnostic", {"role": item["role"], "missing": True}) for item in outcomes],
-            "selected_global_steps": "0..1 and 397..405; writer batch identified by final public step",
-            "scope": "same-host perf_counter/QPC; same-thread CPU; repeated windows are envelopes, "
-                     "not continuous execution; nested durations overlap; non_cpu is not a GIL/I/O cause",
+            "selected_global_steps": ("0..1, 165..168, 176..180; control labels, not prepared_step"
+                                      if supply_diagnostic else
+                                      "0..1 and 397..405; writer batch identified by final public step"),
+            "supply_diagnostic": supply_diagnostic,
+            "control_label_scope": ("Client: INPUT through cycle export callback; P1/P2: last completed "
+                                    "Client request, Client active unknown; not CPU execution or GIL ownership"),
+            "scope": ("same-host perf_counter/QPC; individual task/send/encode/GC intervals; "
+                      "same-thread CPU may be quantized; nested durations overlap; no pure OS/GIL attribution"
+                      if supply_diagnostic else
+                      "same-host perf_counter/QPC; same-thread CPU; repeated windows are envelopes, "
+                      "not continuous execution; nested durations overlap; non_cpu is not a GIL/I/O cause"),
             "python_implementation": platform.python_implementation(),
             "encoded_limit": 256 * 1024}
         diagnostic_report["encoded_bytes"] = 0
