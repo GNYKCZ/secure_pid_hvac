@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import re
 from dataclasses import asdict, dataclass
@@ -34,6 +36,9 @@ from secure_control.protocol.messages import (
     P2TruncationPayload,
     PartyOfflineMaterial,
     PartyOnlineMaterial,
+    PartyResources,
+    PreloadedResourceManifest,
+    PreloadReceipt,
     ProductMaskPayload,
     ProductResourceMaterial,
     Protocol3BatchPayload,
@@ -53,6 +58,11 @@ _OPERATIONS = {
     "ready",
     "offline",
     "online",
+    "preload_init",
+    "preload_block",
+    "preload_seal",
+    "activate",
+    "activate_stage",
     "lan_hello",
     "lan_ready",
     "lan_setup",
@@ -148,6 +158,82 @@ class LanSetupPayload:
     state_payload_bounds: tuple[int, ...]
     input_payload_bounds: tuple[int, ...]
     horizon_steps: int
+
+
+@dataclass(frozen=True, slots=True)
+class PreloadedHelloPayload:
+    """显式预送能力包装；旧角色必须拒绝未知类型，不静默降级。"""
+
+    base: BatchHelloPayload
+    count: int
+    stage_mode: Literal["staged", "fused"]
+    version: Literal["control-preloaded-v1"] = "control-preloaded-v1"
+
+    def __post_init__(self):
+        if (not isinstance(self.base, BatchHelloPayload)
+                or not isinstance(self.base.base, LanSegmentedHelloPayload)
+                or self.base.base.mode != "lan-segmented-v2"
+                or type(self.count) is not int or not 1 <= self.count <= 1000
+                or self.stage_mode not in {"staged", "fused"}
+                or self.version != "control-preloaded-v1"):
+            raise LocalhostCodecError("预送 hello 能力、模式或容量无效")
+
+
+@dataclass(frozen=True, slots=True)
+class PreloadedInitPayload:
+    """完整公开清单及其规范摘要；不以摘要代替认证信道。"""
+
+    manifest: PreloadedResourceManifest
+    manifest_sha256: str
+
+    def __post_init__(self):
+        if (not isinstance(self.manifest, PreloadedResourceManifest)
+                or self.manifest.sha256() != self.manifest_sha256):
+            raise LocalhostCodecError("预送公开清单摘要不匹配")
+
+
+@dataclass(frozen=True, slots=True)
+class PreloadedBlock:
+    """启动期有界原始定宽数值块；JSON 信封仅以规范base64承载这些字节。"""
+
+    receipt: PreloadReceipt
+    values: bytes
+
+    def __post_init__(self):
+        if (not isinstance(self.receipt, PreloadReceipt) or self.receipt.phase != "block"
+                or type(self.values) is not bytes or not 0 < len(self.values) <= 128 * 1024):
+            raise LocalhostCodecError("预送块字节、长度或摘要无效")
+
+
+@dataclass(frozen=True, slots=True)
+class PreloadedReadyPayload:
+    """完整有限窗口安装屏障；双方均确认后 Client 才启动正式控制。"""
+
+    manifest_sha256: str
+    count: int
+
+    def __post_init__(self):
+        _required_sha256(self.manifest_sha256, "manifest_sha256")
+        if type(self.count) is not int or not 1 <= self.count <= 1000:
+            raise LocalhostCodecError("预送就绪数量无效")
+
+
+@dataclass(frozen=True, slots=True)
+class PreloadedInputPayload:
+    """只发送当前测量的本方输入和已经确认的清单引用。"""
+
+    manifest_sha256: str
+    input_message: InputShareMessage
+    slot_index: int
+    plan_sha256: str
+
+    def __post_init__(self):
+        _required_sha256(self.manifest_sha256, "manifest_sha256")
+        _required_sha256(self.plan_sha256, "plan_sha256")
+        _require_nonnegative_integer(self.slot_index, "slot_index")
+        if (not isinstance(self.input_message, InputShareMessage) or self.slot_index >= 1000
+                or self.slot_index != self.input_message.step):
+            raise LocalhostCodecError("预送激活必须携带本次输入份额")
 
 
 @dataclass(frozen=True, slots=True)
@@ -340,6 +426,13 @@ WirePayload = (
     | SegmentBeginPayload
     | SegmentEndPayload
     | SegmentEndReceipt
+    | PreloadedResourceManifest
+    | PreloadedHelloPayload
+    | PreloadedBlock
+    | PreloadedInitPayload
+    | PreloadReceipt
+    | PreloadedReadyPayload
+    | PreloadedInputPayload
     | None
 )
 
@@ -461,7 +554,95 @@ def decode_wire_value(payload: bytes) -> object:
     return _decode_value(_load_json(payload))
 
 
+def _preloaded_values_size(plan: StepResourcePlan, modulus: int) -> int:
+    """固定公开计划的无损数值长度；分配和生成之前即可计算。"""
+    if not isinstance(plan, StepResourcePlan) or type(modulus) is not int or modulus < 3:
+        raise ValueError("预送计划或模数无效")
+    size = ((modulus.bit_length() + 7) // 8) * (3 * plan.triple_count + 2 * plan.truncation_count)
+    if not 0 < size <= 512 * 1024:
+        raise ValueError("单轮预送数值超出编码预算")
+    return size
+
+
+def _encode_preloaded_values(resources: PartyResources, modulus: int) -> bytes:
+    """仅编码本方原材料数值；不传送 owner、lifecycle 或未来输入。"""
+    if not isinstance(resources, PartyResources):
+        raise TypeError("预送只接受单方资源")
+    plan = resources.plan
+    size = _preloaded_values_size(plan, modulus)
+    if (type(resources.recipient) is not int or resources.recipient not in (0, 1)
+            or tuple(item.metadata for item in resources.product_resources) != plan.product_resources
+            or tuple(item.metadata for item in resources.state_truncation_resources)
+            != plan.state_truncation_resources):
+        raise ValueError("预送资源角色或顺序不匹配")
+    width = (modulus.bit_length() + 7) // 8
+    values = []
+    for item in resources.product_resources:
+        if type(item.owner) is not int or item.owner != resources.recipient:
+            raise ValueError("预送资源角色不匹配")
+        values.extend((item.triple.a, item.triple.b, item.triple.c))
+    for item in resources.state_truncation_resources:
+        if type(item.owner) is not int or item.owner != resources.recipient:
+            raise ValueError("预送资源角色不匹配")
+        values.extend((item.truncation.r, item.truncation.r_prime))
+    encoded = []
+    for share in values:
+        value = share.value
+        if type(value) is not int or not 0 <= value < modulus:
+            raise ValueError("预送数值必须是 canonical scalar residue")
+        encoded.append(value.to_bytes(width, "big"))
+    result = b"".join(encoded)
+    if len(result) != size:
+        raise ValueError("预送数值长度错误")
+    return result
+
+
+def _decode_preloaded_values(data: bytes, inp: InputShareMessage,
+                             plan: StepResourcePlan, modulus: int) -> PartyOnlineMaterial:
+    """领取当前轮后才重建单方 DTO，原 protocol recovery 继续拥有生命周期。"""
+    if type(data) is not bytes or len(data) != _preloaded_values_size(plan, modulus):
+        raise ValueError("预送数值长度错误")
+    if not isinstance(inp, InputShareMessage) or type(inp.recipient) is not int or inp.recipient not in (0, 1):
+        raise ValueError("预送输入角色无效")
+    width = (modulus.bit_length() + 7) // 8
+    values = []
+    for offset in range(0, len(data), width):
+        value = int.from_bytes(data[offset:offset + width], "big")
+        if value >= modulus:
+            raise ValueError("预送数值必须是 canonical residue")
+        values.append(AdditiveShare(value))
+    iterator = iter(values)
+    return PartyOnlineMaterial(
+        inp, plan,
+        tuple(ProductResourceMaterial(inp.recipient, item, next(iterator), next(iterator),
+                                      next(iterator)) for item in plan.product_resources),
+        tuple(TruncationResourceMaterial(inp.recipient, item, next(iterator), next(iterator))
+              for item in plan.state_truncation_resources),
+    )
+
+
 def _encode_value(value: object) -> object:
+    if isinstance(value, PreloadedHelloPayload):
+        return {"type": "preloaded_hello", "base": _encode_value(value.base),
+                "count": value.count, "stage_mode": value.stage_mode, "version": value.version}
+    if isinstance(value, PreloadedResourceManifest):
+        fields = asdict(value)
+        fields.update(layout=_encode_value(value.layout), modulus=_decimal(value.modulus))
+        return {"type": "preloaded_manifest", **fields, "derived": value.derived()}
+    if isinstance(value, PreloadedBlock):
+        return {"type": "preloaded_block", "receipt": _encode_value(value.receipt),
+                "values": base64.b64encode(value.values).decode("ascii")}
+    if isinstance(value, PreloadedInitPayload):
+        return {"type": "preloaded_init", "manifest": _encode_value(value.manifest),
+                "manifest_sha256": value.manifest_sha256}
+    if isinstance(value, PreloadReceipt):
+        return {"type": "preload_receipt", **asdict(value)}
+    if isinstance(value, PreloadedReadyPayload):
+        return {"type": "preloaded_ready", **asdict(value)}
+    if isinstance(value, PreloadedInputPayload):
+        return {"type": "preloaded_input", "manifest_sha256": value.manifest_sha256,
+                "input_message": _encode_value(value.input_message), "slot_index": value.slot_index,
+                "plan_sha256": value.plan_sha256}
     if value is None:
         return {"type": "none"}
     if isinstance(value, bool):
@@ -798,6 +979,47 @@ def _decode_value(value: object) -> object:
     kind = mapping.get("type")
     if not isinstance(kind, str):
         raise LocalhostCodecError("wire value 缺少字符串 type。")
+    if kind == "preloaded_hello":
+        _exact_fields(mapping, {"type", "base", "count", "stage_mode", "version"}, kind)
+        return PreloadedHelloPayload(_typed(mapping["base"], BatchHelloPayload),
+                                      mapping["count"], mapping["stage_mode"], mapping["version"])
+    if kind == "preloaded_manifest":
+        _exact_fields(mapping, {"type", "derived", *PreloadedResourceManifest.__dataclass_fields__}, kind)
+        fields = {name: mapping[name] for name in PreloadedResourceManifest.__dataclass_fields__}
+        fields["layout"] = _typed(mapping["layout"], ControllerLayout)
+        fields["modulus"] = _positive_decimal(mapping["modulus"], "modulus")
+        if not isinstance(mapping["round_ids"], list):
+            raise LocalhostCodecError("预送round列表无效")
+        fields["round_ids"] = tuple(mapping["round_ids"])
+        manifest = PreloadedResourceManifest(**fields)
+        derived = _mapping(mapping["derived"], "derived")
+        if (derived != manifest.derived() or any(type(v) is not int for v in derived.values())):
+            raise LocalhostCodecError("预送公开派生数量、宽度或长度不匹配")
+        return manifest
+    if kind == "preloaded_init":
+        _exact_fields(mapping, {"type", "manifest", "manifest_sha256"}, kind)
+        return PreloadedInitPayload(_typed(mapping["manifest"], PreloadedResourceManifest),
+                                   mapping["manifest_sha256"])
+    if kind in {"preload_receipt", "preloaded_ready"}:
+        cls = PreloadReceipt if kind == "preload_receipt" else PreloadedReadyPayload
+        _exact_fields(mapping, {"type", *cls.__dataclass_fields__}, kind)
+        return cls(**{name: mapping[name] for name in cls.__dataclass_fields__})
+    if kind == "preloaded_block":
+        _exact_fields(mapping, {"type", "receipt", "values"}, kind)
+        text = _text(mapping["values"], "values", maximum=4 * ((128 * 1024 + 2) // 3))
+        try:
+            data = base64.b64decode(text, validate=True)
+        except (ValueError, binascii.Error) as error:
+            raise LocalhostCodecError("预送base64无效") from error
+        if base64.b64encode(data).decode("ascii") != text:
+            raise LocalhostCodecError("预送base64非规范")
+        return PreloadedBlock(_typed(mapping["receipt"], PreloadReceipt), data)
+    if kind == "preloaded_input":
+        _exact_fields(mapping, {"type", "manifest_sha256", "input_message", "slot_index",
+                                "plan_sha256"}, kind)
+        return PreloadedInputPayload(mapping["manifest_sha256"],
+                                      _typed(mapping["input_message"], InputShareMessage),
+                                      mapping["slot_index"], mapping["plan_sha256"])
     if kind == "none":
         _exact_fields(mapping, {"type"}, kind)
         return None
@@ -1249,6 +1471,10 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
         ("reply", "shutdown"): {("Client", "Supervisor")} | to_client,
         ("error", "shutdown"): {("Client", "Supervisor")} | to_client,
     }
+    for operation in ("preload_init", "preload_block", "preload_seal", "activate", "activate_stage"):
+        allowed[("request", operation)] = to_party
+        allowed[("reply", operation)] = to_client
+        allowed[("error", operation)] = to_client
     if direction not in allowed.get(key, set()):
         raise LocalhostCodecError("wire kind/operation 与角色方向组合非法。")
     if message.operation == "peer_product" and (
@@ -1263,11 +1489,21 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
     if key == ("hello", "hello"):
         expected = (HelloPayload, BatchHelloPayload)
     elif key == ("hello", "lan_hello"):
-        expected = (LanHelloPayload, LanSegmentedHelloPayload, BatchHelloPayload)
+        expected = (LanHelloPayload, LanSegmentedHelloPayload, BatchHelloPayload,
+                    PreloadedHelloPayload)
     elif key == ("ready", "ready"):
         expected = (ReadyPayload,)
     elif message.kind == "error":
         expected = (RemoteErrorPayload,)
+    elif message.operation == "preload_init":
+        expected = (PreloadedInitPayload,) if message.kind == "request" else (PreloadReceipt,)
+    elif message.operation == "preload_block":
+        expected = (PreloadedBlock,) if message.kind == "request" else (PreloadReceipt,)
+    elif message.operation == "preload_seal":
+        expected = (PreloadedReadyPayload,) if message.kind == "request" else (PreloadReceipt,)
+    elif message.operation in {"activate", "activate_stage"}:
+        expected = ((PreloadedInputPayload,) if message.kind == "request" else
+                    (PartyStageResult,) if message.operation == "activate_stage" else (type(None),))
     elif key == ("request", "step"):
         expected = (np.ndarray,)
     elif key == ("reply", "step"):
@@ -1325,7 +1561,7 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
                  or payload.batch_index != {"product": 0, "product_complete": 1,
                                             "truncation": 2, "state_complete": 3}[payload.phase])):
         raise LocalhostCodecError("Protocol 3 批次方向、阶段或身份非法")
-    if message.operation in {"segment_end", "segment_begin"} and (
+    if message.operation in {"segment_end", "segment_begin", "preload_init", "preload_seal"} and (
         message.session_id is None or message.round_id is not None
         or message.step is not None or message.resource_id is not None
         or (isinstance(payload, SegmentEndReceipt)
@@ -1343,7 +1579,7 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
     ):
         raise LocalhostCodecError("Client 单步结果与信封 step 不匹配。")
     if (
-        message.operation == "endpoint"
+        message.operation in {"endpoint", "activate", "activate_stage"}
         and isinstance(payload, PartyStageResult)
         and (
             direction[0] not in {"P1", "P2"}
@@ -1352,7 +1588,7 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
     ):
         raise LocalhostCodecError("暂存结果的角色不匹配。")
     if (
-        message.operation == "endpoint"
+        message.operation in {"endpoint", "activate", "activate_stage"}
         and isinstance(payload, PartyStageResult)
         and (
             (payload.receipt.session_id, payload.receipt.round_id, payload.receipt.step)
@@ -1361,6 +1597,27 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
         )
     ):
         raise LocalhostCodecError("暂存结果与信封 round identity 不匹配。")
+    if message.operation in {"activate", "activate_stage"} and isinstance(payload, PreloadedInputPayload):
+        inp = payload.input_message
+        if (message.session_id, message.round_id, message.step, message.resource_id) != (
+            inp.session_id, inp.round_id, inp.step, None,
+        ) or inp.recipient != (0 if message.recipient == "P1" else 1):
+            raise LocalhostCodecError("激活信封与本次输入身份不匹配")
+    if isinstance(payload, PreloadedInitPayload) and message.session_id != payload.manifest.session_id:
+        raise LocalhostCodecError("预送manifest与信封session不匹配")
+    if isinstance(payload, PreloadReceipt) and message.kind == "reply" and (
+        payload.party != (0 if message.sender == "P1" else 1)
+        or message.operation != "preload_" + payload.phase
+        or message.step != payload.first_step
+    ):
+        raise LocalhostCodecError("预送回执与信封角色、阶段或区间不匹配")
+    if message.operation == "preload_block" and (
+        message.session_id is None or message.round_id is not None or message.resource_id is not None
+        or isinstance(payload, PreloadedBlock) and (
+            message.step != payload.receipt.first_step
+            or payload.receipt.party != (0 if message.recipient == "P1" else 1))
+    ):
+        raise LocalhostCodecError("预送块信封身份不匹配")
 
 
 def _load_json(payload: bytes) -> object:

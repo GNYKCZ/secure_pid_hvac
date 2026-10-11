@@ -400,7 +400,9 @@ class SustainedCartPoleObserverExperiment:
         self._before = self.device.read_diagnostic_truth()
         return local.copy()
 
-    def advance(self, step: int, raw_control: np.ndarray) -> SustainedObserverStepSnapshot:
+    def advance(self, step: int, raw_control: np.ndarray, *, deadline_ns: int | None = None
+                ) -> SustainedObserverStepSnapshot:
+        """只推进当前新测量；周期模式在设备 send_control 前再次核验本机 QPC 截止。"""
         if (step != self._step or self._sample is None or self._local is None
                 or self._before is None):
             raise ValueError("物理推进与全局样本不一致。")
@@ -411,9 +413,12 @@ class SustainedCartPoleObserverExperiment:
         if not requested:
             requested = self._scheduled.pop(step, 0.)
         self.device.request_disturbance(step, requested)
-        receipt = self.device.send_control(ControlCommand(
+        command = ControlCommand(
             step, self._episode_id, self._sample.sample_id, raw,
-        ))
+        )
+        from secure_control.execution.cycle_timing import check_deadline
+        check_deadline(deadline_ns, "BEFORE_DEVICE_SIGNAL")
+        receipt = self.device.send_control(command)
         if (receipt.disposition != "simulated_interval_completed"
                 or receipt.applied_force_n != raw
                 or receipt.applied_source != "canonical_simulation"):

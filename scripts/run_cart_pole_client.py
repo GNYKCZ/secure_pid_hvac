@@ -17,6 +17,9 @@ if __name__ == "__main__":
     modes.add_argument("--full-route", choices=("plaintext", "secure"))
     modes.add_argument("--full-gui-route", choices=("plaintext", "secure"))
     parser.add_argument("--segment-steps", type=int, default=400)
+    parser.add_argument("--preload-steps", type=int, default=0,
+                        help="动态v2有限预送窗口，1..1000；耗尽后正常停止")
+    parser.add_argument("--preload-execution", choices=("staged", "fused"), default="fused")
     parser.add_argument("--full-output", type=Path)
     parser.add_argument("--swing-config", type=Path,
                         default=Path(__file__).resolve().parents[1]
@@ -28,6 +31,9 @@ if __name__ == "__main__":
                         default=Path(__file__).resolve().parents[1]
                         / "configs/shared_prime_256_pocklington.yaml")
     args = parser.parse_args()
+    if (not 0 <= args.preload_steps <= 1000 or args.preload_steps and (
+            args.finite or args.full_route or args.full_gui_route)):
+        parser.error("--preload-steps 只支持动态v2持续入口，范围1..1000")
     if args.full_gui_route:
         if args.full_output is None:
             parser.error("--full-gui-route 需要 --full-output 指定新结果目录")
@@ -102,12 +108,15 @@ if __name__ == "__main__":
         if config.experiment_config is None:
             raise ValueError("缺少倒立摆 Client profile。")
         dynamic = load_cart_pole_lan_profile(config.experiment_config).observer_design is not None
+        if args.preload_steps and not dynamic:
+            parser.error("--preload-steps 需要动态observer配置")
         # Ctrl+C 仅提交正常停止意图，不抛 KeyboardInterrupt 截断协议 I/O。
         previous = signal.signal(signal.SIGINT, lambda *_args: control.request_stop())
         try:
             result = (run_cart_pole_segmented(
                 config, segment_steps=args.segment_steps, control=control,
                 session=InteractiveSession(),
+                preload_steps=args.preload_steps, preload_execution=args.preload_execution,
             ) if dynamic else run_client_segmented(
                 config, segment_steps=args.segment_steps, control=control,
             ))
@@ -119,4 +128,5 @@ if __name__ == "__main__":
     from secure_control.scenarios.cart_pole.gui import run_window
 
     run_window(args.config, segment_steps=args.segment_steps,
-               mode="finite" if args.finite else "segmented")
+               mode="finite" if args.finite else "segmented",
+               preload_steps=args.preload_steps, preload_execution=args.preload_execution)

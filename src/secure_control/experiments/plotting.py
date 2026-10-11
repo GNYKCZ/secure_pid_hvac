@@ -11,14 +11,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
-import matplotlib
 import numpy as np
-from matplotlib.axis import Axis
-from matplotlib.backends.backend_agg import FigureCanvasAgg
-from matplotlib.figure import Figure
-from matplotlib.ticker import LogFormatterMathtext, ScalarFormatter
+
+if TYPE_CHECKING:
+    from matplotlib.axis import Axis
+    from matplotlib.figure import Figure
 
 from secure_control.simulation import ChannelMetadata, ScenarioMetadata, SimulationResult
 
@@ -94,6 +93,7 @@ def apply_axis_format(
     scientific: bool = True,
 ) -> None:
     """只格式化刻度与零基线，不缩放、截断或改写曲线数组。"""
+    from matplotlib.ticker import LogFormatterMathtext, ScalarFormatter
     if scale not in ("linear", "log"):
         raise ValueError("scale 必须是 linear 或 log。")
     if scale == "log":
@@ -217,6 +217,9 @@ class BoundedOverview:
 
 def _control_axes(title):
     """有限与分桶控制图共享三栏及前两栏同尺度，不重定义 error 口径。"""
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
     figure = Figure(figsize=(9, 9), layout="constrained")
     FigureCanvasAgg(figure)
     axes = figure.subplots(3, 1, sharex=True)
@@ -263,6 +266,9 @@ def _time(record: ExperimentRecord, display: PlotDisplay) -> np.ndarray:
 
 def _axes(record: ExperimentRecord, display: PlotDisplay, title: str, ylabel: str):
     """使用独立 Agg canvas，避免 GUI 后端、LaTeX 或全局 pyplot 状态。"""
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
     figure = Figure(figsize=(8.2, 4.6), layout="constrained")
     FigureCanvasAgg(figure)
     axes = figure.subplots()
@@ -492,6 +498,8 @@ def render_saved_run(
     display: PlotDisplay | None = None,
 ) -> FigureSet:
     """先经正式 reader 复验，再将四类图及追溯清单同批无覆盖发布。"""
+    import matplotlib
+
     if not isinstance(selection, PlotSelection):
         raise TypeError("selection 必须是 PlotSelection。")
     source = Path(run_dir)

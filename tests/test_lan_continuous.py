@@ -398,14 +398,17 @@ cli()
 
 _STALE_SECOND_ONLINE = r"""
 import sys
+from dataclasses import replace
 import secure_control.execution.lan_runtime as lan
+from secure_control.execution.localhost_codec import decode_envelope, encode_envelope
 from secure_control.experiments.lan_runner import cli
-original = lan._request
-def request(sock, role, sequence, operation, session, timeout, payload=None, round_id=None, step=None, **kwargs):
-    if role == 'P1' and operation == 'online' and step == 1:
-        step = 0
-    return original(sock, role, sequence, operation, session, timeout, payload, round_id, step, **kwargs)
-lan._request = request
+original = lan.localhost_transport.send_frame
+def send(sock, payload, **kwargs):
+    message = decode_envelope(payload)
+    if message.recipient == 'P1' and message.operation == 'online' and message.step == 1:
+        payload = encode_envelope(replace(message, step=0))
+    return original(sock, payload, **kwargs)
+lan.localhost_transport.send_frame = send
 sys.argv = ['secure-control', *sys.argv[1:]]
 cli()
 """

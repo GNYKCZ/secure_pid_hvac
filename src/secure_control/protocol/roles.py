@@ -7,10 +7,13 @@ import math
 import random
 import secrets
 from collections.abc import Iterator
+from copy import deepcopy
 from dataclasses import dataclass
 from fractions import Fraction
 from numbers import Integral
+from threading import Lock
 from typing import Any
+from weakref import WeakValueDictionary
 
 import numpy as np
 
@@ -43,12 +46,18 @@ from .messages import (
     ControllerScaleLedger,
     ControllerShare,
     ControlShareMessage,
+    ExportedPreloadedStep,
     InputShareMessage,
     OfflineControllerMessage,
     OfflineDistribution,
     OnlineRound,
     PartyIndex,
     PartyResources,
+    PreloadedInputRound,
+    PreloadedResourceManifest,
+    PreloadReceipt,
+    PreparedOnlineResources,
+    PreparedPreloadedResources,
     ProductResourceShare,
     ResourceMetadata,
     StateTruncationResourceShare,
@@ -56,6 +65,7 @@ from .messages import (
     _ResourceLifecycle,
     closed_loop_composition_sha256,
     controller_payload_fingerprint,
+    preloaded_material_budget,
 )
 
 
@@ -232,6 +242,7 @@ class Client:
         # 测试 RNG 每次 online 预处理都分配不同域，避免重新播种导致辅助材料复用。
         self._test_material_epoch = 0
         self._range_verification: ControllerRangeVerification | None = None
+        self._resource_owners: dict[str, _PreparedResourceOwner] = {}
 
     @property
     def range_verification(self) -> ControllerRangeVerification:
@@ -288,6 +299,9 @@ class Client:
         distribution = OfflineDistribution(
             session_id, range_contract, first_message, second_message
         )
+        self._resource_owners[session_id] = _PreparedResourceOwner(
+            distribution, self.multiplier, self.truncation,
+        )
         self._range_verification = verification
         return distribution
 
@@ -313,44 +327,134 @@ class Client:
         )
         self._validate_input_bound(input_payload, distribution.range_contract)
         round_id = self._identifier("round")
-        identity = (distribution.session_id, round_id, step)
-        if identity in self._issued_rounds:
+        if (distribution.session_id, round_id, step) in self._issued_rounds:
             raise ValueError("同一 controller session 内的 round_id 不能复用。")
         material_rng = self._online_material_rng(rng)
         input_shares = self.sharing.share(
             self.fixed_point.to_residue(input_payload), rng=material_rng
         )
-        plan = self._resource_plan(layout, distribution.session_id, round_id, step)
-        first_products: list[ProductResourceShare] = []
-        second_products: list[ProductResourceShare] = []
-        for metadata in plan.product_resources:
-            triple = self.multiplier.create_triple(rng=material_rng)
-            lifecycle = _ResourceLifecycle()
-            first_products.append(ProductResourceShare(0, metadata, triple[0], lifecycle))
-            second_products.append(ProductResourceShare(1, metadata, triple[1], lifecycle))
-        first_truncations: list[StateTruncationResourceShare] = []
-        second_truncations: list[StateTruncationResourceShare] = []
-        for metadata in plan.state_truncation_resources:
-            auxiliary = self.truncation.create_auxiliary(rng=material_rng)
-            lifecycle = _ResourceLifecycle()
-            first_truncations.append(
-                StateTruncationResourceShare(0, metadata, auxiliary[0], lifecycle)
-            )
-            second_truncations.append(
-                StateTruncationResourceShare(1, metadata, auxiliary[1], lifecycle)
-            )
+        prepared = self._material_owner(distribution).create(step, rng=material_rng, round_id=round_id)
+        return self._bind_online_input(distribution, prepared, input_shares, step, layout)
+
+    def _material_owner(self, distribution: OfflineDistribution) -> _PreparedResourceOwner:
+        """控制线程取得受限创建入口；生产者只持此入口，不持 Client 签发表。"""
+        layout = self._distribution_layout(distribution)
+        owner = self._resource_owners.get(distribution.session_id)
+        if (owner is None or owner.layout != layout
+                or owner.contract != distribution.range_contract):
+            raise ValueError("预准备要求当前 Client 的已验证 session/layout/范围契约。")
+        return owner
+
+    def precompute_online_resources(self, distribution: OfflineDistribution, *, step: int,
+                                    rng: random.Random | None = None) -> PreparedOnlineResources:
+        """在测量之前创建本步新资源；不分享未来输入、不签发输出能力。"""
+        return self._material_owner(distribution).create(step, rng=self._online_material_rng(rng))
+
+    def bind_online_input(self, distribution: OfflineDistribution,
+                          prepared: PreparedOnlineResources, v: Any, *, step: int,
+                          rng: random.Random | None = None) -> OnlineRound:
+        """核验本次新测量并一次性领取本机资源，只有控制线程签发输出能力。"""
+        layout = self._distribution_layout(distribution)
+        owner = self._material_owner(distribution)
+        owner.validate(prepared, step)
+        values = self._normalize_input(v, layout)
+        payload = np.asarray(
+            self._fixed_point_at_scale(layout.scale_ledger.input).encode(values), dtype=object,
+        )
+        self._validate_input_bound(payload, distribution.range_contract)
+        shares = self.sharing.share(self.fixed_point.to_residue(payload),
+                                    rng=self._online_material_rng(rng))
+        return self._bind_online_input(distribution, prepared, shares, step, layout)
+
+    def _bind_online_input(self, distribution, prepared, input_shares, step, layout):
+        owner = self._material_owner(distribution)
+        owner.claim(prepared, step)
+        plan = prepared.p1_resources.plan
+        round_id = plan.round_id
+        identity = (distribution.session_id, round_id, step)
+        if identity in self._issued_rounds:
+            owner.discard(prepared)
+            raise ValueError("同一 controller session 内的 round_id 不能复用。")
         online = OnlineRound(
             distribution.session_id,
             round_id,
             step,
             InputShareMessage(0, distribution.session_id, round_id, step, input_shares[0]),
             InputShareMessage(1, distribution.session_id, round_id, step, input_shares[1]),
-            PartyResources(0, plan, tuple(first_products), tuple(first_truncations)),
-            PartyResources(1, plan, tuple(second_products), tuple(second_truncations)),
+            prepared.p1_resources,
+            prepared.p2_resources,
         )
         # 只有整轮 input 与资源全部准备成功后才签发输出 capability。
         self._issued_rounds[identity] = layout
         return online
+
+    def begin_preloaded_resources(self, distribution: OfflineDistribution, *, run_id: str,
+                                  controller_epoch: str, count: int = 1000,
+                                  stage_mode: str = "fused") -> PreparedPreloadedResources:
+        """启动有限预送窗口；仅公开身份，不分享未来测量或签发未来输出。"""
+        owner = self._material_owner(distribution)
+        if (type(count) is not int or not 1 <= count <= 1000
+                or stage_mode not in {"staged", "fused"}
+                or any(not isinstance(v, str) or not 1 <= len(v) <= 256
+                       for v in (run_id, controller_epoch))):
+            raise ValueError("预送轮数必须是1..1000整数")
+        if owner.horizon is not None:
+            raise ValueError("LAN预送只用于已证明无界契约的动态v2")
+        budget = preloaded_material_budget(owner.layout, self.fixed_point.modulus, count)
+        manifest = PreloadedResourceManifest(
+            run_id, controller_epoch, distribution.session_id, secrets.token_hex(32), 0,
+            tuple(self._identifier("round") for _ in range(count)), owner.layout,
+            self.fixed_point.modulus, stage_mode, budget["block_steps"],
+        )
+        return owner.begin_preload(manifest)
+
+    def export_preloaded_step(self, distribution, batch, *, step, rng=None):
+        """原工厂逐轮生成和导出；立即封闭旧能力，不累积32个Prepared对象。"""
+        return self._material_owner(distribution).export_preload(
+            batch, step, self._online_material_rng(rng),
+        )
+
+    def record_preloaded_receipts(self, distribution, batch, receipts):
+        """网络层已检查信封后，独立验证双方启动/块/封存确认及生成前缀。"""
+        self._material_owner(distribution).record_preload(batch, receipts)
+
+    def bind_preloaded_input(self, distribution, batch, v, *, step, rng=None):
+        """复用原量化、范围和分享；领取当前步后才签发原输出重构能力。"""
+        owner = self._material_owner(distribution)
+        owner.validate_preload(batch, step)
+        layout = self._distribution_layout(distribution)
+        values = self._normalize_input(v, layout)
+        payload = np.asarray(self._fixed_point_at_scale(layout.scale_ledger.input).encode(values),
+                             dtype=object)
+        self._validate_input_bound(payload, distribution.range_contract)
+        shares = self.sharing.share(self.fixed_point.to_residue(payload),
+                                   rng=self._online_material_rng(rng))
+        result = owner.claim_preload(batch, step, shares)
+        plan = result.plan
+        identity = (plan.session_id, plan.round_id, plan.step)
+        if identity in self._issued_rounds:
+            raise ValueError("预送 round 已经签发")
+        self._issued_rounds[identity] = layout
+        return result
+
+    def retire_preloaded_round(self, online, *, success: bool):
+        """只退休当前原始能力；成功重构后仍须由runtime先确认原双提交ACK。"""
+        if not isinstance(online, PreloadedInputRound) or type(success) is not bool:
+            raise ValueError("预送退休必须是本机当前轮及严格success标志")
+        owner = self._resource_owners.get(online.session_id)
+        if owner is None or online._owner is not owner:
+            raise ValueError("预送轮不属于当前Client")
+        identity = (online.session_id, online.round_id, online.step)
+        if success and identity in self._issued_rounds:
+            raise ValueError("预送输出尚未成功重构")
+        owner.retire_preload(online, success)
+        self._issued_rounds.pop(identity, None)
+
+    def discard_preloaded_resources(self, distribution, batch):
+        """停止时永久废弃有限窗口，不移交剩余材料或继续现场生成。"""
+        current = self._material_owner(distribution).discard_preload(batch)
+        if current is not None:
+            self._issued_rounds.pop((current.session_id, current.round_id, current.step), None)
 
     def reconstruct_control(
         self, first: ControlShareMessage, second: ControlShareMessage
@@ -1083,8 +1187,9 @@ class Client:
         """以三角不等式计算每行 ledger accumulator 的公开绝对上界，不读取 shares。"""
         return _row_bounds_integer(first, first_bounds, second, second_bounds)
 
+    @staticmethod
     def _resource_plan(
-        self, layout: ControllerLayout, session_id: str, round_id: str, step: int
+        layout: ControllerLayout, session_id: str, round_id: str, step: int
     ) -> StepResourcePlan:
         """按 ledger 分配所有乘法 triple，以及零份或逐 state 行一份 Trunc mask。"""
         shapes = {
@@ -1167,6 +1272,239 @@ class Client:
         domain = epoch.to_bytes(16, "big")
         seed = hashlib.sha256(b"secure_control.protocol.online_material.v1" + domain + source_seed)
         return random.Random(int.from_bytes(seed.digest(), "big"))
+
+
+class _PreparedResourceOwner:
+    """本 session 受限材料工厂；不持 Client、测量、秘密 state 或输出签发表。"""
+
+    def __init__(self, distribution, multiplier, truncation):
+        self.layout = distribution.p1.layout
+        self.session_id = distribution.session_id
+        self.contract = distribution.range_contract
+        self.horizon = distribution.range_contract.horizon_steps
+        self.multiplier, self.truncation = multiplier, truncation
+        self._tokens = WeakValueDictionary()
+        self._lock = Lock()
+        self._preload_lock = Lock()
+        self._preload = None
+        self._preload_tokens = WeakValueDictionary()
+
+    def begin_preload(self, manifest):
+        with self._preload_lock:
+            if self._preload is not None:
+                raise ValueError("本 session 已创建预送窗口")
+            if self.horizon is not None and len(manifest.round_ids) > self.horizon:
+                raise ValueError("预送窗口超过已证明的有限范围")
+            capability = PreparedPreloadedResources(manifest, self, object())
+            self._preload_tokens[capability._token] = capability
+            self._preload = _PreloadState(capability, deepcopy(manifest), manifest.sha256())
+            return capability
+
+    def _validate_preload(self, batch):
+        state = self._preload
+        if (state is None or state.closed or batch is not state.capability
+                or batch._owner is not self or batch.manifest != state.manifest):
+            raise ValueError("预送能力已废弃、被复制或公开清单被改变")
+        if self._preload_tokens.get(batch._token) is not batch:
+            raise ValueError("预送token不属于原始能力")
+        return state
+
+    def export_preload(self, batch, step, rng):
+        with self._preload_lock:
+            state = self._validate_preload(batch)
+            step = _require_step(step)
+            if (not state.init_confirmed or state.ready or step != state.generated
+                    or step >= len(state.manifest.round_ids)
+                    or state.generated - state.acknowledged >= state.manifest.block_steps):
+                raise ValueError("预送生成次序或未确认块容量无效")
+            prepared = self.create(step, rng=rng, round_id=state.manifest.round_ids[step])
+            try:
+                values = []
+                for resources in (prepared.p1_resources, prepared.p2_resources):
+                    party_values = []
+                    for item in resources.product_resources:
+                        party_values.extend((item.triple.a.value, item.triple.b.value, item.triple.c.value))
+                    for item in resources.state_truncation_resources:
+                        party_values.extend((item.truncation.r.value, item.truncation.r_prime.value))
+                    if any(type(v) is not int or not 0 <= v < state.manifest.modulus for v in party_values):
+                        raise ValueError("导出材料必须是canonical scalar residue")
+                    values.append(tuple(party_values))
+                result = ExportedPreloadedStep(prepared.p1_resources.plan, *values)
+                self.export(prepared, step)
+                state.generated += 1
+                return result
+            except Exception:
+                self.discard(prepared)
+                state.closed = True
+                raise
+
+    def export(self, prepared, step):
+        """只移交新鲜原始能力；exported不伪增实际消费数，也不能再次本地bind。"""
+        with self._lock:
+            self._validate(prepared, step)
+            resources = (*prepared.p1_resources.product_resources,
+                         *prepared.p1_resources.state_truncation_resources,
+                         *prepared.p2_resources.product_resources,
+                         *prepared.p2_resources.state_truncation_resources)
+            if any(v._lifecycle.status != "prepared" or v._lifecycle.claimed_by for v in resources):
+                raise ValueError("已经开始消费的资源不能导出")
+            del self._tokens[prepared._token]
+            seen = set()
+            for item in resources:
+                if id(item._lifecycle) not in seen:
+                    item._lifecycle.export()
+                    seen.add(id(item._lifecycle))
+                primitive = item.triple if isinstance(item, ProductResourceShare) else item.truncation
+                primitive._lifecycle.consumed = True
+
+    def record_preload(self, batch, receipts):
+        with self._preload_lock:
+            state = self._validate_preload(batch)
+            if (not isinstance(receipts, tuple) or len(receipts) != 2
+                    or not all(isinstance(v, PreloadReceipt) for v in receipts)
+                    or tuple(v.party for v in receipts) != (0, 1)):
+                raise ValueError("预送必须同时核验两方回执")
+            count = len(state.manifest.round_ids)
+            if not state.init_confirmed:
+                expected = (state.digest, "init", None, None, count)
+            elif state.acknowledged == count and not state.ready:
+                expected = (state.digest, "seal", None, None, count)
+            else:
+                block = min(state.manifest.block_steps, count - state.acknowledged)
+                if state.ready or block == 0 or state.generated != state.acknowledged + block:
+                    raise ValueError("预送回执不能跳过生成、重复确认或越过前缀")
+                expected = (state.digest, "block", state.acknowledged // state.manifest.block_steps,
+                            state.acknowledged, block)
+            if any((v.manifest_sha256, v.phase, v.block_index, v.first_step, v.count) != expected for v in receipts):
+                raise ValueError("预送回执身份、阶段或连续区间不匹配")
+            if expected[1] == "init":
+                state.init_confirmed = True
+            elif expected[1] == "seal":
+                state.ready = True
+            else:
+                state.acknowledged += expected[-1]
+
+    def validate_preload(self, batch, step):
+        with self._preload_lock:
+            state = self._validate_preload(batch)
+            if (not state.ready or state.current is not None or _require_step(step) != state.claimed
+                    or step >= len(state.manifest.round_ids)):
+                raise ValueError("预送窗口未就绪、重复领取、错步或已经耗尽")
+
+    def claim_preload(self, batch, step, shares):
+        with self._preload_lock:
+            state = self._validate_preload(batch)
+            if (not state.ready or state.current is not None or _require_step(step) != state.claimed
+                    or step >= len(state.manifest.round_ids)):
+                raise ValueError("预送窗口未就绪、重复领取、错步或已经耗尽")
+            plan = Client._resource_plan(self.layout, self.session_id, state.manifest.round_ids[step], step)
+            identity = (plan.session_id, plan.round_id, step)
+            result = PreloadedInputRound(
+                *identity, *(InputShareMessage(party, *identity, shares[party]) for party in (0, 1)),
+                plan, self, object(),
+            )
+            state.current = result
+            state.claimed += 1
+            return result
+
+    def retire_preload(self, online, success):
+        with self._preload_lock:
+            state = self._preload
+            if state is None or state.closed or online is not state.current:
+                raise ValueError("预送退休不是当前原始能力")
+            state.current = None
+            if not success:
+                state.closed = True
+
+    def discard_preload(self, batch):
+        with self._preload_lock:
+            state = self._preload
+            if state is None or batch is not state.capability or batch._owner is not self:
+                raise ValueError("不能关闭其他Client或复制的预送能力")
+            current = state.current
+            state.closed = True
+            state.current = None
+            self._preload_tokens.pop(batch._token, None)
+            return current
+
+    def create(self, step: int, *, rng=None, round_id=None) -> PreparedOnlineResources:
+        """复用 canonical 原语生成全新 owner/lifecycle；仅创建入口可登记能力。"""
+        step = _require_step(step)
+        horizon = self.horizon
+        if horizon is not None and step >= horizon:
+            raise ValueError("step 超出已证明的 finite horizon。")
+        plan = Client._resource_plan(self.layout, self.session_id,
+                                    f"round-{secrets.token_hex(16)}" if round_id is None else round_id, step)
+        products = ([], [])
+        truncations = ([], [])
+        for metadata in plan.product_resources:
+            pair = self.multiplier.create_triple(rng=rng)
+            lifecycle = _ResourceLifecycle()
+            for party in (0, 1):
+                products[party].append(ProductResourceShare(party, metadata, pair[party], lifecycle))
+        for metadata in plan.state_truncation_resources:
+            pair = self.truncation.create_auxiliary(rng=rng)
+            lifecycle = _ResourceLifecycle()
+            for party in (0, 1):
+                truncations[party].append(
+                    StateTruncationResourceShare(party, metadata, pair[party], lifecycle),
+                )
+        token = object()
+        prepared = PreparedOnlineResources(
+            *(PartyResources(party, plan, tuple(products[party]), tuple(truncations[party]))
+              for party in (0, 1)), self, token,
+        )
+        with self._lock:
+            self._tokens[token] = prepared
+        return prepared
+
+    def _validate(self, prepared, step):
+        if (not isinstance(prepared, PreparedOnlineResources)
+                or prepared._owner is not self
+                or self._tokens.get(prepared._token) is not prepared
+                or prepared.p1_resources.plan.step != _require_step(step)):
+            raise ValueError("资源不是本 Client/session/step 的尚未领取原始能力。")
+
+    def validate(self, prepared, step):
+        """先验证身份；复制、错步、跨 Client 和已领取能力均不得分享输入。"""
+        with self._lock:
+            self._validate(prepared, step)
+
+    def claim(self, prepared, step):
+        """原子领取一次，未绑定能力不会使 Client 接受输出。"""
+        with self._lock:
+            self._validate(prepared, step)
+            del self._tokens[prepared._token]
+
+    def discard(self, prepared):
+        """停止或准备失败永久废弃资源；不把尚未使用材料移交新会话。"""
+        if not isinstance(prepared, PreparedOnlineResources) or prepared._owner is not self:
+            raise ValueError("不能废弃其他 owner 的能力。")
+        with self._lock:
+            self._tokens.pop(prepared._token, None)
+        for resources in (prepared.p1_resources, prepared.p2_resources):
+            for item in resources.product_resources:
+                item._lifecycle.abort()
+                item.triple._lifecycle.consumed = True
+            for item in resources.state_truncation_resources:
+                item._lifecycle.abort()
+                item.truncation._lifecycle.consumed = True
+
+
+@dataclass(slots=True)
+class _PreloadState:
+    """只保留一个公开窗口和至多32轮启动待确认材料，不建立1000个 endpoint。"""
+
+    capability: PreparedPreloadedResources
+    manifest: PreloadedResourceManifest
+    digest: str
+    generated: int = 0
+    acknowledged: int = 0
+    claimed: int = 0
+    ready: bool = False
+    closed: bool = False
+    init_confirmed: bool = False
+    current: PreloadedInputRound | None = None
 
 
 @dataclass(slots=True)

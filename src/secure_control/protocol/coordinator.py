@@ -837,6 +837,53 @@ def rehydrate_online_material(
     """
     if not isinstance(material, PartyOnlineMaterial):
         raise TypeError("material 必须是 PartyOnlineMaterial。")
+    sharing = TwoPartySharing(modulus)
+    return _rehydrate_online_material(
+        material, sharing, BeaverMultiplier(sharing), SecureTruncation(
+            sharing, ell=material.plan.scale_ledger.state,
+            security_parameter=security_parameter, modulus_evidence=modulus_evidence,
+        ),
+    )
+
+
+class _OnlineMaterialRecovery:
+    """已安装 setup 的单方 session 算术 owner；绝不共享一次性资源生命周期。"""
+
+    def __init__(self, offline: OfflineControllerMessage, *, modulus: int,
+                 security_parameter: int,
+                 modulus_evidence: PrimeModulusEvidence | None) -> None:
+        self._offline = offline
+        self._sharing = TwoPartySharing(modulus)
+        self._multiplier = BeaverMultiplier(self._sharing)
+        # 每个新 setup 都用完整证据重新验证，不按 q 复用全局验证结果。
+        self._truncation = SecureTruncation(
+            self._sharing, ell=offline.layout.scale_ledger.state,
+            security_parameter=security_parameter, modulus_evidence=modulus_evidence,
+        )
+
+    def restore(self, material: PartyOnlineMaterial) -> PartyOnlineRound:
+        if not isinstance(material, PartyOnlineMaterial):
+            raise TypeError("material 必须是 PartyOnlineMaterial。")
+        plan, layout = material.plan, self._offline.layout
+        if (material.input_message.recipient != self._offline.recipient
+                or plan.session_id != self._offline.session_id
+                or (plan.state_shape, plan.input_shape, plan.output_shape) != (
+                    (layout.state_dimension,), (layout.input_dimension,),
+                    (layout.output_dimension,))
+                or plan.scale_ledger != layout.scale_ledger):
+            raise ValueError("在线材料与已安装 session/角色/layout 不匹配。")
+        return _rehydrate_online_material(
+            material, self._sharing, self._multiplier, self._truncation,
+        )
+
+
+def _rehydrate_online_material(
+    material: PartyOnlineMaterial, sharing: TwoPartySharing,
+    multiplier: BeaverMultiplier, truncation: SecureTruncation,
+) -> PartyOnlineRound:
+    """逐轮检查数值和身份；owner 可复用，triple/mask/lifecycle 必须全新。"""
+    if not isinstance(material, PartyOnlineMaterial):
+        raise TypeError("material 必须是 PartyOnlineMaterial。")
     party = material.input_message.recipient
     if party not in {0, 1}:
         raise ValueError("在线材料 recipient 必须是 P1 或 P2。")
@@ -853,18 +900,14 @@ def rehydrate_online_material(
     ):
         raise ValueError("在线数值材料数量与资源计划不匹配。")
 
-    sharing = TwoPartySharing(modulus)
-    multiplier = BeaverMultiplier(sharing)
-    truncation = SecureTruncation(
-        sharing,
-        ell=plan.scale_ledger.state,
-        security_parameter=security_parameter,
-        modulus_evidence=modulus_evidence,
-    )
+    sharing._validated_share_values(material.input_message.value)
     # protocol 是既有 crypto lifecycle 的拥有边界；execution/wire 不实例化或传输私有对象。
     products: list[ProductResourceShare] = []
     for expected, item in zip(plan.product_resources, material.product_resources, strict=True):
         _validate_product_material(item, expected, party)
+        for value in (item.a, item.b, item.c):
+            if isinstance(sharing._validated_share_values(value), np.ndarray):
+                raise TypeError("乘法材料必须是 canonical scalar。")
         triple_lifecycle = _TripleLifecycle(multiplier)
         triple = BeaverTripleShare(item.a, item.b, item.c, party, triple_lifecycle)
         products.append(ProductResourceShare(party, item.metadata, triple, _ResourceLifecycle()))
@@ -874,6 +917,9 @@ def rehydrate_online_material(
         plan.state_truncation_resources, material.state_truncation_resources, strict=True
     ):
         _validate_truncation_material(item, expected, party)
+        for value in (item.r, item.r_prime):
+            if isinstance(sharing._validated_share_values(value), np.ndarray):
+                raise TypeError("截断材料必须是 canonical scalar。")
         mask_lifecycle = _MaskLifecycle(truncation)
         auxiliary = TruncationAuxiliaryShare(item.r, item.r_prime, party, mask_lifecycle)
         truncations.append(
