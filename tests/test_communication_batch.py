@@ -708,6 +708,15 @@ def test_gc_trial_rejects_invalid_combinations_before_any_experiment(monkeypatch
         with pytest.raises(ValueError):
             benchmark.run_continuous_observation(**{**options, **change})
     trial = benchmark._StartupGCTrial("baseline")
+    s3 = {**options, "steps": 200, "gc_trial_policy": "startup-freeze", "timeout_trace": True}
+    for change in ({"steps": 1000}, {"steps": 199}, {"timeout_trace": 1},
+                   {"timeout_trace": False}, {"gc_trial_policy": None}, {"gc_trial_policy": "baseline"},
+                   {"role_config": "missing"}, {"material_slots": 4}, {"preload_steps": 1}):
+        with pytest.raises(ValueError):
+            benchmark.run_continuous_observation(**{**s3, **change})
+    monkeypatch.setattr(benchmark, "_run_continuous_observation", lambda **kwargs: kwargs)
+    default = benchmark.run_continuous_observation(steps=200, segment_steps=400, delay_ms=0)
+    assert default["timeout_trace"] is False  # 默认路径不进入任何GC/探针作用域。
     for memory in ({"current_rss_bytes": None, "peak_rss_bytes": 1},
                    {"current_rss_bytes": trial.RSS_LIMIT + 1, "peak_rss_bytes": trial.RSS_LIMIT + 1}):
         monkeypatch.setattr(benchmark, "_process_memory", lambda memory=memory: memory)
@@ -730,9 +739,42 @@ def test_gc_trial_real_gc_isolated_process_reclaims_new_cycles_and_restores_on_f
         from secure_control.execution.lan_runtime import LanSegmentedRuntime, _OnlineResourcePool
         case = sys.argv[1]
         before = gc.isenabled(), gc.get_threshold(), gc.get_debug(), list(gc.callbacks)
-        if case in ("init-failure", "hook-init-failure"):
+        if case == "s3-scope":
+            from contextlib import ExitStack
+            from secure_control.execution import localhost_transport
+            original_send, original_close = localhost_transport._send_exact, LanSegmentedRuntime.close
+            predecessor = lambda *args: original_send(*args)
+            localhost_transport._send_exact = predecessor
+            def simulated(**options):
+                assert options["steps"] == 200 and options["timeout_trace"]
+                trial = options["_gc_trial"]
+                observer = benchmark._TimeoutDiagnostic("Client", (101, 102, 103))
+                sockets = ExitStack()
+                trial.cleanup.callback(sockets.close)
+                sockets.enter_context(observer.sockets())
+                _, _, restore = benchmark._meter("Client", (101, 102, 103), 0, diagnostic=observer)
+                trial.cleanup.callback(restore)
+                restore()
+                sockets.close()
+                assert localhost_transport._send_exact is predecessor
+                return {"status": "stopped", "timeout_trace": {"format_version": 1},
+                        "diagnostic_report": {"roles": [observer.report()]}}
+            benchmark._run_continuous_observation = simulated
+            report = benchmark.run_continuous_observation(
+                steps=200, delay_ms=0, segment_steps=400, optimized=True, diagnostic=True,
+                recording_mode="light", gc_trial_policy="startup-freeze", timeout_trace=True)
+            assert localhost_transport._send_exact is predecessor
+            assert LanSegmentedRuntime.close is original_close
+            assert report["gc_trial"]["restored"] and not report["gc_trial"]["cleanup_failed"]
+            assert report["diagnostic_report"]["roles"][0]["socket_hooks_restored"]
+            assert not report["qualification_pass"] and not report["stage_pass"]
+            assert report["comparison_only"] and report["diagnostic"]
+            assert (gc.isenabled(), gc.get_threshold(), gc.get_debug(), list(gc.callbacks)) == before
+            sys.exit(0)
+        if case in ("init-failure", "hook-init-failure", "s3-hook-init-failure"):
             from secure_control.execution import lan_runtime, localhost_transport
-            originals = localhost_transport._send_exact, localhost_transport.encode_envelope
+            originals = (localhost_transport._send_exact, localhost_transport.encode_envelope,
+                         lan_runtime.LanSegmentedRuntime.close)
             def no_ports():
                 assert gc.get_freeze_count() > 0
                 raise OSError("private initialization failure")
@@ -743,15 +785,18 @@ def test_gc_trial_real_gc_isolated_process_reclaims_new_cycles_and_restores_on_f
                     raise OSError("private control initialization failure")
                 lan_runtime.RunControl = no_control
             report = benchmark.run_continuous_observation(
-                steps=1000, delay_ms=0, segment_steps=400, optimized=True, diagnostic=True,
-                recording_mode="light", gc_trial_policy="startup-freeze")
+                steps=200 if case == "s3-hook-init-failure" else 1000,
+                delay_ms=0, segment_steps=400, optimized=True, diagnostic=True,
+                recording_mode="light", gc_trial_policy="startup-freeze",
+                timeout_trace=case == "s3-hook-init-failure")
             assert report["status"] == "failed" and report["failure_category"] == "OSError"
             assert report["gc_trial"]["restored"] and not report["gc_trial"]["cleanup_failed"]
             assert gc.get_freeze_count() == 0
             assert (gc.isenabled(), gc.get_threshold(), gc.get_debug(), list(gc.callbacks)) == before
             assert not report["qualification_pass"] and not report["stage_pass"]
             assert report["comparison_only"] and report["diagnostic"]
-            assert (localhost_transport._send_exact, localhost_transport.encode_envelope) == originals
+            assert (localhost_transport._send_exact, localhost_transport.encode_envelope,
+                    lan_runtime.LanSegmentedRuntime.close) == originals
             sys.exit(0)
         if case == "memory-end":
             closed = []
@@ -837,10 +882,171 @@ def test_gc_trial_real_gc_isolated_process_reclaims_new_cycles_and_restores_on_f
         except RuntimeError:
             pass
     ''')
-    for case in ("baseline", "freeze", "exception", "join-failure", "boundary-failure", "reject", "init-failure", "hook-init-failure", "memory-end"):
+    for case in ("baseline", "freeze", "exception", "join-failure", "boundary-failure", "reject", "init-failure", "hook-init-failure", "s3-hook-init-failure", "s3-scope", "memory-end"):
         result = subprocess.run([sys.executable, "-c", program, case], capture_output=True, timeout=20,
                                 check=False)
         assert result.returncode == 0, (case, result.stdout, result.stderr)
+
+
+def test_timeout_trace_forwards_partial_frames_native_errors_and_never_retries():
+    import struct
+
+    from secure_control.execution import localhost_transport as transport
+    from secure_control.execution.cycle_timing import _CycleDeadline
+    from secure_control.experiments.communication_benchmark import _TimeoutDiagnostic
+
+    class Socket:
+        def __init__(self, data=b"", error=None):
+            self.data, self.error = bytearray(data), error
+            self.calls, self.timeouts = [], []
+            self.timeout = None
+
+        def getsockname(self):
+            return "127.0.0.1", 9000
+
+        def getpeername(self):
+            return "127.0.0.1", 101
+
+        def settimeout(self, value):
+            self.timeouts.append(value)
+            self.timeout = value
+
+        def gettimeout(self):
+            return self.timeout
+
+        def send(self, data):
+            self.calls.append(("send", bytes(data)))
+            if self.error is not None and len(self.calls) == 3:
+                raise self.error
+            return min(3, len(data))
+
+        def recv(self, size):
+            self.calls.append(("recv", size))
+            if self.error is not None:
+                raise self.error
+            value = bytes(self.data[:min(2, size)])
+            del self.data[:len(value)]
+            return value
+
+    deadline = _CycleDeadline(time.perf_counter_ns() + 10**9)
+    observer = _TimeoutDiagnostic("Client", (101, 102, 103))
+    observer.select(47)
+    fields = observer.FIELDS
+    original_send, original_receive = transport._send_exact, transport._receive_exact
+    original_encode, original_decode = transport.encode_envelope, transport.decode_envelope
+    plain, traced = Socket(), Socket()
+    transport._send_exact(plain, b"private-payload-not-in-evidence", deadline)
+    with observer.sockets():
+        transport._send_exact(traced, b"private-payload-not-in-evidence", deadline)
+        assert plain.calls == traced.calls  # 原memoryview cursor/剩余byte切片完全相同。
+        assert all(0 < value <= 1 for value in traced.timeouts)
+        incoming = Socket(struct.pack("!I", 4) + b"ABCD")
+        assert transport.receive_frame(incoming, deadline=deadline, limit=1024) == b"ABCD"
+        probe = observer.probes[incoming]
+        assert probe.receive_header
+        native = [dict(zip(fields, r[2], strict=True)) for r in observer.slots
+                  if r and r[0] == "trace" and r[1] == "socket"]
+        assert {r["frame_part"] for r in native if r["operation"] == "recv"} == {"header", "body"}
+        for record in native:
+            assert record["qpc_before_ns"] <= record["qpc_after_ns"]
+            if record["operation"] == "settimeout":
+                assert record["timeout_s"] == record["actual_timeout_s"]
+        failure = TimeoutError("private-native-error-never-export")
+        broken = Socket(error=failure)
+        with pytest.raises(transport.LocalhostTransportTimeout) as caught:
+            transport._send_exact(broken, b"private-0123456789", deadline)
+        assert caught.value.__cause__ is failure and len(broken.calls) == 3
+        first = dict(zip(fields, observer.first_failure, strict=True))
+        outer = dict(zip(fields, observer.outer_failure, strict=True))
+        assert first["timeout_origin"] == "socket_send" and first["confirmed_bytes_before"] == 6
+        assert first["native_progress_unknown"] and first["end_ns"] < deadline.deadline_ns
+        assert outer["error_type"] == "LocalhostTransportTimeout" and outer["cause_type"] == "TimeoutError"
+        assert observer.report()["latched"]
+    assert (transport._send_exact, transport._receive_exact) == (original_send, original_receive)
+    assert (transport.encode_envelope, transport.decode_envelope) == (original_encode, original_decode)
+    import json
+    encoded = json.dumps(observer.report())
+    assert "private-payload" not in encoded and "private-native-error" not in encoded
+
+    early = _TimeoutDiagnostic("Client", (101, 102, 103))
+    early.select(47)
+    sock = Socket(error=TimeoutError("hidden"))
+    with early.sockets(), pytest.raises(transport.LocalhostTransportTimeout):
+        transport._receive_exact(sock, 4, deadline)
+    assert len(sock.calls) == 1
+    assert dict(zip(fields, early.first_failure, strict=True))["timeout_origin"] == "socket_recv"
+    expired = _TimeoutDiagnostic("Client", (101, 102, 103))
+    expired.select(47)
+    sock = Socket()
+    with expired.sockets(), pytest.raises(transport.LocalhostTransportTimeout):
+        transport._send_exact(sock, b"x", _CycleDeadline(time.perf_counter_ns()-1))
+    assert not sock.calls and not sock.timeouts
+    assert dict(zip(fields, expired.first_failure, strict=True))["timeout_origin"] == "absolute_precheck"
+    disconnected = _TimeoutDiagnostic("Client", (101, 102, 103))
+    disconnected.select(47)
+    sock = Socket()
+    with disconnected.sockets(), pytest.raises(transport.LocalhostTransportDisconnected):
+        transport._receive_exact(sock, 4, deadline)
+    assert len(sock.calls) == 1
+
+
+def test_timeout_trace_rings_clock_domains_whitelist_and_first_failure_latch(monkeypatch):
+    import json
+
+    from secure_control.execution.cycle_timing import _CycleDeadline
+    from secure_control.experiments.communication_benchmark import _TimeoutDiagnostic, _TraceSocket
+
+    observer = _TimeoutDiagnostic("Client", (101, 102, 103))
+    observer.select(999)
+    observer.wall = lambda: 1000
+    monkeypatch.setattr(time, "monotonic_ns", lambda: 10_000_000_000)
+    sock = SimpleNamespace(gettimeout=lambda: .5)
+    probe = _TraceSocket(sock, observer, "P1")
+    probe.deadline, probe.direction, probe.context = 20., "Client->P1", ("public", *["a"*128]*8)
+    record = observer.values(probe, "send", 500, 900, requested=10, returned=3)
+    data = dict(zip(observer.FIELDS, record, strict=True))
+    assert data["deadline_domain"] == "legacy_monotonic" and data["remaining_ns"] == 10_000_000_000
+    probe.deadline = _CycleDeadline(5000)
+    record = observer.values(probe, "send", 500, 900, requested=10, returned=3)
+    assert dict(zip(observer.FIELDS, record, strict=True))["remaining_ns"] == 4000
+    for _ in range(1000):
+        observer.put("socket", record)
+        observer.put("frame", record)
+    observer._gc("start", {"generation": 2})
+    observer.failed(record)
+    for _ in range(1000):
+        observer.put("socket", record)  # 模拟停止流量，首错后不覆盖现场。
+        observer.marker("runtime_close_end")
+    observer._gc("stop", {"generation": 2, "collected": 3, "uncollectable": 0})
+    result = observer.report()
+    assert observer.slots[288][2] is record and observer.first_failure is record
+    assert result["evicted_count"]["socket"] == 872 and result["encoded_omitted"] > 0
+    assert len(observer.slots) == 304 and len(result["events"]) <= 512
+    assert len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode()) == result["encoded_bytes"]
+    assert result["encoded_bytes"] <= 72*1024
+    assert result == observer.report()
+    assert any(r.get("kind") == "gc_interval" and r["collected"] == 3 for r in result["events"])
+    observer.remember(SimpleNamespace(sender="Client", recipient="P1", operation="endpoint",
+        session_id="public-session", round_id="public-round", step=47, sequence=3,
+        resource_id="secret-resource-ignored", payload=SimpleNamespace(operation="stage_batch", secret="hidden")))
+    assert all(isinstance(v, tuple) for v in observer.contexts.values())
+    public = json.dumps(observer.contexts["Client", "P1"])
+    assert "hidden" not in public and "secret-resource" not in public
+    # 真实socket可hash；fixture保留相同行为且不打开网络端口。
+    class Socket:
+        getsockname = staticmethod(lambda: ("127.0.0.1", 9000))
+        getpeername = staticmethod(lambda: ("127.0.0.1", 101))
+    sockets = [Socket() for _ in range(5)]
+    for channel in sockets[:4]:
+        assert observer.probe(channel) is observer.probe(channel)
+    with pytest.raises(RuntimeError):
+        observer.probe(sockets[4])
+    assert len(observer.probes) == 4
+    probe.requested_timeout = True
+    sock.gettimeout = lambda: float("nan")
+    invalid = dict(zip(observer.FIELDS, observer.values(probe, "send", 500, 900), strict=True))
+    assert invalid["timeout_s"] is None and invalid["actual_timeout_s"] is None
+    assert observer.time_fields_unavailable == 2
 
 
 def test_supply_diagnostic_real_producer_labels_original_owner_and_exception_cleanup(monkeypatch):

@@ -16,9 +16,11 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, replace
 from hashlib import sha256
 from itertools import count, pairwise
+from math import isfinite
 from pathlib import Path
 from queue import Empty
 from threading import active_count, current_thread, get_ident, get_native_id, local, main_thread
+from typing import ClassVar
 from unittest.mock import patch
 
 import numpy as np
@@ -304,6 +306,342 @@ class _Diagnostic:
                 "gc_before": self.gc_before,
                 "gc_after": {"enabled": gc.isenabled(), "threshold": list(gc.get_threshold())},
                 "callback_restored": self._gc not in gc.callbacks}
+
+
+class _TimeoutDiagnostic(_Diagnostic):
+    """S3共享304槽；首错锁存，普通滚动与编码省略分别公开。"""
+
+    RINGS: ClassVar = {"socket": (0, 128), "frame": (128, 64), "gc": (192, 64),
+             "producer": (256, 32), "critical": (288, 16)}
+    CONTEXT = ("source", "sender", "recipient", "operation", "endpoint_operation",
+               "session_id", "round_id", "step", "sequence")
+    FIELDS = ("operation", "start_ns", "end_ns", "qpc_before_ns", "monotonic_ns", "qpc_after_ns",
+              "deadline_domain", "deadline_s", "deadline_ns", "remaining_ns", "timeout_s", "actual_timeout_s",
+              "requested_bytes", "confirmed_bytes_before", "returned_bytes", "error_type", "cause_type",
+              "errno", "winerror", "timeout_origin", "native_progress_unknown", "native_thread_id",
+              "direction", "frame_part", "context", "control_label", "cpu_delta_ns")
+
+    def __init__(self, role, ports):
+        super().__init__(role, limit=304, supply=True, all_gc=True)
+        self.ports = ports
+        self.tracing = False
+        self.latched = False
+        self.seen = dict.fromkeys(self.RINGS, 0)
+        self.probes, self.contexts = {}, {}
+        self.first_failure = self.outer_failure = None
+        self.context_dropped = self.suppressed = 0
+        self.time_fields_unavailable = 0
+        self.trace_restored = False
+
+    def select(self, step):
+        super().select(step)
+        self.tracing = True
+
+    def selected(self):
+        return self.tracing and not self.latched
+
+    def reserve(self, bucket=None):
+        bucket = bucket or getattr(self.state, "bucket", "frame")
+        if (not self.tracing and bucket != "critical"
+                or self.latched and bucket not in {"critical", "gc", "producer"}):
+            self.suppressed += 1
+            return None
+        start, size = self.RINGS[bucket]
+        if bucket == "critical":
+            start, size = start + 1, size - 1  # 第一槽专属首错，不被close覆盖。
+        number = self.seen[bucket]
+        self.seen[bucket] = number + 1
+        return start + number % size
+
+    def begin(self, phase):
+        if phase not in {"control_cycle", "material_produce", "party_stage", "receive_request"}:
+            return None
+        return super().begin(phase)
+
+    def end(self, token, **kwargs):
+        previous = getattr(self.state, "bucket", "frame")
+        self.state.bucket = ("producer" if token and token[3] == "material_produce"
+                             else "critical" if self.latched else "frame")
+        try:
+            return super().end(token, **kwargs)
+        finally:
+            self.state.bucket = previous
+
+    def _supply_gc(self, phase, generation, collected=None, uncollectable=None):
+        if not self.tracing or self.latched and (phase == "start" or self.gc_pending is None):
+            return
+        previous = getattr(self.state, "bucket", "frame")
+        self.state.bucket = "gc"
+        try:
+            super()._supply_gc(phase, generation, collected, uncollectable)
+        finally:
+            self.state.bucket = previous
+
+    def put(self, bucket, values):
+        index = self.reserve(bucket)
+        if index is not None:
+            self.slots[index] = ("trace", bucket, values)
+
+    def failed(self, values):
+        if self.first_failure is None:
+            self.first_failure = values
+            self.slots[288] = ("trace", "critical", values)
+            self.latched = True
+
+    @staticmethod
+    def error_type(error):
+        if error is None:
+            return None
+        name = type(error).__name__
+        return name if name in {"TimeoutError", "OSError", "ValueError", "RuntimeError", "TypeError",
+            "LocalhostTransportTimeout", "LocalhostTransportDisconnected", "LocalhostTransportError",
+            "LocalhostCodecError", "ConnectionResetError", "BrokenPipeError", "ConnectionAbortedError",
+            "BlockingIOError", "ConnectionError", "KeyboardInterrupt", "EOFError"} else "OtherException"
+
+    def marker(self, operation):
+        index = self.reserve("critical")
+        if index is not None:
+            self.slots[index] = ("marker", operation, self.wall(), get_native_id(), self._label())
+
+    def remember(self, message):
+        # 仅浅读固定公开identity/操作名；不保留信封、payload或异常对象。
+        sender, recipient = getattr(message, "sender", None), getattr(message, "recipient", None)
+        if sender not in {"Client", "P1", "P2"} or recipient not in {"Client", "P1", "P2"}:
+            return
+        key = (sender, recipient)
+        if key not in self.contexts and len(self.contexts) >= 8:
+            raise RuntimeError("S3公开上下文超过有界表。")
+        values = []
+        for name in self.CONTEXT[3:]:
+            value = (getattr(getattr(message, "payload", None), "operation", None)
+                     if name == "endpoint_operation" else getattr(message, name, None))
+            if value is not None and not (type(value) is int and 0 <= value < 2**63
+                    or type(value) is str and len(value) <= 128):
+                value = None
+                self.context_dropped += 1
+            values.append(value)
+        self.contexts[key] = ("public_envelope", sender, recipient, *values)
+
+    def probe(self, sock):
+        if sock not in self.probes:
+            if len(self.probes) >= 4:
+                raise RuntimeError("S3每角色socket探针超过4个。")
+            try:
+                local_port, remote_port = sock.getsockname()[1], sock.getpeername()[1]
+            except OSError:
+                local_port = remote_port = None  # 已关闭通道仍交给原canonical异常转换。
+            if local_port is None:
+                peer = "unknown"
+            elif self.role == "Client":
+                peer = "P1" if remote_port == self.ports[0] else "P2"
+            elif self.role == "P1":
+                peer = "Client" if local_port == self.ports[0] else "P2"
+            else:
+                peer = "Client" if local_port == self.ports[1] else "P1"
+            self.probes[sock] = _TraceSocket(sock, self, peer)
+        return self.probes[sock]
+
+    def values(self, probe, operation, started, ended, *, requested=None, returned=None,
+               error=None, origin=None, timeout=None, cpu=None):
+        deadline = probe.deadline
+        domain = "qpc_cycle" if hasattr(deadline, "deadline_ns") else "legacy_monotonic"
+        before = self.wall()
+        monotonic = time.monotonic_ns()
+        after = self.wall()
+        deadline_ns = (deadline.deadline_ns if domain == "qpc_cycle" else round(deadline * 1e9))
+        remaining = deadline_ns - (before if domain == "qpc_cycle" else monotonic)
+        try:
+            actual = probe.sock.gettimeout()
+        except Exception:  # noqa: BLE001 - 额外查询失败不替换原socket调用/异常
+            actual = None
+            self.time_fields_unavailable += 1
+        reported_timeout = probe.requested_timeout if timeout is None else timeout
+        for value in (reported_timeout, actual):
+            if value is not None and (type(value) not in (int, float) or not isfinite(value)):
+                self.time_fields_unavailable += 1
+        reported_timeout = (reported_timeout if reported_timeout is None or
+                type(reported_timeout) in (int, float) and isfinite(reported_timeout) else None)
+        actual = actual if actual is None or type(actual) in (int, float) and isfinite(actual) else None
+        cause = getattr(error, "__cause__", None)
+        errno, winerror = getattr(error, "errno", None), getattr(error, "winerror", None)
+        return (operation, started, ended, before, monotonic, after, domain, float(deadline), deadline_ns, remaining,
+                reported_timeout, actual, requested, probe.confirmed, returned,
+                self.error_type(error), self.error_type(cause),
+                errno if type(errno) is int and -2**31 <= errno < 2**31 else None,
+                winerror if type(winerror) is int and -2**31 <= winerror < 2**31 else None,
+                origin, error is not None and operation in {"send", "recv"}, get_native_id(),
+                probe.direction, probe.part, probe.context, self._label(), cpu)
+
+    def frame(self, original, sock, value, deadline, *, sending):
+        probe = self.probe(sock)
+        probe.deadline, probe.confirmed, probe.native_error = deadline, 0, None
+        probe.direction = f"{self.role}->{probe.peer}" if sending else f"{probe.peer}->{self.role}"
+        metadata = self.contexts.get((self.role, probe.peer) if sending else (probe.peer, self.role))
+        if not sending and self.role == "Client":
+            metadata = self.contexts.get((self.role, probe.peer))
+            metadata = ("expected_from_last_request", *metadata[1:]) if metadata else None
+        elif not sending and metadata:
+            metadata = ("last_received_envelope", *metadata[1:])
+        probe.context = metadata
+        # send_exact包含header+body；receive_exact分别读取header和body，不能拼造业务进度。
+        probe.part = "header_and_body" if sending else "header" if probe.receive_header else "body"
+        started, cpu = self.wall(), self._cpu()
+        requested = len(value) if sending else value
+        try:
+            result = original(probe, value, deadline)
+        except BaseException as error:
+            ended = self.wall()  # 清理前首个公开异常锚点。
+            origin = probe.native_error or "unknown"
+            if origin == "unknown" and type(error).__name__ == "LocalhostTransportTimeout":
+                from secure_control.execution.cycle_timing import remaining_seconds
+                if remaining_seconds(deadline) <= 0:
+                    origin = "absolute_precheck"
+            record = self.values(probe, "frame_send" if sending else "frame_recv", started, ended,
+                                 requested=requested, error=error, origin=origin)
+            self.failed(record)
+            if self.outer_failure is None:
+                self.outer_failure = record
+            self.put("critical", record)
+            raise
+        else:
+            ended, final_cpu = self.wall(), self._cpu()
+            if not sending:
+                probe.receive_header = not probe.receive_header
+            self.put("frame", self.values(probe, "frame_send" if sending else "frame_recv", started, ended,
+                requested=requested, returned=probe.confirmed,
+                cpu=None if cpu is None or final_cpu is None else final_cpu-cpu))
+            return result
+
+    @contextmanager
+    def sockets(self):
+        from secure_control.execution import lan_runtime, localhost_transport
+
+        send, receive = localhost_transport._send_exact, localhost_transport._receive_exact
+        encode, decode = localhost_transport.encode_envelope, localhost_transport.decode_envelope
+        runtime_close = lan_runtime.LanSegmentedRuntime.close
+
+        def encoded(message):
+            self.remember(message)
+            return encode(message)
+
+        def decoded(payload):
+            message = decode(payload)
+            self.remember(message)
+            return message
+
+        def closed(runtime):
+            self.marker("runtime_close_begin")
+            try:
+                return runtime_close(runtime)
+            finally:
+                self.marker("runtime_close_end")
+
+        with (patch.object(localhost_transport, "_send_exact", lambda s, v, d: self.frame(send, s, v, d, sending=True)),
+              patch.object(localhost_transport, "_receive_exact", lambda s, v, d: self.frame(receive, s, v, d, sending=False)),
+              patch.object(localhost_transport, "encode_envelope", encoded),
+              patch.object(localhost_transport, "decode_envelope", decoded),
+              patch.object(lan_runtime.LanSegmentedRuntime, "close", closed)):
+            try:
+                yield self
+            finally:
+                self.marker("probe_scope_exit")
+                self.trace_restored = True
+
+    def report(self):
+        # 全部角色只在退出后编码；每个表schema只导出一次，首错/当前失败优先。
+        records = []
+        for index, slot in enumerate(self.slots):
+            if slot is not None:
+                record = ({"kind": slot[1], "values": slot[2]} if slot[0] == "trace" else
+                          {"kind": "marker", "operation": slot[1], "start_ns": slot[2],
+                           "end_ns": slot[2], "native_thread_id": slot[3], "control_label": slot[4]}
+                          if slot[0] == "marker" else super()._supply_event(slot))
+                record["critical"] = index >= 288
+                records.append(record)
+        if self.gc_pending is not None:
+            records.append(super()._supply_event((self.gc_pending, None, "missing_stop")))
+        records.sort(key=lambda r: (not r.get("critical", False), -(r["values"][2] if "values" in r
+                        else r.get("end_ns") or r.get("start_ns") or 0)))
+        result = {"role": self.role, "format_version": 1, "schemas": {"trace": self.FIELDS, "context": self.CONTEXT},
+                  "events": [], "event_limit": 512, "ring_slots": 304, "active_pair_limit": 16,
+                  "ring_capacities": {k: s for k, (_, s) in self.RINGS.items()},
+                  "evicted_count": {k: max(0, self.seen[k] - (s-1 if k == "critical" else s))
+                                    for k, (_, s) in self.RINGS.items()},
+                  "oldest_retained_ns": min((r["values"][1] if "values" in r else
+                       r.get("start_ns") or r.get("end_ns") for r in records), default=None),
+                  "encoded_omitted": 0, "encoded_limit": 72 * 1024, "encoded_bytes": 0,
+                  "first_failure": self.first_failure, "outer_failure": self.outer_failure,
+                  "latched": self.latched, "suppressed_after_latch_or_startup": self.suppressed,
+                  "context_dropped": self.context_dropped, "socket_count": len(self.probes),
+                  "time_fields_unavailable": self.time_fields_unavailable,
+                  "cpu_errors": self.cpu_errors, "clock_pair_probe": self.clock_probe,
+                  "gc_before": self.gc_before,
+                  "gc_after": {"enabled": gc.isenabled(), "threshold": list(gc.get_threshold())},
+                  "clocks": {name: {key: getattr(time.get_clock_info(name), key)
+                      for key in ("implementation", "resolution", "monotonic", "adjustable")}
+                      for name in ("monotonic", "perf_counter", "thread_time")},
+                  "callback_restored": self._gc not in gc.callbacks, "socket_hooks_restored": self.trace_restored,
+                  "scope": "rolling public Python call boundaries; clock pairs sampled after each call; timeout queried after call; native failed-call progress unknown; Python cannot see C/kernel retries"}
+        for record in records:
+            result["events"].append(record)
+            if len(json.dumps(result, separators=(",", ":"), ensure_ascii=False).encode()) + 256 > 72 * 1024:
+                result["events"].pop()
+                result["encoded_omitted"] += 1
+        result["oldest_retained_ns"] = min((r["values"][1] if "values" in r else
+                       r.get("start_ns") or r.get("end_ns") for r in result["events"]), default=None)
+        for _ in range(3):
+            result["encoded_bytes"] = len(json.dumps(result, separators=(",", ":"), ensure_ascii=False).encode())
+        return result
+
+
+class _TraceSocket:
+    """同buffer/参数/返回/异常透传；不改cursor、blocking或重试。"""
+
+    def __init__(self, sock, diagnostic, peer):
+        self.sock, self.diagnostic, self.peer = sock, diagnostic, peer
+        self.deadline = self.context = self.direction = self.part = self.native_error = None
+        self.confirmed = 0
+        self.requested_timeout = None
+        self.receive_header = True
+
+    def __getattr__(self, name):
+        return getattr(self.sock, name)
+
+    def call(self, operation, *args, **kwargs):
+        observer = self.diagnostic
+        started, cpu = observer.wall(), observer._cpu()
+        requested = len(args[0]) if operation == "send" else args[0] if operation == "recv" else None
+        try:
+            result = getattr(self.sock, operation)(*args, **kwargs)
+        except BaseException as error:
+            ended = observer.wall()
+            origin = "socket_send" if operation == "send" else "socket_recv" if operation == "recv" else "unknown"
+            self.native_error = origin
+            record = observer.values(self, operation, started, ended, requested=requested,
+                                     error=error, origin=origin,
+                                     timeout=args[0] if operation == "settimeout" else None)
+            observer.put("socket", record)
+            observer.failed(record)
+            raise
+        else:
+            ended, final_cpu = observer.wall(), observer._cpu()
+            amount = result if operation == "send" else len(result) if operation == "recv" else None
+            observer.put("socket", observer.values(self, operation, started, ended, requested=requested,
+                returned=amount, timeout=args[0] if operation == "settimeout" else None,
+                cpu=None if cpu is None or final_cpu is None else final_cpu-cpu))
+            if amount is not None:
+                self.confirmed += amount
+            return result
+
+    def settimeout(self, *args, **kwargs):
+        self.requested_timeout = args[0] if args else kwargs.get("value")
+        return self.call("settimeout", *args, **kwargs)
+
+    def send(self, *args, **kwargs):
+        return self.call("send", *args, **kwargs)
+
+    def recv(self, *args, **kwargs):
+        return self.call("recv", *args, **kwargs)
 
 
 def _source_fingerprints(extra=()):
@@ -594,7 +932,13 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
 
         observations.enter_context(patch.object(lan_runtime, "_party_reply", observed_reply))
 
+    restored = False
+
     def restore():
+        nonlocal restored
+        if restored:
+            return
+        restored = True
         observations.close()
         localhost_transport._send_exact = originals["send"]
         localhost_transport._receive_exact = originals["receive"]
@@ -609,14 +953,18 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
 def _party_job(
     config: LanConfig, ports: tuple[int, int, int], delay_ms: float, batch: bool, queue,
     diagnostic_enabled=False, full_observation=False, tcp_nodelay=None, supply_diagnostic=False,
+    timeout_trace=False,
 ) -> None:
     role_steps = []
-    diagnostic = _Diagnostic(config.role, supply=supply_diagnostic) if diagnostic_enabled else None
+    diagnostic = (_TimeoutDiagnostic(config.role, ports) if timeout_trace else
+                  _Diagnostic(config.role, supply=supply_diagnostic) if diagnostic_enabled else None)
     observations = ExitStack()
     socket_options = []
     observations.enter_context(_observe_tcp(socket_options, tcp_nodelay))
     if diagnostic:
         observations.enter_context(diagnostic.installed())
+        if timeout_trace:
+            observations.enter_context(diagnostic.sockets())
     counts, activity, restore = _meter(config.role, ports, delay_ms, role_steps, diagnostic,
                                        full_observation=full_observation)
     outcome = {"role": config.role}
@@ -1000,7 +1348,14 @@ class _StartupGCTrial:
             with (patch.object(_OnlineResourcePool, "__init__", initialized),
                   patch.object(_OnlineResourcePool, "close", closed),
                   patch.object(LanSegmentedRuntime, "close", close_runtime)):
-                yield self
+                try:
+                    yield self
+                finally:
+                    # 内层探针必须先还原其前驱，再退出本层GC/close owner。
+                    try:
+                        self.cleanup.close()
+                    except Exception as error:  # noqa: BLE001 - 清理不覆盖原控制异常
+                        self.report["cleanup_errors"].append(type(error).__name__)
         finally:
             # 原池先完成5秒join；即使join失败也先解冻自有永久代，但不再主动收集。
             try:
@@ -1045,18 +1400,21 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                                role_config: Path | None = None, preload_steps=0,
                                preload_execution="fused", diagnostic=False,
                                recording_mode="full", tcp_nodelay=None,
-                               commit_policy="default", gc_trial_policy=None) -> dict[str, object]:
+                               commit_policy="default", gc_trial_policy=None, timeout_trace=False) -> dict[str, object]:
     # 所有试验参数在任何端口/角色/材料创建前拒绝；默认入口走原路径。
     options = {"steps": steps, "delay_ms": delay_ms, "segment_steps": segment_steps,
                "optimized": optimized, "material_slots": material_slots, "role_config": role_config,
                "preload_steps": preload_steps, "preload_execution": preload_execution,
                "diagnostic": diagnostic, "recording_mode": recording_mode,
-               "tcp_nodelay": tcp_nodelay, "commit_policy": commit_policy}
+                   "tcp_nodelay": tcp_nodelay, "commit_policy": commit_policy,
+                   "timeout_trace": timeout_trace}
+    if type(timeout_trace) is not bool or timeout_trace and gc_trial_policy != "startup-freeze":
+        raise ValueError("S3 timeout_trace仅支持显式startup-freeze。")
     if gc_trial_policy is None:
         return _run_continuous_observation(**options)
     if (type(gc_trial_policy) is not str or gc_trial_policy not in ("baseline", "startup-freeze")
             or optimized is not True or diagnostic is not True or recording_mode != "light"
-            or type(steps) is not int or steps != 1000
+            or type(steps) is not int or steps != (200 if timeout_trace else 1000)
             or type(material_slots) is not int or material_slots != 16
             or type(preload_steps) is not int or preload_steps != 0 or preload_execution != "fused"
             or type(segment_steps) is not int or segment_steps != 400
@@ -1084,11 +1442,16 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                   "source_sha256": _source_fingerprints()}
     report.update(gc_trial=trial.report, diagnostic=True, comparison_only=True,
                   qualification_pass=False, stage_pass=False)
+    if timeout_trace:
+        report.setdefault("timeout_trace", {"format_version": 1, "diagnostic_missing": True,
+                                           "first_failure_observed_ns": None})
     if trial.report.get("cleanup_failed") and report["status"] == "stopped":
         report.update(status="failed", failure_category="GCTrialCleanup", failed_phase="GC_RESTORE")
     if trial.report["memory_guard_failed"] and report["status"] == "stopped":
         report.update(status="failed", failure_category="GCTrialMemory", failed_phase="MEMORY_SAMPLE")
     combined = {"diagnostic_report": report.get("diagnostic_report"), "gc_trial": trial.report}
+    if timeout_trace:
+        combined["timeout_trace"] = report.get("timeout_trace")
     trial.report["combined_encoded_bytes"] = 0
     trial.report["combined_encoded_limit"] = 256 * 1024
     for _ in range(3):
@@ -1104,7 +1467,7 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
                                role_config: Path | None = None, preload_steps=0,
                                preload_execution="fused", diagnostic=False,
                                recording_mode="full", tcp_nodelay=None,
-                               commit_policy="default", _gc_trial=None) -> dict[str, object]:
+                               commit_policy="default", _gc_trial=None, timeout_trace=False) -> dict[str, object]:
     """实际持续动态循环及原同步 writer；退出后报告观察，不发布图或更改调度。"""
     from secure_control.execution.lan_runtime import RunControl
     from secure_control.scenarios.cart_pole.interactive import InteractiveSession
@@ -1153,7 +1516,7 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
         _gc_trial.cleanup.callback(queue.close)
     parties = [context.Process(target=_party_job, args=(
         _config(role, ports), ports, delay_ms, True, queue, diagnostic, False, tcp_nodelay,
-        supply_diagnostic,
+        supply_diagnostic, timeout_trace,
     )) for role in ("P1", "P2")] if role_config is None else []
     records, events, outcomes, writer_batches = [], [], [], []
     socket_options = []
@@ -1162,8 +1525,14 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
                           "source_check_ms": 0., "source_check_control_ms": 0.,
                           "source_check_writer_ms": 0., "source_check_control_count": 0,
                           "source_check_writer_count": 0}
-    diagnostic_observer = _Diagnostic("Client", supply=supply_diagnostic,
-                                      all_gc=_gc_trial is not None) if diagnostic else None
+    diagnostic_observer = (_TimeoutDiagnostic("Client", ports) if timeout_trace else
+                          _Diagnostic("Client", supply=supply_diagnostic,
+                                      all_gc=_gc_trial is not None) if diagnostic else None)
+    # 必须先装在meter内层；退出先还原meter前驱，再卸下探针。
+    socket_context = ExitStack() if timeout_trace else None
+    if timeout_trace:
+        _gc_trial.cleanup.callback(socket_context.close)
+        socket_context.enter_context(diagnostic_observer.sockets())
     counts, activity, restore = _meter("Client", ports, delay_ms, diagnostic=diagnostic_observer)
     if _gc_trial:
         _gc_trial.cleanup.callback(restore)
@@ -1179,6 +1548,9 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
         nonlocal current_phase, phase_start, attempt, before_activity, before_storage, before_counts
         nonlocal diagnostic_phase
         if _gc_trial and name == "RUNNING":
+            if timeout_trace:
+                diagnostic_observer.tracing = True
+                diagnostic_observer.marker("control_scope_begin")
             _gc_trial.control_started = True
             _gc_trial.memory("control_start", guard=True)
             _gc_trial.snapshot("control_start")
@@ -1344,6 +1716,8 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
             diagnostic_observer.end(diagnostic_phase)
             diagnostic_observer.finish_control()
         diagnostic_context.close()
+        if socket_context is not None:
+            socket_context.close()
         for party in parties:
             if party.is_alive():
                 party.terminate()
@@ -1376,6 +1750,10 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
                       "not continuous execution; nested durations overlap; non_cpu is not a GIL/I/O cause"),
             "python_implementation": platform.python_implementation(),
             "encoded_limit": 256 * 1024}
+        if timeout_trace:
+            diagnostic_report.update(selected_global_steps="rolling recent public events; first error latched",
+                                     client_gc_scope="rolling recent GC intervals",
+                                     timeout_trace=True, format_version=1)
         diagnostic_report["encoded_bytes"] = 0
         for _ in range(3):
             diagnostic_report["encoded_bytes"] = len(json.dumps(
@@ -1387,6 +1765,10 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
         "recording_mode": recording_mode,
         "evidence_state": "not_recorded" if light else "full_observation_spool",
         "diagnostic": diagnostic, "diagnostic_report": diagnostic_report,
+        "timeout_trace": ({"format_version": 1, "scope": "single bounded S3 diagnosis",
+                           "first_failure_observed_ns": (diagnostic_observer.first_failure[2]
+                                if diagnostic_observer.first_failure is not None else None)}
+                          if timeout_trace else None),
         "case": "cycle" if optimized else "continuous", "mode": "batch",
         "code_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=_ROOT, text=True).strip(),
         "dirty": bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=_ROOT, text=True)),
