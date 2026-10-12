@@ -575,6 +575,8 @@ def _run() -> int:
     benchmark.add_argument("--commit-policy", choices=("default", "serial"), default="default")
     benchmark.add_argument("--diagnostic", action="store_true",
                            help="本机cycle有限CPU/GC观测，不作为正式资格")
+    benchmark.add_argument("--gc-trial-policy", choices=("baseline", "startup-freeze"),
+                           help="独占Client一次性限定GC对照；默认不启用")
     benchmark.add_argument("--fixed-proof-cache", action="store_true",
                            help="full-observation固定精确矩阵计算的显式候选对照")
     benchmark.add_argument("--role-config", type=Path)
@@ -589,6 +591,8 @@ def _run() -> int:
         )
 
         try:
+            if args.gc_trial_policy is not None and (args.case != "cycle" or args.mode != "batch"):
+                raise ValueError("GC限定试验只支持cycle/batch。")
             if args.recording is not None and args.case != "cycle":
                 raise ValueError("--recording 只适用于cycle动态持续观察")
             if (args.tcp_nodelay != "default" or args.commit_policy != "default") and args.case != "cycle":
@@ -613,6 +617,7 @@ def _run() -> int:
                     recording_mode=args.recording if args.recording is not None else "full",
                     tcp_nodelay=False if args.tcp_nodelay == "off" else None,
                     commit_policy=args.commit_policy,
+                    gc_trial_policy=args.gc_trial_policy,
                 )
             else:
                 if args.preload_steps or args.diagnostic:

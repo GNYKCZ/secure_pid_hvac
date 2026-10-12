@@ -471,7 +471,31 @@ callback不写盘、不序列化、不查看对象；退出还原hook，不修�
 综合未执行时间，不能直接解释为GIL、网络或磁盘。报告给出时钟实现/分辨率、
 启动时钟读取探针和实际峰值RSS，测量开销仍计入原绝对20ms期限。
 诊断允许单步请求，标记 `diagnostic=true`，不作为正式qualification资格。
-当前获批观察仅为fused/stock1000/段400的零注入406步和1ms每帧1步，各一次；
+
+限定启动GC试验使用 `--gc-trial-policy baseline|startup-freeze`，默认不启用。
+只允许独占、运行一次即退出的Client主进程，以及cycle/batch/light/diagnostic、
+1000步、段400、16槽、无预送、零注入延迟和默认通信策略；非法组合先拒绝。
+自动GC必须开启，永久代、调试标志和外部callbacks必须为空。必要依赖导入后，
+在端口、角色配置、进程/队列、会话、场景和材料创建前，两组各做一次冷启动完整GC；
+startup-freeze再冻结当时全部受跟踪对象。运行中新对象仍正常GC，原运行时startup_gc保留。
+冻结不保证对象不可变，也不能直接用于GUI或正式入口。
+
+公开 `gc_trial` 分开记录冷GC、freeze计数/耗时、原startup_gc、GC统计采样时刻、
+退出恢复和当前/峰值OS内存。控制开始/结束及g0/每100步输入前检查当前RSS 256MiB保护线；
+不可用或超限按原异常停止，采样开销计入原期限，不能排除采样之间的瞬时超限。
+材料8MiB编码预留不是RSS上界。详细区间保持g0..1、165..168、176..180；
+Client GC配对覆盖整个试验（含初始化/关闭，以control_active区分），P1/P2窗口不扩展。
+GC stop保存collected/uncollectable计数，缺失配对与overflow明确报告；仍共用每角色512槽、
+72KiB事件预算，全部诊断及策略摘要共256KiB。退出集中写JSON，不按周期写文件。
+
+退出先执行原池close/5秒join/discard并移除自有诊断钩子，再解冻自有永久代、
+恢复GC设置；只有供料线程已退出才做停机收集。清理失败单列且不能覆盖原控制失败，
+不能继续建池或重试。S2获批预算为同一固定head先baseline后startup-freeze各一次、
+每组最多1000尝试且首次失败即停，总计最多2000；安全/数学/所有权缺陷取消第二组。
+两组均为comparison_only/diagnostic，qualification_pass和stage_pass均false；
+即使1000步无miss，也不替代默认持续供料门禁、10000步、GUI或三机验收。
+
+早期有限诊断预算为fused/stock1000/段400的零注入406步和1ms每帧1步，各一次，现已使用，不能复用；
 失败即停，退出集中输出。未复现也不得循环追样本或用诊断PASS代替1000/10k验收。
 
 - `configs/lab-p1.example.yaml`、`lab-p2.example.yaml`、`lab-client-continuous.example.yaml`：三个独立角色入口。

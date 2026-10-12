@@ -672,6 +672,15 @@ def test_supply_diagnostic_windows_gc_pairing_missing_cpu_and_fixed_budgets():
     assert diag.report() == report
     legacy = _Diagnostic("Client")
     assert legacy._selected_step(397) and not legacy._selected_step(179)
+    entire = _Diagnostic("Client", supply=True, all_gc=True)
+    entire.select(999)
+    entire._gc("start", {"generation": 2})
+    entire._gc("stop", {"generation": 2, "collected": 7, "uncollectable": 0})
+    entire._gc("start", {"generation": 1})
+    complete, missing = entire.report()["events"]
+    assert complete["control_global_step"] == 999 and complete["collected"] == 7
+    assert complete["uncollectable"] == 0 and complete["pairing"] == "complete"
+    assert missing["pairing"] == "missing_stop" and missing["collected"] is None
     party = _Diagnostic("P1", supply=True)
     party.select(167)
     with party.scope("party_stage"):
@@ -679,6 +688,159 @@ def test_supply_diagnostic_windows_gc_pairing_missing_cpu_and_fixed_budgets():
     event = party.report()["events"][0]
     assert event["control_global_step"] == 167
     assert event["control_active"] is event["control_active_end"] is None
+
+
+def test_gc_trial_rejects_invalid_combinations_before_any_experiment(monkeypatch):
+    from secure_control.experiments import communication_benchmark as benchmark
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid GC trial created experiment/GC scope")
+
+    monkeypatch.setattr(benchmark, "_ports", forbidden)
+    monkeypatch.setattr(benchmark._StartupGCTrial, "installed", forbidden)
+    options = {"steps": 1000, "delay_ms": 0, "segment_steps": 400, "optimized": True,
+               "diagnostic": True, "recording_mode": "light", "gc_trial_policy": "baseline"}
+    for change in ({"steps": True}, {"steps": 999}, {"delay_ms": 1}, {"delay_ms": False},
+                   {"segment_steps": 8}, {"material_slots": 4}, {"preload_steps": 1},
+                   {"preload_execution": "staged"}, {"optimized": False}, {"diagnostic": False},
+                   {"recording_mode": "full"}, {"role_config": "missing"}, {"tcp_nodelay": False},
+                   {"commit_policy": "serial"}, {"gc_trial_policy": "invalid"}):
+        with pytest.raises(ValueError):
+            benchmark.run_continuous_observation(**{**options, **change})
+    trial = benchmark._StartupGCTrial("baseline")
+    for memory in ({"current_rss_bytes": None, "peak_rss_bytes": 1},
+                   {"current_rss_bytes": trial.RSS_LIMIT + 1, "peak_rss_bytes": trial.RSS_LIMIT + 1}):
+        monkeypatch.setattr(benchmark, "_process_memory", lambda memory=memory: memory)
+        with pytest.raises(RuntimeError):
+            trial.memory("before_input", step=100, guard=True)
+        assert trial.report["memory_samples"][-1]["global_step"] == 100
+
+
+def test_gc_trial_real_gc_isolated_process_reclaims_new_cycles_and_restores_on_failure():
+    import subprocess
+    import sys
+    import textwrap
+
+    # 真freeze只在一次性子进程执行；不把pytest及其他测试的对象送入永久代。
+    program = textwrap.dedent('''
+        import gc, sys, weakref
+        from threading import Event, Thread
+        from secure_control.experiments import communication_benchmark as benchmark
+        from secure_control.experiments.communication_benchmark import _StartupGCTrial
+        from secure_control.execution.lan_runtime import LanSegmentedRuntime, _OnlineResourcePool
+        case = sys.argv[1]
+        before = gc.isenabled(), gc.get_threshold(), gc.get_debug(), list(gc.callbacks)
+        if case in ("init-failure", "hook-init-failure"):
+            from secure_control.execution import lan_runtime, localhost_transport
+            originals = localhost_transport._send_exact, localhost_transport.encode_envelope
+            def no_ports():
+                assert gc.get_freeze_count() > 0
+                raise OSError("private initialization failure")
+            if case == "init-failure":
+                benchmark._ports = no_ports
+            else:
+                def no_control():
+                    raise OSError("private control initialization failure")
+                lan_runtime.RunControl = no_control
+            report = benchmark.run_continuous_observation(
+                steps=1000, delay_ms=0, segment_steps=400, optimized=True, diagnostic=True,
+                recording_mode="light", gc_trial_policy="startup-freeze")
+            assert report["status"] == "failed" and report["failure_category"] == "OSError"
+            assert report["gc_trial"]["restored"] and not report["gc_trial"]["cleanup_failed"]
+            assert gc.get_freeze_count() == 0
+            assert (gc.isenabled(), gc.get_threshold(), gc.get_debug(), list(gc.callbacks)) == before
+            assert not report["qualification_pass"] and not report["stage_pass"]
+            assert report["comparison_only"] and report["diagnostic"]
+            assert (localhost_transport._send_exact, localhost_transport.encode_envelope) == originals
+            sys.exit(0)
+        if case == "memory-end":
+            closed = []
+            LanSegmentedRuntime.close = lambda runtime: closed.append(True)
+            trial = _StartupGCTrial("startup-freeze")
+            with trial.installed():
+                trial.control_started = True
+                benchmark._process_memory = lambda: {
+                    "current_rss_bytes": trial.RSS_LIMIT + 1, "peak_rss_bytes": trial.RSS_LIMIT + 1}
+                LanSegmentedRuntime.close(None)
+            assert closed == [True] and trial.report["memory_guard_failed"]
+            assert trial.report["restored"] and gc.get_freeze_count() == 0
+            assert [s["moment"] for s in trial.report["memory_samples"]] == [
+                "before_cold_collect", "after_cold_collect", "control_end", "after_restore"]
+            sys.exit(0)
+        if case == "reject":
+            callback = lambda phase, info: None
+            gc.callbacks.append(callback)
+            try:
+                with _StartupGCTrial("startup-freeze").installed():
+                    raise AssertionError("accepted foreign callback")
+            except RuntimeError:
+                pass
+            assert gc.callbacks == [callback] and gc.get_freeze_count() == 0
+            sys.exit(0)
+        class Cycle:
+            pass
+        old = Cycle()
+        old.link = old
+        old_ref = weakref.ref(old)
+        trial = _StartupGCTrial("baseline" if case == "baseline" else "startup-freeze")
+        gate = Event()
+        def initialized(pool, *args, **kwargs):
+            pool._thread = Thread(target=gate.wait)
+            pool._thread.start()
+        def closed(pool):
+            raise RuntimeError("cleanup payload must not be exposed")
+        if case in ("join-failure", "boundary-failure"):
+            _OnlineResourcePool.__init__, _OnlineResourcePool.close = initialized, closed
+        try:
+            with trial.installed():
+                del old
+                new = Cycle()
+                new.link = new
+                new_ref = weakref.ref(new)
+                del new
+                gc.collect(2)
+                assert new_ref() is None
+                assert (old_ref() is not None) == (case != "baseline")
+                assert gc.isenabled() and gc.get_threshold() == before[1]
+                if case in ("join-failure", "boundary-failure"):
+                    pool = _OnlineResourcePool(None, None)
+                    trial.final_cleanup = case == "join-failure"
+                    pool.close()
+                    trial.final_cleanup = False
+                if case == "exception":
+                    raise OSError("original failure")
+        except OSError as error:
+            assert case == "exception" and str(error) == "original failure"
+        except RuntimeError:
+            assert case == "boundary-failure"
+        finally:
+            gate.set()
+            if case in ("join-failure", "boundary-failure"):
+                pool._thread.join(2)
+        report = trial.report
+        assert gc.get_freeze_count() == 0 and report["restored"]
+        assert (gc.isenabled(), gc.get_threshold(), gc.get_debug(), list(gc.callbacks)) == before
+        assert report["cold_collect"]["duration_ns"] >= 0
+        assert report["freeze"]["after_count"] > 0 if case != "baseline" else report["freeze"]["after_count"] == 0
+        if case in ("join-failure", "boundary-failure"):
+            assert report["cleanup_failed"] and not report["producers_exited"]
+            assert report["shutdown_collect"] is None
+            assert report["cleanup_errors"] == ["RuntimeError", "producer_not_exited"]
+        else:
+            assert not report["cleanup_failed"] and report["producers_exited"]
+            assert old_ref() is None
+        assert [s["moment"] for s in report["memory_samples"]] == [
+            "before_cold_collect", "after_cold_collect", "after_restore"]
+        try:
+            with _StartupGCTrial("baseline").installed():
+                raise AssertionError("reused process")
+        except RuntimeError:
+            pass
+    ''')
+    for case in ("baseline", "freeze", "exception", "join-failure", "boundary-failure", "reject", "init-failure", "hook-init-failure", "memory-end"):
+        result = subprocess.run([sys.executable, "-c", program, case], capture_output=True, timeout=20,
+                                check=False)
+        assert result.returncode == 0, (case, result.stdout, result.stderr)
 
 
 def test_supply_diagnostic_real_producer_labels_original_owner_and_exception_cleanup(monkeypatch):

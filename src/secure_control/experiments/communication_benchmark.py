@@ -18,7 +18,7 @@ from hashlib import sha256
 from itertools import count, pairwise
 from pathlib import Path
 from queue import Empty
-from threading import current_thread, get_ident, get_native_id, local
+from threading import active_count, current_thread, get_ident, get_native_id, local, main_thread
 from unittest.mock import patch
 
 import numpy as np
@@ -35,7 +35,7 @@ class _Diagnostic:
 
     LIMIT = 512
 
-    def __init__(self, role, *, wall=None, cpu=None, limit=LIMIT, supply=False):
+    def __init__(self, role, *, wall=None, cpu=None, limit=LIMIT, supply=False, all_gc=False):
         self.role = role
         self.wall = wall or time.perf_counter_ns
         self.cpu = cpu or getattr(time, "thread_time_ns", None)
@@ -48,6 +48,7 @@ class _Diagnostic:
         self.cpu_errors = 0
         self.gc_before = None
         self.supply = supply
+        self.all_gc = all_gc
         self.control = (None, False)
         self.gc_pending = None
         samples = []
@@ -174,7 +175,7 @@ class _Diagnostic:
     def _gc(self, phase, info):
         # callback只存定长公共tuple；不查看对象、不调用JSON/I/O或主动GC。
         if self.supply:
-            self._supply_gc(phase, info.get("generation"))
+            self._supply_gc(phase, info.get("generation"), info.get("collected"), info.get("uncollectable"))
             return
         if not self.selected():
             return
@@ -185,10 +186,11 @@ class _Diagnostic:
                                  self._cpu(), get_ident(), get_native_id(),
                                  self.state.step, getattr(self.state, "phase", None))
 
-    def _supply_gc(self, phase, generation):
+    def _supply_gc(self, phase, generation, collected=None, uncollectable=None):
         thread = get_ident()
         stamp = ("gc_interval", *self._label(), get_native_id(), thread, generation,
-                 getattr(self.state, "phase", None), self.wall(), self._cpu())
+                 getattr(self.state, "phase", None), self.wall(), self._cpu(),
+                 collected if phase == "stop" else None, uncollectable if phase == "stop" else None)
         if phase == "start":
             self.gc_pending = stamp
             return
@@ -196,11 +198,11 @@ class _Diagnostic:
             return
         initial, self.gc_pending = self.gc_pending, None
         paired = initial is not None and initial[6:8] == stamp[6:8]
-        if initial is not None and not paired and self._selected_step(initial[2]):
+        if initial is not None and not paired and (self.all_gc or self._selected_step(initial[2])):
             index = self.reserve()
             if index is not None:
                 self.slots[index] = (initial, None, "missing_stop")
-        if self._selected_step(stamp[2]) or (paired and self._selected_step(initial[2])):
+        if self.all_gc or self._selected_step(stamp[2]) or (paired and self._selected_step(initial[2])):
             index = self.reserve()
             if index is not None:
                 self.slots[index] = (initial if paired else None, stamp,
@@ -226,6 +228,8 @@ class _Diagnostic:
                 "generation": item[7], "active_phase": item[8], "pairing": pairing,
                 "start_ns": None if initial is None else initial[9],
                 "end_ns": None if final is None else final[9],
+                "collected": None if final is None else final[11],
+                "uncollectable": None if final is None else final[12],
                 "cpu_delta_ns": (None if initial is None or final is None
                                  or initial[10] is None or final[10] is None else final[10] - initial[10]),
                 "control_global_step_end": None if final is None else final[2],
@@ -262,7 +266,7 @@ class _Diagnostic:
                 value["non_cpu_ns"] = (None if value["cpu_ns"] is None else
                                        value["wall_ns"] - value["cpu_ns"])
                 events.append(value)
-        if self.supply and self.gc_pending is not None and self._selected_step(self.gc_pending[2]):
+        if self.supply and self.gc_pending is not None and (self.all_gc or self._selected_step(self.gc_pending[2])):
             if len(events) < len(self.slots):
                 events.append(self._supply_event((self.gc_pending, None, "missing_stop")))
             else:
@@ -880,12 +884,227 @@ def _observe_diagnostic(diagnostic, *, recording=True):
         yield
 
 
+_gc_trial_used = False
+
+
+class _StartupGCTrial:
+    """独占 Client 进程一次性试验；不冻结随后创建的会话或材料。"""
+
+    RSS_LIMIT = 256 * 1024 * 1024
+
+    def __init__(self, policy):
+        self.policy = policy
+        self.owns_freeze = False
+        self.final_cleanup = False
+        self.control_started = self.control_ended = False
+        self.producers = []
+        self.cleanup = ExitStack()
+        self.before = None
+        self.report = {"policy": policy, "scope": "exclusive Client process; all startup tracked objects",
+                       "current_rss_limit_bytes": self.RSS_LIMIT, "memory_samples": [],
+                       "gc_snapshots": [], "cold_collect": None, "freeze": None,
+                       "original_startup_gc": None, "shutdown_collect": None,
+                       "cleanup_errors": [], "restored": False,
+                       "memory_guard_failed": False,
+                       "unavailable_scope": "null means stage not reached or OS/clock field unavailable; GC counters are not restored",
+                       "memory_scope": "sampled current/peak OS memory; between-sample spikes not excluded"}
+
+    def snapshot(self, moment):
+        value = {"moment": moment, "sample_ns": time.perf_counter_ns(),
+                 "enabled": gc.isenabled(), "threshold": list(gc.get_threshold()),
+                 "debug": gc.get_debug(), "freeze_count": gc.get_freeze_count(),
+                 "callback_count": len(gc.callbacks), "stats": gc.get_stats()}
+        self.report["gc_snapshots"].append(value)
+        return value
+
+    def memory(self, moment, *, step=None, guard=False):
+        try:
+            value = _process_memory()
+        except (OSError, RuntimeError) as error:
+            value = {"current_rss_bytes": None, "peak_rss_bytes": None,
+                     "scope": "unavailable", "error_type": type(error).__name__}
+        value = {"moment": moment, "global_step": step, "sample_ns": time.perf_counter_ns(), **value}
+        self.report["memory_samples"].append(value)
+        if guard and (value.get("current_rss_bytes") is None or value.get("peak_rss_bytes") is None):
+            self.report["memory_guard_failed"] = True
+            raise RuntimeError("GC试验的OS内存指标不可用。")
+        if guard and value["current_rss_bytes"] > self.RSS_LIMIT:
+            self.report["memory_guard_failed"] = True
+            raise RuntimeError("GC试验Client当前RSS超出256MiB保护线。")
+
+    @contextmanager
+    def installed(self):
+        global _gc_trial_used
+        from secure_control.execution.lan_runtime import LanSegmentedRuntime, _OnlineResourcePool
+
+        if (self.policy not in ("baseline", "startup-freeze") or _gc_trial_used
+                or current_thread() is not main_thread() or active_count() != 1
+                or mp.current_process().name != "MainProcess"
+                or not gc.isenabled() or gc.get_freeze_count() or gc.get_debug() or gc.callbacks):
+            raise RuntimeError("GC试验仅允许无外部GC策略的独占Client主进程一次运行。")
+        _gc_trial_used = True
+        self.before = self.snapshot("before_cold_collect")
+        original_init, original_close = _OnlineResourcePool.__init__, _OnlineResourcePool.close
+        runtime_close = LanSegmentedRuntime.close
+
+        def initialized(pool, *args, **kwargs):
+            if self.report["cleanup_errors"]:
+                raise RuntimeError("GC试验清理失败后不得再创建材料池。")
+            try:
+                return original_init(pool, *args, **kwargs)
+            finally:
+                thread = getattr(pool, "_thread", None)
+                if thread is not None:
+                    self.producers.append(thread)
+
+        def closed(pool):
+            previous_error = sys.exception()
+            try:
+                return original_close(pool)
+            except Exception as error:  # 清理仅公开类别，不能覆盖原控制失败
+                self.report["cleanup_errors"].append(type(error).__name__)
+                if not self.final_cleanup and previous_error is None:
+                    # 段界close失败必须交给原runner停止，不能静默进入新段/建池。
+                    raise
+
+        def close_runtime(runtime):
+            if self.control_started and not self.control_ended:
+                self.control_ended = True
+                try:
+                    self.memory("control_end", guard=True)
+                except RuntimeError:
+                    pass  # 已记录保护失败；仍须原close，且不能替换原控制错误。
+                self.snapshot("control_end")
+            previous, self.final_cleanup = self.final_cleanup, True
+            try:
+                return runtime_close(runtime)
+            finally:
+                self.final_cleanup = previous
+
+        try:
+            self.memory("before_cold_collect", guard=True)
+            started = time.perf_counter_ns()
+            collected = gc.collect(2)
+            self.report["cold_collect"] = {"duration_ns": time.perf_counter_ns() - started,
+                                           "collected": collected}
+            self.memory("after_cold_collect", guard=True)
+            self.snapshot("after_cold_collect")
+            count_before = gc.get_freeze_count()
+            started = time.perf_counter_ns()
+            if self.policy == "startup-freeze":
+                gc.freeze()
+                self.owns_freeze = True
+            self.report["freeze"] = {"duration_ns": time.perf_counter_ns() - started,
+                                     "before_count": count_before, "after_count": gc.get_freeze_count()}
+            self.snapshot("after_policy")
+            with (patch.object(_OnlineResourcePool, "__init__", initialized),
+                  patch.object(_OnlineResourcePool, "close", closed),
+                  patch.object(LanSegmentedRuntime, "close", close_runtime)):
+                yield self
+        finally:
+            # 原池先完成5秒join；即使join失败也先解冻自有永久代，但不再主动收集。
+            try:
+                self.cleanup.close()
+            except Exception as error:  # noqa: BLE001 - 仅释放自有初始化钩子，保留原异常
+                self.report["cleanup_errors"].append(type(error).__name__)
+            self.snapshot("before_restore")
+            exited = all(not thread.is_alive() for thread in self.producers)
+            self.report["producer_count"] = len(self.producers)
+            self.report["producers_exited"] = exited
+            if not exited:
+                self.report["cleanup_errors"].append("producer_not_exited")
+            try:
+                if self.owns_freeze:
+                    gc.unfreeze()
+                    self.owns_freeze = False
+                if (gc.isenabled() != self.before["enabled"]
+                        or list(gc.get_threshold()) != self.before["threshold"]
+                        or gc.get_debug() != self.before["debug"] or gc.callbacks):
+                    self.report["cleanup_errors"].append("unexpected_gc_state")
+                gc.set_threshold(*self.before["threshold"])
+                gc.set_debug(self.before["debug"])
+                gc.enable() if self.before["enabled"] else gc.disable()
+                if exited:
+                    started = time.perf_counter_ns()
+                    collected = gc.collect(2)
+                    self.report["shutdown_collect"] = {
+                        "duration_ns": time.perf_counter_ns() - started, "collected": collected}
+            except Exception as error:  # noqa: BLE001 - finally不能替换原始错误
+                self.report["cleanup_errors"].append(type(error).__name__)
+            after = self.snapshot("after_restore")
+            self.report["restored"] = (after["freeze_count"] == self.before["freeze_count"]
+                and after["enabled"] == self.before["enabled"]
+                and after["threshold"] == self.before["threshold"]
+                and after["debug"] == self.before["debug"] and not gc.callbacks)
+            self.memory("after_restore")
+            self.report["cleanup_failed"] = bool(self.report["cleanup_errors"]) or not self.report["restored"]
+
+
 def run_continuous_observation(*, steps: int, delay_ms: float,
                                segment_steps: int, optimized=False, material_slots=16,
                                role_config: Path | None = None, preload_steps=0,
                                preload_execution="fused", diagnostic=False,
                                recording_mode="full", tcp_nodelay=None,
-                               commit_policy="default") -> dict[str, object]:
+                               commit_policy="default", gc_trial_policy=None) -> dict[str, object]:
+    # 所有试验参数在任何端口/角色/材料创建前拒绝；默认入口走原路径。
+    options = {"steps": steps, "delay_ms": delay_ms, "segment_steps": segment_steps,
+               "optimized": optimized, "material_slots": material_slots, "role_config": role_config,
+               "preload_steps": preload_steps, "preload_execution": preload_execution,
+               "diagnostic": diagnostic, "recording_mode": recording_mode,
+               "tcp_nodelay": tcp_nodelay, "commit_policy": commit_policy}
+    if gc_trial_policy is None:
+        return _run_continuous_observation(**options)
+    if (type(gc_trial_policy) is not str or gc_trial_policy not in ("baseline", "startup-freeze")
+            or optimized is not True or diagnostic is not True or recording_mode != "light"
+            or type(steps) is not int or steps != 1000
+            or type(material_slots) is not int or material_slots != 16
+            or type(preload_steps) is not int or preload_steps != 0 or preload_execution != "fused"
+            or type(segment_steps) is not int or segment_steps != 400
+            or type(delay_ms) not in (int, float) or delay_ms != 0
+            or role_config is not None or tcp_nodelay is not None or commit_policy != "default"):
+        raise ValueError("GC限定试验只允许cycle/batch/light/diagnostic/1000/400/16/无预送/零延迟/默认通信。")
+    # 固定依赖先导入，再进入冷GC边界；不预建试验对象。
+    from secure_control.execution.lan_runtime import RunControl  # noqa: F401
+    from secure_control.scenarios.cart_pole.interactive import InteractiveSession  # noqa: F401
+
+    from .cart_pole_segmented_evidence import _BatchWriter, _Spool  # noqa: F401
+    from .lan_continuous_profile import load_segmented_experiment  # noqa: F401
+    from .lan_runner import _run_prepared_segmented  # noqa: F401
+
+    trial = _StartupGCTrial(gc_trial_policy)
+    try:
+        with trial.installed():
+            report = _run_continuous_observation(**options, _gc_trial=trial)
+    except Exception as error:  # noqa: BLE001 - 异常也留存公开恢复事实，不透传载荷
+        report = {"schema": "cycle-qualification-v1", "case": "cycle", "mode": "batch",
+                  "status": "failed", "failure_category": type(error).__name__,
+                  "requested_steps": steps, "cycles": [], "cycle_timing": {"p50_ms": None},
+                  "qualification_pass": False, "stage_pass": False, "diagnostic": True,
+                  "code_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=_ROOT, text=True).strip(),
+                  "source_sha256": _source_fingerprints()}
+    report.update(gc_trial=trial.report, diagnostic=True, comparison_only=True,
+                  qualification_pass=False, stage_pass=False)
+    if trial.report.get("cleanup_failed") and report["status"] == "stopped":
+        report.update(status="failed", failure_category="GCTrialCleanup", failed_phase="GC_RESTORE")
+    if trial.report["memory_guard_failed"] and report["status"] == "stopped":
+        report.update(status="failed", failure_category="GCTrialMemory", failed_phase="MEMORY_SAMPLE")
+    combined = {"diagnostic_report": report.get("diagnostic_report"), "gc_trial": trial.report}
+    trial.report["combined_encoded_bytes"] = 0
+    trial.report["combined_encoded_limit"] = 256 * 1024
+    for _ in range(3):
+        trial.report["combined_encoded_bytes"] = len(json.dumps(
+            combined, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode())
+    if trial.report["combined_encoded_bytes"] > 256 * 1024:
+        report.update(status="failed", failure_category="DiagnosticBudget", stage_pass=False)
+    return report
+
+
+def _run_continuous_observation(*, steps: int, delay_ms: float,
+                               segment_steps: int, optimized=False, material_slots=16,
+                               role_config: Path | None = None, preload_steps=0,
+                               preload_execution="fused", diagnostic=False,
+                               recording_mode="full", tcp_nodelay=None,
+                               commit_policy="default", _gc_trial=None) -> dict[str, object]:
     """实际持续动态循环及原同步 writer；退出后报告观察，不发布图或更改调度。"""
     from secure_control.execution.lan_runtime import RunControl
     from secure_control.scenarios.cart_pole.interactive import InteractiveSession
@@ -899,7 +1118,7 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
         raise TypeError("tcp_nodelay 必须为 bool 或 None。")
     if type(commit_policy) is not str or commit_policy not in ("default", "serial"):
         raise ValueError("非法 commit_policy。")
-    comparison_only = tcp_nodelay is not None or commit_policy != "default"
+    comparison_only = tcp_nodelay is not None or commit_policy != "default" or _gc_trial is not None
     if comparison_only and (not optimized or role_config is not None):
         raise ValueError("通信策略对照只支持内部三进程 cycle。")
     if type(recording_mode) is not str or recording_mode not in ("light", "full") or recording_mode == "light" and not optimized:
@@ -921,7 +1140,7 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
     if not isinstance(delay_ms, (int, float)) or not 0 <= delay_ms <= 3:
         raise ValueError("单帧注入等待必须在0..3ms")
     supply_diagnostic = (diagnostic and light and not preload_steps and material_slots == 16
-                         and not comparison_only)
+                         and (not comparison_only or _gc_trial is not None))
     ports = _ports()
     config = _config("Client", ports) if role_config is None else load_lan_config(role_config, "Client")
     if role_config is not None:
@@ -930,6 +1149,8 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
         ))
     context = mp.get_context("spawn")
     queue = context.Queue()
+    if _gc_trial:
+        _gc_trial.cleanup.callback(queue.close)
     parties = [context.Process(target=_party_job, args=(
         _config(role, ports), ports, delay_ms, True, queue, diagnostic, False, tcp_nodelay,
         supply_diagnostic,
@@ -941,8 +1162,11 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                           "source_check_ms": 0., "source_check_control_ms": 0.,
                           "source_check_writer_ms": 0., "source_check_control_count": 0,
                           "source_check_writer_count": 0}
-    diagnostic_observer = _Diagnostic("Client", supply=supply_diagnostic) if diagnostic else None
+    diagnostic_observer = _Diagnostic("Client", supply=supply_diagnostic,
+                                      all_gc=_gc_trial is not None) if diagnostic else None
     counts, activity, restore = _meter("Client", ports, delay_ms, diagnostic=diagnostic_observer)
+    if _gc_trial:
+        _gc_trial.cleanup.callback(restore)
     control, session = RunControl(), InteractiveSession()
     fsync, checkpoint = os.fsync, None if light else _Spool._checkpoint
     before_activity, before_storage = dict(activity), dict(storage)
@@ -954,6 +1178,10 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
     def phase(name):
         nonlocal current_phase, phase_start, attempt, before_activity, before_storage, before_counts
         nonlocal diagnostic_phase
+        if _gc_trial and name == "RUNNING":
+            _gc_trial.control_started = True
+            _gc_trial.memory("control_start", guard=True)
+            _gc_trial.snapshot("control_start")
         if diagnostic_observer:
             if not supply_diagnostic or name == "INPUT":
                 diagnostic_observer.end(diagnostic_phase)
@@ -961,6 +1189,8 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                 diagnostic_observer.select(len(records))
             if not supply_diagnostic or name == "INPUT":
                 diagnostic_phase = diagnostic_observer.begin("control_cycle" if supply_diagnostic else name)
+        if _gc_trial and name == "INPUT" and len(records) % 100 == 0:
+            _gc_trial.memory("before_input", step=len(records), guard=True)
         now = time.perf_counter_ns()
         if current_phase is not None:
             events.append({"phase": current_phase, "duration_ms": (now - phase_start) / 1e6,
@@ -1024,6 +1254,8 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
             storage["checkpoint_ms"] += (time.perf_counter_ns() - start) / 1e6
 
     diagnostic_context = ExitStack()
+    if _gc_trial:
+        _gc_trial.cleanup.callback(diagnostic_context.close)
     if diagnostic_observer:
         diagnostic_context.enter_context(diagnostic_observer.installed())
         diagnostic_context.enter_context(_observe_diagnostic(diagnostic_observer, recording=not light))
@@ -1075,6 +1307,8 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                     cycle_snapshot=writer.snapshot if writer else None,
                     before_sample=writer.check if writer else None,
                 )
+                if _gc_trial:
+                    _gc_trial.report["original_startup_gc"] = result.get("startup_gc")
                 active_storage = dict(storage)
                 if writer is not None:
                     try:
@@ -1132,6 +1366,7 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                                       if supply_diagnostic else
                                       "0..1 and 397..405; writer batch identified by final public step"),
             "supply_diagnostic": supply_diagnostic,
+            "client_gc_scope": "entire trial including startup/close" if _gc_trial else "selected windows",
             "control_label_scope": ("Client: INPUT through cycle export callback; P1/P2: last completed "
                                     "Client request, Client active unknown; not CPU execution or GIL ownership"),
             "scope": ("same-host perf_counter/QPC; individual task/send/encode/GC intervals; "
