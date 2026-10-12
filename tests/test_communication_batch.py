@@ -708,12 +708,15 @@ def test_gc_trial_rejects_invalid_combinations_before_any_experiment(monkeypatch
         with pytest.raises(ValueError):
             benchmark.run_continuous_observation(**{**options, **change})
     trial = benchmark._StartupGCTrial("baseline")
-    s3 = {**options, "steps": 200, "gc_trial_policy": "startup-freeze", "timeout_trace": True}
-    for change in ({"steps": 1000}, {"steps": 199}, {"timeout_trace": 1},
-                   {"timeout_trace": False}, {"gc_trial_policy": None}, {"gc_trial_policy": "baseline"},
-                   {"role_config": "missing"}, {"material_slots": 4}, {"preload_steps": 1}):
-        with pytest.raises(ValueError):
-            benchmark.run_continuous_observation(**{**s3, **change})
+    for policy in ("baseline", "startup-freeze"):
+        traced = {**options, "steps": 200, "gc_trial_policy": policy, "timeout_trace": True}
+        for change in ({"steps": 1000}, {"steps": 199}, {"steps": True}, {"timeout_trace": 1},
+                       {"timeout_trace": False}, {"gc_trial_policy": None}, {"gc_trial_policy": "invalid"},
+                       {"role_config": "missing"}, {"material_slots": 4}, {"preload_steps": 1},
+                       {"diagnostic": False}, {"recording_mode": "full"}, {"segment_steps": 200},
+                       {"delay_ms": 1}, {"tcp_nodelay": False}, {"commit_policy": "serial"}):
+            with pytest.raises(ValueError):
+                benchmark.run_continuous_observation(**{**traced, **change})
     monkeypatch.setattr(benchmark, "_run_continuous_observation", lambda **kwargs: kwargs)
     default = benchmark.run_continuous_observation(steps=200, segment_steps=400, delay_ms=0)
     assert default["timeout_trace"] is False  # 默认路径不进入任何GC/探针作用域。
@@ -739,21 +742,30 @@ def test_gc_trial_real_gc_isolated_process_reclaims_new_cycles_and_restores_on_f
         from secure_control.execution.lan_runtime import LanSegmentedRuntime, _OnlineResourcePool
         case = sys.argv[1]
         before = gc.isenabled(), gc.get_threshold(), gc.get_debug(), list(gc.callbacks)
-        if case == "s3-scope":
+        if case in ("s3-scope", "s4-scope", "s4-scope-failure"):
             from contextlib import ExitStack
             from secure_control.execution import localhost_transport
+            policy = "baseline" if case.startswith("s4-") else "startup-freeze"
+            if policy == "baseline":
+                def forbidden(*args):
+                    raise AssertionError("baseline called freeze/unfreeze/disable")
+                gc.freeze = gc.unfreeze = gc.disable = forbidden
             original_send, original_close = localhost_transport._send_exact, LanSegmentedRuntime.close
             predecessor = lambda *args: original_send(*args)
             localhost_transport._send_exact = predecessor
             def simulated(**options):
                 assert options["steps"] == 200 and options["timeout_trace"]
                 trial = options["_gc_trial"]
+                assert trial.policy == policy
+                assert bool(gc.get_freeze_count()) == (policy == "startup-freeze")
                 observer = benchmark._TimeoutDiagnostic("Client", (101, 102, 103))
                 sockets = ExitStack()
                 trial.cleanup.callback(sockets.close)
                 sockets.enter_context(observer.sockets())
                 _, _, restore = benchmark._meter("Client", (101, 102, 103), 0, diagnostic=observer)
                 trial.cleanup.callback(restore)
+                if case == "s4-scope-failure":
+                    raise OSError("private baseline scope initialization failure")
                 restore()
                 sockets.close()
                 assert localhost_transport._send_exact is predecessor
@@ -762,11 +774,16 @@ def test_gc_trial_real_gc_isolated_process_reclaims_new_cycles_and_restores_on_f
             benchmark._run_continuous_observation = simulated
             report = benchmark.run_continuous_observation(
                 steps=200, delay_ms=0, segment_steps=400, optimized=True, diagnostic=True,
-                recording_mode="light", gc_trial_policy="startup-freeze", timeout_trace=True)
+                recording_mode="light", gc_trial_policy=policy, timeout_trace=True)
             assert localhost_transport._send_exact is predecessor
             assert LanSegmentedRuntime.close is original_close
             assert report["gc_trial"]["restored"] and not report["gc_trial"]["cleanup_failed"]
-            assert report["diagnostic_report"]["roles"][0]["socket_hooks_restored"]
+            if case == "s4-scope-failure":
+                assert report["status"] == "failed" and report["failure_category"] == "OSError"
+            else:
+                assert report["status"] == "stopped"
+                assert report["diagnostic_report"]["roles"][0]["socket_hooks_restored"]
+            assert report["gc_trial"]["freeze"]["after_count"] == 0 if policy == "baseline" else report["gc_trial"]["freeze"]["after_count"] > 0
             assert not report["qualification_pass"] and not report["stage_pass"]
             assert report["comparison_only"] and report["diagnostic"]
             assert (gc.isenabled(), gc.get_threshold(), gc.get_debug(), list(gc.callbacks)) == before
@@ -882,7 +899,7 @@ def test_gc_trial_real_gc_isolated_process_reclaims_new_cycles_and_restores_on_f
         except RuntimeError:
             pass
     ''')
-    for case in ("baseline", "freeze", "exception", "join-failure", "boundary-failure", "reject", "init-failure", "hook-init-failure", "s3-hook-init-failure", "s3-scope", "memory-end"):
+    for case in ("baseline", "freeze", "exception", "join-failure", "boundary-failure", "reject", "init-failure", "hook-init-failure", "s3-hook-init-failure", "s3-scope", "s4-scope", "s4-scope-failure", "memory-end"):
         result = subprocess.run([sys.executable, "-c", program, case], capture_output=True, timeout=20,
                                 check=False)
         assert result.returncode == 0, (case, result.stdout, result.stderr)

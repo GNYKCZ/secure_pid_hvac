@@ -1408,8 +1408,8 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                "diagnostic": diagnostic, "recording_mode": recording_mode,
                    "tcp_nodelay": tcp_nodelay, "commit_policy": commit_policy,
                    "timeout_trace": timeout_trace}
-    if type(timeout_trace) is not bool or timeout_trace and gc_trial_policy != "startup-freeze":
-        raise ValueError("S3 timeout_trace仅支持显式startup-freeze。")
+    if type(timeout_trace) is not bool or timeout_trace and gc_trial_policy not in ("baseline", "startup-freeze"):
+        raise ValueError("timeout_trace仅支持显式baseline或startup-freeze。")
     if gc_trial_policy is None:
         return _run_continuous_observation(**options)
     if (type(gc_trial_policy) is not str or gc_trial_policy not in ("baseline", "startup-freeze")
@@ -1420,7 +1420,7 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
             or type(segment_steps) is not int or segment_steps != 400
             or type(delay_ms) not in (int, float) or delay_ms != 0
             or role_config is not None or tcp_nodelay is not None or commit_policy != "default"):
-        raise ValueError("GC限定试验只允许cycle/batch/light/diagnostic/1000/400/16/无预送/零延迟/默认通信。")
+        raise ValueError("GC限定试验只允许cycle/batch/light/diagnostic/无trace1000或trace200/400/16/无预送/零延迟/默认通信。")
     # 固定依赖先导入，再进入冷GC边界；不预建试验对象。
     from secure_control.execution.lan_runtime import RunControl  # noqa: F401
     from secure_control.scenarios.cart_pole.interactive import InteractiveSession  # noqa: F401
@@ -1765,7 +1765,7 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
         "recording_mode": recording_mode,
         "evidence_state": "not_recorded" if light else "full_observation_spool",
         "diagnostic": diagnostic, "diagnostic_report": diagnostic_report,
-        "timeout_trace": ({"format_version": 1, "scope": "single bounded S3 diagnosis",
+        "timeout_trace": ({"format_version": 1, "scope": f"single bounded {_gc_trial.policy} timeout diagnosis",
                            "first_failure_observed_ns": (diagnostic_observer.first_failure[2]
                                 if diagnostic_observer.first_failure is not None else None)}
                           if timeout_trace else None),

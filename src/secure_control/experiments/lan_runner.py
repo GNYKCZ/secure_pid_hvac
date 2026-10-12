@@ -578,7 +578,7 @@ def _run() -> int:
     benchmark.add_argument("--gc-trial-policy", choices=("baseline", "startup-freeze"),
                            help="独占Client一次性限定GC对照；默认不启用")
     benchmark.add_argument("--timeout-trace", action="store_true",
-                           help="S3一次最多200周期的有限socket超时定位")
+                           help="显式baseline或startup-freeze一次最多200周期的有限socket超时定位")
     benchmark.add_argument("--fixed-proof-cache", action="store_true",
                            help="full-observation固定精确矩阵计算的显式候选对照")
     benchmark.add_argument("--role-config", type=Path)
@@ -594,7 +594,7 @@ def _run() -> int:
 
         try:
             if args.timeout_trace and (args.case != "cycle" or args.mode != "batch"):
-                raise ValueError("S3 timeout-trace只支持cycle/batch。")
+                raise ValueError("timeout-trace只支持cycle/batch。")
             if args.gc_trial_policy is not None and (args.case != "cycle" or args.mode != "batch"):
                 raise ValueError("GC限定试验只支持cycle/batch。")
             if args.recording is not None and args.case != "cycle":

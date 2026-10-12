@@ -495,9 +495,13 @@ GC stop保存collected/uncollectable计数，缺失配对与overflow明确报告
 两组均为comparison_only/diagnostic，qualification_pass和stage_pass均false；
 即使1000步无miss，也不替代默认持续供料门禁、10000步、GUI或三机验收。
 
-S3为另行批准的单次定位：`--timeout-trace`仅与startup-freeze及200周期、
+S3为另行批准的单次定位：`--timeout-trace`与startup-freeze及200周期、
 cycle/batch/light/diagnostic、段400/槽16/无预送/零注入/默认通信的本机三角色组合。
-False不安装socket探针；S2不带该标志仍严格要求1000周期。新探针在freeze后创建，
+S4另行批准baseline的同一严格200周期组合，复用相同探针及预算，只有启动GC条件不同：
+一次cold collect和原startup_gc保留，不freeze/unfreeze、disable或改阈值。
+baseline仍是有额外冷启动清理和观测的诊断条件，不等于正式默认资格；
+S3预算已用尽，S4仅一组一次、最多200尝试，初始化失败也耗用机会，不追加冻结对照。
+False不安装socket探针；S2不带该标志仍严格要求1000周期。新探针在冷GC及可选freeze后创建，
 仅在原send_exact/receive_exact调用参数处透传同buffer、参数、返回及异常；
 不改socket算法、blocking、原cursor或deadline，不加重试/业务重发。每角色最多4探针、
 8条公开上下文，只有角色/操作/session/round/step/sequence等白名单标量，
@@ -511,13 +515,14 @@ first_failure锚点在清理前，区分absolute_precheck、socket_send、socket
 外层和直接cause仅公开类别与整数errno/winerror，异常native调用的部分进度明确unknown。
 时点包含探针开销，不能看到C内部重试/内核路径，线程CPU量化不证明GIL归因。
 
-S3固定环为128 socket/64 frame阶段/64 GC/32 producer/16首错与关闭，共304槽，
+S3/S4固定环为128 socket/64 frame阶段/64 GC/32 producer/16首错与关闭，共304槽，
 活跃配对最多16，仍受每角色512槽/72KiB、总256KiB（含GCtrial摘要）保护。
 各环正常淘汰evicted_count与导出encoded_omitted分别记录，公开实际最早保留时点。
 首个Client错误立即锁存；随后正常停止流量不挤掉现场，只保留在途GC/补货结束和有界close。
 旧固定窗口不叠加；保持原RSS256MiB、g0/g100与启动/结束/恢复检查及GC/钩子恢复。
 仅在固定提交推送、发布预声明后运行一次最多200周期，首失败停，退出一次集中输出。
 失败/缺测/省略/未复现均不重跑，不复用剩余上限、不加对照或参数扫描。
+S4未复现或关键区间缺证时定位未完成，停止新增运行与自动往返交接，不制造后续试验。
 diagnostic/comparison_only=true，qualification/stage=false；200成功不代表正式冻结可采用，
 也不替代1000/10000、跨段、完整路线/GUI、网络、三机或硬件资格。
 
