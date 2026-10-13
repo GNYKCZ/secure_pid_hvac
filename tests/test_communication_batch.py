@@ -3091,3 +3091,336 @@ def test_s10_cli_rejects_other_routes_and_transfers_only_diagnostic_flag(tmp_pat
     monkeypatch.setattr("sys.argv", base+["--case", "cycle", "--mode", "batch"])
     assert lan_runner._run() == 0
     assert calls[0]["worker_wait_diagnostic"] is True and calls[0]["worker_long_run"] is False
+
+
+def test_s11_party_offline_collect_once_before_ack_and_restore_meter(monkeypatch):
+    """穿过真实party/meter组合；装配后清理，原参数及所有hook退出恢复。"""
+    import gc
+
+    from secure_control.execution import lan_runtime, localhost_transport
+    from secure_control.experiments import communication_benchmark as bench
+
+    before = (lan_runtime._party_reply, lan_runtime.receive_envelope,
+              localhost_transport._send_exact, localhost_transport.decode_envelope, list(gc.callbacks))
+    calls, assembled = [], []
+    sock, payload, answer = object(), object(), object()
+    def reply(s, request, value, timeout, *, deadline=None):
+        assert (s, value, timeout, deadline) == (sock, payload, 30, 123)
+        calls.append(request.operation)
+        return answer
+    def collect(generation):
+        assert generation == 2 and assembled == ["offline", "role", "recovery"]
+        calls.append("collect")
+        for callback in tuple(gc.callbacks):
+            callback("start", {"generation": 2})
+            callback("stop", {"generation": 2, "collected": 6, "uncollectable": 0})
+        return 6
+    def run(config, *, batch):
+        assert batch
+        for op in ("lan_ready", "lan_setup"):
+            request = SimpleNamespace(operation=op, payload=None)
+            assert lan_runtime._party_reply(sock, request, payload, 30, deadline=123) is answer
+        assembled.extend(("offline", "role", "recovery"))
+        for op in ("offline", "offline", "online", "commit", "segment_begin", "segment_end"):
+            request = SimpleNamespace(operation=op, payload=SimpleNamespace(action="stop"))
+            assert lan_runtime._party_reply(sock, request, payload, 30, deadline=123) is answer
+        return {"status": "closed"}
+    monkeypatch.setattr(lan_runtime, "_party_reply", reply)
+    monkeypatch.setattr(gc, "collect", collect)
+    monkeypatch.setattr(bench, "run_party_single_step", run)
+    monkeypatch.setattr(bench, "_process_memory", lambda: {"current_rss_bytes": 1024, "peak_rss_bytes": 1024})
+    queue = Queue()
+    bench._party_job(SimpleNamespace(role="P1"), (101, 102, 103), 0, True, queue,
+                     material_comparison=True, server_gc_candidate=True)
+    row = queue.get_nowait()
+    assert row["status"] == "closed" and calls == ["lan_ready", "lan_setup", "collect",
+        "offline", "offline", "online", "commit", "segment_begin", "segment_end"]
+    assert lan_runtime._party_reply is reply
+    assert before[1:] == (lan_runtime.receive_envelope, localhost_transport._send_exact,
+                          localhost_transport.decode_envelope, list(gc.callbacks))
+    observed = row["server_gc"]
+    assert observed["startup_collect"]["completed"] and observed["startup_collect"]["collected"] == 6
+    assert observed["startup_attempted"] and observed["normal_stop_ack_sent"]
+    assert observed["events"] == [] and observed["callback_and_hook_restored"]
+    assert observed["gc_before"]["threshold"] == observed["gc_after"]["threshold"] == [700, 10, 10]
+
+
+def test_s11_selector_rejects_invalid_and_conflicting_modes_before_side_effects(monkeypatch):
+    import gc
+
+    from secure_control.experiments import communication_benchmark as bench
+
+    calls = []
+    def selected(options, candidate, **kw):
+        calls.append((options, candidate, kw))
+        return {}
+    def forbidden(*args, **kwargs):
+        pytest.fail("非法S11选择不能创建端口、角色或材料")
+    monkeypatch.setattr(bench, "_run_material_comparison", selected)
+    monkeypatch.setattr(bench, "_ports", forbidden)
+    base = {"steps": 4000, "delay_ms": 0, "segment_steps": 400, "material_slots": 16,
+            "optimized": True, "recording_mode": "light", "server_gc_candidate": True}
+    edits = {"steps": (20, 1000, 10000, 4000., True), "segment_steps": (400., 401),
+        "material_slots": (16., 17), "delay_ms": (True, .1), "preload_steps": (1, False),
+        "preload_execution": ("split",), "optimized": (False,), "recording_mode": ("full",),
+        "diagnostic": (True,), "timeout_trace": (True,), "material_candidate": ("worker", "thread"),
+        "worker_timeout_diagnostic": (True,), "worker_long_run": (True,), "worker_wait_diagnostic": (True,),
+        "gc_trial_policy": ("baseline",), "role_config": ("external.yaml",), "tcp_nodelay": (False, True),
+        "commit_policy": ("parallel",), "server_gc_candidate": (1, "yes")}
+    for key, values in edits.items():
+        for value in values:
+            with pytest.raises(ValueError):
+                bench.run_continuous_observation(**(base | {key: value}))
+            assert not calls
+    for name, replacement in (("isenabled", lambda: False), ("get_threshold", lambda: (701, 10, 10)),
+                              ("get_freeze_count", lambda: 1), ("get_debug", lambda: 1),
+                              ("callbacks", [lambda *args: None])):
+        with monkeypatch.context() as patcher:
+            patcher.setattr(gc, name, replacement)
+            with pytest.raises(ValueError):
+                bench.run_continuous_observation(**base)
+        assert not calls
+    bench.run_continuous_observation(**base)
+    assert calls[0][1:] == ("worker", {"target_steps": 4000})
+    assert calls[0][0]["server_gc_candidate"] is True
+
+
+def test_s11_startup_or_original_reply_error_never_fakes_ack_and_restores(monkeypatch):
+    import gc
+
+    from secure_control.execution import lan_runtime
+    from secure_control.experiments import communication_benchmark as bench
+
+    callbacks, state = list(gc.callbacks), bench._ServerGCObservation.state()
+    monkeypatch.setattr(bench, "_process_memory", lambda: {"current_rss_bytes": 1024})
+    for fault in ("collect", "reply"):
+        calls, error = [], OSError("private failure text")
+        def collect(generation, calls=calls, fault=fault, error=error):
+            calls.append("collect")
+            if fault == "collect":
+                raise error
+            return 4
+        def reply(*args, calls=calls, error=error, **kwargs):
+            calls.append("reply")
+            raise error
+        monkeypatch.setattr(gc, "collect", collect)
+        monkeypatch.setattr(lan_runtime, "_party_reply", reply)
+        observation = bench._ServerGCObservation("P2")
+        with pytest.raises(OSError) as caught, observation.installed():
+            lan_runtime._party_reply(object(), SimpleNamespace(operation="offline"), None, 30)
+        assert caught.value is error and calls == (["collect"] if fault == "collect" else ["collect", "reply"])
+        row = observation.report()
+        assert row["startup_collect"]["completed"] == (fault == "reply")
+        assert row["startup_collect"]["error_type"] == ("OSError" if fault == "collect" else None)
+        assert row["callback_and_hook_restored"] and lan_runtime._party_reply is reply
+        assert gc.callbacks == callbacks and bench._ServerGCObservation.state()["threshold"] == state["threshold"]
+        assert "private" not in str(row)
+
+
+def test_s11_gen2_ring_is_bounded_pairing_honest_and_no_runtime_encoding(monkeypatch):
+    from secure_control.experiments import communication_benchmark as bench
+
+    ticks = iter(range(10000))
+    observation = bench._ServerGCObservation("P1", wall=lambda: next(ticks))
+    def forbidden(*args, **kw):
+        pytest.fail("回调不能编码JSON或主动collect")
+    with monkeypatch.context() as patcher:
+        patcher.setattr(bench.json, "dumps", forbidden)
+        patcher.setattr(bench.gc, "collect", forbidden)
+        observation._gc("start", {"generation": 0})
+        observation._gc("stop", {"generation": 0})
+        assert observation.pending is None and observation.count == 0
+        for _ in range(70):
+            observation._gc("start", {"generation": 2})
+            observation._gc("stop", {"generation": 2, "collected": 6, "uncollectable": 0})
+        observation._gc("stop", {"generation": 2})
+        observation._gc("start", {"generation": 2})
+        observation._gc("start", {"generation": 2})
+    row = observation.report()
+    assert len(row["events"]) == 64 and row["completed_count"] == 70 and row["evicted_count"] == 6
+    assert row["unpaired_count"] == 2 and row["pending"] is not None
+    assert row["max_interval_ns"] == 1 and row["total_interval_ns"] == 70
+    assert row["events"][0][:2] == (12, 13) and row["events"][-1][:2] == (138, 139)
+    assert row["encoded_bytes"] <= 32768 and not row["budget_failed"]
+    assert all(len(event) == 6 for event in row["events"])
+    assert "round" not in row["fields"] and "step" not in row["fields"]
+
+
+def test_s11_observation_clock_encoding_and_child_memory_failures_refuse_evidence(monkeypatch):
+    from secure_control.experiments import communication_benchmark as bench
+
+    ticks = iter((2, 1))
+    observation = bench._ServerGCObservation("P1", wall=lambda: next(ticks))
+    observation._gc("start", {"generation": 2})
+    observation._gc("stop", {"generation": 2, "collected": 0, "uncollectable": 0})
+    assert observation.error_type == "ValueError" and observation.count == 0
+    huge = 10**300
+    observation.slots = [(huge, huge + 1, huge, 2, huge, huge)] * 64
+    row = observation.report()
+    assert row["budget_failed"] and row["encoded_omitted"] > 0 and row["encoded_bytes"] <= 32768
+    monkeypatch.setattr(bench, "_process_memory", lambda: {"current_rss_bytes": 257 * 1024**2})
+    with pytest.raises(RuntimeError, match="RSS"):
+        observation._memory("software_fixture")
+
+
+def _s11_public_result():
+    """复用已有公开周期fixture，缩为4000并补9次维护/启动/原停止证据。"""
+    from secure_control.experiments import communication_benchmark as bench
+
+    result = _s9_public_result()
+    result["cycles"] = result["cycles"][:4000]
+    result.update(requested_steps=4000, successful_steps=4000, protocol_committed_count=4000,
+                  physically_confirmed_count=4000, cycle_summary={"attempts": 4000, "misses": 0},
+                  resource_counts={"products_consumed": 120000, "truncations_consumed": 16000})
+    result["material_summary"].update(claimed=4000, generated_received=4016)
+    numeric = result.pop("worker_long_run")["numeric_contract"]
+    numeric.update(block_steps=19, parameter_bits=40, runtime_payload_bits=46)
+    metadata = {"format_version": 1, "target_steps": 4000, "maximum_attempts": 4000,
+                "first_failure_stop": True, "numeric_contract": numeric}
+    for step in range(399, 3999, 400):
+        result["cycles"][step]["phase_durations_ns"] = {"maintenance": 1}
+    for party in result["party_outcomes"]:
+        party["steps"] = party["steps"][:4000]
+        observation = bench._ServerGCObservation(party["role"])
+        observation.gc_before = observation.gc_after = {
+            "enabled": True, "threshold": [700, 10, 10], "freeze_count": 0, "debug": 0}
+        observation.startup = {"start_ns": -10, "end_ns": -1, "collected": 6,
+                               "completed": True, "error_type": None, "native_thread_id": 1}
+        observation.startup_attempted = observation.normal_stop_ack_sent = observation.restored = True
+        party["server_gc"] = observation.report()
+    result["last_commit_observation"].update(round_id="round-3999", step=3999, global_step=3999)
+    result.update(comparison_only=True, qualification_pass=False, stage_pass=False)
+    return result, metadata
+
+
+def test_s11_gate_separates_finite_candidate_from_runtime_gen2_coverage():
+    from secure_control.experiments import communication_benchmark as bench
+
+    report = {"memory_guard_failed": False, "cleanup_failed": False, "producer_exited": True}
+    for covered in (False, True):
+        result, metadata = _s11_public_result()
+        if covered:
+            for party in result["party_outcomes"]:
+                party["server_gc"]["events"] = [(100, 200, 1, 2, 6, 0)]
+        bench._finish_server_gc(result, report, metadata)
+        assert result["server_gc_candidate_gate_pass"]
+        assert metadata["runtime_gen2_covered"] == covered
+        assert metadata["actual_attempts"] == 4000 and metadata["invocation_budget_consumed"]
+        assert metadata["encoded_bytes"] <= 98304
+        assert result["diagnostic"] is False and result["diagnostic_report"] is None and result["timeout_trace"] is None
+        assert result["comparison_only"] and not any(result[key] for key in
+            ("candidate_gate_pass", "worker_long_run_gate_pass", "qualification_pass", "stage_pass"))
+
+
+def test_s11_gate_rejects_bad_period_boundary_proof_stop_and_missing_evidence():
+    from copy import deepcopy
+
+    from secure_control.experiments import communication_benchmark as bench
+
+    good, metadata = _s11_public_result()
+    report = {"memory_guard_failed": False, "cleanup_failed": False, "producer_exited": True}
+    bench._finish_server_gc(good, report, metadata)
+    edits = [(("cycles", 0, "global_step"), False), (("cycle_summary", "misses"), False),
+        (("cycles", 399, "cycle_completed_ns"), good["cycles"][399]["deadline_ns"]),
+        (("cycles", 3999, "cycle_completed_ns"), None), (("cycles", 400, "actual_sample_start_ns"), None),
+        (("cycles", 399, "phase_durations_ns", "maintenance"), -1),
+        (("cycles", 799, "phase_durations_ns"), {}), (("cycles", 400, "round_id"), "round-399"),
+        (("server_gc_candidate", "numeric_contract", "block_steps"), 20),
+        (("server_gc_candidate", "numeric_contract", "horizon_steps"), 4000),
+        (("server_gc_candidate", "numeric_contract", "runtime_payload_bits"), 45),
+        (("server_gc_candidate", "roles", 0, "normal_stop_ack_sent"), False),
+        (("server_gc_candidate", "roles", 1, "startup_collect", "completed"), False),
+        (("server_gc_candidate", "observation_failed"), True),
+        (("last_commit_observation", "parties", "P2", "valid_ack_received"), False),
+        (("material_summary", "worker_exited"), False), (("material_summary", "cleanup_failed"), True),
+        (("material_summary", "inventory_inflight_high_water"), 17),
+        (("material_summary", "material_encoded_bound_high_water"), 8388609),
+        (("resource_counts", "products_consumed"), 119970), (("protocol_committed_count",), 3999)]
+    for path, value in edits:
+        bad = deepcopy(good)
+        parent = bad
+        for key in path[:-1]:
+            parent = parent[key]
+        parent[path[-1]] = value
+        assert not bench._server_gc_run_gate(bad, report), path
+    for key in ("cycles", "party_outcomes", "last_commit_observation", "server_gc_candidate"):
+        bad = deepcopy(good)
+        bad.pop(key)
+        assert not bench._server_gc_run_gate(bad, report)
+
+
+def test_s11_missing_role_record_or_budget_failure_preserves_control_first_error():
+    from secure_control.experiments import communication_benchmark as bench
+
+    report = {"memory_guard_failed": False, "cleanup_failed": False, "producer_exited": True}
+    for fault in ("missing", "encoding", "pending", "budget"):
+        result, metadata = _s11_public_result()
+        original_cycles = result["cycles"]
+        if fault == "missing":
+            result["party_outcomes"][1].pop("server_gc")
+        elif fault == "encoding":
+            result["party_outcomes"][1]["server_gc"] = {"role": "P2", "error_type": "OSError"}
+        elif fault == "pending":
+            for party in result["party_outcomes"]:
+                party["server_gc"].update(events=[(100, 200, 1, 2, 6, 0)], pending=(300, 1))
+        else:
+            metadata["scope_fixture"] = "public" * 17000
+            result.update(status="uncertain", failure_category="LocalhostTransportTimeout", failed_phase="ROUND_IN_FLIGHT")
+        bench._finish_server_gc(result, report, metadata)
+        assert result["cycles"] is original_cycles and not metadata["runtime_gen2_covered"]
+        if fault in ("missing", "encoding"):
+            assert result["failure_category"] == "ServerGCObservation" and not result["server_gc_candidate_gate_pass"]
+        elif fault == "pending":
+            assert result["server_gc_candidate_gate_pass"]  # 有限通过，但gen2观察不完整
+        else:
+            assert result["failure_category"] == "LocalhostTransportTimeout" and metadata["budget_failed"]
+            assert result["failed_phase"] == "ROUND_IN_FLIGHT" and not result["server_gc_candidate_gate_pass"]
+
+
+def test_s11_real_initialization_restores_hooks_closes_queue_and_retains_original_error(monkeypatch):
+    import gc
+
+    from secure_control.execution import lan_runtime, localhost_transport
+    from secure_control.experiments import communication_benchmark as bench
+    from secure_control.experiments import lan_continuous_profile
+
+    originals = (localhost_transport._send_exact, localhost_transport._receive_exact,
+                 lan_runtime._party_reply, lan_runtime.LanSegmentedRuntime.close, list(gc.callbacks))
+    for fault in ("control", "profile"):
+        with monkeypatch.context() as patcher:
+            closed = []
+            def failed(*args, **kwargs):
+                raise OSError("private startup text")
+            def forbidden(*args, **kwargs):
+                pytest.fail("软件fixture不能启动角色或性能验证")
+            context = SimpleNamespace(Queue=lambda closed=closed: SimpleNamespace(close=lambda: closed.append(True)),
+                Process=lambda **kwargs: SimpleNamespace(start=forbidden, join=forbidden, is_alive=lambda: False))
+            patcher.setattr(bench.mp, "get_context", lambda method, context=context: context)
+            patcher.setattr(bench, "_ports", lambda: (101, 102, 103))
+            patcher.setattr(lan_runtime if fault == "control" else lan_continuous_profile,
+                            "RunControl" if fault == "control" else "load_segmented_experiment", failed)
+            result = bench.run_continuous_observation(steps=4000, delay_ms=0, segment_steps=400,
+                optimized=True, recording_mode="light", server_gc_candidate=True)
+            assert closed == [True] and result["failure_category"] == "OSError" and result["cycles"] == []
+            assert result["server_gc_candidate"]["actual_attempts"] == 0
+            assert result["diagnostic"] is False and result["diagnostic_report"] is None
+            assert not result["server_gc_candidate_gate_pass"] and "private startup" not in str(result)
+        assert originals == (localhost_transport._send_exact, localhost_transport._receive_exact,
+                            lan_runtime._party_reply, lan_runtime.LanSegmentedRuntime.close, list(gc.callbacks))
+
+
+def test_s11_cli_rejects_other_routes_and_transfers_only_candidate_flag(tmp_path, monkeypatch):
+    from secure_control.experiments import communication_benchmark as bench
+    from secure_control.experiments import lan_runner
+
+    calls = []
+    monkeypatch.setattr(bench, "run_continuous_observation", lambda **kw:
+                        calls.append(kw) or {"status": "stopped", "cycle_timing": {"p50_ms": 1.}})
+    base = ["secure-control", "benchmark", "--server-gc-candidate", "--steps", "4000",
+            "--recording", "light", "--output", str(tmp_path / "raw.json")]
+    for route in (["--case", "full-observation"], ["--case", "cycle", "--mode", "legacy"]):
+        monkeypatch.setattr("sys.argv", base + route)
+        assert lan_runner._run() == 5 and not calls and not (tmp_path / "raw.json").exists()
+    monkeypatch.setattr("sys.argv", base + ["--case", "cycle", "--mode", "batch"])
+    assert lan_runner._run() == 0
+    assert calls[0]["server_gc_candidate"] is True and calls[0]["worker_wait_diagnostic"] is False

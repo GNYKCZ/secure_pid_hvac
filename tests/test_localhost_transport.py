@@ -181,6 +181,111 @@ def test_integer_share_wire_bytes_match_original_scalar_and_array_encoding() -> 
             encode_wire_value(AdditiveShare(invalid))
 
 
+def _s11_online_wire(role):
+    """原数学/材料生成器产出合法online，不拼装一个绕过校验的DTO。"""
+    import random
+
+    from test_two_party_protocol import make_stack
+
+    from secure_control.protocol.messages import PartyOnlineMaterial, PartyOnlineRound
+
+    owner, _, _, _, distribution = make_stack()
+    online = owner.prepare_online(distribution, [0.25], step=0, rng=random.Random(11))
+    material = PartyOnlineMaterial.from_round(PartyOnlineRound(
+        online.p1_input if role == "P1" else online.p2_input,
+        online.p1_resources if role == "P1" else online.p2_resources))
+    return encode_envelope(WireEnvelope(SCHEMA_VERSION, "request", "Client", role, 3, "online",
+        online.session_id, online.round_id, 0, None, material))
+
+
+def test_s11_codec_reordered_online_preserves_both_roles_wire_bytes():
+    def reverse(value):
+        if isinstance(value, dict):
+            return {key: reverse(value[key]) for key in reversed(value)}
+        if isinstance(value, list):
+            return [reverse(item) for item in value]
+        return value
+    for role in ("P1", "P2"):
+        wire = _s11_online_wire(role)
+        shuffled = json.dumps(reverse(json.loads(wire)), separators=(",", ":")).encode()
+        assert shuffled != wire
+        assert encode_envelope(decode_envelope(shuffled)) == wire
+
+
+def test_s11_codec_rejects_missing_extra_and_same_count_wrong_hot_fields():
+    from copy import deepcopy
+
+    from secure_control.execution import localhost_codec as codec
+
+    roots = [json.loads(_s11_online_wire("P1")), json.loads(encode_wire_value(AdditiveShare(7)))]
+    found = {}
+    def visit(value):
+        if isinstance(value, dict):
+            if value.get("type") in codec._ONLINE_FIELDS:
+                found.setdefault(value["type"], value)
+            for item in value.values():
+                visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+    for root in roots:
+        visit(root)
+    assert set(found) == set(codec._ONLINE_FIELDS)
+    for obj in found.values():
+        key = next(key for key in obj if key != "type")
+        for edit in ("missing", "extra", "same_count"):
+            bad = deepcopy(obj)
+            if edit != "extra":
+                value = bad.pop(key)
+            if edit != "missing":
+                bad["unexpected_public_field"] = None if edit == "extra" else value
+            with pytest.raises(LocalhostCodecError, match="字段集合"):
+                decode_wire_value(json.dumps(bad).encode())
+    with pytest.raises(TypeError):
+        codec._ONLINE_FIELDS["share"] = frozenset()
+    assert all(isinstance(fields, frozenset) for fields in codec._ONLINE_FIELDS.values())
+
+
+def test_s11_codec_generic_rejections_match_original_field_algorithms(monkeypatch):
+    """旧集合算法作独立比较，合法/非法语言和异常不因减少分配而改变。"""
+    from secure_control.execution import localhost_codec as codec
+
+    original_mapping, original_fields = codec._mapping, codec._exact_fields
+    def mapping(value, name):
+        if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+            raise LocalhostCodecError(f"{name} 必须是 JSON object。")
+        return value
+    def fields(value, expected, name):
+        if set(value) != expected:
+            raise LocalhostCodecError(f"{name} 字段集合不匹配。")
+    def outcome(wire):
+        try:
+            return ("wire", encode_wire_value(decode_wire_value(wire)))
+        except (LocalhostCodecError, ValueError, TypeError) as error:
+            return (type(error).__name__, str(error))
+    deep = {"type": "share", "value": None}
+    for _ in range(34):
+        deep = {"public": deep}
+    wires = [encode_wire_value(AdditiveShare(-(1 << 200))),
+        encode_wire_value(AdditiveShare(np.array([[0, 1 << 180]], dtype=object))),
+        b'{"type":"share","value":{"type":"bigint","decimal":true}}',
+        b'{"type":"share","value":{"type":"bigint","decimal":"-0"}}',
+        b'{"type":"bigint_array","shape":[true],"values":["1"]}',
+        b'{"type":"bigint_array","shape":[2],"values":["1"]}',
+        b'{"type":"bigint_array","shape":[1000001],"values":[]}',
+        b'{"type":"float_array","shape":[1],"values":[1e309]}',
+        b'{"type":"bigint","type":"bigint","decimal":"1"}', b'\xff',
+        b'{"type":"bigint","decimal":NaN}', json.dumps(deep).encode(),
+        json.dumps({str(i): i for i in range(65)}).encode()]
+    expected = [outcome(wire) for wire in wires]
+    assert all(row[0] != "wire" for row in expected[2:])
+    monkeypatch.setattr(codec, "_mapping", mapping)
+    monkeypatch.setattr(codec, "_exact_fields", fields)
+    assert [outcome(wire) for wire in wires] == expected
+    monkeypatch.setattr(codec, "_mapping", original_mapping)
+    monkeypatch.setattr(codec, "_exact_fields", original_fields)
+
+
 def test_public_int64_input_array_round_trip_preserves_low_bits() -> None:
     vector = np.array([(1 << 60) - 1, -((1 << 60) - 1)], dtype=np.int64)
 

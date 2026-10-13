@@ -694,6 +694,56 @@ worker_long_run/stage/qualification均false。即使4000全成功也只报“未
 Design分析后停止。GC重合仅是线索、低CPU大等待不证明网络/GIL原因，ACK发送
 返回不等于Client已收到，软件设备确认不等于硬件施力。
 
+### 正常 GC 下的有限服务器候选（S11）
+
+`--server-gc-candidate` 默认关闭，严格独立接受 cycle/batch/light、4000周期、
+段400、16槽、无预送、零注入、内部角色、原TCP和双提交。使用既有worker；
+与S5/S6/S9/S10、GC试验、重诊断、timeout_trace和配置/通信覆盖双向互斥。
+选择必须为严格bool；GC须enabled、700/10/10、无冻结/debug/外部callback，
+错误选择在创建端口和材料之前拒绝。原入口的20/1000/4000诊断/10000限制保持。
+
+```powershell
+uv run secure-control benchmark --case cycle --mode batch --steps 4000 --delay-ms 0 --segment-steps 400 --material-slots 16 --preload-steps 0 --recording light --server-gc-candidate --output .tmp/issue120-s11-server-gc-candidate.json
+```
+
+[D11批准](https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6148905058)
+授权六文件限定优化与软件/独立核查通过后一次最多4000尝试的验证。先发布并
+全文读回新完整SHA、来源/配置/依赖/初态/持续数值证明/环境时钟和唯一命令；
+输出/日志必须尚不存在。启动失败也消费预算，首次失败立即停，不预热、补步、
+重跑或加对照；3/3不重置，新有效Finding不触发自动第四轮。完成后公开全部
+尝试和可恢复原件/hash，实际交回Design只读分析后停止。
+
+canonical codec只减少固定字段校验的临时对象，公开字段名为不可变常量，
+不缓存秘密值/DTO。schema3和原编码字节、重复键/UTF-8/有限值、深度/数量、
+完整字段集合（含同数异名）、严格类型/shape/decimal/资源身份检查保持。
+候选P1/P2在有效offline材料恢复、角色/recovery装配后、原offline ACK前各
+仅主动`gc.collect(2)`一次。清理失败不发伪ACK；lan_ready、online、commit及
+跨段不重复主动清理。Client原准备及t0边界保持，正式入口GC策略不改。
+
+新增轻量profile `server-gen2-light-v1`只保存正常gen2的公开QPC起止、线程、
+generation/collected/uncollectable；没有当前round/step身份，明确unknown。
+每方64完成区间+1pending、32KiB/角色，合并96KiB含元数据，全周期/raw另计。
+淘汰/未配对/编码省略/已观察最大值另报；启动主动清理单列，不算运行期覆盖。
+运行中不遍历对象、读locals或秘密值、编码JSON/写盘，不安装S10逐socket/frame/
+阶段探针。退出恢复callback及hook；观察/编码/内存错误拒绝候选且不覆盖原首错。
+原材料库存+在途16、预编码8MiB、Client/worker及新增子角色离散RSS256MiB、
+原有界退出保护保持；离散RSS不是瞬时峰值或长期内存证明。
+
+`server_gc_candidate`元数据version1公开target/max4000、实际尝试/失败、预算
+消费、两方启动清理、运行期gen2覆盖和观察预算。`diagnostic=false`、
+`diagnostic_report=null`、`timeout_trace=null`表示没有旧重探针，新增轻量GC
+观察仍存在。新`server_gc_candidate_gate_pass`须4000全部有效按时确认、零miss、
+唯一身份与连续确认前缀、120000乘法/16000截断、原持续reachability/horizon=None/
+block19证明、9次继续维护g399…3599在原20M ns周期内，以及最后周期和原正常
+停止/双方ACK/worker退出成功。迟采样占原预算，不刷新deadline。
+
+`runtime_gen2_covered`独立报告：两方完整保留控制窗口内gen2且没有淘汰/未配对/
+省略才支持覆盖此类暂停。未发生或记录不完整时，即使有限门禁通过也不能说
+长期GC风险已经验证；启动清理可能只推迟首轮暂停。两项优化共同候选、无同SHA
+A/B，不分配单项收益。始终`comparison_only=true`，旧candidate/worker_long_run/
+stage/qualification保持false。原10000、完整路线、认证三机网络和硬件验收仍需
+独立完成，软件设备确认不等于真实施力，不据此推广正式默认或合并PR。
+
 早期有限诊断预算为fused/stock1000/段400的零注入406步和1ms每帧1步，各一次，现已使用，不能复用；
 失败即停，退出集中输出。未复现也不得循环追样本或用诊断PASS代替1000/10k验收。
 

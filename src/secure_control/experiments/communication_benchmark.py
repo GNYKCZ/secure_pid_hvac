@@ -32,6 +32,135 @@ from secure_control.execution.lan_scalar_runtime import LanScalarRuntime
 _ROOT = Path(__file__).resolve().parents[3]
 
 
+class _ServerGCObservation:
+    """S11单方轻量gen2观察；不读对象/秘密身份，不安装逐帧或阶段探针。"""
+
+    def __init__(self, role, *, wall=None):
+        self.role, self.wall = role, wall or time.perf_counter_ns
+        self.slots = [None] * 64
+        self.count = self.evicted = self.unpaired = self.max_ns = self.total_ns = 0
+        self.pending = self.startup = self.error_type = None
+        self.collecting = self.startup_attempted = self.normal_stop_ack_sent = False
+        self.memory = []
+        self.gc_before = self.gc_after = None
+        self.restored = False
+
+    @staticmethod
+    def state():
+        return {"enabled": gc.isenabled(), "threshold": list(gc.get_threshold()),
+                "freeze_count": gc.get_freeze_count(), "debug": gc.get_debug(), "stats": gc.get_stats()}
+
+    def _gc(self, phase, info):
+        # 回调不能冒用上轮身份；启动主动清理单独计时，不计作运行期gen2覆盖。
+        if self.collecting or info.get("generation") != 2:
+            return
+        try:
+            stamp = self.wall()
+            thread = get_native_id()
+            if phase == "start":
+                if self.pending is not None:
+                    self.unpaired += 1
+                self.pending = (stamp, thread)
+            elif phase == "stop":
+                if self.pending is None or self.pending[1] != thread:
+                    self.unpaired += 1
+                    return
+                started, thread = self.pending
+                self.pending = None
+                elapsed = stamp-started
+                if elapsed < 0:
+                    raise ValueError("S11观察时钟逆序。")
+                self.slots[self.count % 64] = (started, stamp, thread, 2,
+                    info.get("collected"), info.get("uncollectable"))
+                self.count += 1
+                self.evicted = max(0, self.count-64)
+                self.max_ns = max(self.max_ns, elapsed)
+                self.total_ns += elapsed
+        except Exception as error:  # noqa: BLE001 - GC不会传播回调错误；下次原回复前拒绝
+            self.error_type = type(error).__name__
+
+    def _memory(self, moment):
+        value = _process_memory()
+        self.memory.append({"moment": moment, **value})
+        if value["current_rss_bytes"] > 256 * 1024 * 1024:
+            raise RuntimeError("S11子角色离散RSS超出原256MiB保护。")
+
+    @contextmanager
+    def installed(self):
+        """有效offline装配后、原ACK前仅清理一次；原回复/异常保持。"""
+        from secure_control.execution import lan_runtime
+
+        original = lan_runtime._party_reply
+        self.gc_before = self.state()
+        if (not gc.isenabled() or gc.get_threshold() != (700, 10, 10)
+                or gc.get_freeze_count() or gc.get_debug() or gc.callbacks):
+            raise ValueError("S11子角色必须使用原正常GC且没有外部callback。")
+        self._memory("before_offline")
+        def replied(sock, request, *args, **kwargs):
+            if self.error_type is not None:
+                raise RuntimeError("S11轻量观察失败。")
+            if request.operation == "offline" and not self.startup_attempted:
+                self.startup_attempted = True
+                self.collecting = True
+                self.startup = {"start_ns": self.wall(), "end_ns": None, "collected": None,
+                    "completed": False, "error_type": None, "native_thread_id": get_native_id()}
+                try:
+                    self.startup["collected"] = gc.collect(2)
+                    self.startup["end_ns"] = self.wall()
+                    self._memory("after_startup_collect")
+                    self.startup["completed"] = True
+                except Exception as error:  # 原异常直接传播，不伪造offline ACK
+                    self.startup["error_type"] = type(error).__name__
+                    raise
+                finally:
+                    self.collecting = False
+            value = original(sock, request, *args, **kwargs)
+            if request.operation == "segment_end" and getattr(request.payload, "action", None) == "stop":
+                self.normal_stop_ack_sent = True
+            return value
+        gc.callbacks.append(self._gc)
+        try:
+            with patch.object(lan_runtime, "_party_reply", replied):
+                yield self
+        finally:
+            if self._gc in gc.callbacks:
+                gc.callbacks.remove(self._gc)
+            self.restored = self._gc not in gc.callbacks and lan_runtime._party_reply is original
+            try:
+                self.gc_after = self.state()
+                self._memory("exit")
+            except Exception as error:  # noqa: BLE001 - 清理观察附加错误，不覆盖原首错
+                self.error_type = self.error_type or type(error).__name__
+
+    def report(self):
+        """仅退出时编码；环淘汰/未配对/编码省略与未知身份如实保留。"""
+        events = [slot for slot in self.slots if slot is not None]
+        events.sort(key=lambda slot: slot[0])
+        result = {"format_version": 1, "role": self.role, "profile": "server-gen2-light-v1",
+            "fields": ["start_ns", "end_ns", "native_thread_id", "generation", "collected", "uncollectable"],
+            "events": events, "pending": self.pending, "completed_count": self.count,
+            "evicted_count": self.evicted, "unpaired_count": self.unpaired, "max_interval_ns": self.max_ns,
+            "total_interval_ns": self.total_ns, "startup_collect": self.startup,
+            "startup_attempted": self.startup_attempted, "normal_stop_ack_sent": self.normal_stop_ack_sent,
+            "gc_before": self.gc_before, "gc_after": self.gc_after, "memory": self.memory,
+            "callback_and_hook_restored": self.restored, "error_type": self.error_type,
+            "scope": "public gen2 QPC intervals; round/step unknown; excludes explicit startup collect; no CPU/kernel attribution",
+            "event_limit": 64, "pending_limit": 1, "encoded_limit": 32 * 1024,
+            "encoded_omitted": 0, "budget_failed": False, "encoded_bytes": 0}
+        def size():
+            for _ in range(3):
+                result["encoded_bytes"] = len(json.dumps(result, separators=(",", ":"), allow_nan=False).encode())
+        size()
+        while result["encoded_bytes"] > result["encoded_limit"] and result["events"]:
+            result["budget_failed"] = True
+            result["encoded_omitted"] += 1
+            result["events"].pop(0)
+            size()
+        if result["encoded_bytes"] > result["encoded_limit"]:
+            result["budget_failed"] = True
+        return result
+
+
 class _Diagnostic:
     """基准专用有界观测；嵌套/重复阶段不可相加成独占成本。"""
 
@@ -1076,7 +1205,7 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
 def _party_job(
     config: LanConfig, ports: tuple[int, int, int], delay_ms: float, batch: bool, queue,
     diagnostic_enabled=False, full_observation=False, tcp_nodelay=None, supply_diagnostic=False,
-    timeout_trace=False, material_comparison=False, worker_wait_diagnostic=False,
+    timeout_trace=False, material_comparison=False, worker_wait_diagnostic=False, server_gc_candidate=False,
 ) -> None:
     role_steps = []
     diagnostic = (_TimeoutDiagnostic(config.role, ports, wait_profile=worker_wait_diagnostic) if timeout_trace else
@@ -1092,7 +1221,10 @@ def _party_job(
     counts, activity, restore = _meter(config.role, ports, delay_ms, role_steps, diagnostic,
                                        full_observation=full_observation, gc_boundaries=gc_boundaries)
     outcome = {"role": config.role}
+    server_gc = _ServerGCObservation(config.role) if server_gc_candidate else None
     try:
+        if server_gc:
+            observations.enter_context(server_gc.installed())
         result = run_party_single_step(config, batch=batch)
         outcome.update({"status": result.get("status", "closed"),
                    "directions": counts, "activity_ms": activity, "steps": role_steps,
@@ -1102,11 +1234,24 @@ def _party_job(
                    "error_type": type(error).__name__, "directions": counts,
                    "activity_ms": activity, "steps": role_steps, "memory": _process_memory()})
     finally:
-        restore()
-        observations.close()
+        # S11后装在meter之外，必须先退出外层，再恢复meter，避免留下旧包装。
+        if server_gc:
+            try:
+                observations.close()
+            finally:
+                restore()
+        else:
+            restore()
+            observations.close()
         outcome["tcp_socket_options"] = socket_options
         if diagnostic:
             outcome["diagnostic"] = diagnostic.report()
+        if server_gc:
+            try:
+                outcome["server_gc"] = server_gc.report()
+            except Exception as error:  # noqa: BLE001 - 编码失败也交回公开类别，不覆盖原首错
+                outcome["server_gc"] = {"role": config.role, "error_type": type(error).__name__,
+                                        "observation_report_failed": True}
         if gc_boundaries is not None:
             if "begin" in gc_boundaries and "end" not in gc_boundaries:
                 gc_boundaries["end"] = {"stats": gc.get_stats(), "enabled": gc.isenabled(),
@@ -1542,7 +1687,8 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                                recording_mode="full", tcp_nodelay=None,
                                commit_policy="default", gc_trial_policy=None, timeout_trace=False,
                                material_candidate=None, worker_timeout_diagnostic=False,
-                               worker_long_run=False, worker_wait_diagnostic=False) -> dict[str, object]:
+                               worker_long_run=False, worker_wait_diagnostic=False,
+                               server_gc_candidate=False) -> dict[str, object]:
     # 所有试验参数在任何端口/角色/材料创建前拒绝；默认入口走原路径。
     options = {"steps": steps, "delay_ms": delay_ms, "segment_steps": segment_steps,
                "optimized": optimized, "material_slots": material_slots, "role_config": role_config,
@@ -1550,6 +1696,23 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                "diagnostic": diagnostic, "recording_mode": recording_mode,
                    "tcp_nodelay": tcp_nodelay, "commit_policy": commit_policy,
                    "timeout_trace": timeout_trace}
+    if type(server_gc_candidate) is not bool:
+        raise ValueError("S11候选选择必须为严格bool。")
+    if server_gc_candidate:
+        if (optimized is not True or recording_mode != "light" or diagnostic is not False
+                or worker_long_run is not False or worker_timeout_diagnostic is not False
+                or worker_wait_diagnostic is not False or material_candidate is not None
+                or gc_trial_policy is not None or timeout_trace is not False
+                or type(steps) is not int or steps != 4000
+                or type(segment_steps) is not int or segment_steps != 400
+                or type(material_slots) is not int or material_slots != 16
+                or type(preload_steps) is not int or preload_steps != 0 or preload_execution != "fused"
+                or type(delay_ms) not in (int, float) or delay_ms != 0 or role_config is not None
+                or tcp_nodelay is not None or commit_policy != "default"
+                or not gc.isenabled() or gc.get_threshold() != (700, 10, 10)
+                or gc.get_freeze_count() or gc.get_debug() or gc.callbacks):
+            raise ValueError("S11只允许独立正常GC的worker/cycle/batch/light/4000/400/16/无预送/默认通信。")
+        return _run_material_comparison({**options, "server_gc_candidate": True}, "worker", target_steps=4000)
     if type(worker_wait_diagnostic) is not bool:
         raise ValueError("S10诊断选择必须为严格bool。")
     if worker_wait_diagnostic:
@@ -1666,7 +1829,7 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
     return report
 
 
-def _material_run_gate(result, report, candidate, target_steps, *, strict=False):
+def _material_run_gate(result, report, candidate, target_steps, *, strict=False, numeric_key="worker_long_run"):
     """复用S5材料/周期门禁；长期样本还须有全分母、身份链与双方确认。"""
     material = result.get("material_summary") or {}
     cycles = result.get("cycles", [])
@@ -1700,7 +1863,7 @@ def _material_run_gate(result, report, candidate, target_steps, *, strict=False)
                 or material["worker"].get("memory_guard_failed") is not False
                 or report.get("producer_exited") is not True):
             return False
-        numeric = result["worker_long_run"]["numeric_contract"]
+        numeric = result[numeric_key]["numeric_contract"]
         if (numeric["mode"] != "bounded_input_reachability" or numeric["horizon_steps"] is not None
                 or numeric["proof_algorithm"] != "encoded-block-power-rational-v1"):
             return False
@@ -1738,6 +1901,108 @@ def _material_run_gate(result, report, candidate, target_steps, *, strict=False)
         return False
 
 
+def _server_gc_run_gate(result, report):
+    """有限4000候选独立门禁；运行gen2覆盖单独判断，不授予原长期资格。"""
+    if not _material_run_gate(result, report, "worker", 4000, strict=True, numeric_key="server_gc_candidate"):
+        return False
+    try:
+        metadata = result["server_gc_candidate"]
+        if (metadata["observation_failed"] or metadata["budget_failed"]
+                or result.get("diagnostic") is not False or result.get("diagnostic_report") is not None
+                or result.get("timeout_trace") is not None):
+            return False
+        for row in result["cycles"]:
+            if any(type(row[k]) is not int for k in ("global_step", "segment_index", "period_ns",
+                    "scheduled_start_ns", "actual_sample_start_ns", "deadline_ns", "device_completed_ns",
+                    "bookkeeping_completed_ns", "cycle_completed_ns", "protocol_committed_count", "physically_confirmed_count")):
+                return False
+        if any(type(result[k]) is not int for k in ("requested_steps", "successful_steps", "failed_attempts",
+                "protocol_committed_count", "physically_confirmed_count")):
+            return False
+        if any(type(result["cycle_summary"][k]) is not int for k in ("attempts", "misses")):
+            return False
+        material = result["material_summary"]
+        if any(type(material[k]) is not int or material[k] < 0 for k in
+               ("claimed", "generated_received", "inventory_inflight_high_water", "material_encoded_bound_high_water")):
+            return False
+        numeric = metadata["numeric_contract"]
+        if any(type(numeric[k]) is not int or numeric[k] != v for k, v in
+               (("block_steps", 19), ("parameter_bits", 40), ("runtime_payload_bits", 46))):
+            return False
+        boundaries = [r for r in result["cycles"] if "maintenance" in r.get("phase_durations_ns", {})]
+        if ([r["global_step"] for r in boundaries] != list(range(399, 3999, 400))
+                or any(type(r["phase_durations_ns"]["maintenance"]) is not int
+                       or r["phase_durations_ns"]["maintenance"] < 0 for r in boundaries)):
+            return False
+        roles = metadata["roles"]
+        if len(roles) != 2 or {role["role"] for role in roles} != {"P1", "P2"}:
+            return False
+        for role in roles:
+            if (role["startup_attempted"] is not True or role["startup_collect"]["completed"] is not True
+                    or role["startup_collect"]["error_type"] is not None
+                    or role["normal_stop_ack_sent"] is not True):
+                return False
+        return True
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _finish_server_gc(result, report, metadata):
+    """退出后统一编码轻量公开证据；附加失败不覆盖原控制首错/全分母。"""
+    roles = [party.pop("server_gc") for party in result.get("party_outcomes", []) if "server_gc" in party]
+    metadata.update(roles=roles, actual_attempts=len(result.get("cycles", [])),
+        failed_attempts=result.get("failed_attempts"), invocation_budget_consumed=True,
+        encoded_limit=96 * 1024, encoded_bytes=0, budget_failed=False,
+        observation_failed=False, runtime_gen2_covered=False)
+    def normal(state):
+        return (isinstance(state, dict) and state.get("enabled") is True and state.get("threshold") == [700, 10, 10]
+                and state.get("freeze_count") == 0 and state.get("debug") == 0)
+    metadata["observation_failed"] = (len(roles) != 2
+        or any(not isinstance(r, dict) for r in roles)
+        or {r.get("role") for r in roles} != {"P1", "P2"}
+        or any(r.get("error_type") is not None or r.get("callback_and_hook_restored") is not True
+            or r.get("budget_failed") is not False or not normal(r.get("gc_before"))
+            or not normal(r.get("gc_after")) for r in roles))
+    cycles = result.get("cycles", [])
+    window = None
+    if cycles:
+        try:
+            window = (cycles[0]["scheduled_start_ns"], cycles[-1].get("cycle_completed_ns") or cycles[-1]["deadline_ns"])
+        except (KeyError, TypeError):
+            metadata["observation_failed"] = True
+    coverage = {}
+    for role in roles:
+        try:
+            retained = sum(window is not None and window[0] <= e[0] <= e[1] <= window[1]
+                           for e in role["events"])
+            coverage[role["role"]] = {"retained_complete_in_control_window": retained,
+                "covered": bool(retained and not role["pending"] and not role["unpaired_count"]
+                                and not role["evicted_count"] and not role["encoded_omitted"])}
+        except (KeyError, TypeError, ValueError, IndexError):
+            metadata["observation_failed"] = True
+    metadata.update(runtime_gen2_coverage=coverage,
+        runtime_gen2_covered=set(coverage) == {"P1", "P2"} and all(r["covered"] for r in coverage.values()),
+        control_window_ns=window, scope="finite candidate; runtime gen2 coverage separately reported; not long-run qualification")
+    for _ in range(3):
+        metadata["encoded_bytes"] = len(json.dumps(metadata, separators=(",", ":"), allow_nan=False).encode())
+    if metadata["encoded_bytes"] > metadata["encoded_limit"]:
+        metadata["budget_failed"] = True
+        for role in roles:
+            if isinstance(role, dict):
+                role["encoded_omitted"] = role.get("encoded_omitted", 0) + len(role.get("events", []))
+                role["events"] = []
+        metadata["runtime_gen2_covered"] = False
+        for value in coverage.values():
+            value.update(covered=False, retained_complete_in_control_window=0)
+        for _ in range(3):
+            metadata["encoded_bytes"] = len(json.dumps(metadata, separators=(",", ":"), allow_nan=False).encode())
+    result.update(server_gc_candidate=metadata, diagnostic=False, diagnostic_report=None, timeout_trace=None,
+                  candidate_gate_pass=False, worker_long_run_gate_pass=False)
+    if result["status"] == "stopped" and (metadata["observation_failed"] or metadata["budget_failed"]):
+        result.update(status="failed", failure_category="ServerGCObservation", failed_phase="GC_OBSERVATION")
+    result["server_gc_candidate_gate_pass"] = _server_gc_run_gate(result, report)
+
+
 def _run_material_comparison(options, candidate, *, target_steps=1000):
     """S5仅边界快照；S6独立持有既有探针退出栈，不改变GC策略。"""
     from secure_control.execution import lan_runtime
@@ -1746,6 +2011,7 @@ def _run_material_comparison(options, candidate, *, target_steps=1000):
               "producer_exited": None, "memory_sample_error_type": None, "cleanup_error_type": None}
     started_cpu = time.process_time_ns()
     wait_diagnostic = options.get("worker_wait_diagnostic", False)
+    server_gc_candidate = options.get("server_gc_candidate", False)
     traced = options.get("worker_timeout_diagnostic", False) or wait_diagnostic
     long_run = target_steps == 10000
     long_metadata = {"format_version": 1, "target_steps": 10000, "maximum_attempts": 10000,
@@ -1754,6 +2020,8 @@ def _run_material_comparison(options, candidate, *, target_steps=1000):
                      "numeric_contract": None} if long_run else None
     wait_metadata = {"format_version": 1, "maximum_attempts": 4000, "first_failure_stop": True,
                      "numeric_contract": None} if wait_diagnostic else None
+    server_gc_metadata = {"format_version": 1, "target_steps": 4000, "maximum_attempts": 4000,
+        "first_failure_stop": True, "numeric_contract": None} if server_gc_candidate else None
     trace_observers = []
     original_close = lan_runtime.LanContinuousRuntime.close
     def sample(moment):
@@ -1804,9 +2072,9 @@ def _run_material_comparison(options, candidate, *, target_steps=1000):
                 cleanup.callback(restored)
                 return restored
             result = _run_continuous_observation(**options, material_candidate=candidate,
-                _material_event=event, **({"_long_run_metadata": long_metadata or wait_metadata}
-                                        if long_run or wait_diagnostic else {}),
-                **({"_register_trace_cleanup": register} if traced or long_run else {}),
+                _material_event=event, **({"_long_run_metadata": long_metadata or wait_metadata or server_gc_metadata}
+                                        if long_run or wait_diagnostic or server_gc_candidate else {}),
+                **({"_register_trace_cleanup": register} if traced or long_run or server_gc_candidate else {}),
                 **({"_trace_observers": trace_observers} if traced else {}))
     except Exception as error:  # noqa: BLE001 - 初始化/清理失败也保留，不启动替代路线
         result = {"schema": "cycle-qualification-v1", "case": "cycle", "mode": "batch",
@@ -1831,6 +2099,8 @@ def _run_material_comparison(options, candidate, *, target_steps=1000):
         result["worker_long_run_gate_pass"] = _material_run_gate(
             result, report, candidate, target_steps, strict=True)
     result["candidate_gate_pass"] = not long_run and _material_run_gate(result, report, candidate, 1000)
+    if server_gc_candidate:
+        _finish_server_gc(result, report, server_gc_metadata)
     if traced:
         result["diagnostic"] = True
         if result.get("diagnostic_report") is None:
@@ -1897,7 +2167,8 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
                                commit_policy="default", _gc_trial=None, timeout_trace=False,
                                material_candidate=None, _material_event=None, worker_timeout_diagnostic=False,
                                _register_trace_cleanup=None, _trace_observers=None,
-                               _long_run_metadata=None, worker_wait_diagnostic=False) -> dict[str, object]:
+                               _long_run_metadata=None, worker_wait_diagnostic=False,
+                               server_gc_candidate=False) -> dict[str, object]:
     """实际持续动态循环及原同步 writer；退出后报告观察，不发布图或更改调度。"""
     from secure_control.execution.lan_runtime import RunControl
     from secure_control.scenarios.cart_pole.interactive import InteractiveSession
@@ -1963,7 +2234,7 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
         stop_roles = _register_trace_cleanup(stop_roles)
     parties = [context.Process(target=_party_job, args=(
         _config(role, ports), ports, delay_ms, True, queue, diagnostic, False, tcp_nodelay,
-        supply_diagnostic, timeout_trace, material_candidate is not None, worker_wait_diagnostic,
+        supply_diagnostic, timeout_trace, material_candidate is not None, worker_wait_diagnostic, server_gc_candidate,
     )) for role in ("P1", "P2")] if role_config is None else []
     records, events, outcomes, writer_batches = [], [], [], []
     socket_options = []

@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass, field
 from fractions import Fraction
 from math import isfinite, prod
 from numbers import Integral
+from types import MappingProxyType
 from typing import Any, Literal
 
 import numpy as np
@@ -79,6 +80,20 @@ _CANONICAL_INTEGER = re.compile(r"(?:0|-[1-9][0-9]*|[1-9][0-9]*)\Z")
 _MAX_INTEGER_DIGITS = 100_000
 _MAX_ARRAY_ITEMS = 1_000_000
 _MAX_JSON_DEPTH = 32
+# 在线材料的公开固定字段名可共享；不缓存解码树、DTO 或秘密值。
+_ONLINE_FIELDS = MappingProxyType({
+    "share": frozenset({"type", "value"}),
+    "bigint": frozenset({"type", "decimal"}),
+    "bigint_array": frozenset({"type", "shape", "values"}),
+    "input_share": frozenset({"type", "recipient", "session_id", "round_id", "step", "value"}),
+    "resource_metadata": frozenset({"type", "resource_id", "session_id", "round_id", "step", "kind",
+        "term", "index", "shape", "left_fractional_bits", "right_fractional_bits", "output_fractional_bits"}),
+    "step_resource_plan": frozenset({"type", "session_id", "round_id", "step", "state_shape", "input_shape",
+        "output_shape", "scale_ledger", "product_resources", "state_truncation_resources"}),
+    "product_resource_material": frozenset({"type", "owner", "metadata", "a", "b", "c"}),
+    "truncation_resource_material": frozenset({"type", "owner", "metadata", "r", "r_prime"}),
+    "party_online_material": frozenset({"type", "input_message", "plan", "product_resources", "state_truncation_resources"}),
+})
 _RANGE_PROOF_MODES = {
     "finite_horizon",
     "closed_loop_invariant",
@@ -1200,7 +1215,7 @@ def _decode_value(value: object) -> object:
         _exact_fields(mapping, {"type", "shape", "values"}, kind)
         return _decode_float_array(mapping["shape"], mapping["values"])
     if kind == "share":
-        _exact_fields(mapping, {"type", "value"}, kind)
+        _exact_fields(mapping, _ONLINE_FIELDS[kind], kind)
         return AdditiveShare(_decode_integer_value(mapping["value"]))
     if kind == "scale_ledger":
         names = set(ControllerScaleLedger.__dataclass_fields__)
@@ -1302,7 +1317,7 @@ def _decode_value(value: object) -> object:
     if kind == "input_share":
         _exact_fields(
             mapping,
-            {"type", "recipient", "session_id", "round_id", "step", "value"},
+            _ONLINE_FIELDS[kind],
             kind,
         )
         return InputShareMessage(
@@ -1313,20 +1328,7 @@ def _decode_value(value: object) -> object:
             _typed(mapping["value"], AdditiveShare),
         )
     if kind == "resource_metadata":
-        fields = {
-            "type",
-            "resource_id",
-            "session_id",
-            "round_id",
-            "step",
-            "kind",
-            "term",
-            "index",
-            "shape",
-            "left_fractional_bits",
-            "right_fractional_bits",
-            "output_fractional_bits",
-        }
+        fields = _ONLINE_FIELDS[kind]
         _exact_fields(mapping, fields, kind)
         right = mapping["right_fractional_bits"]
         return ResourceMetadata(
@@ -1343,18 +1345,7 @@ def _decode_value(value: object) -> object:
             _nonnegative(mapping["output_fractional_bits"], "output_fractional_bits"),
         )
     if kind == "step_resource_plan":
-        fields = {
-            "type",
-            "session_id",
-            "round_id",
-            "step",
-            "state_shape",
-            "input_shape",
-            "output_shape",
-            "scale_ledger",
-            "product_resources",
-            "state_truncation_resources",
-        }
+        fields = _ONLINE_FIELDS[kind]
         _exact_fields(mapping, fields, kind)
         return StepResourcePlan(
             _text(mapping["session_id"], "session_id"),
@@ -1368,7 +1359,7 @@ def _decode_value(value: object) -> object:
             _typed_tuple(mapping["state_truncation_resources"], ResourceMetadata),
         )
     if kind == "product_resource_material":
-        _exact_fields(mapping, {"type", "owner", "metadata", "a", "b", "c"}, kind)
+        _exact_fields(mapping, _ONLINE_FIELDS[kind], kind)
         return ProductResourceMaterial(
             _party(mapping["owner"]),
             _typed(mapping["metadata"], ResourceMetadata),
@@ -1377,7 +1368,7 @@ def _decode_value(value: object) -> object:
             _typed(mapping["c"], AdditiveShare),
         )
     if kind == "truncation_resource_material":
-        _exact_fields(mapping, {"type", "owner", "metadata", "r", "r_prime"}, kind)
+        _exact_fields(mapping, _ONLINE_FIELDS[kind], kind)
         return TruncationResourceMaterial(
             _party(mapping["owner"]),
             _typed(mapping["metadata"], ResourceMetadata),
@@ -1387,7 +1378,7 @@ def _decode_value(value: object) -> object:
     if kind == "party_online_material":
         _exact_fields(
             mapping,
-            {"type", "input_message", "plan", "product_resources", "state_truncation_resources"},
+            _ONLINE_FIELDS[kind],
             kind,
         )
         return PartyOnlineMaterial(
@@ -1741,11 +1732,11 @@ def _decode_integer_value(value: object) -> int | np.ndarray:
     mapping = _mapping(value, "integer value")
     kind = mapping.get("type")
     if kind == "bigint":
-        _exact_fields(mapping, {"type", "decimal"}, "bigint")
+        _exact_fields(mapping, _ONLINE_FIELDS[kind], "bigint")
         return _parse_decimal(mapping["decimal"])
     if kind != "bigint_array":
         raise LocalhostCodecError("share value 必须是 bigint 或 bigint_array。")
-    _exact_fields(mapping, {"type", "shape", "values"}, "bigint_array")
+    _exact_fields(mapping, _ONLINE_FIELDS[kind], "bigint_array")
     shape = _shape(mapping["shape"], "shape")
     values = mapping["values"]
     if not isinstance(values, list) or len(values) != prod(shape):
@@ -1773,14 +1764,21 @@ def _decode_float_array(shape_value: object, values_value: object) -> np.ndarray
 
 
 def _mapping(value: object, name: str) -> dict[str, object]:
-    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+    if not isinstance(value, dict):
         raise LocalhostCodecError(f"{name} 必须是 JSON object。")
+    for key in value:
+        if not isinstance(key, str):
+            raise LocalhostCodecError(f"{name} 必须是 JSON object。")
     return value
 
 
-def _exact_fields(mapping: dict[str, object], fields: set[str], name: str) -> None:
-    if set(mapping) != fields:
+def _exact_fields(mapping: dict[str, object], fields: set[str] | frozenset[str], name: str) -> None:
+    # 数量相同还必须逐键包含，不能用数量检查接纳同数异名字段。
+    if len(mapping) != len(fields):
         raise LocalhostCodecError(f"{name} 字段集合不匹配。")
+    for key in mapping:
+        if key not in fields:
+            raise LocalhostCodecError(f"{name} 字段集合不匹配。")
 
 
 def _typed(value: object, expected: type[Any]) -> Any:
