@@ -1,5 +1,27 @@
 # 独立三角色连续 LAN 实验（Issues #86、#84、#75、#92）
 
+## S6 独立 worker 首轮通信定位（#120）
+
+`benchmark --case cycle --mode batch --steps 20 --segment-steps 400
+--material-slots 16 --preload-steps 0 --recording light --delay-ms 0
+--worker-timeout-diagnostic --output <本次新结果路径>` 是独立诊断入口，隐式选择原worker。
+不同时传S5 material-candidate、旧timeout-trace、diagnostic或GC-trial选项；旧门禁不放宽。
+必须正常GC/原阈值、默认通信/ACK及原20ms。D6只批准唯一一次最多20周期，首错停，
+启动/准备失败也消费该次调用，不重跑、不补步；软件检查和固定提交后的声明先于运行。
+
+复用原304槽/每角色72KiB的socket/frame/GC探针，首错锁存在清理前，公开上下文只含
+角色、操作、轮身份及序列。保存native调用起止/返回字节/部分进度/超时设置及读回/类别；
+remaining与QPC/monotonic时钟对在调用结束后采样，不标成入口余量，不跨机器直接相减。
+区分absolute_precheck、native异常、EOF及后续对端关闭，不把帧尝试计数当完整交付。
+不记录秘密或异常消息，不写逐步诊断；原权威CycleTiming包括首步和失败/null端点及确认前缀。
+
+S6由独立ExitStack持有恢复回调/角色队列，不依赖StartupGCTrial；初始化/运行/关闭失败
+仍保留原错误并逆序恢复，附加清理失败拒绝成功。总诊断（含材料/GC/trace摘要）上限262144B，
+输出声明实际字节、丢弃及恢复事实。`comparison_only=true`，qualification/stage/candidate门禁
+始终false；20步全成功只算未复现，探针有扰动，不能替代1000/10000/完整路线或三机设备资格。
+总预算不足时只保留首错/外层错与恢复事实、明确历史省略；必要时省略材料摘要但不丢周期，
+预算失败拒绝资格，不把被省略的退出/内存事实补造为成功。
+
 ## S5 显式本机材料供料对照（#120）
 
 `benchmark --case cycle --mode batch --steps 1000 --segment-steps 400

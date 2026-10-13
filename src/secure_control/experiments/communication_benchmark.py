@@ -1433,7 +1433,7 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                                preload_execution="fused", diagnostic=False,
                                recording_mode="full", tcp_nodelay=None,
                                commit_policy="default", gc_trial_policy=None, timeout_trace=False,
-                               material_candidate=None) -> dict[str, object]:
+                               material_candidate=None, worker_timeout_diagnostic=False) -> dict[str, object]:
     # 所有试验参数在任何端口/角色/材料创建前拒绝；默认入口走原路径。
     options = {"steps": steps, "delay_ms": delay_ms, "segment_steps": segment_steps,
                "optimized": optimized, "material_slots": material_slots, "role_config": role_config,
@@ -1441,6 +1441,22 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                "diagnostic": diagnostic, "recording_mode": recording_mode,
                    "tcp_nodelay": tcp_nodelay, "commit_policy": commit_policy,
                    "timeout_trace": timeout_trace}
+    if type(worker_timeout_diagnostic) is not bool:
+        raise ValueError("S6诊断选择必须为严格bool。")
+    if worker_timeout_diagnostic:
+        if (optimized is not True or recording_mode != "light" or diagnostic is not False
+                or gc_trial_policy is not None or timeout_trace is not False or material_candidate is not None
+                or type(steps) is not int or steps != 20
+                or type(segment_steps) is not int or segment_steps != 400
+                or type(material_slots) is not int or material_slots != 16
+                or type(preload_steps) is not int or preload_steps != 0 or preload_execution != "fused"
+                or type(delay_ms) not in (int, float) or delay_ms != 0 or role_config is not None
+                or tcp_nodelay is not None or commit_policy != "default"
+                or not gc.isenabled() or gc.get_freeze_count() or gc.callbacks or gc.get_debug()
+                or gc.get_threshold() != (700, 10, 10)):
+            raise ValueError("S6只允许正常GC的worker/cycle/batch/light/20/400/16/无预送/默认通信独立诊断。")
+        return _run_material_comparison({**options, "diagnostic": True, "timeout_trace": True,
+                                        "worker_timeout_diagnostic": True}, "worker")
     if type(timeout_trace) is not bool or timeout_trace and gc_trial_policy not in ("baseline", "startup-freeze"):
         raise ValueError("timeout_trace仅支持显式baseline或startup-freeze。")
     if material_candidate is not None:
@@ -1509,12 +1525,14 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
 
 
 def _run_material_comparison(options, candidate):
-    """只有两端 GC 快照与离散内存；不安装 GC/socket 事件探针。"""
+    """S5仅边界快照；S6独立持有既有探针退出栈，不改变GC策略。"""
     from secure_control.execution import lan_runtime
     report = {"candidate": candidate, "gc_begin": None, "gc_end": None, "memory": [],
               "memory_guard_failed": False, "cleanup_failed": False, "process_cpu_ns": None,
               "producer_exited": None, "memory_sample_error_type": None, "cleanup_error_type": None}
     started_cpu = time.process_time_ns()
+    traced = options.get("worker_timeout_diagnostic", False)
+    trace_observers = []
     original_close = lan_runtime.LanContinuousRuntime.close
     def sample(moment):
         value = {"moment": moment, **_process_memory()}
@@ -1551,9 +1569,21 @@ def _run_material_comparison(options, candidate):
         # runner可能已把首错转成返回结果，finally中异常栈已空；关闭观察不再抛出覆盖结果。
         # 保留公开附加失败并执行原关闭，返回后统一门禁；无原失败也不能因此获得成功资格。
     try:
-        with patch.object(lan_runtime.LanContinuousRuntime, "close", close):
+        with ExitStack() as cleanup:
+            cleanup.enter_context(patch.object(lan_runtime.LanContinuousRuntime, "close", close))
+            def register(callback):
+                # 初始化尚未进入runner也要逆序还原；附加清理失败不能抹掉已返回的周期。
+                def restored():
+                    try:
+                        callback()
+                    except Exception as error:  # noqa: BLE001 - 只记录公开类别，最终门禁拒绝
+                        report["cleanup_failed"] = True
+                        report["cleanup_error_type"] = type(error).__name__
+                cleanup.callback(restored)
+                return restored
             result = _run_continuous_observation(**options, material_candidate=candidate,
-                                                _material_event=event)
+                _material_event=event, **({"_register_trace_cleanup": register,
+                                          "_trace_observers": trace_observers} if traced else {}))
     except Exception as error:  # noqa: BLE001 - 初始化/清理失败也保留，不启动替代路线
         result = {"schema": "cycle-qualification-v1", "case": "cycle", "mode": "batch",
                   "status": "failed", "failure_category": type(error).__name__,
@@ -1589,6 +1619,54 @@ def _run_material_comparison(options, candidate):
         and material.get("worker_exited") is True and material.get("receiver_exited") is True
         and material.get("credit_thread_exited") is True and material.get("cleanup_failed") is False
         and not report["memory_guard_failed"] and not report["cleanup_failed"])
+    if traced:
+        if result.get("diagnostic_report") is None:
+            result["diagnostic_report"] = {"diagnostic": True, "roles": [v.report() for v in trace_observers],
+                                           "incomplete": True, "scope": "initialization or report failure"}
+        result.setdefault("timeout_trace", {"format_version": 1, "diagnostic_missing": True})
+        result["worker_timeout_diagnostic"] = {"scope": "single normal-GC worker diagnosis, not qualification",
+            "maximum_attempts": 20, "diagnostic_encoded_limit": 256 * 1024,
+            "diagnostic_encoded_bytes": 0, "diagnostic_budget_failed": False,
+            "precompact_encoded_bytes": None, "compacted_event_count": 0, "material_summary_omitted": False}
+        combined = {name: result.get(name) for name in ("diagnostic_report", "timeout_trace",
+                    "material_comparison", "material_summary", "worker_timeout_diagnostic")}
+        for _ in range(3):
+            result["worker_timeout_diagnostic"]["diagnostic_encoded_bytes"] = len(json.dumps(
+                combined, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode())
+        if result["worker_timeout_diagnostic"]["diagnostic_encoded_bytes"] > 256 * 1024:
+            budget = result["worker_timeout_diagnostic"]
+            budget["diagnostic_budget_failed"] = True
+            budget["precompact_encoded_bytes"] = budget["diagnostic_encoded_bytes"]
+            # 总预算不足时只留下各角色首错/外层错及恢复事实，省略普通历史并明确拒绝资格。
+            roles = []
+            for role in result["diagnostic_report"].get("roles", []):
+                compact = {key: role.get(key) for key in ("role", "format_version", "trace_fields",
+                    "trace_context_fields", "first_failure", "outer_failure", "evictions", "clocks",
+                    "callback_restored", "socket_hooks_restored")}
+                omitted = len(role.get("events", []))
+                budget["compacted_event_count"] += omitted
+                compact.update(events=[], encoded_omitted=role.get("encoded_omitted", 0) + omitted,
+                               incomplete=True, encoded_limit=72 * 1024, encoded_bytes=0)
+                for _ in range(3):
+                    compact["encoded_bytes"] = len(json.dumps(compact, separators=(",", ":"),
+                                                              ensure_ascii=False, allow_nan=False).encode())
+                roles.append(compact)
+            result["diagnostic_report"] = {"diagnostic": True, "roles": roles, "incomplete": True,
+                                           "budget_compacted": True}
+            combined["diagnostic_report"] = result["diagnostic_report"]
+            for _ in range(3):
+                budget["diagnostic_encoded_bytes"] = len(json.dumps(combined, separators=(",", ":"),
+                                                                    ensure_ascii=False, allow_nan=False).encode())
+            if budget["diagnostic_encoded_bytes"] > 256 * 1024:
+                # 材料摘要亦可能占用总预算；缺测明确标记，不丢runner权威周期或制造退出事实。
+                result["material_summary"] = combined["material_summary"] = None
+                budget["material_summary_omitted"] = True
+                for _ in range(3):
+                    budget["diagnostic_encoded_bytes"] = len(json.dumps(combined, separators=(",", ":"),
+                                                                        ensure_ascii=False, allow_nan=False).encode())
+            if result["status"] == "stopped":
+                result.update(status="failed", failure_category="DiagnosticBudget", failed_phase="DIAGNOSTIC_REPORT")
+        result["candidate_gate_pass"] = False
     return result
 
 
@@ -1598,7 +1676,8 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
                                preload_execution="fused", diagnostic=False,
                                recording_mode="full", tcp_nodelay=None,
                                commit_policy="default", _gc_trial=None, timeout_trace=False,
-                               material_candidate=None, _material_event=None) -> dict[str, object]:
+                               material_candidate=None, _material_event=None, worker_timeout_diagnostic=False,
+                               _register_trace_cleanup=None, _trace_observers=None) -> dict[str, object]:
     """实际持续动态循环及原同步 writer；退出后报告观察，不发布图或更改调度。"""
     from secure_control.execution.lan_runtime import RunControl
     from secure_control.scenarios.cart_pole.interactive import InteractiveSession
@@ -1635,7 +1714,7 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
     if not isinstance(delay_ms, (int, float)) or not 0 <= delay_ms <= 3:
         raise ValueError("单帧注入等待必须在0..3ms")
     supply_diagnostic = (diagnostic and light and not preload_steps and material_slots == 16
-                         and (not comparison_only or _gc_trial is not None))
+                         and (not comparison_only or _gc_trial is not None or worker_timeout_diagnostic))
     ports = _ports()
     config = _config("Client", ports) if role_config is None else load_lan_config(role_config, "Client")
     if role_config is not None:
@@ -1646,6 +1725,21 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
     queue = context.Queue()
     if _gc_trial:
         _gc_trial.cleanup.callback(queue.close)
+    parties, roles_closed = [], False
+    def stop_roles():
+        nonlocal roles_closed
+        if roles_closed:
+            return
+        roles_closed = True
+        try:
+            for party in parties:
+                if party.is_alive():
+                    party.terminate()
+                    party.join(timeout=5)
+        finally:
+            queue.close()
+    if _register_trace_cleanup:
+        stop_roles = _register_trace_cleanup(stop_roles)
     parties = [context.Process(target=_party_job, args=(
         _config(role, ports), ports, delay_ms, True, queue, diagnostic, False, tcp_nodelay,
         supply_diagnostic, timeout_trace, material_candidate is not None,
@@ -1662,12 +1756,16 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
                                       all_gc=_gc_trial is not None) if diagnostic else None)
     # 必须先装在meter内层；退出先还原meter前驱，再卸下探针。
     socket_context = ExitStack() if timeout_trace else None
+    register_cleanup = _gc_trial.cleanup.callback if _gc_trial else _register_trace_cleanup
+    socket_close = None
     if timeout_trace:
-        _gc_trial.cleanup.callback(socket_context.close)
+        if _trace_observers is not None:
+            _trace_observers.append(diagnostic_observer)
+        socket_close = register_cleanup(socket_context.close)
         socket_context.enter_context(diagnostic_observer.sockets())
     counts, activity, restore = _meter("Client", ports, delay_ms, diagnostic=diagnostic_observer)
-    if _gc_trial:
-        _gc_trial.cleanup.callback(restore)
+    if register_cleanup:
+        restore = register_cleanup(restore)
     control, session = RunControl(), InteractiveSession()
     fsync, checkpoint = os.fsync, None if light else _Spool._checkpoint
     before_activity, before_storage = dict(activity), dict(storage)
@@ -1760,8 +1858,9 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
             storage["checkpoint_ms"] += (time.perf_counter_ns() - start) / 1e6
 
     diagnostic_context = ExitStack()
-    if _gc_trial:
-        _gc_trial.cleanup.callback(diagnostic_context.close)
+    diagnostic_close = diagnostic_context.close
+    if register_cleanup:
+        diagnostic_close = register_cleanup(diagnostic_close)
     if diagnostic_observer:
         diagnostic_context.enter_context(diagnostic_observer.installed())
         diagnostic_context.enter_context(_observe_diagnostic(diagnostic_observer, recording=not light))
@@ -1850,14 +1949,10 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
         if diagnostic_observer:
             diagnostic_observer.end(diagnostic_phase)
             diagnostic_observer.finish_control()
-        diagnostic_context.close()
+        diagnostic_close()
         if socket_context is not None:
-            socket_context.close()
-        for party in parties:
-            if party.is_alive():
-                party.terminate()
-                party.join(timeout=5)
-        queue.close()
+            socket_close()
+        stop_roles()
     directions = dict(counts)
     for item in outcomes:
         directions.update(item["directions"])
@@ -1900,7 +1995,8 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
         "recording_mode": recording_mode,
         "evidence_state": "not_recorded" if light else "full_observation_spool",
         "diagnostic": diagnostic, "diagnostic_report": diagnostic_report,
-        "timeout_trace": ({"format_version": 1, "scope": f"single bounded {_gc_trial.policy} timeout diagnosis",
+        "timeout_trace": ({"format_version": 1, "scope": (f"single bounded {_gc_trial.policy} timeout diagnosis"
+                              if _gc_trial else "single bounded normal-GC worker timeout diagnosis"),
                            "first_failure_observed_ns": (diagnostic_observer.first_failure[2]
                                 if diagnostic_observer.first_failure is not None else None)}
                           if timeout_trace else None),

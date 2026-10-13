@@ -412,15 +412,17 @@ def test_s5_close_observation_preserves_first_error_and_always_cleans(
 
 
 @pytest.mark.parametrize("closing_fault", ("normal", "limit", "query", "cleanup"))
-def test_s5_real_runner_failed_return_keeps_cycles_and_confirmed_prefix(monkeypatch, closing_fault):
+@pytest.mark.parametrize("s6", (False, True))
+def test_s5_real_runner_failed_return_keeps_cycles_and_confirmed_prefix(monkeypatch, closing_fault, s6):
     """真实runner返回/finally出口和真实周期；虚拟时钟/协议替身不构成性能运行。"""
+    import gc
     import sys
     from dataclasses import asdict
 
     from secure_control.execution import lan_runtime
     from secure_control.execution.cycle_timing import AbsoluteCycleClock, check_deadline
     from secure_control.experiments import communication_benchmark as bench
-    from secure_control.experiments import lan_runner
+    from secure_control.experiments import lan_continuous_profile, lan_runner
     from secure_control.scenarios.cart_pole.interactive import InteractiveSession
 
     def check(candidate, failure_step):
@@ -449,7 +451,14 @@ def test_s5_real_runner_failed_return_keeps_cycles_and_confirmed_prefix(monkeypa
                 def step(self, value, **kwargs):
                     step = self.confirmed_step_count
                     self.protocol_committed_count += 1
-                    return SimpleNamespace(global_step=step, raw_control=(0.,), round_id=f"round-{step}")
+                    return SimpleNamespace(global_step=step, raw_control=(0.,), round_id=f"round-{step}",
+                                           segment_index=0, session_id="test-session")
+
+                def enable_material_preparation(self, **kwargs):
+                    assert kwargs == {"slots": 16, "_candidate": "worker"}
+
+                def _begin_material_control(self):
+                    pass  # 软件协议替身，不创建工人或生成秘密材料。
 
                 def confirm_applied(self, identity):
                     self.confirmed_step_count += 1
@@ -467,9 +476,10 @@ def test_s5_real_runner_failed_return_keeps_cycles_and_confirmed_prefix(monkeypa
 
             def memory():
                 reads.append(True)
-                if len(reads) == 2 and closing_fault == "query":
+                end_read = 3 if s6 else 2  # S6还有g0输入前采样；故障只注入control_end。
+                if len(reads) == end_read and closing_fault == "query":
                     raise OSError("private OS message")
-                rss = 257 * 1024**2 if len(reads) == 2 and closing_fault == "limit" else 1024
+                rss = 257 * 1024**2 if len(reads) == end_read and closing_fault == "limit" else 1024
                 return {"current_rss_bytes": rss, "peak_rss_bytes": rss}
 
             def clock(period):
@@ -513,12 +523,41 @@ def test_s5_real_runner_failed_return_keeps_cycles_and_confirmed_prefix(monkeypa
                             check_deadline(deadline, phase, now=lambda: now[0]))
             patcher.setattr(lan_runtime.LanContinuousRuntime, "close", cleanup)
             patcher.setattr(bench, "_process_memory", memory)
-            patcher.setattr(bench, "_run_continuous_observation", observation)
-            result = bench._run_material_comparison({"steps": 1000}, candidate)
-            assert close_context == [None] and len(closed) == 1 and len(reads) == 2
+            if s6:
+                from secure_control.execution import localhost_transport as transport
+                originals = (transport._send_exact, transport._receive_exact, transport.encode_envelope,
+                    transport.decode_envelope, lan_runtime.LanSegmentedRuntime.close, list(gc.callbacks))
+                ports = (101, 102, 103)
+                real_prepared = lan_continuous_profile.load_segmented_experiment(
+                    bench._config("Client", ports).experiment_config, 400, InteractiveSession())
+                patcher.setattr(lan_continuous_profile, "load_segmented_experiment",
+                                lambda *args: replace(real_prepared, scene=prepared.scene))
+                queue_closes = []
+                outcomes = iter([{"role": role, "directions": {}} for role in ("P1", "P2")])
+                queue = SimpleNamespace(get=lambda **kwargs: next(outcomes), close=lambda: queue_closes.append(True))
+                context = SimpleNamespace(Queue=lambda: queue, Process=lambda **kwargs: SimpleNamespace(
+                    start=lambda: None, join=lambda **kwargs: None, is_alive=lambda: False))
+                patcher.setattr(bench.mp, "get_context", lambda method: context)
+                patcher.setattr(bench, "_ports", lambda: ports)
+                result = bench.run_continuous_observation(steps=20, delay_ms=0, segment_steps=400,
+                    optimized=True, recording_mode="light", worker_timeout_diagnostic=True)
+                assert queue_closes == [True]
+                assert originals == (transport._send_exact, transport._receive_exact, transport.encode_envelope,
+                    transport.decode_envelope, lan_runtime.LanSegmentedRuntime.close, list(gc.callbacks))
+                client_trace = result["diagnostic_report"]["roles"][0]
+                assert client_trace["callback_restored"] and client_trace["socket_hooks_restored"]
+                assert client_trace["encoded_bytes"] <= 72 * 1024
+                assert result["worker_timeout_diagnostic"]["diagnostic_encoded_bytes"] <= 256 * 1024
+                assert not result["worker_timeout_diagnostic"]["diagnostic_budget_failed"]
+                cycles = result["cycles"]
+            else:
+                patcher.setattr(bench, "_run_continuous_observation", observation)
+                result = bench._run_material_comparison({"steps": 1000}, candidate)
+                assert result["cycles"] == [asdict(v) for v in cycles]
+            assert close_context == [None] and len(closed) == 1 and len(reads) == (4 if s6 else 2)
             assert lan_runtime.LanContinuousRuntime.close is cleanup
             assert result["status"] == "failed" and result["failure_category"] == "CycleDeadlineExceeded"
-            assert result["failed_phase"] == "INPUT" and result["cycles"] == [asdict(v) for v in cycles]
+            assert result["failed_phase"] == "INPUT"
             assert len(cycles) == failure_step + 1 and applied == list(range(failure_step))
             last = result["cycle_summary"]["last_cycle"]
             assert result["cycle_summary"]["attempts"] == failure_step + 1
@@ -542,7 +581,7 @@ def test_s5_real_runner_failed_return_keeps_cycles_and_confirmed_prefix(monkeypa
             assert not result["candidate_gate_pass"] and not result["qualification_pass"]
             assert not result["stage_pass"] and result["comparison_only"] and "private" not in str(result)
 
-    for candidate in ("thread", "worker"):
+    for candidate in (("worker",) if s6 else ("thread", "worker")):
         for failure_step in (0, 2):
             check(candidate, failure_step)
 
@@ -560,6 +599,109 @@ def test_s5_fixed_budget_rejected_before_any_port_or_process(monkeypatch):
                    {"timeout_trace": True}, {"recording_mode": "full"}, {"material_candidate": "invalid"}):
         with pytest.raises(ValueError):
             bench.run_continuous_observation(**(options | change))
+
+
+def test_s6_independent_worker_trace_guard_preserves_old_trial_limits(monkeypatch):
+    from secure_control.experiments import communication_benchmark as bench
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("非法S6不得分配端口、材料、工人或GC试验")
+    monkeypatch.setattr(bench, "_ports", forbidden)
+    monkeypatch.setattr(bench._StartupGCTrial, "installed", forbidden)
+    options = {"steps": 20, "delay_ms": 0, "segment_steps": 400, "optimized": True,
+               "recording_mode": "light", "worker_timeout_diagnostic": True}
+    for change in ({"steps": 0}, {"steps": 19}, {"steps": 21}, {"steps": True},
+                   {"worker_timeout_diagnostic": 1}, {"delay_ms": False}, {"delay_ms": 1},
+                   {"diagnostic": True}, {"optimized": 1}, {"recording_mode": "full"},
+                   {"gc_trial_policy": "baseline"}, {"timeout_trace": True}, {"timeout_trace": 1},
+                   {"material_candidate": "worker"}, {"material_candidate": "thread"},
+                   {"segment_steps": 20}, {"material_slots": 4}, {"preload_steps": 1},
+                   {"preload_execution": "staged"}, {"role_config": "unused"},
+                   {"tcp_nodelay": False}, {"commit_policy": "serial"}):
+        with pytest.raises(ValueError):
+            bench.run_continuous_observation(**(options | change))
+    for change in ({"worker_timeout_diagnostic": False, "material_candidate": "worker"},
+                   {"worker_timeout_diagnostic": False, "timeout_trace": True}):
+        with pytest.raises(ValueError):
+            bench.run_continuous_observation(**(options | change))
+    monkeypatch.setattr(bench, "_run_material_comparison", lambda options, candidate: (options, candidate))
+    accepted, candidate = bench.run_continuous_observation(**options)
+    assert candidate == "worker" and accepted["worker_timeout_diagnostic"]
+    assert accepted["diagnostic"] and accepted["timeout_trace"]
+    assert accepted["steps"] == 20 and "_gc_trial" not in accepted
+
+
+@pytest.mark.parametrize("failure_point", ("control", "prepared"))
+def test_s6_initialization_failure_restores_owned_hooks_and_closes_queue(monkeypatch, failure_point):
+    import gc
+
+    from secure_control.execution import lan_runtime
+    from secure_control.execution import localhost_transport as transport
+    from secure_control.experiments import communication_benchmark as bench
+    from secure_control.experiments import lan_continuous_profile
+
+    originals = (transport._send_exact, transport._receive_exact, transport.encode_envelope,
+                 transport.decode_envelope, lan_runtime.LanContinuousRuntime.close,
+                 lan_runtime.LanSegmentedRuntime.close, list(gc.callbacks), gc.get_threshold())
+    closed = []
+    def failed(*args, **kwargs):
+        raise OSError("private initialization message")
+    def forbidden(*args, **kwargs):
+        pytest.fail("软件初始化故障测试不能启动子进程")
+    queue = SimpleNamespace(close=lambda: closed.append(True))
+    context = SimpleNamespace(Queue=lambda: queue, Process=lambda **kwargs: SimpleNamespace(
+        start=forbidden, join=forbidden, is_alive=lambda: False))
+    monkeypatch.setattr(bench.mp, "get_context", lambda method: context)
+    monkeypatch.setattr(bench, "_ports", lambda: (101, 102, 103))
+    if failure_point == "control":
+        monkeypatch.setattr(lan_runtime, "RunControl", failed)
+    else:
+        monkeypatch.setattr(lan_continuous_profile, "load_segmented_experiment", failed)
+    result = bench.run_continuous_observation(steps=20, delay_ms=0, segment_steps=400,
+        optimized=True, recording_mode="light", worker_timeout_diagnostic=True)
+    assert result["status"] == "failed" and result["failure_category"] == "OSError"
+    assert result["cycles"] == [] and result["diagnostic_report"]["incomplete"]
+    assert result["timeout_trace"]["diagnostic_missing"] and closed == [True]
+    assert originals == (transport._send_exact, transport._receive_exact, transport.encode_envelope,
+        transport.decode_envelope, lan_runtime.LanContinuousRuntime.close,
+        lan_runtime.LanSegmentedRuntime.close, list(gc.callbacks), gc.get_threshold())
+    trace = result["diagnostic_report"]["roles"][0]
+    assert trace["socket_hooks_restored"] and trace["callback_restored"]
+    assert result["worker_timeout_diagnostic"]["diagnostic_encoded_bytes"] <= 256 * 1024
+    assert not result["candidate_gate_pass"] and not result["qualification_pass"]
+    assert not result["stage_pass"] and result["comparison_only"]
+    assert "private initialization" not in str(result)
+
+
+def test_s6_combined_budget_compacts_history_keeps_first_failure_and_rejects_qualification(monkeypatch):
+    import json
+
+    from secure_control.experiments import communication_benchmark as bench
+
+    first = tuple("public-first-error" if key == "error_type" else None for key in bench._TimeoutDiagnostic.FIELDS)
+    cycles, summary = [{"status": "failed", "cycle_completed_ns": None}], {"attempts": 1, "misses": 1}
+    def observation(**options):
+        return {"status": "failed", "failure_category": "CycleDeadlineExceeded", "failed_phase": "INPUT",
+            "cycles": cycles, "cycle_summary": summary,
+            "diagnostic_report": {"roles": [{"role": "Client", "first_failure": first,
+                "outer_failure": first, "trace_fields": list(bench._TimeoutDiagnostic.FIELDS),
+                "events": [{"public_history": "x" * (256 * 1024)}], "encoded_omitted": 2,
+                "callback_restored": True, "socket_hooks_restored": True}]}}
+    monkeypatch.setattr(bench, "_run_continuous_observation", observation)
+    result = bench._run_material_comparison({"steps": 20, "worker_timeout_diagnostic": True}, "worker")
+    budget = result["worker_timeout_diagnostic"]
+    assert budget["diagnostic_budget_failed"] and budget["precompact_encoded_bytes"] > 256 * 1024
+    assert budget["compacted_event_count"] == 1 and not budget["material_summary_omitted"]
+    role = result["diagnostic_report"]["roles"][0]
+    assert role["first_failure"] == role["outer_failure"] == first
+    assert role["events"] == [] and role["encoded_omitted"] == 3 and role["incomplete"]
+    encoded = len(json.dumps({name: result.get(name) for name in ("diagnostic_report", "timeout_trace",
+        "material_comparison", "material_summary", "worker_timeout_diagnostic")},
+        separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode())
+    assert encoded == budget["diagnostic_encoded_bytes"] <= 256 * 1024
+    assert result["cycles"] is cycles and result["cycle_summary"] is summary
+    assert result["failure_category"] == "CycleDeadlineExceeded" and result["failed_phase"] == "INPUT"
+    assert not result["candidate_gate_pass"] and not result["qualification_pass"] and not result["stage_pass"]
 
 
 @pytest.mark.parametrize(("actor", "fault"), [
