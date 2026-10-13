@@ -411,6 +411,142 @@ def test_s5_close_observation_preserves_first_error_and_always_cleans(
             assert "private" not in str(result)
 
 
+@pytest.mark.parametrize("closing_fault", ("normal", "limit", "query", "cleanup"))
+def test_s5_real_runner_failed_return_keeps_cycles_and_confirmed_prefix(monkeypatch, closing_fault):
+    """真实runner返回/finally出口和真实周期；虚拟时钟/协议替身不构成性能运行。"""
+    import sys
+    from dataclasses import asdict
+
+    from secure_control.execution import lan_runtime
+    from secure_control.execution.cycle_timing import AbsoluteCycleClock, check_deadline
+    from secure_control.experiments import communication_benchmark as bench
+    from secure_control.experiments import lan_runner
+    from secure_control.scenarios.cart_pole.interactive import InteractiveSession
+
+    def check(candidate, failure_step):
+        with monkeypatch.context() as patcher:
+            now, closed, close_context, reads, cycles, applied = [0], [], [], [], [], []
+
+            class Runtime:
+                def __init__(self, *args, **kwargs):
+                    self.phase, self.run_id = "RUNNING", "test-run"
+                    self.confirmed_step_count = self.protocol_committed_count = 0
+                    self.resource_counts = {"products_consumed": 0, "truncations_consumed": 0}
+                    self.public_setup = None
+                    self.cycle_phase_ns, self.cycle_queue_levels = {}, {}
+                    self.segment = SimpleNamespace(_material_pool=None)
+
+                def snapshot(self):
+                    count = self.confirmed_step_count
+                    return lan_runtime.LanLifecycleSnapshot(self.phase, self.run_id, "test-session",
+                        "epoch", 0, 0, count, f"round-{count}", self.protocol_committed_count,
+                        count, 30 * count, 4 * count, 0)
+
+                @property
+                def segment_full(self):
+                    return False
+
+                def step(self, value, **kwargs):
+                    step = self.confirmed_step_count
+                    self.protocol_committed_count += 1
+                    return SimpleNamespace(global_step=step, raw_control=(0.,), round_id=f"round-{step}")
+
+                def confirm_applied(self, identity):
+                    self.confirmed_step_count += 1
+                    self.resource_counts = {"products_consumed": 30 * self.confirmed_step_count,
+                                            "truncations_consumed": 4 * self.confirmed_step_count}
+
+                def close(self):
+                    close_context.append(sys.exception())
+                    lan_runtime.LanContinuousRuntime.close(self.segment)
+
+            def cleanup(segment):
+                closed.append(segment)
+                if closing_fault == "cleanup":
+                    raise ValueError("private cleanup message")
+
+            def memory():
+                reads.append(True)
+                if len(reads) == 2 and closing_fault == "query":
+                    raise OSError("private OS message")
+                rss = 257 * 1024**2 if len(reads) == 2 and closing_fault == "limit" else 1024
+                return {"current_rss_bytes": rss, "peak_rss_bytes": rss}
+
+            def clock(period):
+                return AbsoluteCycleClock(period, now=lambda: now[0],
+                    sleep=lambda seconds: now.__setitem__(0, now[0] + round(seconds * 1e9)))
+
+            inputs = []
+            def input_value():
+                step = len(inputs)
+                inputs.append(step)
+                now[0] += 21_000_000 if step == failure_step else 1_000_000
+                return [0.]
+
+            def advance(step, value, **kwargs):
+                applied.append(step)
+                now[0] += 1_000_000
+                return {}
+
+            prepared = SimpleNamespace(spec=SimpleNamespace(state_dimension=4), context=None,
+                contract=None, security_parameter=8, evidence=None, segment_capacity=400,
+                recheck_sources=lambda: None, scene=SimpleNamespace(period=.02,
+                    controller_input=input_value, advance=advance))
+
+            def observation(**options):
+                result = lan_runner._run_prepared_segmented(None, prepared,
+                    control=lan_runtime.RunControl(), session=InteractiveSession(), realtime=True,
+                    material_slots=0, on_cycle=cycles.append,
+                    phase=lambda name: options["_material_event"]("control_begin")
+                        if name == "RUNNING" else None)
+                return {"status": result["status"], "failure_category": result["category"],
+                    "failed_phase": result["failure_phase"], "cycles": [asdict(v) for v in cycles],
+                    "cycle_summary": result["cycle_summary"], "resource_counts": result["resource_counts"],
+                    "protocol_committed_count": result["protocol_committed_count"],
+                    "physically_confirmed_count": result["confirmed_step_count"]}
+
+            patcher.setattr(lan_runner, "LanSegmentedRuntime", Runtime)
+            patcher.setattr(lan_runner, "perf_counter_ns", lambda: now[0])
+            patcher.setattr(lan_runner, "AbsoluteCycleClock", clock)
+            patcher.setattr(lan_runner.gc, "collect", lambda generation: 0)
+            patcher.setattr(lan_runner, "check_deadline", lambda deadline, phase:
+                            check_deadline(deadline, phase, now=lambda: now[0]))
+            patcher.setattr(lan_runtime.LanContinuousRuntime, "close", cleanup)
+            patcher.setattr(bench, "_process_memory", memory)
+            patcher.setattr(bench, "_run_continuous_observation", observation)
+            result = bench._run_material_comparison({"steps": 1000}, candidate)
+            assert close_context == [None] and len(closed) == 1 and len(reads) == 2
+            assert lan_runtime.LanContinuousRuntime.close is cleanup
+            assert result["status"] == "failed" and result["failure_category"] == "CycleDeadlineExceeded"
+            assert result["failed_phase"] == "INPUT" and result["cycles"] == [asdict(v) for v in cycles]
+            assert len(cycles) == failure_step + 1 and applied == list(range(failure_step))
+            last = result["cycle_summary"]["last_cycle"]
+            assert result["cycle_summary"]["attempts"] == failure_step + 1
+            assert result["cycle_summary"]["misses"] == 1
+            assert last["status"] == "miss_before_apply" and last["failure_phase"] == "INPUT"
+            assert last["global_step"] == failure_step and last["cycle_completed_ns"] is None
+            assert last["scheduled_start_ns"] == last["actual_sample_start_ns"] == failure_step * 20_000_000
+            assert last["deadline_ns"] == (failure_step + 1) * 20_000_000
+            assert all(v["status"] == "confirmed" and v["global_step"] == step
+                       for step, v in enumerate(result["cycles"][:-1]))
+            assert last["device_completed_ns"] is None and last["bookkeeping_completed_ns"] is None
+            assert result["protocol_committed_count"] == result["physically_confirmed_count"] == failure_step
+            assert result["resource_counts"] == {"products_consumed": 30 * failure_step,
+                                                 "truncations_consumed": 4 * failure_step}
+            summary = result["material_comparison"]
+            assert summary["memory_guard_failed"] == (closing_fault in {"limit", "query"})
+            assert summary["cleanup_failed"] == (closing_fault == "cleanup")
+            assert summary["memory_sample_error_type"] == {
+                "limit": "RuntimeError", "query": "OSError"}.get(closing_fault)
+            assert summary["cleanup_error_type"] == ("ValueError" if closing_fault == "cleanup" else None)
+            assert not result["candidate_gate_pass"] and not result["qualification_pass"]
+            assert not result["stage_pass"] and result["comparison_only"] and "private" not in str(result)
+
+    for candidate in ("thread", "worker"):
+        for failure_step in (0, 2):
+            check(candidate, failure_step)
+
+
 def test_s5_fixed_budget_rejected_before_any_port_or_process(monkeypatch):
     from secure_control.experiments import communication_benchmark as bench
 

@@ -1531,8 +1531,6 @@ def _run_material_comparison(options, candidate):
         sample(moment)
     def close(runtime):
         pool = runtime._material_pool
-        previous_error = sys.exception()
-        observation_error = cleanup_error = None
         try:
             if report["gc_begin"] is not None and report["gc_end"] is None:
                 report["gc_end"] = snapshot()
@@ -1540,7 +1538,6 @@ def _run_material_comparison(options, candidate):
         except Exception as error:  # noqa: BLE001 - 关闭观察只记类别，不覆盖原协议错误
             report["memory_guard_failed"] = True
             report["memory_sample_error_type"] = type(error).__name__
-            observation_error = error
         finally:
             try:
                 original_close(runtime)
@@ -1551,14 +1548,8 @@ def _run_material_comparison(options, candidate):
             except Exception as error:  # noqa: BLE001 - 清理失败附加记录，仍保留先发生的错误
                 report["cleanup_failed"] = True
                 report["cleanup_error_type"] = type(error).__name__
-                cleanup_error = error
-        # 原协议异常出口/finally中的首错优先；观察失败只附加公开类别，原关闭仍必执行。
-        # 没有原错误时仍抛保护/清理错误；两者同时失败保留较早的观察错误。
-        if previous_error is None:
-            if observation_error is not None:
-                raise observation_error
-            if cleanup_error is not None:
-                raise cleanup_error
+        # runner可能已把首错转成返回结果，finally中异常栈已空；关闭观察不再抛出覆盖结果。
+        # 保留公开附加失败并执行原关闭，返回后统一门禁；无原失败也不能因此获得成功资格。
     try:
         with patch.object(lan_runtime.LanContinuousRuntime, "close", close):
             result = _run_continuous_observation(**options, material_candidate=candidate,
@@ -1578,7 +1569,9 @@ def _run_material_comparison(options, candidate):
     material = result.get("material_summary") or {}
     if result["status"] == "stopped" and (material.get("cleanup_failed") or report["cleanup_failed"]
                                            or report["memory_guard_failed"]):
-        result.update(status="failed", failure_category="MaterialComparisonCleanupOrMemory")
+        result.update(status="failed", failure_category=(report["memory_sample_error_type"]
+            or report["cleanup_error_type"] or "MaterialComparisonCleanupOrMemory"),
+            failed_phase="MEMORY_SAMPLE" if report["memory_guard_failed"] else "CLEANUP")
     result["candidate_gate_pass"] = (candidate == "worker" and result["status"] == "stopped"
         and len(result["cycles"]) == 1000 and result.get("cycle_summary", {}).get("misses") == 0
         and all(row["status"] == "confirmed" and row["global_step"] == step
