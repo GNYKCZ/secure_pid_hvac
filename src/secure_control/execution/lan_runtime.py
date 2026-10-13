@@ -1130,12 +1130,17 @@ class LanSegmentedRuntime:
             return {"capacity": self.preload_steps,
                     "level": max(0, self.preload_steps - self._segment._step)}
         pool = self._segment._material_pool
-        return pool.snapshot() if pool is not None else getattr(self._segment, "_material_statistics", {})
+        summary = pool.snapshot() if pool is not None else getattr(self._segment, "_material_statistics", {})
+        # CycleTiming v1只接受非负整数；完整供料/清理摘要在停止报告中另行返回。
+        return {key: value for key, value in summary.items() if type(value) is int and value >= 0}
 
     @property
     def material_summary(self):
         if self.preload_steps and self._segment is not None:
             return {**self._segment._preload_statistics, **self.cycle_queue_levels}
+        if self._segment is not None:
+            pool = self._segment._material_pool
+            return pool.snapshot() if pool is not None else getattr(self._segment, "_material_statistics", {})
         return self.cycle_queue_levels
 
     def step(self, v: Any, *, deadline_ns: int | None = None) -> SegmentedStep | None:

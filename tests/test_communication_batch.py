@@ -253,6 +253,12 @@ def test_spawn_material_candidate_uses_existing_lan_state_segments_and_failure_s
             control=lan_runtime.RunControl(), segment_capacity=2)
         runtime.enable_material_preparation(slots=4, _candidate="worker")
         pool = runtime._segment._material_pool
+        from secure_control.execution.cycle_timing import CycleTiming
+        # 真实供料摘要包含模式/布尔/工人字典，周期schema只能接受整数公开计数。
+        timing = CycleTiming(runtime.run_id, runtime._segment.session_id, runtime.controller_epoch,
+            0, 0, None, 20_000_000, 0, 0, 20_000_000, queue_levels=runtime.cycle_queue_levels)
+        assert all(type(v) is int and v >= 0 for v in timing.queue_levels.values())
+        assert runtime.material_summary["material_mode"] == "local-worker-v1"
         worker_pid, session_id = pool._process.pid, runtime.public_setup
         pool.control_begin()
         original_send = localhost_transport.send_frame
