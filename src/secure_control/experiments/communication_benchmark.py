@@ -1513,7 +1513,7 @@ def _run_material_comparison(options, candidate):
     from secure_control.execution import lan_runtime
     report = {"candidate": candidate, "gc_begin": None, "gc_end": None, "memory": [],
               "memory_guard_failed": False, "cleanup_failed": False, "process_cpu_ns": None,
-              "producer_exited": None}
+              "producer_exited": None, "memory_sample_error_type": None, "cleanup_error_type": None}
     started_cpu = time.process_time_ns()
     original_close = lan_runtime.LanContinuousRuntime.close
     def sample(moment):
@@ -1531,13 +1531,16 @@ def _run_material_comparison(options, candidate):
         sample(moment)
     def close(runtime):
         pool = runtime._material_pool
+        previous_error = sys.exception()
+        observation_error = cleanup_error = None
         try:
             if report["gc_begin"] is not None and report["gc_end"] is None:
                 report["gc_end"] = snapshot()
                 event("control_end")
-        except Exception:
+        except Exception as error:  # noqa: BLE001 - 关闭观察只记类别，不覆盖原协议错误
             report["memory_guard_failed"] = True
-            raise
+            report["memory_sample_error_type"] = type(error).__name__
+            observation_error = error
         finally:
             try:
                 original_close(runtime)
@@ -1545,9 +1548,17 @@ def _run_material_comparison(options, candidate):
                     report["producer_exited"] = not pool._thread.is_alive()
                 elif pool is not None:
                     report["producer_exited"] = pool.snapshot()["worker_exited"]
-            except Exception:
+            except Exception as error:  # noqa: BLE001 - 清理失败附加记录，仍保留先发生的错误
                 report["cleanup_failed"] = True
-                raise
+                report["cleanup_error_type"] = type(error).__name__
+                cleanup_error = error
+        # 原协议异常出口/finally中的首错优先；观察失败只附加公开类别，原关闭仍必执行。
+        # 没有原错误时仍抛保护/清理错误；两者同时失败保留较早的观察错误。
+        if previous_error is None:
+            if observation_error is not None:
+                raise observation_error
+            if cleanup_error is not None:
+                raise cleanup_error
     try:
         with patch.object(lan_runtime.LanContinuousRuntime, "close", close):
             result = _run_continuous_observation(**options, material_candidate=candidate,

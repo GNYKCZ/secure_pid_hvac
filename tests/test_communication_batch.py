@@ -324,6 +324,93 @@ def test_spawn_material_candidate_uses_existing_lan_state_segments_and_failure_s
         queue.close()
 
 
+@pytest.mark.parametrize(("sampling", "protocol_failure", "cleanup_failure"), [
+    ("normal", True, False), ("limit", True, False), ("query", True, False),
+    ("normal", False, False), ("limit", False, False), ("query", False, False),
+    ("normal", True, True), ("normal", False, True), ("limit", False, True),
+])
+def test_s5_close_observation_preserves_first_error_and_always_cleans(
+        monkeypatch, sampling, protocol_failure, cleanup_failure):
+    """真实段开始异常出口；只注入请求/OS/清理，不执行控制或性能对照。"""
+    from secure_control.execution import lan_runtime
+    from secure_control.execution.localhost_codec import SegmentBeginPayload
+    from secure_control.execution.localhost_transport import LocalhostTransportTimeout
+    from secure_control.experiments import communication_benchmark as bench
+
+    for candidate in ("thread", "worker"):
+        with monkeypatch.context() as patcher:
+            runtime = lan_runtime.LanContinuousRuntime.__new__(lan_runtime.LanContinuousRuntime)
+            runtime._v2, runtime._failed, runtime._finished = True, False, False
+            runtime._step, runtime._sequences = 0, [0, 0]
+            runtime._sockets, runtime._material_pool = [object(), object()], None
+            runtime.session_id, runtime.config = "test-session", SimpleNamespace(shutdown_timeout=1.)
+            original = LocalhostTransportTimeout("private protocol message")
+            original.phase = "SEGMENT_BEGIN"
+            begin = SegmentBeginPayload("test-run", 0, 0, "0" * 64, None)
+            closed, requests, observed, reads = [], [], [], []
+
+            def request(*args, requests=requests, original=original, **kwargs):
+                requests.append(True)
+                raise original
+
+            def cleanup(value, closed=closed):
+                closed.append(value)
+                if cleanup_failure:
+                    raise ValueError("private cleanup message")
+
+            def memory(reads=reads):
+                reads.append(True)
+                if len(reads) == 2 and sampling == "query":
+                    raise OSError("private OS message")
+                rss = 257 * 1024**2 if len(reads) == 2 and sampling == "limit" else 1024
+                return {"current_rss_bytes": rss, "peak_rss_bytes": rss}
+
+            failed_cycles = [{"global_step": 0, "status": "failed",
+                              "failure_phase": "SEGMENT_BEGIN", "cycle_completed_ns": None}]
+
+            def observation(*, runtime=runtime, begin=begin, observed=observed,
+                            original=original, failed_cycles=failed_cycles, **options):
+                options["_material_event"]("control_begin")
+                try:
+                    if protocol_failure:
+                        runtime.begin_segment(begin)
+                    else:
+                        runtime.close()
+                except (LocalhostTransportTimeout, RuntimeError, OSError, ValueError) as error:
+                    observed.append(error)
+                    return {"status": "failed", "failure_category": type(error).__name__,
+                            "failed_phase": getattr(error, "phase", "CLOSE"),
+                            "cycles": failed_cycles if error is original else []}
+                return {"status": "stopped", "cycles": []}
+
+            patcher.setattr(lan_runtime, "_request", request)
+            patcher.setattr(lan_runtime.LanContinuousRuntime, "close", cleanup)
+            patcher.setattr(bench, "_process_memory", memory)
+            patcher.setattr(bench, "_run_continuous_observation", observation)
+            result = bench._run_material_comparison({"steps": 1000}, candidate)
+            summary = result["material_comparison"]
+            assert closed == [runtime] and len(reads) == 2
+            assert requests == ([True] if protocol_failure else [])
+            assert lan_runtime.LanContinuousRuntime.close is cleanup
+            assert summary["memory_guard_failed"] == (sampling != "normal")
+            assert summary["cleanup_failed"] == cleanup_failure
+            if protocol_failure:
+                assert observed == [original] and result["failure_category"] == "LocalhostTransportTimeout"
+                assert result["failed_phase"] == "SEGMENT_BEGIN" and result["cycles"] is failed_cycles
+                assert runtime._failed
+            elif sampling != "normal" or cleanup_failure:
+                expected = {"limit": "RuntimeError", "query": "OSError"}.get(sampling, "ValueError")
+                assert result["status"] == "failed" and result["failure_category"] == expected
+            else:
+                assert result["status"] == "stopped" and not observed
+            assert summary.get("memory_sample_error_type") == {
+                "normal": None, "limit": "RuntimeError", "query": "OSError"}[sampling]
+            assert summary.get("cleanup_error_type") == ("ValueError" if cleanup_failure else None)
+            assert result["comparison_only"] and not result["candidate_gate_pass"]
+            assert not result["qualification_pass"] and not result["stage_pass"]
+            assert "private" not in str(result)
+
+
 def test_s5_fixed_budget_rejected_before_any_port_or_process(monkeypatch):
     from secure_control.experiments import communication_benchmark as bench
 

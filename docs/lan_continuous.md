@@ -21,6 +21,9 @@ worker在Client本机用一个spawn工人生成原Beaver/Trunc及静态JSON片�
 短缺、工人/通道故障、部分帧、超期及未知提交封闭当前run，不重启/重试/fallback。
 停止废弃库存、五秒内join工人与接收/额度线程；强制终止或缺最终汇总记清理失败，
 不能通过候选门禁。材料不写磁盘，不跨运行缓存。
+关闭观察或清理异常不覆盖已发生的协议首错；`material_comparison`中的
+`memory_sample_error_type`/`cleanup_error_type`只附加公开异常类别（无消息），
+同时保留保护/清理失败标志。无先前错误时保护或清理失败仍使对照失败，不能通过候选门禁。
 
 正常GC/原阈值，保留原启动收集，不freeze/disable，也不安装S3/S4 socket或GC事件探针。
 仅控制开始/结束读取GC统计；worker按开始命令接收和停止读取，P1/P2以第一online请求
