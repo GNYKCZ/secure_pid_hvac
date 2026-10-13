@@ -817,9 +817,10 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
     from secure_control.protocol import coordinator
 
     if gc_boundaries is not None and role != "Client":
-        receive = lan_runtime.receive_envelope
+        # 每层保留独立前驱；后续诊断包装不能重绑定本层闭包而形成自递归。
+        boundary_receive = lan_runtime.receive_envelope
         def boundary_request(*args, **kwargs):
-            request = receive(*args, **kwargs)
+            request = boundary_receive(*args, **kwargs)
             if request.sender == "Client" and request.operation == "online" and "begin" not in gc_boundaries:
                 gc_boundaries["begin"] = {"stats": gc.get_stats(), "enabled": gc.isenabled(),
                                            "threshold": list(gc.get_threshold())}
@@ -831,11 +832,11 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
         observations.enter_context(patch.object(lan_runtime, "receive_envelope", boundary_request))
 
     if diagnostic and role != "Client":
-        receive = lan_runtime.receive_envelope
+        observed_receive = lan_runtime.receive_envelope
 
         def observed_request(*args, **kwargs):
             started, cpu = diagnostic.wall(), diagnostic._cpu()
-            request = receive(*args, **kwargs)
+            request = observed_receive(*args, **kwargs)
             if request.sender == "Client" and request.step is not None:
                 diagnostic.select(request.step)
                 if diagnostic.selected():

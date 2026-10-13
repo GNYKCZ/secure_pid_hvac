@@ -1778,6 +1778,144 @@ def test_supply_diagnostic_real_producer_labels_original_owner_and_exception_cle
     assert control["owner"] == "Client control"
 
 
+@pytest.mark.parametrize("role", ("P1", "P2"))
+@pytest.mark.parametrize("boundaries_enabled,trace_enabled", ((False, False), (True, False),
+                                                          (False, True), (True, True)))
+def test_party_receive_observers_delegate_once_and_restore(monkeypatch, role, boundaries_enabled,
+                                                          trace_enabled):
+    """组合观察必须单向委托；只替换原接收，不启动网络/协议/控制或供料。"""
+    import gc
+    from contextlib import ExitStack
+
+    from secure_control.execution import lan_runtime, lan_scalar_runtime, localhost_transport
+    from secure_control.experiments import communication_benchmark as bench
+
+    requests = [SimpleNamespace(sender="Client", operation=operation, step=step,
+                                payload=SimpleNamespace(action="stop"))
+                for operation, step in (("lan_hello", None), ("online", 0),
+                                        ("online", 1), ("segment_end", 2))]
+    calls, snapshots = [], []
+    channel, deadline = object(), object()
+    original_error = LocalhostTransportProtocolError("private-receive-failure")
+
+    def receive(sock, *, deadline, limit):
+        calls.append((sock, deadline, limit))
+        if len(calls) > len(requests):
+            raise original_error
+        return requests[len(calls) - 1]
+
+    def stats():
+        value = [{"collections": len(snapshots) + 1, "collected": 0, "uncollectable": 0}]
+        snapshots.append(value)
+        return value
+
+    monkeypatch.setattr(lan_runtime, "receive_envelope", receive)
+    monkeypatch.setattr(gc, "get_stats", stats)
+    hooks = ((lan_runtime, "receive_envelope"), (lan_runtime, "_party_reply"),
+             (localhost_transport, "_send_exact"), (localhost_transport, "_receive_exact"),
+             (localhost_transport, "encode_envelope"), (localhost_transport, "decode_envelope"),
+             (lan_scalar_runtime, "encode_scalar_frame_v3"),
+             (lan_scalar_runtime, "decode_scalar_frame_v3"))
+    before = tuple(getattr(owner, name) for owner, name in hooks)
+    gc_before = list(gc.callbacks), gc.isenabled(), gc.get_threshold()
+    boundaries = {} if boundaries_enabled else None
+    observer = bench._TimeoutDiagnostic(role, (101, 102, 103)) if trace_enabled else None
+    with ExitStack() as owned:
+        if observer:
+            owned.enter_context(observer.installed())
+            owned.enter_context(observer.sockets())
+        _, _, restore = bench._meter(role, (101, 102, 103), 0, diagnostic=observer,
+                                    gc_boundaries=boundaries)
+        owned.callback(restore)
+        for index, request in enumerate(requests, 1):
+            assert lan_runtime.receive_envelope(channel, deadline=deadline, limit=1024) is request
+            assert len(calls) == index
+        with pytest.raises(LocalhostTransportProtocolError) as caught:
+            lan_runtime.receive_envelope(channel, deadline=deadline, limit=1024)
+        assert caught.value is original_error
+        assert calls == [(channel, deadline, 1024)] * 5
+        assert len(snapshots) == (2 if boundaries_enabled else 0)
+        if boundaries_enabled:
+            assert set(boundaries) == {"begin", "end"}
+            assert boundaries["begin"]["stats"] is snapshots[0]
+            assert boundaries["end"]["stats"] is snapshots[1]
+            assert all(value["enabled"] == gc_before[1] and
+                       tuple(value["threshold"]) == gc_before[2] for value in boundaries.values())
+    assert tuple(getattr(owner, name) for owner, name in hooks) == before
+    assert (list(gc.callbacks), gc.isenabled(), gc.get_threshold()) == gc_before
+    if observer:
+        report = observer.report()
+        received = [event for event in report["events"] if event.get("phase") == "receive_request"]
+        assert sorted(event["control_global_step"] for event in received) == [0, 1, 2]
+        assert all(event["status"] == "complete" for event in received)
+        assert report["callback_restored"] and report["socket_hooks_restored"]
+        assert report["encoded_bytes"] <= report["encoded_limit"] == 72 * 1024
+        assert "private-receive" not in str(report)
+
+
+@pytest.mark.parametrize("role", ("P1", "P2"))
+def test_s6_party_job_composes_receive_observers_and_preserves_original_failure(monkeypatch, role):
+    """实际party入口采用软件业务替身，验证组合可达、公开错误与恢复，不做测量。"""
+    import gc
+
+    from secure_control.execution import lan_runtime, localhost_transport
+    from secure_control.experiments import communication_benchmark as bench
+
+    def check(failure_index):
+        with monkeypatch.context() as patcher:
+            calls, outcomes = [], []
+            requests = [SimpleNamespace(sender="Client", operation=operation, step=step,
+                                        payload=SimpleNamespace(action="stop"))
+                        for operation, step in (("lan_hello", None), ("online", 0),
+                                                ("segment_end", 1))]
+            original_error = LocalhostTransportProtocolError("private-party-receive")
+
+            def receive(*args, **kwargs):
+                calls.append((args, kwargs))
+                if failure_index is not None and len(calls) == failure_index + 1:
+                    raise original_error
+                return requests[len(calls) - 1]
+
+            def party(config, *, batch):
+                assert config.role == role and batch
+                for request in requests:
+                    assert lan_runtime.receive_envelope(None, deadline=123, limit=1024) is request
+                return {"status": "closed", "material_summary": None}
+
+            patcher.setattr(lan_runtime, "receive_envelope", receive)
+            patcher.setattr(bench, "run_party_single_step", party)
+            patcher.setattr(bench, "_process_memory", lambda: {"scope": "software fixture"})
+            hooks = ((lan_runtime, "receive_envelope"), (lan_runtime, "_party_reply"),
+                     (lan_runtime.LanSegmentedRuntime, "close"),
+                     (localhost_transport, "_send_exact"), (localhost_transport, "_receive_exact"),
+                     (localhost_transport, "encode_envelope"), (localhost_transport, "decode_envelope"))
+            before = tuple(getattr(owner, name) for owner, name in hooks)
+            gc_before = list(gc.callbacks), gc.isenabled(), gc.get_threshold()
+            bench._party_job(bench._config(role, (101, 102, 103)), (101, 102, 103), 0, True,
+                             SimpleNamespace(put=outcomes.append), diagnostic_enabled=True,
+                             supply_diagnostic=True, timeout_trace=True, material_comparison=True)
+            assert len(outcomes) == 1
+            assert len(calls) == (3 if failure_index is None else failure_index + 1)
+            outcome = outcomes[0]
+            assert outcome["role"] == role
+            assert outcome["status"] == ("closed" if failure_index is None else "failed")
+            assert outcome.get("error_type") == (None if failure_index is None else
+                                                  "LocalhostTransportProtocolError")
+            assert set(outcome["gc_boundaries"]) == (set() if failure_index == 0 else {"begin", "end"})
+            assert tuple(getattr(owner, name) for owner, name in hooks) == before
+            assert (list(gc.callbacks), gc.isenabled(), gc.get_threshold()) == gc_before
+            diagnostic = outcome["diagnostic"]
+            assert diagnostic["callback_restored"] and diagnostic["socket_hooks_restored"]
+            assert diagnostic["gc_before"] == diagnostic["gc_after"]
+            received = [event for event in diagnostic["events"] if event.get("phase") == "receive_request"]
+            expected_steps = {None: [0, 1], 0: [], 2: [0]}[failure_index]
+            assert sorted(event["control_global_step"] for event in received) == expected_steps
+            assert "private-party" not in str(outcome)
+
+    for failure_index in (None, 0, 2):
+        check(failure_index)
+
+
 def test_supply_diagnostic_canonical_send_encode_public_metadata_and_cleanup(monkeypatch):
     import json
 
