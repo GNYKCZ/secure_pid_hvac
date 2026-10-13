@@ -601,6 +601,251 @@ def test_s5_fixed_budget_rejected_before_any_port_or_process(monkeypatch):
             bench.run_continuous_observation(**(options | change))
 
 
+def test_s9_guard_selection_and_old_budgets_before_resources(monkeypatch):
+    import gc
+
+    from secure_control.experiments import communication_benchmark as bench
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("非法长期组合不得分配端口、材料或进程")
+    monkeypatch.setattr(bench, "_ports", forbidden)
+    monkeypatch.setattr(bench, "_run_continuous_observation", forbidden)
+    options = {"steps": 10000, "delay_ms": 0, "segment_steps": 400, "optimized": True,
+               "recording_mode": "light", "worker_long_run": True}
+    for change in ({"worker_long_run": 1}, {"steps": 9999}, {"steps": 10001}, {"steps": True},
+                   {"steps": 10000.0}, {"delay_ms": False}, {"delay_ms": 1}, {"optimized": 1},
+                   {"segment_steps": 400.0}, {"material_slots": 16.0}, {"material_slots": 4},
+                   {"preload_steps": False}, {"preload_steps": 1}, {"preload_execution": "staged"},
+                   {"recording_mode": "full"}, {"diagnostic": True}, {"timeout_trace": True},
+                   {"timeout_trace": 0}, {"gc_trial_policy": "baseline"}, {"role_config": "unused"},
+                   {"tcp_nodelay": False}, {"commit_policy": "serial"},
+                   {"material_candidate": "worker"}, {"material_candidate": "thread"},
+                   {"worker_timeout_diagnostic": True}, {"worker_timeout_diagnostic": 0}):
+        with pytest.raises(ValueError):
+            bench.run_continuous_observation(**(options | change))
+    for name, value in (("isenabled", False), ("get_threshold", (701, 10, 10)),
+                        ("get_freeze_count", 1), ("get_debug", 1)):
+        with monkeypatch.context() as patcher:
+            patcher.setattr(gc, name, lambda value=value: value)
+            with pytest.raises(ValueError):
+                bench.run_continuous_observation(**options)
+    with monkeypatch.context() as patcher:
+        patcher.setattr(gc, "callbacks", [object()])
+        with pytest.raises(ValueError):
+            bench.run_continuous_observation(**options)
+    for change in ({"worker_long_run": False, "material_candidate": "worker"},
+                   {"worker_long_run": False, "worker_timeout_diagnostic": True}):
+        with pytest.raises(ValueError):
+            bench.run_continuous_observation(**(options | change))
+    calls = []
+    monkeypatch.setattr(bench, "_run_material_comparison", lambda opts, candidate, **kwargs:
+                        calls.append((opts, candidate, kwargs)) or {"status": "synthetic"})
+    assert bench.run_continuous_observation(**options) == {"status": "synthetic"}
+    assert calls[0][1:] == ("worker", {"target_steps": 10000})
+    assert calls[0][0]["steps"] == 10000 and not calls[0][0]["diagnostic"]
+    bench.run_continuous_observation(**(options | {"steps": 1000, "worker_long_run": False,
+                                                  "material_candidate": "worker"}))
+    assert calls[-1][1:] == ("worker", {})
+
+
+def _s9_public_result():
+    """仅合成身份/计时/计数；不创建控制、材料或端口。"""
+    cycles = []
+    for step in range(10000):
+        start = step * 20000000
+        cycles.append({"run_id": "run", "session_id": "session", "controller_epoch": "epoch",
+            "round_id": f"round-{step}", "global_step": step, "segment_index": step // 400,
+            "status": "confirmed", "failure_phase": None, "period_ns": 20000000,
+            "scheduled_start_ns": start, "actual_sample_start_ns": start + 1,
+            "device_completed_ns": start + 2, "bookkeeping_completed_ns": start + 3,
+            "cycle_completed_ns": start + 4, "deadline_ns": start + 20000000,
+            "protocol_committed_count": step + 1, "physically_confirmed_count": step + 1})
+    return {"status": "stopped", "requested_steps": 10000, "successful_steps": 10000,
+        "failed_attempts": 0, "cycles": cycles, "cycle_summary": {"attempts": 10000, "misses": 0},
+        "protocol_committed_count": 10000, "physically_confirmed_count": 10000,
+        "resource_counts": {"products_consumed": 300000, "truncations_consumed": 40000},
+        "material_summary": {"claimed": 10000, "generated_received": 10016,
+            "inventory_inflight_high_water": 16, "material_encoded_bound_high_water": 8388608,
+            "worker_exited": True, "receiver_exited": True, "credit_thread_exited": True,
+            "cleanup_failed": False, "worker": {"error_type": None, "memory_guard_failed": False}},
+        "worker_long_run": {"numeric_contract": {"mode": "bounded_input_reachability",
+            "horizon_steps": None, "proof_algorithm": "encoded-block-power-rational-v1"}},
+        "party_outcomes": [{"role": role, "status": "closed", "steps": [
+            {"step": step, "round_id": f"round-{step}"} for step in range(10000)]}
+            for role in ("P1", "P2")],
+        "last_commit_observation": {"run_id": "run", "session_id": "session", "controller_epoch": "epoch",
+            "round_id": "round-9999", "global_step": 9999, "step": 9999,
+            "parties": {role: {"request_state": "sent", "valid_ack_received": True}
+                        for role in ("P1", "P2")}}}
+
+
+def test_s9_gate_rejects_single_bad_period_identity_receipt_or_material():
+    from copy import deepcopy
+
+    from secure_control.experiments import communication_benchmark as bench
+
+    good = _s9_public_result()
+    report = {"memory_guard_failed": False, "cleanup_failed": False, "producer_exited": True}
+    assert bench._material_run_gate(good, report, "worker", 10000, strict=True)
+    # 改一个公开事实就不能过门禁；包含内部边界和最后周期，不靠分位数掩盖。
+    edits = [(("cycles", 799, "cycle_completed_ns"), 800 * 20000000),
+        (("cycles", 799, "cycle_completed_ns"), 800 * 20000000 + 1),
+        (("cycles", 9999, "cycle_completed_ns"), None),
+        (("cycles", 400, "global_step"), 399), (("cycles", 400, "segment_index"), 0),
+        (("cycles", 400, "round_id"), "round-399"), (("cycles", 400, "session_id"), "other"),
+        (("cycles", 400, "controller_epoch"), "other"), (("cycles", 400, "run_id"), "other"),
+        (("cycles", 400, "status"), "miss_after_apply"), (("cycles", 400, "actual_sample_start_ns"), None),
+        (("cycles", 400, "physically_confirmed_count"), 400),
+        (("cycles", 400, "scheduled_start_ns"), 1),
+        (("party_outcomes", 0, "steps", 400, "round_id"), "round-399"),
+        (("party_outcomes", 0, "steps", 400, "step"), 399),
+        (("party_outcomes", 0, "status"), "uncertain"),
+        (("last_commit_observation", "parties", "P2", "valid_ack_received"), False),
+        (("last_commit_observation", "round_id"), "round-9998"),
+        (("material_summary", "claimed"), 9999), (("material_summary", "error_type"), "OSError"),
+        (("material_summary", "worker", "error_type"), "OSError"),
+        (("material_summary", "worker", "memory_guard_failed"), True),
+        (("material_summary", "inventory_inflight_high_water"), 17),
+        (("material_summary", "material_encoded_bound_high_water"), 8388609),
+        (("material_summary", "worker_exited"), False), (("material_summary", "receiver_exited"), False),
+        (("material_summary", "credit_thread_exited"), False), (("material_summary", "cleanup_failed"), True),
+        (("resource_counts", "products_consumed"), 299970),
+        (("resource_counts", "truncations_consumed"), 39996),
+        (("worker_long_run", "numeric_contract", "horizon_steps"), 10000),
+        (("cycle_summary", "attempts"), 9999), (("cycle_summary", "misses"), 1)]
+    for path, value in edits:
+        bad = deepcopy(good)
+        target = bad
+        for key in path[:-1]:
+            target = target[key]
+        target[path[-1]] = value
+        assert not bench._material_run_gate(bad, report, "worker", 10000, strict=True), path
+    for key in ("cycles", "party_outcomes", "last_commit_observation"):
+        bad = deepcopy(good)
+        bad.pop(key)
+        assert not bench._material_run_gate(bad, report, "worker", 10000, strict=True)
+    short = deepcopy(good)
+    short["cycles"].pop()
+    assert not bench._material_run_gate(short, report, "worker", 10000, strict=True)
+    for key in ("memory_guard_failed", "cleanup_failed", "producer_exited"):
+        assert not bench._material_run_gate(good, report | {key: key != "producer_exited"},
+                                            "worker", 10000, strict=True)
+
+
+@pytest.mark.parametrize("fault", ("normal", "initialization", "cleanup", "memory", "control"))
+def test_s9_result_metadata_and_original_error_survive_stop(monkeypatch, fault):
+    from secure_control.execution import lan_runtime
+    from secure_control.experiments import communication_benchmark as bench
+
+    good = _s9_public_result()
+    runtime = object.__new__(lan_runtime.LanContinuousRuntime)
+    runtime._material_pool = SimpleNamespace(snapshot=lambda: {"worker_exited": True})
+    closed = []
+    def close(value):
+        closed.append(value)
+        if fault == "cleanup":
+            raise OSError("private closing error")
+    memory = iter((1024, 257 * 1024**2 if fault == "memory" else 1024))
+    def observe(**options):
+        assert options["material_candidate"] == "worker" and not options.get("diagnostic")
+        if fault == "initialization":
+            raise ValueError("private startup error")
+        options["_long_run_metadata"]["numeric_contract"] = good["worker_long_run"]["numeric_contract"]
+        options["_material_event"]("control_begin")
+        if fault == "control":
+            good.update(status="failed", failure_category="CycleDeadlineExceeded", failed_phase="INPUT",
+                        cycles=[{"status": "miss_before_apply", "cycle_completed_ns": None}])
+        runtime.close()
+        return good
+    monkeypatch.setattr(lan_runtime.LanContinuousRuntime, "close", close)
+    monkeypatch.setattr(bench, "_process_memory", lambda: {"current_rss_bytes": next(memory)})
+    monkeypatch.setattr(bench, "_run_continuous_observation", observe)
+    result = bench.run_continuous_observation(steps=10000, delay_ms=0, segment_steps=400,
+        optimized=True, recording_mode="light", worker_long_run=True)
+    assert lan_runtime.LanContinuousRuntime.close is close
+    assert result["worker_long_run"]["maximum_attempts"] == 10000
+    assert result["worker_long_run"]["target_steps"] == 10000
+    assert result["worker_long_run_gate_pass"] == (fault == "normal")
+    assert result["comparison_only"] and not result["candidate_gate_pass"]
+    assert not result["qualification_pass"] and not result["stage_pass"]
+    if fault == "initialization":
+        assert result["cycles"] == [] and result["worker_long_run"]["numeric_contract"] is None
+        assert result["failure_category"] == "ValueError" and not closed
+    else:
+        assert closed == [runtime]
+        if fault == "control":
+            assert result["cycles"] is good["cycles"] and result["failed_phase"] == "INPUT"
+            assert result["failure_category"] == "CycleDeadlineExceeded"
+    assert "private" not in str(result)
+
+
+def test_s9_cli_only_cycle_batch_transfers_long_flag(tmp_path, monkeypatch, capsys):
+    import json
+    import sys
+
+    from secure_control.experiments import communication_benchmark as bench
+    from secure_control.experiments import lan_runner
+
+    calls = []
+    def selected(options, candidate, **kwargs):
+        calls.append((options, candidate, kwargs))
+        return {"status": "stopped", "cycle_timing": {"p50_ms": 1.0}}
+    monkeypatch.setattr(bench, "_run_material_comparison", selected)
+    def forbidden(*args, **kwargs):
+        pytest.fail("非法case不能进入其他运行路径")
+    monkeypatch.setattr(bench, "run_full_observation", forbidden)
+    monkeypatch.setattr(bench, "run_local_benchmark", forbidden)
+    base = ["secure-control", "benchmark", "--steps", "10000", "--segment-steps", "400",
+            "--recording", "light", "--worker-long-run", "--output", str(tmp_path / "result.json")]
+    for case, mode in (("cycle", "legacy"), ("full-observation", "batch"), ("dynamic", "batch")):
+        monkeypatch.setattr(sys, "argv", base + ["--case", case, "--mode", mode])
+        assert lan_runner._run() == 5 and not calls
+        assert not (tmp_path / "result.json").exists()
+    monkeypatch.setattr(sys, "argv", base + ["--case", "cycle", "--mode", "batch"])
+    assert lan_runner._run() == 0
+    assert calls[0][1:] == ("worker", {"target_steps": 10000})
+    assert json.loads((tmp_path / "result.json").read_text(encoding="utf-8"))["status"] == "stopped"
+    capsys.readouterr()
+
+
+def test_s9_real_initialization_restores_owned_observers_without_starting_roles(monkeypatch):
+    import gc
+
+    from secure_control.execution import lan_runtime
+    from secure_control.execution import localhost_transport as transport
+    from secure_control.experiments import communication_benchmark as bench
+    from secure_control.experiments import lan_continuous_profile
+
+    original = (transport._send_exact, transport._receive_exact, transport.encode_envelope,
+                transport.decode_envelope, lan_runtime.LanContinuousRuntime.close, list(gc.callbacks))
+    for failure_point in ("control", "profile"):
+        with monkeypatch.context() as patcher:
+            closed = []
+            def forbidden(*args, **kwargs):
+                pytest.fail("初始化软件故障测试不能启动角色")
+            def failed(*args, **kwargs):
+                raise OSError("private initialization")
+            queue = SimpleNamespace(close=lambda closed=closed: closed.append(True))
+            context = SimpleNamespace(Queue=lambda queue=queue: queue,
+                Process=lambda forbidden=forbidden, **kwargs: SimpleNamespace(
+                    start=forbidden, join=forbidden, is_alive=lambda: False))
+            patcher.setattr(bench.mp, "get_context", lambda method, context=context: context)
+            patcher.setattr(bench, "_ports", lambda: (101, 102, 103))
+            if failure_point == "control":
+                patcher.setattr(lan_runtime, "RunControl", failed)
+            else:
+                patcher.setattr(lan_continuous_profile, "load_segmented_experiment", failed)
+            result = bench.run_continuous_observation(steps=10000, delay_ms=0, segment_steps=400,
+                optimized=True, recording_mode="light", worker_long_run=True)
+            assert result["status"] == "failed" and result["failure_category"] == "OSError"
+            assert result["cycles"] == [] and not result["worker_long_run_gate_pass"]
+            assert result["worker_long_run"]["numeric_contract"] is None and closed == [True]
+            assert not result.get("diagnostic", False)
+            assert "private initialization" not in str(result)
+        assert original == (transport._send_exact, transport._receive_exact, transport.encode_envelope,
+            transport.decode_envelope, lan_runtime.LanContinuousRuntime.close, list(gc.callbacks))
+
+
 def test_s6_independent_worker_trace_guard_preserves_old_trial_limits(monkeypatch):
     from secure_control.experiments import communication_benchmark as bench
 

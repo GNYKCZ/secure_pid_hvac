@@ -586,6 +586,60 @@ S4未复现或关键区间缺证时定位未完成，停止新增运行与自动
 diagnostic/comparison_only=true，qualification/stage=false；200成功不代表正式冻结可采用，
 也不替代1000/10000、跨段、完整路线/GUI、网络、三机或硬件资格。
 
+### 显式 worker 长期候选（S9）
+
+`--worker-long-run` 默认关闭，只续接现有 worker，不改变正式线程供料或 GUI。
+原 `--material-candidate` 仍固定 1000 周期，`--worker-timeout-diagnostic`
+仍固定 20 周期。S9 仅接受 cycle/batch/light、严格整数 10000 周期、段 400、
+16 槽、无预送、零延迟、内部本机角色、默认 TCP/双提交和正常 GC 700/10/10。
+冻结、禁用、调试 GC、外部 callback、诊断/trace/GC-trial、外部 role-config、
+候选选择或通信策略覆盖均互斥；非法组合在端口、材料、进程创建前拒绝。
+
+```powershell
+uv run secure-control benchmark --case cycle --mode batch --steps 10000 --delay-ms 0 --segment-steps 400 --material-slots 16 --preload-steps 0 --recording light --worker-long-run --output .tmp/issue120-s9-worker-long-run.json
+```
+
+[D9 批准](https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6144849748)
+覆盖限定入口/门禁/测试/文档实施及新 SHA 必要软件检查、独立核查；只有该软件
+部分无确认缺陷并获准进入验证，才可发布预声明后使用唯一一次最多 10000 尝试
+的预算。初始化失败也耗用机会，首个失败即停，不重跑、补步或加对照/探针。
+输出必须是新文件，不覆盖 S5–S8 原件；失败后的新修复/测量另需具体决定。
+累计自动返工仍 3/3，不自动第四轮，不合并或开始下一阶段。
+
+有效配置仍为 `cart_pole_observer_lan.example.yaml`。原小数 32 bit、lambda80、
+参数/运行 payload 40/46 bit、256 bit 素数和 n4/m2/p1 不变。持续装配使用
+`sustained_observer_numeric_contract` 的 `bounded_input_reachability`，
+`horizon_steps=None`，原精确编码块幂证明覆盖有界输入下任意轮次并含截断误差。
+原 Client 仍在控制前验证范围、累加器和截断界，每轮检查输入，场景守卫保留；
+不延长有限证书、不重建初态或跨段清秘密状态。只公开证明模式/算法/位宽摘要，
+不导出矩阵、编码初态或秘密状态。数学范围证明不是物理或硬实时无限期保证。
+
+10000 个完整周期从原计划起点计至软件设备确认、记账与观测出口，均须严格
+小于原 20ms 期限。g399、799…9599 共 24 次继续控制的段维护计入对应周期，
+不刷新时钟或期限。g9999 设备确认和记账仍受最后周期保护；之后正常停止的
+末段 END/双方停止确认、终止 source 复核、关闭和结果导出属于周期外停止流。
+不能称停止握手也在 20ms 内，不能用退出耗时倒推周期完成。停止必须成功：
+缺双方关闭确认、来源复核或清理失败均拒绝长期门禁，即使控制周期全部按时。
+
+`worker_long_run` 元数据含版本 1、目标/最大尝试 10000、条件及持续数值契约
+摘要；初始化失败也保留模式和原失败周期/类别。`worker_long_run_gate_pass`
+要求全分母、连续步/段/身份和唯一 round、原计划/期限/确认前缀、双方各步对应
+round及末步双 ACK、10000 次材料领取、库存+在途≤16、编码≤8MiB、原内存保护
+及全部供料进程/线程有界退出。材料消费为300000次乘法/40000次截断，多余库存
+停止废弃。所有首步、慢步、跨段和失败/null端点保留，不能只看平均值或p99。
+
+原 Client/worker 256MiB 离散当前 RSS 保护线不提高；worker 内存 deque(maxlen=32)
+和 16KiB 结束摘要保持。benchmark 最多保存10000尝试、生产近期窗口仍256，
+它们不是无限期内存证明。light 不在控制期间新增写盘或存储材料；退出后沿
+既有方式一次导出公开结果，不承诺一次物理写入。离散采样和各角色 GC 边界
+也不能定位逐 socket 错误、证明瞬时总内存或排除未来尖峰。
+
+长期候选通过时 `candidate_gate_pass=false`，`comparison_only=true`，
+`qualification_pass=false`、`stage_pass=false`。结果只适用于声明 SHA/配置/
+环境的本机 worker 动态长期样本；不是正式默认推广、完整路线、认证三机
+Wi-Fi 或硬件施力资格。未开启重 socket/GC 事件探针，历史 S5 根因仍可能未知。
+完成后发布完整原件/hash与实际结果交回 Design，停止，不自动追加运行。
+
 早期有限诊断预算为fused/stock1000/段400的零注入406步和1ms每帧1步，各一次，现已使用，不能复用；
 失败即停，退出集中输出。未复现也不得循环追样本或用诊断PASS代替1000/10k验收。
 

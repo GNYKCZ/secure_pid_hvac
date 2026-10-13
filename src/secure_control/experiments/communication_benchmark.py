@@ -1434,7 +1434,8 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                                preload_execution="fused", diagnostic=False,
                                recording_mode="full", tcp_nodelay=None,
                                commit_policy="default", gc_trial_policy=None, timeout_trace=False,
-                               material_candidate=None, worker_timeout_diagnostic=False) -> dict[str, object]:
+                               material_candidate=None, worker_timeout_diagnostic=False,
+                               worker_long_run=False) -> dict[str, object]:
     # 所有试验参数在任何端口/角色/材料创建前拒绝；默认入口走原路径。
     options = {"steps": steps, "delay_ms": delay_ms, "segment_steps": segment_steps,
                "optimized": optimized, "material_slots": material_slots, "role_config": role_config,
@@ -1442,6 +1443,22 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                "diagnostic": diagnostic, "recording_mode": recording_mode,
                    "tcp_nodelay": tcp_nodelay, "commit_policy": commit_policy,
                    "timeout_trace": timeout_trace}
+    if type(worker_long_run) is not bool:
+        raise ValueError("worker长期选择必须为严格bool。")
+    if worker_long_run:
+        if (optimized is not True or recording_mode != "light" or diagnostic is not False
+                or worker_timeout_diagnostic is not False or material_candidate is not None
+                or gc_trial_policy is not None or timeout_trace is not False
+                or type(steps) is not int or steps != 10000
+                or type(segment_steps) is not int or segment_steps != 400
+                or type(material_slots) is not int or material_slots != 16
+                or type(preload_steps) is not int or preload_steps != 0 or preload_execution != "fused"
+                or type(delay_ms) not in (int, float) or delay_ms != 0 or role_config is not None
+                or tcp_nodelay is not None or commit_policy != "default"
+                or not gc.isenabled() or gc.get_freeze_count() or gc.callbacks or gc.get_debug()
+                or gc.get_threshold() != (700, 10, 10)):
+            raise ValueError("S9只允许正常GC的worker/cycle/batch/light/10000/400/16/无预送/默认通信。")
+        return _run_material_comparison(options, "worker", target_steps=10000)
     if type(worker_timeout_diagnostic) is not bool:
         raise ValueError("S6诊断选择必须为严格bool。")
     if worker_timeout_diagnostic:
@@ -1525,7 +1542,79 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
     return report
 
 
-def _run_material_comparison(options, candidate):
+def _material_run_gate(result, report, candidate, target_steps, *, strict=False):
+    """复用S5材料/周期门禁；长期样本还须有全分母、身份链与双方确认。"""
+    material = result.get("material_summary") or {}
+    cycles = result.get("cycles", [])
+    try:
+        complete = (candidate == "worker" and result["status"] == "stopped"
+            and len(cycles) == target_steps and result.get("cycle_summary", {}).get("misses") == 0
+            and all(row["status"] == "confirmed" and row["global_step"] == step
+                    and row["segment_index"] == step // 400 and row["cycle_completed_ns"] is not None
+                    and row["cycle_completed_ns"] < row["deadline_ns"]
+                    for step, row in enumerate(cycles))
+            and len({row["session_id"] for row in cycles}) == 1
+            and len({row["controller_epoch"] for row in cycles}) == 1
+            and result.get("protocol_committed_count") == target_steps
+            and result.get("physically_confirmed_count") == target_steps
+            and material.get("claimed") == target_steps and material.get("generated_received", 0) >= target_steps
+            and material.get("inventory_inflight_high_water", 17) <= 16
+            and material.get("material_encoded_bound_high_water", 8 * 1024 * 1024 + 1) <= 8 * 1024 * 1024
+            and material.get("error_type") is None and (material.get("worker") or {}).get("error_type") is None
+            and material.get("worker_exited") is True and material.get("receiver_exited") is True
+            and material.get("credit_thread_exited") is True and material.get("cleanup_failed") is False
+            and not report["memory_guard_failed"] and not report["cleanup_failed"])
+        if not complete or not strict:
+            return complete
+        if (result.get("requested_steps") != target_steps or result.get("successful_steps") != target_steps
+                or result.get("failed_attempts") != 0 or result["cycle_summary"].get("attempts") != target_steps
+                or result.get("failure_category") is not None or result.get("failed_phase") is not None
+                or result.get("resource_counts") != {"products_consumed": 30 * target_steps,
+                                                      "truncations_consumed": 4 * target_steps}
+                or len({row["round_id"] for row in cycles}) != target_steps
+                or len({row["run_id"] for row in cycles}) != 1
+                or material["worker"].get("memory_guard_failed") is not False
+                or report.get("producer_exited") is not True):
+            return False
+        numeric = result["worker_long_run"]["numeric_contract"]
+        if (numeric["mode"] != "bounded_input_reachability" or numeric["horizon_steps"] is not None
+                or numeric["proof_algorithm"] != "encoded-block-power-rational-v1"):
+            return False
+        first = cycles[0]
+        for step, row in enumerate(cycles):
+            if (any(not isinstance(row[key], str) or not row[key] for key in
+                    ("run_id", "session_id", "controller_epoch", "round_id"))
+                    or row["period_ns"] != 20000000
+                    or row["scheduled_start_ns"] != first["scheduled_start_ns"] + step * 20000000
+                    or row["deadline_ns"] != row["scheduled_start_ns"] + 20000000
+                    or not row["scheduled_start_ns"] <= row["actual_sample_start_ns"]
+                        <= row["device_completed_ns"] <= row["bookkeeping_completed_ns"]
+                        <= row["cycle_completed_ns"] < row["deadline_ns"]
+                    or row["protocol_committed_count"] != step + 1
+                    or row["physically_confirmed_count"] != step + 1
+                    or row.get("failure_phase") is not None):
+                return False
+        parties = result["party_outcomes"]
+        if len(parties) != 2 or {party["role"] for party in parties} != {"P1", "P2"}:
+            return False
+        for party in parties:
+            if (party["status"] != "closed" or len(party["steps"]) != target_steps
+                    or any(row["step"] != step or row["round_id"] != cycles[step]["round_id"]
+                           for step, row in enumerate(party["steps"]))):
+                return False
+        last, commit = cycles[-1], result["last_commit_observation"]
+        return (all(commit[key] == last[key] for key in ("run_id", "session_id", "controller_epoch",
+                                                       "round_id", "global_step"))
+                and commit["step"] == target_steps - 1
+                and set(commit["parties"]) == {"P1", "P2"}
+                and all(p["request_state"] == "sent" and p["valid_ack_received"] is True
+                        for p in commit["parties"].values()))
+    except (KeyError, TypeError, ValueError, IndexError):
+        # 缺失或畸形公开证据拒绝门禁，仍保留原失败结果供导出。
+        return False
+
+
+def _run_material_comparison(options, candidate, *, target_steps=1000):
     """S5仅边界快照；S6独立持有既有探针退出栈，不改变GC策略。"""
     from secure_control.execution import lan_runtime
     report = {"candidate": candidate, "gc_begin": None, "gc_end": None, "memory": [],
@@ -1533,6 +1622,11 @@ def _run_material_comparison(options, candidate):
               "producer_exited": None, "memory_sample_error_type": None, "cleanup_error_type": None}
     started_cpu = time.process_time_ns()
     traced = options.get("worker_timeout_diagnostic", False)
+    long_run = target_steps == 10000
+    long_metadata = {"format_version": 1, "target_steps": 10000, "maximum_attempts": 10000,
+                     "candidate": "worker", "period_ns": 20000000, "segment_steps": 400,
+                     "recording_mode": "light", "first_failure_stop": True,
+                     "numeric_contract": None} if long_run else None
     trace_observers = []
     original_close = lan_runtime.LanContinuousRuntime.close
     def sample(moment):
@@ -1583,8 +1677,9 @@ def _run_material_comparison(options, candidate):
                 cleanup.callback(restored)
                 return restored
             result = _run_continuous_observation(**options, material_candidate=candidate,
-                _material_event=event, **({"_register_trace_cleanup": register,
-                                          "_trace_observers": trace_observers} if traced else {}))
+                _material_event=event, **({"_long_run_metadata": long_metadata} if long_run else {}),
+                **({"_register_trace_cleanup": register} if traced or long_run else {}),
+                **({"_trace_observers": trace_observers} if traced else {}))
     except Exception as error:  # noqa: BLE001 - 初始化/清理失败也保留，不启动替代路线
         result = {"schema": "cycle-qualification-v1", "case": "cycle", "mode": "batch",
                   "status": "failed", "failure_category": type(error).__name__,
@@ -1603,23 +1698,11 @@ def _run_material_comparison(options, candidate):
         result.update(status="failed", failure_category=(report["memory_sample_error_type"]
             or report["cleanup_error_type"] or "MaterialComparisonCleanupOrMemory"),
             failed_phase="MEMORY_SAMPLE" if report["memory_guard_failed"] else "CLEANUP")
-    result["candidate_gate_pass"] = (candidate == "worker" and result["status"] == "stopped"
-        and len(result["cycles"]) == 1000 and result.get("cycle_summary", {}).get("misses") == 0
-        and all(row["status"] == "confirmed" and row["global_step"] == step
-                and row["segment_index"] == step // 400 and row["cycle_completed_ns"] is not None
-                and row["cycle_completed_ns"] < row["deadline_ns"]
-                for step, row in enumerate(result["cycles"]))
-        and len({row["session_id"] for row in result["cycles"]}) == 1
-        and len({row["controller_epoch"] for row in result["cycles"]}) == 1
-        and result.get("protocol_committed_count") == 1000
-        and result.get("physically_confirmed_count") == 1000
-        and material.get("claimed") == 1000 and material.get("generated_received", 0) >= 1000
-        and material.get("inventory_inflight_high_water", 17) <= 16
-        and material.get("material_encoded_bound_high_water", 8 * 1024 * 1024 + 1) <= 8 * 1024 * 1024
-        and material.get("error_type") is None and (material.get("worker") or {}).get("error_type") is None
-        and material.get("worker_exited") is True and material.get("receiver_exited") is True
-        and material.get("credit_thread_exited") is True and material.get("cleanup_failed") is False
-        and not report["memory_guard_failed"] and not report["cleanup_failed"])
+    if long_run:
+        result["worker_long_run"] = long_metadata
+        result["worker_long_run_gate_pass"] = _material_run_gate(
+            result, report, candidate, target_steps, strict=True)
+    result["candidate_gate_pass"] = not long_run and _material_run_gate(result, report, candidate, 1000)
     if traced:
         if result.get("diagnostic_report") is None:
             result["diagnostic_report"] = {"diagnostic": True, "roles": [v.report() for v in trace_observers],
@@ -1678,7 +1761,8 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
                                recording_mode="full", tcp_nodelay=None,
                                commit_policy="default", _gc_trial=None, timeout_trace=False,
                                material_candidate=None, _material_event=None, worker_timeout_diagnostic=False,
-                               _register_trace_cleanup=None, _trace_observers=None) -> dict[str, object]:
+                               _register_trace_cleanup=None, _trace_observers=None,
+                               _long_run_metadata=None) -> dict[str, object]:
     """实际持续动态循环及原同步 writer；退出后报告观察，不发布图或更改调度。"""
     from secure_control.execution.lan_runtime import RunControl
     from secure_control.scenarios.cart_pole.interactive import InteractiveSession
@@ -1873,6 +1957,19 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
               tempfile.TemporaryDirectory(prefix="secure-control-observation-")) as folder:
             assembly_start = time.perf_counter_ns()
             prepared = load_segmented_experiment(config.experiment_config, segment_steps, session)
+            if _long_run_metadata is not None:
+                # 只公开持续证明的适用模式，不导出矩阵、编码初态或秘密范围数值。
+                effective = prepared.effective_config
+                numeric = {"mode": effective["range"]["mode"],
+                           "horizon_steps": prepared.contract.horizon_steps,
+                           "proof_algorithm": effective["range"]["proof"]["algorithm"],
+                           "block_steps": prepared.contract.reachability_block_steps,
+                           "parameter_bits": effective["paper_parameter_bits"],
+                           "runtime_payload_bits": effective["runtime_payload_bits"],
+                           "client_validation": "original range validation before control and each input"}
+                _long_run_metadata["numeric_contract"] = numeric
+                if numeric["mode"] != "bounded_input_reachability" or numeric["horizon_steps"] is not None:
+                    raise ValueError("worker长期验证需要原持续有界输入证明。")
             recheck = prepared.recheck_sources
 
             def measured_sources():

@@ -587,6 +587,8 @@ def _run() -> int:
                            help="S5显式供料对照，固定1000/400/16/light；默认不启用")
     benchmark.add_argument("--worker-timeout-diagnostic", action="store_true",
                            help="S6独立worker正常GC定位，固定20/400/16/light，首次失败停，非性能资格")
+    benchmark.add_argument("--worker-long-run", action="store_true",
+                           help="S9显式worker长期候选，固定10000/400/16/light，首次失败停，非整体资格")
     benchmark.add_argument("--fixed-proof-cache", action="store_true",
                            help="full-observation固定精确矩阵计算的显式候选对照")
     benchmark.add_argument("--role-config", type=Path)
@@ -601,6 +603,9 @@ def _run() -> int:
         )
 
         try:
+            if args.worker_long_run and (args.case != "cycle" or args.mode != "batch"
+                                         or args.fixed_proof_cache):
+                raise ValueError("worker-long-run只支持独立cycle/batch候选。")
             if args.worker_timeout_diagnostic and (args.case != "cycle" or args.mode != "batch"):
                 raise ValueError("worker-timeout-diagnostic只支持cycle/batch。")
             if args.material_candidate is not None and (args.case != "cycle" or args.mode != "batch"):
@@ -637,6 +642,7 @@ def _run() -> int:
                     timeout_trace=args.timeout_trace,
                     material_candidate=args.material_candidate,
                     worker_timeout_diagnostic=args.worker_timeout_diagnostic,
+                    worker_long_run=args.worker_long_run,
                 )
             else:
                 if args.preload_steps or args.diagnostic:
