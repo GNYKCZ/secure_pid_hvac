@@ -144,7 +144,8 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                             phase=None, realtime=None, material_slots=16,
                             on_cycle=None, cycle_snapshot=None,
                             before_sample=None, preload_steps=0,
-                            preload_execution="fused", on_segment_ready=None) -> dict[str, object]:
+                            preload_execution="fused", on_segment_ready=None,
+                            _material_candidate=None) -> dict[str, object]:
     """唯一持续循环接收已装配场景；保存/GUI 与 headless 不重复 parse 或创建 plant。"""
     control.bind_stop(session.reject_new)
     if preload_steps and material_slots != 16:
@@ -283,12 +284,15 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                                            or control.stop_requested)
         if dynamic_realtime:
             if material_slots and not preload_steps:
-                runtime.enable_material_preparation(slots=material_slots)
+                runtime.enable_material_preparation(slots=material_slots,
+                    **({"_candidate": _material_candidate} if _material_candidate else {}))
             # 所有固定验证、建连、writer 初始化与首池填充完成后才确定唯一 t0。
             # 收集初始化暂存垃圾；运行中的自动 GC/阈值保持原样，不转移周期内的工作。
             started = perf_counter_ns()
             collected = gc.collect(2)
             startup_gc = {"duration_ns": perf_counter_ns() - started, "collected": collected}
+            if _material_candidate:
+                runtime._begin_material_control()
             if session.cancelled.is_set():
                 raise RuntimeError("Client 运行已取消。")
             # 启动期间的正常停止仍关闭零步段，不再建立不需要的控制时钟。
@@ -579,6 +583,8 @@ def _run() -> int:
                            help="独占Client一次性限定GC对照；默认不启用")
     benchmark.add_argument("--timeout-trace", action="store_true",
                            help="显式baseline或startup-freeze一次最多200周期的有限socket超时定位")
+    benchmark.add_argument("--material-candidate", choices=("thread", "worker"),
+                           help="S5显式供料对照，固定1000/400/16/light；默认不启用")
     benchmark.add_argument("--fixed-proof-cache", action="store_true",
                            help="full-observation固定精确矩阵计算的显式候选对照")
     benchmark.add_argument("--role-config", type=Path)
@@ -593,6 +599,8 @@ def _run() -> int:
         )
 
         try:
+            if args.material_candidate is not None and (args.case != "cycle" or args.mode != "batch"):
+                raise ValueError("材料候选只支持cycle/batch")
             if args.timeout_trace and (args.case != "cycle" or args.mode != "batch"):
                 raise ValueError("timeout-trace只支持cycle/batch。")
             if args.gc_trial_policy is not None and (args.case != "cycle" or args.mode != "batch"):
@@ -623,6 +631,7 @@ def _run() -> int:
                     commit_policy=args.commit_policy,
                     gc_trial_policy=args.gc_trial_policy,
                     timeout_trace=args.timeout_trace,
+                    material_candidate=args.material_candidate,
                 )
             else:
                 if args.preload_steps or args.diagnostic:

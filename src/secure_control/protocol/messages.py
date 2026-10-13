@@ -566,6 +566,28 @@ class PreparedOnlineResources:
     _token: object = field(repr=False, compare=False)
 
 
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class _PreparedEncodedResources:
+    """专属本地工人字节的父进程原始能力；不能 pickle 后恢复授权。"""
+
+    plan: StepResourcePlan
+    fragments: tuple[bytes, bytes] = field(repr=False)
+    _owner: object = field(repr=False, compare=False)
+    _token: object = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _EncodedInputRound:
+    """测量后绑定的当前轮；仅有公开计划、输入份额和不透明静态字节。"""
+
+    session_id: str
+    round_id: str
+    step: int
+    p1_input: InputShareMessage
+    p2_input: InputShareMessage
+    prepared: _PreparedEncodedResources = field(repr=False)
+
+
 @dataclass(frozen=True, slots=True)
 class PreloadedResourceManifest:
     """有限预送窗口的公开身份；不携带数值材料或输出签发能力。"""

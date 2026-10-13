@@ -44,6 +44,7 @@ from secure_control.protocol.messages import (
     Protocol3EndpointCommand,
     Protocol3StageReceipt,
     TruncationResourceMaterial,
+    _EncodedInputRound,
     preloaded_material_budget,
     public_step_plan_sha256,
 )
@@ -57,6 +58,7 @@ from ._localhost_workers import (
     _complete_client_round,
     _validate_party_reply,
 )
+from ._material_worker import _MaterialWorkerPool
 from .cycle_timing import check_deadline, network_deadline
 from .lan_config import LanConfig, Role
 from .lan_transport import accept_role, connect_role, listener
@@ -80,6 +82,7 @@ from .localhost_codec import (
     SegmentEndReceipt,
     WireEnvelope,
     _decode_preloaded_values,
+    _EncodedOnlinePayload,
     encode_wire_value,
 )
 from .localhost_transport import deadline_after, receive_envelope, send_envelope
@@ -692,12 +695,18 @@ class LanContinuousRuntime:
                 current = self.client.prepare_online(self.distribution, value, step=self._step)
             else:
                 prepared = self._material_pool.take(self._step)
-                current = self.client.bind_online_input(self.distribution, prepared, value,
-                                                        step=self._step)
+                if isinstance(self._material_pool, _MaterialWorkerPool):
+                    current = self.client._bind_encoded_input(self.distribution, prepared, value,
+                                                             step=self._step)
+                else:
+                    current = self.client.bind_online_input(self.distribution, prepared, value,
+                                                            step=self._step)
             self._last_phase_ns["material_bind"] = time.perf_counter_ns() - started
             check_deadline(deadline_ns, "MATERIAL_BIND")
-            plan = current.plan if self._preload_steps else current.p1_resources.plan
-            if not self._preload_steps and current.p2_resources.plan != plan:
+            encoded_current = isinstance(current, _EncodedInputRound)
+            plan = (current.prepared.plan if encoded_current else
+                    current.plan if self._preload_steps else current.p1_resources.plan)
+            if not self._preload_steps and not encoded_current and current.p2_resources.plan != plan:
                 raise ValueError("两方在线资源计划不一致。")
             self._last_plan = plan
             if deadline is None:
@@ -713,6 +722,13 @@ class LanContinuousRuntime:
                 prepared_requests = _prepare_requests(materials,
                     "activate_stage" if fused else "activate", self.session_id,
                     plan.round_id, self._step, self._sequences, _FRAME_LIMIT)
+            elif encoded_current:
+                materials = tuple(_EncodedOnlinePayload(inp, plan, fragment) for inp, fragment in
+                    zip((current.p1_input, current.p2_input), current.prepared.fragments, strict=True))
+                prepared_requests = _prepare_online_requests(
+                    materials, self.session_id, plan.round_id, self._step, self._sequences)
+                self._material_pool.observe_current_encoded(sum(len(v[1]) for v in prepared_requests)
+                    + sum(len(v) for v in current.prepared.fragments))
             else:
                 materials = tuple(PartyOnlineMaterial.from_round(PartyOnlineRound(
                     current.p1_input if party == 0 else current.p2_input,
@@ -862,7 +878,11 @@ class LanContinuousRuntime:
         if self._material_pool is not None:
             pool, self._material_pool = self._material_pool, None
             self._material_statistics = pool.snapshot()
-            pool.close()
+            try:
+                pool.close()
+            finally:
+                if isinstance(pool, _MaterialWorkerPool):
+                    self._material_statistics = pool.snapshot()
 
 
 class RunControl:
@@ -1066,7 +1086,7 @@ class LanSegmentedRuntime:
     def segment_full(self) -> bool:
         return self.confirmed_step_count - self.global_start == self.segment_capacity
 
-    def enable_material_preparation(self, *, slots: int = 16) -> None:
+    def enable_material_preparation(self, *, slots: int = 16, _candidate=None) -> None:
         """只在动态初始准备期填充库存；计时开始后禁止重新填充初始池。"""
         if (self.preload_steps or not self._v2 or self.confirmed_step_count
                 or self.phase != "RUNNING"):
@@ -1074,8 +1094,22 @@ class LanSegmentedRuntime:
         segment = self._segment
         if segment is None or segment._material_pool is not None:
             raise RuntimeError("材料池不存在或已经安装。")
-        segment._material_pool = _OnlineResourcePool(segment.client, segment.distribution,
-                                                   start=segment._step, slots=slots)
+        if _candidate not in (None, "thread", "worker") or _candidate and self._full_v3:
+            raise ValueError("实验供料只支持动态v2")
+        if _candidate == "worker":
+            try:
+                segment._material_pool = _MaterialWorkerPool(segment.client, segment.distribution,
+                    run_id=self.run_id, epoch=self.controller_epoch, start=segment._step, slots=slots)
+            except Exception as error:
+                segment._material_statistics = getattr(error, "_public_material_summary", {})
+                raise
+        else:
+            segment._material_pool = _OnlineResourcePool(segment.client, segment.distribution,
+                                                       start=segment._step, slots=slots)
+
+    def _begin_material_control(self):
+        if self._segment is not None and isinstance(self._segment._material_pool, _MaterialWorkerPool):
+            self._segment._material_pool.control_begin()
 
     def enable_material_preload(self, *, cancelled=None):
         if self.phase != "RUNNING" or self.confirmed_step_count or self._segment is None:

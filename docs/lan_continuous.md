@@ -1,5 +1,36 @@
 # 独立三角色连续 LAN 实验（Issues #86、#84、#75、#92）
 
+## S5 显式本机材料供料对照（#120）
+
+`benchmark --case cycle --mode batch --steps 1000 --segment-steps 400
+--material-slots 16 --preload-steps 0 --recording light --delay-ms 0
+--material-candidate thread|worker --output <本次结果路径>` 只选择实验候选；
+不改变正式 CLI/GUI/配置默认。S5批准范围为同一提交先thread一次、再worker一次，
+各最多1000尝试，首次失败停止；初始化失败也保留，不补步、不重跑或筛选参数。
+
+worker在Client本机用一个spawn工人生成原Beaver/Trunc及静态JSON片段，
+两个单向私有Pipe只传有界字节/累计前缀额度。父接收器核对身份、计划摘要、
+尺寸/完整性/步号/额度后登记父进程一次性能力；当前测量由原Client量化/检查/分享，
+父进程拼装的两份完整信封均预检后才发送。工人不持测量、控制参数、秘密state、
+控制socket或输出签发表，不pickle业务对象，不恢复父进程秘密DTO树。
+双方仍用原动态后端、旧state出力、逐行Trunc、原重构、双提交及设备确认。
+
+库存与生成/IPC在途合计最多16份，每份预留512KiB，总编码预留8MiB；
+当前已领取轮、IPC临时副本单独报告。这不是RSS上限。Client/worker各受256MiB
+离散内存保护；采样不证明瞬时上限或长期无泄漏。控制线程不等待Pipe/补货，
+短缺、工人/通道故障、部分帧、超期及未知提交封闭当前run，不重启/重试/fallback。
+停止废弃库存、五秒内join工人与接收/额度线程；强制终止或缺最终汇总记清理失败，
+不能通过候选门禁。材料不写磁盘，不跨运行缓存。
+
+正常GC/原阈值，保留原启动收集，不freeze/disable，也不安装S3/S4 socket或GC事件探针。
+仅控制开始/结束读取GC统计；worker按开始命令接收和停止读取，P1/P2以第一online请求
+及stop请求（故障时退出）为边界，不把这些非同步时钟边界作单向网络时间。
+只在结束输出轻量公开汇总，保留所有权威CycleTiming的尝试、失败与null端点。
+`comparison_only=true`，`qualification_pass/stage_pass=false`；
+`candidate_gate_pass`只在worker完整1000步零超期/故障、状态/跨段/资源连续且清理成功时通过。
+1000未发生整代GC可能仅推迟扫描；不是10,000、完整路线、三机Wi-Fi或硬件验收，
+也不自动推广默认、追加试验、合并或关闭Issue。
+
 ## 批量通信（#116）
 
 三个角色默认通过 `control-batch-v1` 能力握手，同一运行必须使用同一版本程序；

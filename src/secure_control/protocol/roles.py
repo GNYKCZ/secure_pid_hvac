@@ -66,6 +66,8 @@ from .messages import (
     ResourceMetadata,
     StateTruncationResourceShare,
     StepResourcePlan,
+    _EncodedInputRound,
+    _PreparedEncodedResources,
     _ResourceLifecycle,
     closed_loop_composition_sha256,
     controller_payload_fingerprint,
@@ -505,6 +507,27 @@ class Client:
         self._issued_rounds[identity] = layout
         return online
 
+    def _bind_encoded_input(self, distribution, prepared, v, *, step):
+        """沿用原量化、范围和分享，领取父进程能力后才签发输出。"""
+        layout = self._distribution_layout(distribution)
+        owner = self._material_owner(distribution)
+        owner.validate_encoded(prepared, step)
+        values = self._normalize_input(v, layout)
+        payload = np.asarray(
+            self._fixed_point_at_scale(layout.scale_ledger.input).encode(values), dtype=object,
+        )
+        self._validate_input_bound(payload, distribution.range_contract)
+        shares = self.sharing.share(self.fixed_point.to_residue(payload))
+        owner.claim_encoded(prepared, step)
+        plan = prepared.plan
+        identity = (plan.session_id, plan.round_id, step)
+        if identity in self._issued_rounds:
+            raise ValueError("本 session 的 round 不能复用")
+        online = _EncodedInputRound(*identity,
+            *(InputShareMessage(party, *identity, shares[party]) for party in (0, 1)), prepared)
+        self._issued_rounds[identity] = layout
+        return online
+
     def begin_preloaded_resources(self, distribution: OfflineDistribution, *, run_id: str,
                                   controller_epoch: str, count: int = 1000,
                                   stage_mode: str = "fused") -> PreparedPreloadedResources:
@@ -759,7 +782,7 @@ class Client:
         该操作不接收、更不重构任何 share。执行阶段失败时资源由 coordinator 永久废弃；
         输出重构失败时资源已经消费，因此这里只负责阻止失败输出被再次应用。
         """
-        if not isinstance(online, OnlineRound):
+        if not isinstance(online, (OnlineRound, _EncodedInputRound)):
             raise TypeError("online 必须是 Client.prepare_online 返回的 OnlineRound。")
         identity = (online.session_id, online.round_id, online.step)
         if online.session_id not in self._issued_sessions or identity not in self._issued_rounds:
@@ -1405,6 +1428,52 @@ class _PreparedResourceOwner:
         self._preload_lock = Lock()
         self._preload = None
         self._preload_tokens = WeakValueDictionary()
+        self._encoded_source = None
+        self._encoded_tokens = WeakValueDictionary()
+
+    def open_encoded_source(self, source):
+        """只给同 session 的一个专属接收器登记能力；停止后不能换工人续接。"""
+        with self._lock:
+            if self._encoded_source is not None:
+                raise ValueError("编码材料来源已安装")
+            self._encoded_source = source
+
+    def register_encoded(self, source, plan, fragments):
+        """接收器已校验原始通道/额度/摘要；此处只登记本机原对象。"""
+        with self._lock:
+            if source is not self._encoded_source or source is None:
+                raise ValueError("不是专属编码材料来源")
+            if plan.session_id != self.session_id or (self.horizon is not None and plan.step >= self.horizon):
+                raise ValueError("编码计划超出本 session 范围")
+            result = _PreparedEncodedResources(plan, fragments, self, object())
+            self._encoded_tokens[result._token] = result
+            return result
+
+    def _validate_encoded(self, prepared, step):
+        if (not isinstance(prepared, _PreparedEncodedResources) or prepared._owner is not self
+                or self._encoded_tokens.get(prepared._token) is not prepared
+                or prepared.plan.step != _require_step(step)):
+            raise ValueError("编码材料不是本 Client/step 的原始未领取能力")
+
+    def validate_encoded(self, prepared, step):
+        with self._lock:
+            self._validate_encoded(prepared, step)
+
+    def claim_encoded(self, prepared, step):
+        with self._lock:
+            self._validate_encoded(prepared, step)
+            del self._encoded_tokens[prepared._token]
+
+    def discard_encoded(self, prepared):
+        if not isinstance(prepared, _PreparedEncodedResources) or prepared._owner is not self:
+            raise ValueError("不能废弃其他 owner 的编码能力")
+        with self._lock:
+            self._encoded_tokens.pop(prepared._token, None)
+
+    def encoded_pending(self, prepared):
+        """库存协调器只查询当前原始能力是否仍未绑定，不穿透token登记表。"""
+        with self._lock:
+            return self._encoded_tokens.get(prepared._token) is prepared
 
     def begin_preload(self, manifest):
         with self._preload_lock:
@@ -1552,24 +1621,9 @@ class _PreparedResourceOwner:
             raise ValueError("step 超出已证明的 finite horizon。")
         plan = Client._resource_plan(self.layout, self.session_id,
                                     f"round-{secrets.token_hex(16)}" if round_id is None else round_id, step)
-        products = ([], [])
-        truncations = ([], [])
-        for metadata in plan.product_resources:
-            pair = self.multiplier.create_triple(rng=rng)
-            lifecycle = _ResourceLifecycle()
-            for party in (0, 1):
-                products[party].append(ProductResourceShare(party, metadata, pair[party], lifecycle))
-        for metadata in plan.state_truncation_resources:
-            pair = self.truncation.create_auxiliary(rng=rng)
-            lifecycle = _ResourceLifecycle()
-            for party in (0, 1):
-                truncations[party].append(
-                    StateTruncationResourceShare(party, metadata, pair[party], lifecycle),
-                )
         token = object()
         prepared = PreparedOnlineResources(
-            *(PartyResources(party, plan, tuple(products[party]), tuple(truncations[party]))
-              for party in (0, 1)), self, token,
+            *_create_resource_pair(plan, self.multiplier, self.truncation, rng=rng), self, token,
         )
         with self._lock:
             self._tokens[token] = prepared
@@ -1595,6 +1649,9 @@ class _PreparedResourceOwner:
 
     def discard(self, prepared):
         """停止或准备失败永久废弃资源；不把尚未使用材料移交新会话。"""
+        if isinstance(prepared, _PreparedEncodedResources):
+            self.discard_encoded(prepared)
+            return
         if not isinstance(prepared, PreparedOnlineResources) or prepared._owner is not self:
             raise ValueError("不能废弃其他 owner 的能力。")
         with self._lock:
@@ -1606,6 +1663,23 @@ class _PreparedResourceOwner:
             for item in resources.state_truncation_resources:
                 item._lifecycle.abort()
                 item.truncation._lifecycle.consumed = True
+
+
+def _create_resource_pair(plan, multiplier, truncation, *, rng=None):
+    """原路径与本地工人共用的唯一新鲜材料生成顺序，不签发 Client 输出。"""
+    products, truncations = ([], []), ([], [])
+    for metadata in plan.product_resources:
+        pair = multiplier.create_triple(rng=rng)
+        lifecycle = _ResourceLifecycle()
+        for party in (0, 1):
+            products[party].append(ProductResourceShare(party, metadata, pair[party], lifecycle))
+    for metadata in plan.state_truncation_resources:
+        pair = truncation.create_auxiliary(rng=rng)
+        lifecycle = _ResourceLifecycle()
+        for party in (0, 1):
+            truncations[party].append(StateTruncationResourceShare(party, metadata, pair[party], lifecycle))
+    return tuple(PartyResources(party, plan, tuple(products[party]), tuple(truncations[party]))
+                 for party in (0, 1))
 
 
 @dataclass(slots=True)

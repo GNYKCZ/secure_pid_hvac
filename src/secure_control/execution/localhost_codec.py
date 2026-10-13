@@ -6,7 +6,7 @@ import base64
 import binascii
 import json
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from fractions import Fraction
 from math import isfinite, prod
 from numbers import Integral
@@ -475,6 +475,8 @@ def encode_envelope(message: WireEnvelope) -> bytes:
     """将合法信封编码为字段顺序稳定、禁止 NaN 的 UTF-8 JSON。"""
     if not isinstance(message, WireEnvelope):
         raise TypeError("message 必须是 WireEnvelope。")
+    if isinstance(message.payload, _EncodedOnlinePayload):
+        return _encode_current_envelope(message)
     payload = {
         "schema_version": message.schema_version,
         "kind": message.kind,
@@ -495,6 +497,52 @@ def encode_envelope(message: WireEnvelope) -> bytes:
         separators=(",", ":"),
         allow_nan=False,
     ).encode("utf-8")
+
+
+@dataclass(frozen=True, slots=True)
+class _EncodedOnlinePayload:
+    """仅本地编码能力使用；原 decoder 始终恢复 PartyOnlineMaterial。"""
+
+    input_message: InputShareMessage
+    plan: StepResourcePlan
+    fragment: bytes = field(repr=False)
+
+
+def _canonical_json(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+
+def _encode_online_fragment(resources: PartyResources, modulus: int) -> bytes:
+    """工人内从类型受限原材料生成静态尾部；每个 residue 仍按原 bigint 编码。"""
+    products = tuple(ProductResourceMaterial(v.owner, v.metadata, v.triple.a, v.triple.b,
+                                             v.triple.c) for v in resources.product_resources)
+    truncations = tuple(TruncationResourceMaterial(v.owner, v.metadata, v.truncation.r,
+                                                 v.truncation.r_prime)
+                        for v in resources.state_truncation_resources)
+    values = [share.value for item in products for share in (item.a, item.b, item.c)]
+    values.extend(share.value for item in truncations for share in (item.r, item.r_prime))
+    if any(type(value) is not int or not 0 <= value < modulus for value in values):
+        raise LocalhostCodecError("静态材料存在非 canonical residue")
+    fields = {"plan": _encode_value(resources.plan),
+              "product_resources": [_encode_value(v) for v in products],
+              "state_truncation_resources": [_encode_value(v) for v in truncations],
+              "type": "party_online_material"}
+    # input_message 是排序后的第一字段；只截取此受限 dict 的外层花括号。
+    return b"," + _canonical_json(fields)[1:]
+
+
+def _encode_current_envelope(message):
+    """按原 sort_keys 顺序组合明确字段，不替换标记，不解码秘密材料树。"""
+    value = message.payload
+    payload = b'{"input_message":' + _canonical_json(_encode_value(value.input_message)) + value.fragment
+    fields = {name: getattr(message, name) for name in (
+        "schema_version", "kind", "sender", "recipient", "sequence", "operation",
+        "session_id", "round_id", "step", "resource_id")}
+    fields["payload"] = None
+    return b"{" + b",".join(_canonical_json(key) + b":" +
+        (payload if key == "payload" else _canonical_json(fields[key]))
+        for key in sorted(fields)) + b"}"
 
 
 def decode_envelope(payload: bytes) -> WireEnvelope:
@@ -1529,7 +1577,7 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
     elif key == ("reply", "segment_end"):
         expected = (SegmentEndReceipt,)
     elif key == ("request", "online"):
-        expected = (PartyOnlineMaterial,)
+        expected = (PartyOnlineMaterial, _EncodedOnlinePayload)
     elif (
         key
         in {
@@ -1547,6 +1595,15 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
         expected = None
     if expected is None or not isinstance(payload, expected):
         raise LocalhostCodecError("wire kind/operation 与 payload 类型组合非法。")
+    if isinstance(payload, _EncodedOnlinePayload):
+        inp, plan = payload.input_message, payload.plan
+        if (type(payload.fragment) is not bytes or not payload.fragment.startswith(b',"plan":')
+                or not payload.fragment.endswith(b'"type":"party_online_material"}')
+                or (inp.session_id, inp.round_id, inp.step) != (plan.session_id, plan.round_id, plan.step)
+                or (message.session_id, message.round_id, message.step, message.resource_id)
+                   != (plan.session_id, plan.round_id, plan.step, None)
+                or inp.recipient != (0 if message.recipient == "P1" else 1)):
+            raise LocalhostCodecError("编码当前材料与信封方向或关联头不匹配")
     if isinstance(payload, BatchHelloPayload) and (
         message.operation == "hello" and not isinstance(payload.base, HelloPayload)
         or message.operation == "lan_hello" and not isinstance(

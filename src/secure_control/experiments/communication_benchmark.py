@@ -650,6 +650,7 @@ def _source_fingerprints(extra=()):
         "src/secure_control/protocol/coordinator.py",
         "src/secure_control/protocol/roles.py", "src/secure_control/protocol/messages.py",
         "src/secure_control/execution/lan_runtime.py",
+        "src/secure_control/execution/_material_worker.py",
         "src/secure_control/execution/localhost_transport.py",
         "src/secure_control/execution/localhost_codec.py",
         "src/secure_control/execution/_localhost_workers.py",
@@ -723,7 +724,7 @@ def _config(role: str, ports: tuple[int, int, int]) -> LanConfig:
 
 
 def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=None,
-           diagnostic=None, full_observation=False):
+           diagnostic=None, full_observation=False, gc_boundaries=None):
     """包住既有 framing 最外层，只数发送次数/字节，不解码或保存 payload。"""
     from secure_control.execution import lan_scalar_runtime, localhost_transport
 
@@ -814,6 +815,20 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
     observations = ExitStack()
     from secure_control.execution import _localhost_peer, lan_runtime
     from secure_control.protocol import coordinator
+
+    if gc_boundaries is not None and role != "Client":
+        receive = lan_runtime.receive_envelope
+        def boundary_request(*args, **kwargs):
+            request = receive(*args, **kwargs)
+            if request.sender == "Client" and request.operation == "online" and "begin" not in gc_boundaries:
+                gc_boundaries["begin"] = {"stats": gc.get_stats(), "enabled": gc.isenabled(),
+                                           "threshold": list(gc.get_threshold())}
+            if (request.sender == "Client" and request.operation == "segment_end"
+                    and request.payload.action == "stop" and "end" not in gc_boundaries):
+                gc_boundaries["end"] = {"stats": gc.get_stats(), "enabled": gc.isenabled(),
+                                         "threshold": list(gc.get_threshold())}
+            return request
+        observations.enter_context(patch.object(lan_runtime, "receive_envelope", boundary_request))
 
     if diagnostic and role != "Client":
         receive = lan_runtime.receive_envelope
@@ -953,20 +968,21 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
 def _party_job(
     config: LanConfig, ports: tuple[int, int, int], delay_ms: float, batch: bool, queue,
     diagnostic_enabled=False, full_observation=False, tcp_nodelay=None, supply_diagnostic=False,
-    timeout_trace=False,
+    timeout_trace=False, material_comparison=False,
 ) -> None:
     role_steps = []
     diagnostic = (_TimeoutDiagnostic(config.role, ports) if timeout_trace else
                   _Diagnostic(config.role, supply=supply_diagnostic) if diagnostic_enabled else None)
     observations = ExitStack()
     socket_options = []
+    gc_boundaries = {} if material_comparison else None
     observations.enter_context(_observe_tcp(socket_options, tcp_nodelay))
     if diagnostic:
         observations.enter_context(diagnostic.installed())
         if timeout_trace:
             observations.enter_context(diagnostic.sockets())
     counts, activity, restore = _meter(config.role, ports, delay_ms, role_steps, diagnostic,
-                                       full_observation=full_observation)
+                                       full_observation=full_observation, gc_boundaries=gc_boundaries)
     outcome = {"role": config.role}
     try:
         result = run_party_single_step(config, batch=batch)
@@ -983,6 +999,11 @@ def _party_job(
         outcome["tcp_socket_options"] = socket_options
         if diagnostic:
             outcome["diagnostic"] = diagnostic.report()
+        if gc_boundaries is not None:
+            if "begin" in gc_boundaries and "end" not in gc_boundaries:
+                gc_boundaries["end"] = {"stats": gc.get_stats(), "enabled": gc.isenabled(),
+                                         "threshold": list(gc.get_threshold())}
+            outcome["gc_boundaries"] = gc_boundaries
         queue.put(outcome)
 
 
@@ -1072,6 +1093,16 @@ def _observe_dynamic(marks):
             marks["material_bind_ms"] = (time.perf_counter_ns() - started) / 1e6
             marks["prepare_end_ns"] = time.perf_counter_ns()
 
+    def measured_encoded_bind(self, *args, **kwargs):
+        started = time.perf_counter_ns()
+        try:
+            return encoded_bind(self, *args, **kwargs)
+        finally:
+            marks["material_bind_ms"] = (time.perf_counter_ns() - started) / 1e6
+            marks["prepare_end_ns"] = time.perf_counter_ns()
+
+    encoded_bind = Client._bind_encoded_input
+
     def measured_commit(self):
         started = time.perf_counter_ns()
         try:
@@ -1096,6 +1127,7 @@ def _observe_dynamic(marks):
 
     with (patch.object(Client, "prepare_online", measured_prepare),
           patch.object(Client, "bind_online_input", measured_bind),
+          patch.object(Client, "_bind_encoded_input", measured_encoded_bind),
           patch.object(Client, "bind_preloaded_input", measured_preload_bind),
           patch.object(lan_runtime, "_complete_client_round", measured_complete),
           patch.object(_ClientPartyEndpoint, "commit", measured_commit),
@@ -1400,7 +1432,8 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                                role_config: Path | None = None, preload_steps=0,
                                preload_execution="fused", diagnostic=False,
                                recording_mode="full", tcp_nodelay=None,
-                               commit_policy="default", gc_trial_policy=None, timeout_trace=False) -> dict[str, object]:
+                               commit_policy="default", gc_trial_policy=None, timeout_trace=False,
+                               material_candidate=None) -> dict[str, object]:
     # 所有试验参数在任何端口/角色/材料创建前拒绝；默认入口走原路径。
     options = {"steps": steps, "delay_ms": delay_ms, "segment_steps": segment_steps,
                "optimized": optimized, "material_slots": material_slots, "role_config": role_config,
@@ -1410,6 +1443,19 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                    "timeout_trace": timeout_trace}
     if type(timeout_trace) is not bool or timeout_trace and gc_trial_policy not in ("baseline", "startup-freeze"):
         raise ValueError("timeout_trace仅支持显式baseline或startup-freeze。")
+    if material_candidate is not None:
+        if (material_candidate not in ("thread", "worker") or optimized is not True
+                or recording_mode != "light" or diagnostic is not False or gc_trial_policy is not None
+                or timeout_trace or type(steps) is not int or steps != 1000
+                or type(segment_steps) is not int or segment_steps != 400
+                or type(material_slots) is not int or material_slots != 16
+                or type(preload_steps) is not int or preload_steps != 0 or preload_execution != "fused"
+                or type(delay_ms) not in (int, float) or delay_ms != 0 or role_config is not None
+                or tcp_nodelay is not None or commit_policy != "default"
+                or not gc.isenabled() or gc.get_freeze_count() or gc.callbacks or gc.get_debug()
+                or gc.get_threshold() != (700, 10, 10)):
+            raise ValueError("S5仅允许正常GC的cycle/batch/light/1000/400/16/无预送/默认通信两模式")
+        return _run_material_comparison(options, material_candidate)
     if gc_trial_policy is None:
         return _run_continuous_observation(**options)
     if (type(gc_trial_policy) is not str or gc_trial_policy not in ("baseline", "startup-freeze")
@@ -1462,12 +1508,93 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
     return report
 
 
+def _run_material_comparison(options, candidate):
+    """只有两端 GC 快照与离散内存；不安装 GC/socket 事件探针。"""
+    from secure_control.execution import lan_runtime
+    report = {"candidate": candidate, "gc_begin": None, "gc_end": None, "memory": [],
+              "memory_guard_failed": False, "cleanup_failed": False, "process_cpu_ns": None,
+              "producer_exited": None}
+    started_cpu = time.process_time_ns()
+    original_close = lan_runtime.LanContinuousRuntime.close
+    def sample(moment):
+        value = {"moment": moment, **_process_memory()}
+        report["memory"].append(value)
+        if value.get("current_rss_bytes", value.get("peak_rss_bytes")) is None or value.get(
+                "current_rss_bytes", value.get("peak_rss_bytes", 0)) > 256 * 1024 * 1024:
+            report["memory_guard_failed"] = True
+            raise RuntimeError("S5 Client内存保护触发")
+    def snapshot():
+        return {"enabled": gc.isenabled(), "threshold": list(gc.get_threshold()), "stats": gc.get_stats()}
+    def event(moment):
+        if moment == "control_begin" and report["gc_begin"] is None:
+            report["gc_begin"] = snapshot()
+        sample(moment)
+    def close(runtime):
+        pool = runtime._material_pool
+        try:
+            if report["gc_begin"] is not None and report["gc_end"] is None:
+                report["gc_end"] = snapshot()
+                event("control_end")
+        except Exception:
+            report["memory_guard_failed"] = True
+            raise
+        finally:
+            try:
+                original_close(runtime)
+                if isinstance(pool, lan_runtime._OnlineResourcePool):
+                    report["producer_exited"] = not pool._thread.is_alive()
+                elif pool is not None:
+                    report["producer_exited"] = pool.snapshot()["worker_exited"]
+            except Exception:
+                report["cleanup_failed"] = True
+                raise
+    try:
+        with patch.object(lan_runtime.LanContinuousRuntime, "close", close):
+            result = _run_continuous_observation(**options, material_candidate=candidate,
+                                                _material_event=event)
+    except Exception as error:  # noqa: BLE001 - 初始化/清理失败也保留，不启动替代路线
+        result = {"schema": "cycle-qualification-v1", "case": "cycle", "mode": "batch",
+                  "status": "failed", "failure_category": type(error).__name__,
+                  "requested_steps": options["steps"], "cycles": [], "cycle_timing": _timing([]),
+                  "material_summary": getattr(error, "_public_material_summary", {}), "qualification_pass": False,
+                  "stage_pass": False, "code_sha": subprocess.check_output(
+                      ["git", "rev-parse", "HEAD"], cwd=_ROOT, text=True).strip(),
+                  "source_sha256": _source_fingerprints()}
+    report["process_cpu_ns"] = time.process_time_ns() - started_cpu
+    result.update(material_comparison=report, comparison_only=True, qualification_pass=False, stage_pass=False)
+    if "environment" in result and candidate == "worker":
+        result["environment"]["roles"] = "three local control roles plus one local material worker"
+    material = result.get("material_summary") or {}
+    if result["status"] == "stopped" and (material.get("cleanup_failed") or report["cleanup_failed"]
+                                           or report["memory_guard_failed"]):
+        result.update(status="failed", failure_category="MaterialComparisonCleanupOrMemory")
+    result["candidate_gate_pass"] = (candidate == "worker" and result["status"] == "stopped"
+        and len(result["cycles"]) == 1000 and result.get("cycle_summary", {}).get("misses") == 0
+        and all(row["status"] == "confirmed" and row["global_step"] == step
+                and row["segment_index"] == step // 400 and row["cycle_completed_ns"] is not None
+                and row["cycle_completed_ns"] < row["deadline_ns"]
+                for step, row in enumerate(result["cycles"]))
+        and len({row["session_id"] for row in result["cycles"]}) == 1
+        and len({row["controller_epoch"] for row in result["cycles"]}) == 1
+        and result.get("protocol_committed_count") == 1000
+        and result.get("physically_confirmed_count") == 1000
+        and material.get("claimed") == 1000 and material.get("generated_received", 0) >= 1000
+        and material.get("inventory_inflight_high_water", 17) <= 16
+        and material.get("material_encoded_bound_high_water", 8 * 1024 * 1024 + 1) <= 8 * 1024 * 1024
+        and material.get("error_type") is None and (material.get("worker") or {}).get("error_type") is None
+        and material.get("worker_exited") is True and material.get("receiver_exited") is True
+        and material.get("credit_thread_exited") is True and material.get("cleanup_failed") is False
+        and not report["memory_guard_failed"] and not report["cleanup_failed"])
+    return result
+
+
 def _run_continuous_observation(*, steps: int, delay_ms: float,
                                segment_steps: int, optimized=False, material_slots=16,
                                role_config: Path | None = None, preload_steps=0,
                                preload_execution="fused", diagnostic=False,
                                recording_mode="full", tcp_nodelay=None,
-                               commit_policy="default", _gc_trial=None, timeout_trace=False) -> dict[str, object]:
+                               commit_policy="default", _gc_trial=None, timeout_trace=False,
+                               material_candidate=None, _material_event=None) -> dict[str, object]:
     """实际持续动态循环及原同步 writer；退出后报告观察，不发布图或更改调度。"""
     from secure_control.execution.lan_runtime import RunControl
     from secure_control.scenarios.cart_pole.interactive import InteractiveSession
@@ -1481,7 +1608,8 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
         raise TypeError("tcp_nodelay 必须为 bool 或 None。")
     if type(commit_policy) is not str or commit_policy not in ("default", "serial"):
         raise ValueError("非法 commit_policy。")
-    comparison_only = tcp_nodelay is not None or commit_policy != "default" or _gc_trial is not None
+    comparison_only = (tcp_nodelay is not None or commit_policy != "default"
+                       or _gc_trial is not None or material_candidate is not None)
     if comparison_only and (not optimized or role_config is not None):
         raise ValueError("通信策略对照只支持内部三进程 cycle。")
     if type(recording_mode) is not str or recording_mode not in ("light", "full") or recording_mode == "light" and not optimized:
@@ -1516,7 +1644,7 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
         _gc_trial.cleanup.callback(queue.close)
     parties = [context.Process(target=_party_job, args=(
         _config(role, ports), ports, delay_ms, True, queue, diagnostic, False, tcp_nodelay,
-        supply_diagnostic, timeout_trace,
+        supply_diagnostic, timeout_trace, material_candidate is not None,
     )) for role in ("P1", "P2")] if role_config is None else []
     records, events, outcomes, writer_batches = [], [], [], []
     socket_options = []
@@ -1547,6 +1675,8 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
     def phase(name):
         nonlocal current_phase, phase_start, attempt, before_activity, before_storage, before_counts
         nonlocal diagnostic_phase
+        if _material_event and (name == "RUNNING" and not records or name == "INPUT" and len(records) % 100 == 0):
+            _material_event("control_begin" if name == "RUNNING" else "before_input")
         if _gc_trial and name == "RUNNING":
             if timeout_trace:
                 diagnostic_observer.tracing = True
@@ -1678,6 +1808,7 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
                     on_cycle=observed_cycle if optimized else None,
                     cycle_snapshot=writer.snapshot if writer else None,
                     before_sample=writer.check if writer else None,
+                    **({"_material_candidate": material_candidate} if material_candidate else {}),
                 )
                 if _gc_trial:
                     _gc_trial.report["original_startup_gc"] = result.get("startup_gc")

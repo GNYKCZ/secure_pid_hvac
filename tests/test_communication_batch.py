@@ -54,6 +54,285 @@ from secure_control.protocol.messages import (
 )
 
 
+def test_encoded_material_matches_original_codec_and_rejects_copied_capabilities():
+    """逐字节比较原 wire；复制/错步/跨Client/重复领取不能签发输出。"""
+    from copy import copy
+
+    import numpy as np
+    from test_two_party_protocol import make_stack
+
+    from secure_control.execution.localhost_codec import (
+        _encode_online_fragment,
+        _EncodedOnlinePayload,
+    )
+    from secure_control.protocol.messages import InputShareMessage
+
+    client, _, _, _, distribution = make_stack()
+    owner = client._material_owner(distribution)
+    source = object()
+    owner.open_encoded_source(source)
+    prepared = owner.create(999, rng=random.Random(31))
+    plan = prepared.p1_resources.plan
+    fragments = tuple(_encode_online_fragment(v, client.fixed_point.modulus)
+                      for v in (prepared.p1_resources, prepared.p2_resources))
+    cap = owner.register_encoded(source, plan, fragments)
+    assert not client._issued_rounds
+    for invalid, step in ((copy(cap), 999), (cap, 998)):
+        with pytest.raises(ValueError, match="原始"):
+            client._bind_encoded_input(distribution, invalid, [.25], step=step)
+    other, _, _, _, other_distribution = make_stack()
+    with pytest.raises(ValueError, match="原始"):
+        other._bind_encoded_input(other_distribution, cap, [.25], step=999)
+    with pytest.raises(ValueError, match="input_payload_bounds"):
+        client._bind_encoded_input(distribution, cap, [1000.], step=999)
+    current = client._bind_encoded_input(distribution, cap, [.25], step=999)
+    with pytest.raises(ValueError, match="原始"):
+        client._bind_encoded_input(distribution, cap, [.25], step=999)
+    for party, resources, inp, fragment in zip((0, 1),
+        (prepared.p1_resources, prepared.p2_resources), (current.p1_input, current.p2_input), fragments, strict=True):
+        # 额外覆盖 q-1/0 输入、UTF-8转义、序列位宽，静态材料来自受限类型。
+        for sequence in (0, 999999):
+            for share in (inp.value, AdditiveShare(np.array([client.fixed_point.modulus - 1], dtype=object)),
+                          AdditiveShare(np.array([2**256 - 1], dtype=object)), AdditiveShare(np.array([0], dtype=object))):
+                input_message = InputShareMessage(party, plan.session_id, plan.round_id, plan.step, share)
+                original = WireEnvelope(SCHEMA_VERSION, "request", "Client", f"P{party + 1}",
+                    sequence, "online", plan.session_id, plan.round_id, plan.step, None,
+                    PartyOnlineMaterial.from_round(PartyOnlineRound(input_message, resources)))
+                encoded = replace(original, payload=_EncodedOnlinePayload(input_message, plan, fragment))
+                assert encode_envelope(original) == encode_envelope(encoded)
+                assert decode_envelope(encode_envelope(encoded)).payload.plan == plan
+                with pytest.raises(LocalhostCodecError, match="关联"):
+                    replace(encoded, step=998)
+    client.abort_round(current)
+    assert not client._issued_rounds
+    owner.discard(prepared)
+    # 独立受限类型的转义身份，避免模板拼接只对ASCII随机ID等价。
+    from secure_control.protocol.roles import Client, _create_resource_pair
+    escaped = Client._resource_plan(owner.layout, 'session-"汉\\', 'round-"汉\\', 1000)
+    for resources in _create_resource_pair(escaped, client.multiplier, client.truncation, rng=random.Random(39)):
+        inp = InputShareMessage(resources.recipient, escaped.session_id, escaped.round_id, 1000,
+                                AdditiveShare(np.array([0], dtype=object)))
+        original = WireEnvelope(SCHEMA_VERSION, "request", "Client", f"P{resources.recipient + 1}", 33,
+            "online", escaped.session_id, escaped.round_id, 1000, None,
+            PartyOnlineMaterial.from_round(PartyOnlineRound(inp, resources)))
+        fast = replace(original, payload=_EncodedOnlinePayload(inp, escaped,
+                                    _encode_online_fragment(resources, client.fixed_point.modulus)))
+        assert encode_envelope(fast) == encode_envelope(original)
+        assert decode_envelope(encode_envelope(fast)).payload.plan == escaped
+
+
+def test_worker_take_shortage_never_waits_for_ipc_or_creates_material():
+    from collections import deque
+    from threading import Condition
+
+    from secure_control.execution._material_worker import _MaterialWorkerPool
+
+    pool = _MaterialWorkerPool.__new__(_MaterialWorkerPool)
+    pool._condition, pool._queue = Condition(), deque()
+    pool._stop, pool._error = False, None
+    pool._process = SimpleNamespace(is_alive=lambda: True)
+    # 没有通道/工厂/等待接口，短缺路径仍立即明确失败。
+    with pytest.raises(RuntimeError, match="库存短缺"):
+        pool.take(0)
+
+
+def test_worker_close_discards_taken_unbound_capability_and_start_error_is_public(monkeypatch):
+    import multiprocessing as mp
+
+    from test_two_party_protocol import make_stack
+
+    from secure_control.execution._material_worker import _MaterialWorkerPool
+
+    client, _, _, _, distribution = make_stack()
+    pool = _MaterialWorkerPool(client, distribution, run_id="run", epoch="epoch", slots=2)
+    cap = pool.take(0)
+    with pytest.raises(RuntimeError, match="尚未绑定"):
+        pool.take(1)
+    pool.close()
+    with pytest.raises(ValueError, match="原始"):
+        client._bind_encoded_input(distribution, cap, [.25], step=0)
+    assert not client._issued_rounds and not pool.snapshot()["cleanup_failed"]
+    def failed_start(process):
+        raise OSError("private test startup error")
+    monkeypatch.setattr(mp.get_context("spawn").Process, "start", failed_start)
+    other, _, _, _, other_distribution = make_stack()
+    with pytest.raises(OSError) as caught:
+        _MaterialWorkerPool(other, other_distribution, run_id="other-run", epoch="other-epoch", slots=2)
+    summary = caught.value._public_material_summary
+    assert summary["claimed"] == 0 and summary["worker_exited"] and summary["receiver_exited"]
+    assert summary["credit_thread_exited"] and summary["worker"] is None
+    assert "private test" not in str(summary)
+
+
+def test_worker_package_has_strict_identity_credit_shape_and_bounded_bytes():
+    """私有包篡改/重复/跨epoch/截断/超限均拒绝；验证不恢复数值树。"""
+    import struct
+
+    from test_two_party_protocol import make_stack
+
+    from secure_control.execution._material_worker import _package, _unpack, _WorkerSpec
+    from secure_control.execution.localhost_codec import (
+        _canonical_json,
+        _encode_online_fragment,
+        _load_json,
+    )
+
+    client, _, _, _, distribution = make_stack()
+    spec = _WorkerSpec(distribution.p1.layout, client.fixed_point.modulus, 8, 8, None, None,
+                       'run-"汉', distribution.session_id, "epoch", 0, 16)
+    prepared = client.precompute_online_resources(distribution, step=0)
+    plan = prepared.p1_resources.plan
+    fragments = tuple(_encode_online_fragment(v, spec.modulus) for v in
+                      (prepared.p1_resources, prepared.p2_resources))
+    packet = _package(spec, plan, fragments, 100, 50)
+    decoded, actual, _ = _unpack(spec, packet, 0)
+    assert decoded == plan and actual == fragments and 2 * len(packet) < 512 * 1024
+    size = struct.unpack(">I", packet[1:5])[0]
+    header = _load_json(packet[5:5 + size])
+    for field, value in (("version", True), ("step", False), ("epoch", "old"),
+                         ("recipients", [1, 0]), ("recipients", [False, 1]), ("plan", "0" * 64),
+                         ("lengths", [1, 1]), ("cpu_ns", 1.0)):
+        changed = _canonical_json({**header, field: value})
+        invalid = b"M" + struct.pack(">I", len(changed)) + changed + packet[5 + size:]
+        with pytest.raises(ValueError):
+            _unpack(spec, invalid, 0)
+    for invalid, step in ((packet[:-1], 0), (packet + b"x", 0), (packet, 1),
+                          (b"M" * (256 * 1024 + 1), 0), (packet[:-2] + b"xx", 0)):
+        with pytest.raises(ValueError):
+            _unpack(spec, invalid, step)
+    client._material_owner(distribution).discard(prepared)
+
+
+def test_worker_memory_guard_retains_first_error_and_report_without_generating(monkeypatch):
+    from test_two_party_protocol import make_stack
+
+    from secure_control.execution import _material_worker as worker
+    from secure_control.execution.localhost_codec import _load_json
+
+    client, _, _, _, distribution = make_stack()
+    spec = worker._WorkerSpec(distribution.p1.layout, client.fixed_point.modulus, 8, 8, None, None,
+                              "run", distribution.session_id, "epoch", 0, 16)
+    monkeypatch.setattr(worker, "_memory", lambda: {"current_rss_bytes": 257 * 1024**2,
+                                                    "peak_rss_bytes": 257 * 1024**2})
+    packets, closed = [], []
+    def forbidden(*args, **kwargs):
+        pytest.fail("启动内存保护失败后不得开始生成或等额度")
+    monkeypatch.setattr(worker, "_create_resource_pair", forbidden)
+    worker._worker_main(spec, SimpleNamespace(poll=forbidden, close=lambda: closed.append("credit")),
+                        SimpleNamespace(send_bytes=packets.append, close=lambda: closed.append("data")))
+    assert closed == ["credit", "data"] and len(packets) == 1 and packets[0][:1] == b"R"
+    report = _load_json(packets[0][1:])
+    assert report["generated"] == 0 and report["memory_guard_failed"] and report["error_type"] == "RuntimeError"
+    assert report["gc_begin"] is None and len(report["memory"]) == 2
+
+
+@pytest.mark.parametrize("fault", (None, "worker_exit", "partial_send"))
+def test_spawn_material_candidate_uses_existing_lan_state_segments_and_failure_stop(monkeypatch, fault):
+    """真实spawn与原LAN小规模功能联调；不使用绝对周期作性能试跑。"""
+    import multiprocessing as mp
+
+    import numpy as np
+
+    from secure_control.execution import lan_runtime, localhost_transport
+    from secure_control.experiments.communication_benchmark import _config, _party_job, _ports
+    from secure_control.experiments.lan_continuous_profile import load_segmented_experiment
+    from secure_control.scenarios.cart_pole.interactive import InteractiveSession
+
+    ports = _ports()
+    context = mp.get_context("spawn")
+    queue = context.Queue()
+    parties = [context.Process(target=_party_job, args=(_config(role, ports), ports, 0, True, queue))
+               for role in ("P1", "P2")]
+    runtime, pool = None, None
+    try:
+        prepared = load_segmented_experiment(_config("Client", ports).experiment_config, 2, InteractiveSession())
+        for party in parties:
+            party.start()
+        runtime = lan_runtime.LanSegmentedRuntime(_config("Client", ports), prepared.spec, prepared.context,
+            prepared.contract, prepared.security_parameter, prepared.evidence,
+            control=lan_runtime.RunControl(), segment_capacity=2)
+        runtime.enable_material_preparation(slots=4, _candidate="worker")
+        pool = runtime._segment._material_pool
+        worker_pid, session_id = pool._process.pid, runtime.public_setup
+        pool.control_begin()
+        original_send = localhost_transport.send_frame
+        if fault == "worker_exit":
+            pool._process.terminate()
+            pool._process.join(timeout=5)
+        if fault == "partial_send":
+            def partial(sock, encoded, **kwargs):
+                if sock is runtime._segment._sockets[1]:
+                    raise OSError("test partial frame")
+                return original_send(sock, encoded, **kwargs)
+            monkeypatch.setattr(localhost_transport, "send_frame", partial)
+        if fault:
+            with pytest.raises((RuntimeError, OSError)):
+                runtime.step(np.zeros(2))
+            assert runtime.confirmed_step_count == 0 and runtime.phase in {"FAILED", "UNCERTAIN"}
+            with pytest.raises(RuntimeError):
+                runtime.step(np.zeros(2))
+            assert not pool._process.is_alive()
+            if fault == "worker_exit":
+                assert pool.snapshot()["cleanup_failed"]
+        else:
+            identities, outputs, expected = [], [], []
+            state = np.asarray(prepared.spec.x0, dtype=float)
+            for step in range(5):
+                if runtime.segment_full:
+                    record = runtime.end_segment()
+                    runtime.next_segment()
+                    assert record.setup == session_id and pool._process.pid == worker_pid
+                identity = runtime.step(np.zeros(2))
+                assert identity.global_step == step
+                identities.append((identity.session_id, identity.round_id))
+                outputs.append(identity.raw_control)
+                expected.append(np.asarray(prepared.spec.C) @ state)
+                state = np.asarray(prepared.spec.A) @ state
+                runtime.confirm_applied(identity)
+                # 测试线程可等补货；实际control take没有此等待。
+                with pool._condition:
+                    assert pool._condition.wait_for(lambda: len(pool._queue) == 4 or pool._error, timeout=10)
+                    assert not pool._error
+            runtime.control.request_stop()
+            runtime.end_segment()
+            assert runtime.confirmed_step_count == 5 and runtime.resource_counts == {
+                "products_consumed": 150, "truncations_consumed": 20}
+            assert len({v[0] for v in identities}) == 1 and len({v[1] for v in identities}) == 5
+            # 独立旧state出力递推：零输入保留配置的真实非零x0，不重置跨段状态。
+            np.testing.assert_allclose(outputs, expected, atol=1e-5, rtol=0)
+            stats = runtime.material_summary
+            assert stats["claimed"] == 5 and stats["inventory_inflight_high_water"] <= 4
+            assert stats["material_encoded_bound_high_water"] <= stats["material_reserved_bytes"]
+            assert stats["worker_exited"] and stats["receiver_exited"] and stats["credit_thread_exited"]
+            assert not stats["cleanup_failed"] and stats["worker"]["gc_begin"] is not None
+        pool.close()  # 幂等；不再生成或换worker。
+    finally:
+        if runtime is not None:
+            runtime.close()
+        for party in parties:
+            if party.pid is not None:
+                party.join(timeout=5)
+                if party.is_alive():
+                    party.terminate()
+                    party.join(timeout=5)
+        queue.close()
+
+
+def test_s5_fixed_budget_rejected_before_any_port_or_process(monkeypatch):
+    from secure_control.experiments import communication_benchmark as bench
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("非法候选不得创建端口/材料/进程")
+    monkeypatch.setattr(bench, "_ports", forbidden)
+    options = {"steps": 1000, "delay_ms": 0, "segment_steps": 400, "optimized": True,
+               "recording_mode": "light", "material_candidate": "worker"}
+    for change in ({"steps": 999}, {"steps": True}, {"material_slots": 4}, {"diagnostic": True},
+                   {"gc_trial_policy": "baseline"}, {"preload_steps": 1000}, {"delay_ms": 1},
+                   {"timeout_trace": True}, {"recording_mode": "full"}, {"material_candidate": "invalid"}):
+        with pytest.raises(ValueError):
+            bench.run_continuous_observation(**(options | change))
+
+
 @pytest.mark.parametrize(("actor", "fault"), [
     (None, None), (0, "send"), (1, "send"), (0, "missing"), (1, "missing"),
     (0, "identity"), (1, "payload"),
