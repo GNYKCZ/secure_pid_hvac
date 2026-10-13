@@ -640,6 +640,60 @@ round及末步双 ACK、10000 次材料领取、库存+在途≤16、编码≤8M
 Wi-Fi 或硬件施力资格。未开启重 socket/GC 事件探针，历史 S5 根因仍可能未知。
 完成后发布完整原件/hash与实际结果交回 Design，停止，不自动追加运行。
 
+### 显式 worker 在线确认链定位（S10）
+
+`--worker-wait-diagnostic` 默认关闭，独立接受 cycle/batch/light、4000周期、段400、
+16槽、无预送、零注入、内部角色、原TCP/双提交与正常GC700/10/10。
+与所有其他候选/诊断/trace/GC选择及外部配置/通信覆盖互斥，严格类型检查在
+端口/材料创建前完成。S5/S8的1000、S6的20、S9的10000入口限制保持。
+
+```powershell
+uv run secure-control benchmark --case cycle --mode batch --steps 4000 --delay-ms 0 --segment-steps 400 --material-slots 16 --preload-steps 0 --recording light --worker-wait-diagnostic --output .tmp/issue120-s10-worker-wait-diagnostic.json
+```
+
+[D10批准](https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6146925091)
+仅授权四文件诊断续接，必要软件验证和独立核查通过后，先预声明新完整SHA、
+有效来源/配置/数值/初态/依赖锁/环境时钟/正常GC及完整命令，再仅运行一次，
+最多4000尝试，首次失败停。准备/启动失败也消费；不预热、补步、重跑或加对照。
+输出必须是新文件，不覆盖旧原件。3/3不重置，不自动第四轮修复。
+
+复用原worker及持续证明（reachability/horizon=None/block19），不改输入、秘密
+状态、材料新鲜性、截断/模数/位宽、安全校验和online→stage→重构→双提交顺序。
+20M ns绝对期限、迟采样占预算、继续段维护计入周期，正常停止握手/退出/导出
+仍在周期外另计且必须成功；失败关闭不能冒充正常停止或周期完成。
+
+新增探针profile为`worker-online-wait-v1`，角色报告`format_version=2`。
+原trace `values`/`schemas.trace`字段仍在调用后采样，尤其`remaining_ns`仍不是
+入口预算。新增`schemas.entry`定义调用前固定快照：操作、peer、方向、header/body、
+时钟域、deadline、`remaining_at_entry_ns`、请求/实际timeout_s、`native_called`、
+请求字节/之前确认字节、线程及可确认公共上下文。QPC/monotonic/QPC配对在调用前
+读取；legacy剩余时间按monotonic计算，不能把跨时钟域值直接相减。
+canonical timeout precheck前也采样；其后才可能耗尽预算，因此入口正余量不保证
+原precheck或调用返回时仍有余量。预检异常`native_called=false`，实际send/recv为true；
+失败实际进度未知，不由请求字节数推造。每socket只保留当前入口，角色首错入口
+`first_failure_entry`锁存；普通native事件的entry进入原滚动socket环，不无限累计。
+
+Client分别记录`online_wait_P1/P2`；服务器记录完整body返回时身份未知的标记、
+decode区间及online解码返回标记、`material_restore`及`online_ack`区间。
+服务器收帧/解码前不使用上轮身份；解码成功后才登记当前公开身份。两层phase过滤
+都支持这些事件。正常GC callback仅记录起止、线程CPU/墙钟和公开计数，不主动
+collect/freeze/调阈值；生产事件沿用原观察入口。没有采集worker内部GC或内核状态。
+
+每角色共享304槽/最多4socket、72KiB角色报告、256KiB额外诊断合并预算保持。
+入口快照、schema和首错也计入编码预算；滚动淘汰、编码省略、未配对GC及未知
+上下文如实保存。完整CycleTiming/逐步原件另计，不能说整份JSON≤256KiB。
+原Client/worker离散256MiB、库存+在途16、预编码8MiB保护保持。探针会有开销；
+不能将有探针S10与无探针S9当严格性能收益对照。原函数调用次数/参数/返回/异常
+透传，退出恢复hook/callback，首错不被关闭覆盖。探针/预算/清理错误拒绝成功。
+
+顶层`worker_wait_diagnostic`含版本1、最大4000、实际尝试/失败、预算使用及持续
+数值摘要；初始化失败也保留。`diagnostic=true`、`comparison_only=true`，candidate/
+worker_long_run/stage/qualification均false。即使4000全成功也只报“未复现”，
+不授予10000、正式默认、完整路线、TLS三机Wi-Fi或真实设备资格。
+退出后保存全部尝试及失败null端点，公开可恢复完整原件/hash和时序证据，交回
+Design分析后停止。GC重合仅是线索、低CPU大等待不证明网络/GIL原因，ACK发送
+返回不等于Client已收到，软件设备确认不等于硬件施力。
+
 早期有限诊断预算为fused/stock1000/段400的零注入406步和1ms每帧1步，各一次，现已使用，不能复用；
 失败即停，退出集中输出。未复现也不得循环追样本或用诊断PASS代替1000/10k验收。
 

@@ -165,7 +165,8 @@ class _Diagnostic:
 
     def wrap(self, phase, original):
         # S0保留关键区间，避免无关嵌套事件挤掉末轮任务/GC；原meter仍完整累计。
-        if self.supply and phase not in {"encode_ms", "material_restore", "party_stage"}:
+        if (self.supply and not getattr(self, "wait_profile", False)
+                and phase not in {"encode_ms", "material_restore", "party_stage"}):
             return original
         def measured(*args, **kwargs):
             if not self.selected():
@@ -321,7 +322,13 @@ class _TimeoutDiagnostic(_Diagnostic):
               "errno", "winerror", "timeout_origin", "native_progress_unknown", "native_thread_id",
               "direction", "frame_part", "context", "control_label", "cpu_delta_ns")
 
-    def __init__(self, role, ports):
+    ENTRY_FIELDS = ("operation", "peer", "direction", "frame_part", "entry_time_ns",
+                    "clock_domain", "deadline_ns", "remaining_at_entry_ns", "requested_timeout_s",
+                    "actual_timeout_s", "native_called", "requested_bytes", "confirmed_bytes_before",
+                    "thread_id", "native_thread_id", "context", "control_label",
+                    "qpc_before_ns", "monotonic_ns", "qpc_after_ns")
+
+    def __init__(self, role, ports, *, wait_profile=False):
         super().__init__(role, limit=304, supply=True, all_gc=True)
         self.ports = ports
         self.tracing = False
@@ -332,6 +339,15 @@ class _TimeoutDiagnostic(_Diagnostic):
         self.context_dropped = self.suppressed = 0
         self.time_fields_unavailable = 0
         self.trace_restored = False
+        self.wait_profile = wait_profile
+        self.first_failure_entry = None
+        # S10从收第一帧前开始观察；服务器解码前的身份未知，不能沿用上轮。
+        self.tracing = wait_profile
+
+    def _label(self):
+        if self.wait_profile and self.role != "Client" and getattr(self.state, "frame_unknown", True):
+            return self.role, None, None, None
+        return super()._label()
 
     def select(self, step):
         super().select(step)
@@ -354,7 +370,9 @@ class _TimeoutDiagnostic(_Diagnostic):
         return start + number % size
 
     def begin(self, phase):
-        if phase not in {"control_cycle", "material_produce", "party_stage", "receive_request"}:
+        if (phase not in {"control_cycle", "material_produce", "party_stage", "receive_request"}
+                and not (self.wait_profile and phase in {"encode_ms", "decode_ms", "material_restore",
+                    "online_wait_P1", "online_wait_P2", "online_ack"})):
             return None
         return super().begin(phase)
 
@@ -377,10 +395,11 @@ class _TimeoutDiagnostic(_Diagnostic):
         finally:
             self.state.bucket = previous
 
-    def put(self, bucket, values):
+    def put(self, bucket, values, *, entry=None):
         index = self.reserve(bucket)
         if index is not None:
-            self.slots[index] = ("trace", bucket, values)
+            self.slots[index] = (("trace", bucket, values, entry) if entry is not None
+                                 else ("trace", bucket, values))
 
     def failed(self, values):
         if self.first_failure is None:
@@ -472,6 +491,36 @@ class _TimeoutDiagnostic(_Diagnostic):
                 origin, error is not None and operation in {"send", "recv"}, get_native_id(),
                 probe.direction, probe.part, probe.context, self._label(), cpu)
 
+    def entry(self, probe, operation, *, requested=None, native_called=False):
+        """S10调用前固定公共快照；旧values仍是调用后的字段，不能改标。"""
+        deadline = probe.deadline
+        domain = "qpc_cycle" if hasattr(deadline, "deadline_ns") else "legacy_monotonic"
+        try:
+            actual = probe.sock.gettimeout()
+        except Exception:  # noqa: BLE001 - 查询失败不改变原调用
+            actual = None
+            self.time_fields_unavailable += 1
+        if actual is not None and (type(actual) not in (int, float) or not isfinite(actual)):
+            actual = None
+            self.time_fields_unavailable += 1
+        requested_timeout = probe.requested_timeout if native_called else None
+        if requested_timeout is not None and (type(requested_timeout) not in (int, float)
+                                             or not isfinite(requested_timeout)):
+            requested_timeout = None
+            self.time_fields_unavailable += 1
+        # 最后才读入口时钟；原生方法及canonical precheck仍使用原deadline/参数。
+        qpc_before = self.wall()
+        monotonic = time.monotonic_ns()
+        qpc_after = self.wall()
+        stamp = qpc_before if domain == "qpc_cycle" else monotonic
+        deadline_ns = deadline.deadline_ns if domain == "qpc_cycle" else round(deadline * 1e9)
+        value = (operation, probe.peer, probe.direction, probe.part, stamp, domain, deadline_ns,
+                 deadline_ns-stamp, requested_timeout, actual, native_called, requested,
+                 probe.confirmed, get_ident(), get_native_id(), probe.context, self._label(),
+                 qpc_before, monotonic, qpc_after)
+        probe.current_entry = value
+        return value
+
     def frame(self, original, sock, value, deadline, *, sending):
         probe = self.probe(sock)
         probe.deadline, probe.confirmed, probe.native_error = deadline, 0, None
@@ -482,11 +531,15 @@ class _TimeoutDiagnostic(_Diagnostic):
             metadata = ("expected_from_last_request", *metadata[1:]) if metadata else None
         elif not sending and metadata:
             metadata = ("last_received_envelope", *metadata[1:])
+        if self.wait_profile and not sending and self.role != "Client":
+            metadata = None  # 收帧前不知道当前帧，不能冒用最近解码的identity。
+            self.state.frame_unknown = True
         probe.context = metadata
         # send_exact包含header+body；receive_exact分别读取header和body，不能拼造业务进度。
         probe.part = "header_and_body" if sending else "header" if probe.receive_header else "body"
         started, cpu = self.wall(), self._cpu()
         requested = len(value) if sending else value
+        probe.frame_requested = requested
         try:
             result = original(probe, value, deadline)
         except BaseException as error:
@@ -507,6 +560,8 @@ class _TimeoutDiagnostic(_Diagnostic):
             ended, final_cpu = self.wall(), self._cpu()
             if not sending:
                 probe.receive_header = not probe.receive_header
+                if self.wait_profile and probe.receive_header:
+                    self.marker("frame_body_received_identity_unknown")
             self.put("frame", self.values(probe, "frame_send" if sending else "frame_recv", started, ended,
                 requested=requested, returned=probe.confirmed,
                 cpu=None if cpu is None or final_cpu is None else final_cpu-cpu))
@@ -519,15 +574,49 @@ class _TimeoutDiagnostic(_Diagnostic):
         send, receive = localhost_transport._send_exact, localhost_transport._receive_exact
         encode, decode = localhost_transport.encode_envelope, localhost_transport.decode_envelope
         runtime_close = lan_runtime.LanSegmentedRuntime.close
+        precheck = localhost_transport._set_remaining_timeout
+        receive_reply = lan_runtime._receive_reply
+        party_reply = lan_runtime._party_reply
 
         def encoded(message):
             self.remember(message)
             return encode(message)
 
         def decoded(payload):
-            message = decode(payload)
+            # 解码区间开始时身份未知；只在原解码成功后登记本帧公开身份。
+            with self.scope("decode_ms") if self.wait_profile else nullcontext():
+                message = decode(payload)
             self.remember(message)
+            if self.wait_profile:
+                self.state.frame_unknown = False
+                if message.sender == "Client" and message.operation == "online":
+                    self.select(message.step)
+                    self.marker("online_decode_return")
             return message
+
+        def checked(sock, deadline):
+            if not isinstance(sock, _TraceSocket) or sock.diagnostic is not self:
+                return precheck(sock, deadline)
+            entry = self.entry(sock, "timeout_precheck", requested=sock.frame_requested-sock.confirmed)
+            try:
+                return precheck(sock, deadline)
+            except BaseException:
+                if self.first_failure_entry is None:
+                    self.first_failure_entry = entry
+                raise
+
+        def waited(sock, request, **kwargs):
+            if request.operation != "online":
+                return receive_reply(sock, request, **kwargs)
+            self.remember(request)
+            with self.scope("online_wait_" + request.recipient):
+                return receive_reply(sock, request, **kwargs)
+
+        def replied(sock, request, *args, **kwargs):
+            if request.operation != "online":
+                return party_reply(sock, request, *args, **kwargs)
+            with self.scope("online_ack"):
+                return party_reply(sock, request, *args, **kwargs)
 
         def closed(runtime):
             self.marker("runtime_close_begin")
@@ -540,7 +629,10 @@ class _TimeoutDiagnostic(_Diagnostic):
               patch.object(localhost_transport, "_receive_exact", lambda s, v, d: self.frame(receive, s, v, d, sending=False)),
               patch.object(localhost_transport, "encode_envelope", encoded),
               patch.object(localhost_transport, "decode_envelope", decoded),
-              patch.object(lan_runtime.LanSegmentedRuntime, "close", closed)):
+              patch.object(lan_runtime.LanSegmentedRuntime, "close", closed),
+              patch.object(localhost_transport, "_set_remaining_timeout", checked) if self.wait_profile else nullcontext(),
+              patch.object(lan_runtime, "_receive_reply", waited) if self.wait_profile else nullcontext(),
+              patch.object(lan_runtime, "_party_reply", replied) if self.wait_profile else nullcontext()):
             try:
                 yield self
             finally:
@@ -557,6 +649,8 @@ class _TimeoutDiagnostic(_Diagnostic):
                            "end_ns": slot[2], "native_thread_id": slot[3], "control_label": slot[4]}
                           if slot[0] == "marker" else super()._supply_event(slot))
                 record["critical"] = index >= 288
+                if slot[0] == "trace" and len(slot) == 4:
+                    record["entry"] = slot[3]
                 records.append(record)
         if self.gc_pending is not None:
             records.append(super()._supply_event((self.gc_pending, None, "missing_stop")))
@@ -582,6 +676,13 @@ class _TimeoutDiagnostic(_Diagnostic):
                       for name in ("monotonic", "perf_counter", "thread_time")},
                   "callback_restored": self._gc not in gc.callbacks, "socket_hooks_restored": self.trace_restored,
                   "scope": "rolling public Python call boundaries; clock pairs sampled after each call; timeout queried after call; native failed-call progress unknown; Python cannot see C/kernel retries"}
+        if self.wait_profile:
+            result.update(format_version=2, profile="worker-online-wait-v1",
+                first_failure_entry=self.first_failure_entry,
+                socket_current_entries=[p.current_entry for p in self.probes.values()],
+                identity_before_server_decode="unknown; prior round never copied into current frame",
+                scope="S10 entry sampled before original native/precheck; legacy trace values sampled after call; failure progress unknown; no kernel/GIL attribution")
+            result["schemas"]["entry"] = self.ENTRY_FIELDS
         for record in records:
             result["events"].append(record)
             if len(json.dumps(result, separators=(",", ":"), ensure_ascii=False).encode()) + 256 > 72 * 1024:
@@ -603,6 +704,8 @@ class _TraceSocket:
         self.confirmed = 0
         self.requested_timeout = None
         self.receive_header = True
+        self.current_entry = None
+        self.frame_requested = 0
 
     def __getattr__(self, name):
         return getattr(self.sock, name)
@@ -611,6 +714,8 @@ class _TraceSocket:
         observer = self.diagnostic
         started, cpu = observer.wall(), observer._cpu()
         requested = len(args[0]) if operation == "send" else args[0] if operation == "recv" else None
+        entry = (observer.entry(self, operation, requested=requested, native_called=True)
+                 if observer.wait_profile and operation in {"send", "recv"} else None)
         try:
             result = getattr(self.sock, operation)(*args, **kwargs)
         except BaseException as error:
@@ -620,7 +725,9 @@ class _TraceSocket:
             record = observer.values(self, operation, started, ended, requested=requested,
                                      error=error, origin=origin,
                                      timeout=args[0] if operation == "settimeout" else None)
-            observer.put("socket", record)
+            observer.put("socket", record, entry=entry)
+            if entry is not None and observer.first_failure_entry is None:
+                observer.first_failure_entry = entry
             observer.failed(record)
             raise
         else:
@@ -628,7 +735,7 @@ class _TraceSocket:
             amount = result if operation == "send" else len(result) if operation == "recv" else None
             observer.put("socket", observer.values(self, operation, started, ended, requested=requested,
                 returned=amount, timeout=args[0] if operation == "settimeout" else None,
-                cpu=None if cpu is None or final_cpu is None else final_cpu-cpu))
+                cpu=None if cpu is None or final_cpu is None else final_cpu-cpu), entry=entry)
             if amount is not None:
                 self.confirmed += amount
             return result
@@ -969,10 +1076,10 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
 def _party_job(
     config: LanConfig, ports: tuple[int, int, int], delay_ms: float, batch: bool, queue,
     diagnostic_enabled=False, full_observation=False, tcp_nodelay=None, supply_diagnostic=False,
-    timeout_trace=False, material_comparison=False,
+    timeout_trace=False, material_comparison=False, worker_wait_diagnostic=False,
 ) -> None:
     role_steps = []
-    diagnostic = (_TimeoutDiagnostic(config.role, ports) if timeout_trace else
+    diagnostic = (_TimeoutDiagnostic(config.role, ports, wait_profile=worker_wait_diagnostic) if timeout_trace else
                   _Diagnostic(config.role, supply=supply_diagnostic) if diagnostic_enabled else None)
     observations = ExitStack()
     socket_options = []
@@ -1435,7 +1542,7 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                                recording_mode="full", tcp_nodelay=None,
                                commit_policy="default", gc_trial_policy=None, timeout_trace=False,
                                material_candidate=None, worker_timeout_diagnostic=False,
-                               worker_long_run=False) -> dict[str, object]:
+                               worker_long_run=False, worker_wait_diagnostic=False) -> dict[str, object]:
     # 所有试验参数在任何端口/角色/材料创建前拒绝；默认入口走原路径。
     options = {"steps": steps, "delay_ms": delay_ms, "segment_steps": segment_steps,
                "optimized": optimized, "material_slots": material_slots, "role_config": role_config,
@@ -1443,6 +1550,23 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                "diagnostic": diagnostic, "recording_mode": recording_mode,
                    "tcp_nodelay": tcp_nodelay, "commit_policy": commit_policy,
                    "timeout_trace": timeout_trace}
+    if type(worker_wait_diagnostic) is not bool:
+        raise ValueError("S10诊断选择必须为严格bool。")
+    if worker_wait_diagnostic:
+        if (optimized is not True or recording_mode != "light" or diagnostic is not False
+                or worker_long_run is not False or worker_timeout_diagnostic is not False
+                or material_candidate is not None or gc_trial_policy is not None or timeout_trace is not False
+                or type(steps) is not int or steps != 4000
+                or type(segment_steps) is not int or segment_steps != 400
+                or type(material_slots) is not int or material_slots != 16
+                or type(preload_steps) is not int or preload_steps != 0 or preload_execution != "fused"
+                or type(delay_ms) not in (int, float) or delay_ms != 0 or role_config is not None
+                or tcp_nodelay is not None or commit_policy != "default"
+                or not gc.isenabled() or gc.get_freeze_count() or gc.callbacks or gc.get_debug()
+                or gc.get_threshold() != (700, 10, 10)):
+            raise ValueError("S10只允许独立正常GC的worker/cycle/batch/light/4000/400/16/无预送/默认通信。")
+        return _run_material_comparison({**options, "diagnostic": True, "timeout_trace": True,
+                                        "worker_wait_diagnostic": True}, "worker", target_steps=4000)
     if type(worker_long_run) is not bool:
         raise ValueError("worker长期选择必须为严格bool。")
     if worker_long_run:
@@ -1621,12 +1745,15 @@ def _run_material_comparison(options, candidate, *, target_steps=1000):
               "memory_guard_failed": False, "cleanup_failed": False, "process_cpu_ns": None,
               "producer_exited": None, "memory_sample_error_type": None, "cleanup_error_type": None}
     started_cpu = time.process_time_ns()
-    traced = options.get("worker_timeout_diagnostic", False)
+    wait_diagnostic = options.get("worker_wait_diagnostic", False)
+    traced = options.get("worker_timeout_diagnostic", False) or wait_diagnostic
     long_run = target_steps == 10000
     long_metadata = {"format_version": 1, "target_steps": 10000, "maximum_attempts": 10000,
                      "candidate": "worker", "period_ns": 20000000, "segment_steps": 400,
                      "recording_mode": "light", "first_failure_stop": True,
                      "numeric_contract": None} if long_run else None
+    wait_metadata = {"format_version": 1, "maximum_attempts": 4000, "first_failure_stop": True,
+                     "numeric_contract": None} if wait_diagnostic else None
     trace_observers = []
     original_close = lan_runtime.LanContinuousRuntime.close
     def sample(moment):
@@ -1677,7 +1804,8 @@ def _run_material_comparison(options, candidate, *, target_steps=1000):
                 cleanup.callback(restored)
                 return restored
             result = _run_continuous_observation(**options, material_candidate=candidate,
-                _material_event=event, **({"_long_run_metadata": long_metadata} if long_run else {}),
+                _material_event=event, **({"_long_run_metadata": long_metadata or wait_metadata}
+                                        if long_run or wait_diagnostic else {}),
                 **({"_register_trace_cleanup": register} if traced or long_run else {}),
                 **({"_trace_observers": trace_observers} if traced else {}))
     except Exception as error:  # noqa: BLE001 - 初始化/清理失败也保留，不启动替代路线
@@ -1704,21 +1832,27 @@ def _run_material_comparison(options, candidate, *, target_steps=1000):
             result, report, candidate, target_steps, strict=True)
     result["candidate_gate_pass"] = not long_run and _material_run_gate(result, report, candidate, 1000)
     if traced:
+        result["diagnostic"] = True
         if result.get("diagnostic_report") is None:
             result["diagnostic_report"] = {"diagnostic": True, "roles": [v.report() for v in trace_observers],
                                            "incomplete": True, "scope": "initialization or report failure"}
         result.setdefault("timeout_trace", {"format_version": 1, "diagnostic_missing": True})
-        result["worker_timeout_diagnostic"] = {"scope": "single normal-GC worker diagnosis, not qualification",
-            "maximum_attempts": 20, "diagnostic_encoded_limit": 256 * 1024,
+        budget_key = "worker_wait_diagnostic" if wait_diagnostic else "worker_timeout_diagnostic"
+        result[budget_key] = {"scope": "single normal-GC worker diagnosis, not qualification",
+            "maximum_attempts": 4000 if wait_diagnostic else 20, "diagnostic_encoded_limit": 256 * 1024,
             "diagnostic_encoded_bytes": 0, "diagnostic_budget_failed": False,
             "precompact_encoded_bytes": None, "compacted_event_count": 0, "material_summary_omitted": False}
+        if wait_diagnostic:
+            result[budget_key].update(wait_metadata, actual_attempts=len(result.get("cycles", [])),
+                failed_attempts=result.get("failed_attempts"), invocation_budget_consumed=True)
+            result["worker_long_run_gate_pass"] = False
         combined = {name: result.get(name) for name in ("diagnostic_report", "timeout_trace",
-                    "material_comparison", "material_summary", "worker_timeout_diagnostic")}
+                    "material_comparison", "material_summary", budget_key)}
         for _ in range(3):
-            result["worker_timeout_diagnostic"]["diagnostic_encoded_bytes"] = len(json.dumps(
+            result[budget_key]["diagnostic_encoded_bytes"] = len(json.dumps(
                 combined, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode())
-        if result["worker_timeout_diagnostic"]["diagnostic_encoded_bytes"] > 256 * 1024:
-            budget = result["worker_timeout_diagnostic"]
+        if result[budget_key]["diagnostic_encoded_bytes"] > 256 * 1024:
+            budget = result[budget_key]
             budget["diagnostic_budget_failed"] = True
             budget["precompact_encoded_bytes"] = budget["diagnostic_encoded_bytes"]
             # 总预算不足时只留下各角色首错/外层错及恢复事实，省略普通历史并明确拒绝资格。
@@ -1726,7 +1860,8 @@ def _run_material_comparison(options, candidate, *, target_steps=1000):
             for role in result["diagnostic_report"].get("roles", []):
                 compact = {key: role.get(key) for key in ("role", "format_version", "trace_fields",
                     "trace_context_fields", "first_failure", "outer_failure", "evictions", "clocks",
-                    "callback_restored", "socket_hooks_restored")}
+                    "callback_restored", "socket_hooks_restored", "schemas", "profile",
+                    "first_failure_entry", "socket_current_entries", "evicted_count")}
                 omitted = len(role.get("events", []))
                 budget["compacted_event_count"] += omitted
                 compact.update(events=[], encoded_omitted=role.get("encoded_omitted", 0) + omitted,
@@ -1762,7 +1897,7 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
                                commit_policy="default", _gc_trial=None, timeout_trace=False,
                                material_candidate=None, _material_event=None, worker_timeout_diagnostic=False,
                                _register_trace_cleanup=None, _trace_observers=None,
-                               _long_run_metadata=None) -> dict[str, object]:
+                               _long_run_metadata=None, worker_wait_diagnostic=False) -> dict[str, object]:
     """实际持续动态循环及原同步 writer；退出后报告观察，不发布图或更改调度。"""
     from secure_control.execution.lan_runtime import RunControl
     from secure_control.scenarios.cart_pole.interactive import InteractiveSession
@@ -1799,7 +1934,8 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
     if not isinstance(delay_ms, (int, float)) or not 0 <= delay_ms <= 3:
         raise ValueError("单帧注入等待必须在0..3ms")
     supply_diagnostic = (diagnostic and light and not preload_steps and material_slots == 16
-                         and (not comparison_only or _gc_trial is not None or worker_timeout_diagnostic))
+                         and (not comparison_only or _gc_trial is not None or worker_timeout_diagnostic
+                              or worker_wait_diagnostic))
     ports = _ports()
     config = _config("Client", ports) if role_config is None else load_lan_config(role_config, "Client")
     if role_config is not None:
@@ -1827,7 +1963,7 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
         stop_roles = _register_trace_cleanup(stop_roles)
     parties = [context.Process(target=_party_job, args=(
         _config(role, ports), ports, delay_ms, True, queue, diagnostic, False, tcp_nodelay,
-        supply_diagnostic, timeout_trace, material_candidate is not None,
+        supply_diagnostic, timeout_trace, material_candidate is not None, worker_wait_diagnostic,
     )) for role in ("P1", "P2")] if role_config is None else []
     records, events, outcomes, writer_batches = [], [], [], []
     socket_options = []
@@ -1836,7 +1972,7 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
                           "source_check_ms": 0., "source_check_control_ms": 0.,
                           "source_check_writer_ms": 0., "source_check_control_count": 0,
                           "source_check_writer_count": 0}
-    diagnostic_observer = (_TimeoutDiagnostic("Client", ports) if timeout_trace else
+    diagnostic_observer = (_TimeoutDiagnostic("Client", ports, wait_profile=worker_wait_diagnostic) if timeout_trace else
                           _Diagnostic("Client", supply=supply_diagnostic,
                                       all_gc=_gc_trial is not None) if diagnostic else None)
     # 必须先装在meter内层；退出先还原meter前驱，再卸下探针。

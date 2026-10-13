@@ -589,6 +589,8 @@ def _run() -> int:
                            help="S6独立worker正常GC定位，固定20/400/16/light，首次失败停，非性能资格")
     benchmark.add_argument("--worker-long-run", action="store_true",
                            help="S9显式worker长期候选，固定10000/400/16/light，首次失败停，非整体资格")
+    benchmark.add_argument("--worker-wait-diagnostic", action="store_true",
+                           help="S10独立worker确认链定位，固定4000/400/16/light，首次失败停，非资格")
     benchmark.add_argument("--fixed-proof-cache", action="store_true",
                            help="full-observation固定精确矩阵计算的显式候选对照")
     benchmark.add_argument("--role-config", type=Path)
@@ -603,6 +605,9 @@ def _run() -> int:
         )
 
         try:
+            if args.worker_wait_diagnostic and (args.case != "cycle" or args.mode != "batch"
+                                                or args.fixed_proof_cache):
+                raise ValueError("worker-wait-diagnostic只支持独立cycle/batch诊断。")
             if args.worker_long_run and (args.case != "cycle" or args.mode != "batch"
                                          or args.fixed_proof_cache):
                 raise ValueError("worker-long-run只支持独立cycle/batch候选。")
@@ -643,6 +648,7 @@ def _run() -> int:
                     material_candidate=args.material_candidate,
                     worker_timeout_diagnostic=args.worker_timeout_diagnostic,
                     worker_long_run=args.worker_long_run,
+                    worker_wait_diagnostic=args.worker_wait_diagnostic,
                 )
             else:
                 if args.preload_steps or args.diagnostic:

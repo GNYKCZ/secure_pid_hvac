@@ -2767,3 +2767,327 @@ def test_full_observation_real_switch_failure_keeps_attempt_and_public_whitelist
     assert "raw_force" not in json.dumps(report) and "output_share" not in json.dumps(report)
     with pytest.raises(ValueError):
         run_full_observation(steps=10000, delay_ms=0)
+
+def test_s10_guard_is_independent_and_rejects_before_resources(monkeypatch):
+    import gc
+
+    from secure_control.experiments import communication_benchmark as bench
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("S10非法组合不能创建端口、材料或工人")
+    monkeypatch.setattr(bench, "_ports", forbidden)
+    options = {"steps": 4000, "delay_ms": 0, "segment_steps": 400, "optimized": True,
+               "recording_mode": "light", "worker_wait_diagnostic": True}
+    for change in ({"worker_wait_diagnostic": 1}, {"steps": 3999}, {"steps": 4001}, {"steps": True},
+                   {"segment_steps": 400.0}, {"material_slots": 16.0}, {"preload_steps": False},
+                   {"delay_ms": False}, {"delay_ms": 1}, {"preload_steps": 1}, {"preload_execution": "staged"},
+                   {"optimized": 1}, {"recording_mode": "full"}, {"diagnostic": True},
+                   {"worker_long_run": True}, {"worker_long_run": 0}, {"worker_timeout_diagnostic": True},
+                   {"worker_timeout_diagnostic": 0}, {"material_candidate": "worker"},
+                   {"gc_trial_policy": "baseline"}, {"timeout_trace": True}, {"timeout_trace": 0},
+                   {"role_config": "unused"}, {"tcp_nodelay": False}, {"commit_policy": "serial"}):
+        with pytest.raises(ValueError):
+            bench.run_continuous_observation(**(options | change))
+    for name, value in (("isenabled", False), ("get_threshold", (701, 10, 10)),
+                        ("get_freeze_count", 1), ("get_debug", 1), ("callbacks", [object()])):
+        with monkeypatch.context() as context:
+            context.setattr(gc, name, value if name == "callbacks" else lambda value=value: value)
+            with pytest.raises(ValueError):
+                bench.run_continuous_observation(**options)
+    calls = []
+    monkeypatch.setattr(bench, "_run_material_comparison", lambda opts, candidate, **kw:
+                        calls.append((opts, candidate, kw)) or {"status": "software-only"})
+    assert bench.run_continuous_observation(**options)["status"] == "software-only"
+    assert calls[0][1:] == ("worker", {"target_steps": 4000})
+    assert calls[0][0]["diagnostic"] and calls[0][0]["timeout_trace"]
+    # 两个开关任意排列都必须拒绝，不以先到的旧入口掩盖新选择。
+    for selector, steps in (("worker_long_run", 10000), ("worker_timeout_diagnostic", 20),
+                            ("material_candidate", 1000)):
+        with pytest.raises(ValueError):
+            bench.run_continuous_observation(**(options | {selector: "worker" if selector == "material_candidate" else True,
+                                                           "steps": steps}))
+
+
+class _S10Socket:
+    """无端口替身；分片及故障仍穿过canonical framing，不执行控制轮。"""
+    def __init__(self, data=b"", fail_at=None):
+        self.data, self.fail_at = bytearray(data), fail_at
+        self.calls, self.timeout = [], None
+        self.failure = TimeoutError("private socket text")
+
+    def getsockname(self):
+        return "127.0.0.1", 9000
+
+    def getpeername(self):
+        return "127.0.0.1", 102
+
+    def gettimeout(self):
+        return self.timeout
+
+    def settimeout(self, value):
+        self.timeout = value
+
+    def recv(self, length):
+        self.calls.append(("recv", length))
+        if len(self.calls) == self.fail_at:
+            raise self.failure
+        size = min(2, length, len(self.data))
+        value = bytes(self.data[:size])
+        del self.data[:size]
+        return value
+
+    def send(self, data):
+        self.calls.append(("send", len(data)))
+        if len(self.calls) == self.fail_at:
+            raise self.failure
+        return min(2, len(data))
+
+
+@pytest.mark.parametrize(("operation", "fail_at", "part", "confirmed"),
+                         [("recv", 2, "header", 2), ("recv", 4, "body", 2), ("send", 2, "header_and_body", 2)])
+def test_s10_native_entry_preserves_partial_progress_original_error_and_first_failure(operation, fail_at, part, confirmed):
+    import struct
+
+    from secure_control.execution import localhost_transport as transport
+    from secure_control.execution.cycle_timing import _CycleDeadline
+    from secure_control.experiments.communication_benchmark import _TimeoutDiagnostic
+
+    observer = _TimeoutDiagnostic("Client", (101, 102, 103), wait_profile=True)
+    observer.select(2823)
+    sock = _S10Socket(struct.pack("!I", 5)+b"abcde", fail_at)
+    deadline = _CycleDeadline(time.perf_counter_ns()+1_000_000_000)
+    original_native = getattr(sock, operation)
+    def native(*args):
+        try:
+            return original_native(*args)
+        finally:
+            if len(sock.calls) == fail_at:
+                # 原生失败后才改变观察时钟：旧post字段应负，新entry仍为正。
+                observer.wall = lambda: deadline.deadline_ns+1_000_000
+    setattr(sock, operation, native)
+    callbacks = list(__import__("gc").callbacks)
+    original_precheck = transport._set_remaining_timeout
+    with observer.installed(), observer.sockets(), pytest.raises(transport.LocalhostTransportTimeout) as raised:
+        if operation == "recv":
+            transport.receive_frame(sock, deadline=deadline, limit=10)
+        else:
+            transport.send_frame(sock, b"abcde", deadline=deadline, limit=10)
+    assert raised.value.__cause__ is sock.failure and len(sock.calls) == fail_at
+    entry = dict(zip(observer.ENTRY_FIELDS, observer.first_failure_entry, strict=True))
+    assert entry["operation"] == operation and entry["peer"] == "P2" and entry["frame_part"] == part
+    assert entry["native_called"] and entry["remaining_at_entry_ns"] > 0
+    assert dict(zip(observer.FIELDS, observer.first_failure, strict=True))["remaining_ns"] < 0
+    assert entry["confirmed_bytes_before"] == confirmed
+    assert entry["actual_timeout_s"] == entry["requested_timeout_s"] > 0
+    assert entry["deadline_ns"] == deadline.deadline_ns and entry["clock_domain"] == "qpc_cycle"
+    assert entry["qpc_before_ns"] <= entry["qpc_after_ns"]
+    saved = observer.first_failure_entry
+    observer.marker("runtime_close_end")
+    observer.failed(tuple(None for _ in observer.FIELDS))
+    assert observer.first_failure_entry is saved
+    report = observer.report()
+    assert report["format_version"] == 2 and report["profile"] == "worker-online-wait-v1"
+    assert report["callback_restored"] and report["socket_hooks_restored"]
+    assert transport._set_remaining_timeout is original_precheck and __import__("gc").callbacks == callbacks
+    assert any(event.get("entry") == saved for event in report["events"])
+    assert "private socket text" not in str(report)
+
+
+def test_s10_expired_precheck_never_calls_native_and_keeps_negative_entry():
+    from secure_control.execution import localhost_transport as transport
+    from secure_control.execution.cycle_timing import _CycleDeadline
+    from secure_control.experiments.communication_benchmark import _TimeoutDiagnostic
+
+    observer = _TimeoutDiagnostic("Client", (101, 102, 103), wait_profile=True)
+    sock = _S10Socket()
+    deadline = _CycleDeadline(time.perf_counter_ns()-1_000_000)
+    with observer.sockets(), pytest.raises(transport.LocalhostTransportTimeout):
+        transport.receive_frame(sock, deadline=deadline, limit=10)
+    entry = dict(zip(observer.ENTRY_FIELDS, observer.first_failure_entry, strict=True))
+    assert entry["operation"] == "timeout_precheck" and entry["native_called"] is False
+    assert entry["remaining_at_entry_ns"] < 0 and not sock.calls
+    assert entry["requested_bytes"] == 4 and entry["requested_timeout_s"] is None
+
+
+def test_s10_both_phase_filters_context_and_gc_are_observable_and_bounded(monkeypatch):
+    import gc
+    import json
+
+    from secure_control.experiments.communication_benchmark import _TimeoutDiagnostic
+
+    observer = _TimeoutDiagnostic("P2", (101, 102, 103), wait_profile=True)
+    observer.select(2822)
+    observer.state.frame_unknown = True
+    assert observer._label()[1] is None
+    calls = []
+    observer.wrap("material_restore", lambda: calls.append("restore"))()
+    observer.wrap("decode_ms", lambda: calls.append("decode"))()
+    observer.state.frame_unknown = False
+    observer.select(2823)
+    observer.wrap("online_ack", lambda: calls.append("ack"))()
+    phases = {e.get("phase") for e in observer.report()["events"]}
+    assert {"material_restore", "decode_ms", "online_ack"} <= phases
+    observer._gc("start", {"generation": 1})
+    observer._gc("stop", {"generation": 1, "collected": 2, "uncollectable": 0})
+    assert any(e.get("pairing") == "complete" for e in observer.report()["events"])
+    for _ in range(1000):
+        observer.wrap("online_wait_P2", lambda: None)()
+    observer._gc("start", {"generation": 2})
+    pending = observer.gc_pending
+    assert pending is not None
+    report = observer.report()
+    assert calls == ["restore", "decode", "ack"] and len(observer.slots) == 304
+    assert report["evicted_count"]["frame"] > 0 and report["encoded_bytes"] <= 72*1024
+    assert any(e.get("pairing") == "missing_stop" for e in report["events"])
+    assert report == observer.report() and "private" not in json.dumps(report)
+    assert gc.get_threshold() == (700, 10, 10)
+
+
+@pytest.mark.parametrize("fault", ("success", "control", "cleanup", "budget"))
+def test_s10_diagnostic_never_grants_qualification_and_preserves_failure(monkeypatch, fault):
+    from secure_control.experiments import communication_benchmark as bench
+
+    cycles = [{"status": "failed", "cycle_completed_ns": None}] if fault == "control" else []
+    roles = [{"role": "Client", "format_version": 2, "first_failure_entry": ("public",),
+              "events": [{"padding": "x" * (256*1024)}] if fault == "budget" else [],
+              "callback_restored": True, "socket_hooks_restored": True}]
+    def observed(**options):
+        if fault == "cleanup":
+            options["_register_trace_cleanup"](lambda: (_ for _ in ()).throw(OSError("private cleanup")))()
+        return {"status": "failed" if fault == "control" else "stopped", "cycles": cycles,
+                "failure_category": "LocalhostTransportTimeout" if fault == "control" else None,
+                "failed_phase": "ROUND_IN_FLIGHT" if fault == "control" else None,
+                "diagnostic_report": {"roles": roles}, "successful_steps": 0, "failed_attempts": len(cycles)}
+    monkeypatch.setattr(bench, "_run_continuous_observation", observed)
+    result = bench._run_material_comparison({"steps": 4000, "worker_wait_diagnostic": True}, "worker", target_steps=4000)
+    assert result["diagnostic"] and result["comparison_only"] and result["cycles"] is cycles
+    assert all(result[key] is False for key in ("candidate_gate_pass", "worker_long_run_gate_pass", "stage_pass", "qualification_pass"))
+    assert result["worker_wait_diagnostic"]["maximum_attempts"] == 4000
+    assert "worker_timeout_diagnostic" not in result and "worker_long_run" not in result
+    if fault == "control":
+        assert result["failure_category"] == "LocalhostTransportTimeout" and result["failed_phase"] == "ROUND_IN_FLIGHT"
+    elif fault != "success":
+        assert result["status"] == "failed"
+    if fault == "budget":
+        assert result["worker_wait_diagnostic"]["diagnostic_budget_failed"]
+        assert result["diagnostic_report"]["roles"][0]["first_failure_entry"] == ("public",)
+    assert "private cleanup" not in str(result)
+
+
+def test_s10_real_observer_composition_records_online_chain_without_previous_identity(monkeypatch):
+    import struct
+
+    from test_two_party_protocol import make_stack
+
+    from secure_control.execution import lan_runtime
+    from secure_control.experiments import communication_benchmark as bench
+    from secure_control.protocol import coordinator
+
+    client_owner, _, _, _, distribution = make_stack()
+    online = client_owner.prepare_online(distribution, [.25], step=2823, rng=random.Random(10))
+    message = WireEnvelope(SCHEMA_VERSION, "request", "Client", "P2", 3, "online",
+                           online.session_id, online.round_id, 2823, None,
+                           PartyOnlineMaterial.from_round(PartyOnlineRound(online.p2_input, online.p2_resources)))
+    encoded = encode_envelope(message)
+    sock = _S10Socket(struct.pack("!I", len(encoded))+encoded)
+    sock.getsockname = lambda: ("127.0.0.1", 102)
+    sock.getpeername = lambda: ("127.0.0.1", 9000)
+    sock.send = lambda data: len(data)
+    observer = bench._TimeoutDiagnostic("P2", (101, 102, 103), wait_profile=True)
+    observer.select(2822)
+    observer.remember(SimpleNamespace(sender="Client", recipient="P2", operation="online",
+                                     step=2822, round_id="previous-public-round", payload=None))
+    recovered = object()
+    monkeypatch.setattr(coordinator._OnlineMaterialRecovery, "restore", lambda self: recovered)
+    with observer.installed(), observer.sockets():
+        _, _, restore = bench._meter("P2", (101, 102, 103), 0, diagnostic=observer)
+        try:
+            request = lan_runtime.receive_envelope(sock, deadline=time.monotonic()+10, limit=len(encoded))
+            assert (request.session_id, request.round_id, request.step) == (online.session_id, online.round_id, 2823)
+            assert coordinator._OnlineMaterialRecovery.restore(object()) is recovered
+            lan_runtime._party_reply(sock, request, None, 10)
+        finally:
+            restore()
+    report = observer.report()
+    phases = {e.get("phase") for e in report["events"]}
+    assert {"decode_ms", "receive_request", "material_restore", "online_ack"} <= phases
+    assert any(e.get("operation") == "online_decode_return" for e in report["events"])
+    entries = [dict(zip(observer.ENTRY_FIELDS, e["entry"], strict=True))
+               for e in report["events"] if e.get("entry")]
+    received = [e for e in entries if e["operation"] == "recv"]
+    assert received and all(e["context"] is None and e["control_label"][1] is None for e in received)
+    assert all(e["clock_domain"] == "legacy_monotonic" for e in entries)
+    assert report["callback_restored"] and report["socket_hooks_restored"]
+    # Client两个等待各有独立区间，透传原请求/参数/返回和失败对象。
+    calls = []
+    error = OSError("private wait")
+    def receive(sock, request, **kwargs):
+        calls.append((request.recipient, kwargs))
+        if request.recipient == "P2":
+            raise error
+        return recovered
+    monkeypatch.setattr(lan_runtime, "_receive_reply", receive)
+    client = bench._TimeoutDiagnostic("Client", (101, 102, 103), wait_profile=True)
+    client.select(2823)
+    first_request = SimpleNamespace(sender="Client", recipient="P1", operation="online", step=2823,
+                                    round_id=online.round_id, session_id=online.session_id, payload=None)
+    with client.sockets():
+        assert lan_runtime._receive_reply(None, first_request, deadline=123.) is recovered
+        with pytest.raises(OSError) as raised:
+            lan_runtime._receive_reply(None, message, deadline=123.)
+        assert raised.value is error
+    events = client.report()["events"]
+    assert {(e["phase"], e["status"]) for e in events if e.get("phase", "").startswith("online_wait")} == {
+        ("online_wait_P1", "complete"), ("online_wait_P2", "OSError")}
+    assert calls == [("P1", {"deadline": 123.}), ("P2", {"deadline": 123.})]
+
+
+@pytest.mark.parametrize("failure_point", ("control", "prepared"))
+def test_s10_real_initialization_restores_new_and_old_hooks_without_starting_roles(monkeypatch, failure_point):
+    import gc
+
+    from secure_control.execution import lan_runtime
+    from secure_control.execution import localhost_transport as transport
+    from secure_control.experiments import communication_benchmark as bench
+    from secure_control.experiments import lan_continuous_profile
+
+    originals = (transport._send_exact, transport._receive_exact, transport._set_remaining_timeout,
+                 transport.encode_envelope, transport.decode_envelope, lan_runtime._receive_reply,
+                 lan_runtime._party_reply, lan_runtime.LanSegmentedRuntime.close, list(gc.callbacks))
+    closed = []
+    def failed(*args, **kwargs):
+        raise OSError("private initialization")
+    def forbidden(*args, **kwargs):
+        pytest.fail("软件测试不能启动定位控制进程")
+    context = SimpleNamespace(Queue=lambda: SimpleNamespace(close=lambda: closed.append(True)),
+        Process=lambda **kwargs: SimpleNamespace(start=forbidden, join=forbidden, is_alive=lambda: False))
+    monkeypatch.setattr(bench.mp, "get_context", lambda method: context)
+    monkeypatch.setattr(bench, "_ports", lambda: (101, 102, 103))
+    monkeypatch.setattr(lan_runtime if failure_point == "control" else lan_continuous_profile,
+                        "RunControl" if failure_point == "control" else "load_segmented_experiment", failed)
+    result = bench.run_continuous_observation(steps=4000, delay_ms=0, segment_steps=400,
+        optimized=True, recording_mode="light", worker_wait_diagnostic=True)
+    assert result["status"] == "failed" and result["failure_category"] == "OSError" and closed == [True]
+    assert originals == (transport._send_exact, transport._receive_exact, transport._set_remaining_timeout,
+        transport.encode_envelope, transport.decode_envelope, lan_runtime._receive_reply,
+        lan_runtime._party_reply, lan_runtime.LanSegmentedRuntime.close, list(gc.callbacks))
+    assert result["worker_wait_diagnostic"]["actual_attempts"] == 0
+    role = result["diagnostic_report"]["roles"][0]
+    assert role["profile"] == "worker-online-wait-v1" and role["socket_hooks_restored"] and role["callback_restored"]
+    assert role["first_failure_entry"] is None and "private initialization" not in str(result)
+
+
+def test_s10_cli_rejects_other_routes_and_transfers_only_diagnostic_flag(tmp_path, monkeypatch):
+    from secure_control.experiments import communication_benchmark as bench
+    from secure_control.experiments import lan_runner
+
+    calls = []
+    monkeypatch.setattr(bench, "run_continuous_observation", lambda **kw:
+                        calls.append(kw) or {"status": "stopped", "cycle_timing": {"p50_ms": 1.}})
+    base = ["secure-control", "benchmark", "--worker-wait-diagnostic", "--steps", "4000",
+            "--recording", "light", "--output", str(tmp_path/"raw.json")]
+    monkeypatch.setattr("sys.argv", base+["--case", "full-observation"])
+    assert lan_runner._run() == 5 and not calls
+    monkeypatch.setattr("sys.argv", base+["--case", "cycle", "--mode", "batch"])
+    assert lan_runner._run() == 0
+    assert calls[0]["worker_wait_diagnostic"] is True and calls[0]["worker_long_run"] is False
