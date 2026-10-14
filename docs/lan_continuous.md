@@ -806,3 +806,56 @@ stage/qualification均false，timeout_trace=null表示没有旧全量trace。原
 - `configs/paper_pid_fig3_sweep.yaml`：四点图独占的冻结定义，仍读取历史名 `hvac_2r2c_sweep_prime.yaml`，因为已发布 Fig3 清单绑定文件名和原始 SHA。
 
 旧 LAN/TLS 示例配置和 VS Code 调试清单已移除。历史 HVAC 配置仅留在 `tests/fixtures/legacy_hvac/` 供内部回归；它们不是日常实验入口。正式 `results/paper_pid_fig3/` 证据和四点 reader 保留。三角色与 Fig3 复用同一个 paper PID 场景计算，不复制安全协议。
+## S13：有限实验历史的紧凑表示
+
+`--compact-history-candidate` 默认关闭，仅用于显式批准的本机
+cycle/batch/worker、4000 steps、400 segment、16 slots、preload0、light、delay0。
+它与 S11/S12 及其余试验/诊断/外部角色或通信覆盖互斥，严格 bool 和形状检查在端口、角色、材料之前完成。
+正式 light 的 256 近期窗口和段内 400 记录不变；本候选改变的是实验层全量历史表示。
+
+Client/P1/P2 在各自控制开始前分配固定 `bytearray` 行表。Client 的 steps/cycles
+各 4001 槽（含失败/尾部预留），phase events 为 16×4000+64 槽；P1/P2 各 4001 step 槽。
+公开字段白名单及布局在启动前确定，不扩容、不循环覆盖、不保存输入 DTO 或完整嵌套树。
+控制回调直接读取原公开标量，原 meter 的计数/分项仍使用原一次调用；不先 asdict/JSON/pickle
+整棵输入对象。原 runner 自身的必要有界状态与校验没有因此移除。
+
+每字段独立区分未出现、None、实际值；整数 ns/count 检查后按无符号 64bit 保存，不经 float；
+毫秒保存为原 binary64，不舍入、不转 float32；UTF-8 显式检查字节长度，不静默截断。
+全部字段写完才发布有效行计数，未知字段、重复字段、非法父映射、容量/类型/范围/长度错误停止捕获。
+半写入行不发布，已完整捕获前缀保留；展开损坏只返回完整行前缀，并明确不完整。
+错误只记公开类别，不保留异常对象、任意错误文本、份额、材料、矩阵、对象图或分配栈。
+
+当前启动布局：Client buffer 12,257,607B，加固定元数据保守上界 524,288B，预留上界
+12,781,895B；P1/P2 各 buffer 1,348,337B，加同样元数据上界，各 1,872,625B。
+三角色合计预留上界 16,527,145B，分别小于每角色 16MiB、合并 48MiB。
+元数据上界是固定字段表/计数/登记/报告的保守预算，不是测得 RSS 或额外物理 arena。
+预分配与展开分别采样原 OS RSS，原离散 256MiB、材料库存+在途16和预编码8MiB保护不放宽。
+捕获时间仍在原20ms预算内；控制停止、S12 hooks/callback卸载后才展开/汇总/写盘，展开耗时单列。
+JSON编码及独占文件写入的退出后耗时另存命令末行 `history_export_ns`（运行log），不倒填为周期成本。
+原 `_correct_cycle_tail` 在退出展开后处理同身份权威尾部；不另造控制成功数或把 miss_after_apply 改为成功。
+
+仅在原材料工厂成功装配后读取 control/receiver/credit 的 PID、native ID、ident 和观察生命周期，
+保存标量，不保存线程对象。原 close 后读取已有 receiver/credit 的存活状态；控制线程的 observation_end
+表示观察结束，不谎称控制线程此时已经退出。登记早于 GC start 且 GC end 早于观察结束、PID/native
+匹配时才标明线程角色，否则保留未知；这不证明触发分配的函数或独占 CPU，也不反改 S12 的旧线程14320。
+材料生成、接收、公开计划/片段校验、摘要和 IPC 格式保持原实现，无新进程、依赖或模块。
+
+内部复用 S12 stage-wait-light-v1、每方128 stage环/4在途/独立首错、GC64+1及三方192KiB观察预算；
+非stage成功 I/O 没有新增全量历史。Client原startup、P1/P2 offline装配后ACK前各一次collect2保持；
+运行GC enabled700/10/10/freeze0/debug0，不冻结/禁用/改阈值/主动运行期收集。
+新 `compact_history_candidate` version1 明示尝试/失败/消费预算、布局/捕获与展开、首错/线程及GC覆盖，
+`diagnostic/comparison_only=true`；所有原 S11/candidate/worker_long_run/stage/qualification flags 为 false。
+`finite_sample_pass` 单独检查4000按时完整、原身份/数值/材料/资源、9次继续维护、正常STOP双ACK、
+worker/receiver/credit退出与完整恢复。无运行 gen2 只能说未覆盖，不能说GC成本降为0。
+
+仅软件和新head独立核查通过、目录释放、完整预声明发布且全文读回后允许：
+
+```powershell
+uv run secure-control benchmark --case cycle --mode batch --steps 4000 --delay-ms 0 --segment-steps 400 --material-slots 16 --preload-steps 0 --recording light --compact-history-candidate --output .tmp/issue120-s13-compact-history-candidate.json
+```
+
+一次最多4000，启动失败也消费，首失败停，不补步/重跑/预热/额外20步/第二组/对照。
+旧预算不复用；全部成功/慢步/失败/null、阶段事件和双方逐步记录退出后完整导出，可恢复原件和hash。
+观察或展开失败不覆盖原控制首错、不获得完整/PASS，不靠再次运行恢复证据。
+正常GC、算法/协议/精度、20ms及正式默认不变；新旧SHA/随机负载不同，不是同SHA A/B。
+即使有限样本通过，也不授原10000、完整路线、认证三机或真实硬件资格，不自动进入下一试验或合并。

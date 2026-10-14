@@ -3863,3 +3863,401 @@ def test_s12_cli_rejects_other_routes_and_transfers_only_stage_flag(tmp_path, mo
     monkeypatch.setattr("sys.argv", base + ["--case", "cycle", "--mode", "batch"])
     assert lan_runner._run() == 0 and calls[0]["stage_wait_diagnostic"] is True
     assert calls[0]["server_gc_candidate"] is False and calls[0]["worker_wait_diagnostic"] is False
+
+
+def test_s13_fixed_history_preserves_types_presence_precision_and_atomic_prefix():
+    import struct
+
+    from secure_control.experiments import communication_benchmark as bench
+
+    table = bench._HistoryTable(3, {("n",): "u", ("f",): "d", ("s",): 4, ("m",): "m", ("m", "n"): "u"})
+    values = [{"n": 2**63+17, "f": -0.0, "s": "汉a", "m": {"n": None}},
+              {"n": None, "f": 0.1, "m": {}}, {"n": 0}]
+    for row in values:
+        table.append(row.items())
+    assert table.expand() == values
+    assert struct.pack('>d', table.expand()[0]['f']) == struct.pack('>d', -0.0)
+    assert len(table.buffer) == table.capacity * table.row_bytes
+    with pytest.raises(RuntimeError):
+        table.append({"n": 1}.items())
+    assert table.count == 3 and table.expand() == values and table.error_type is not None
+
+    for bad in (True, -1, 2**64, 1.5):
+        broken = bench._HistoryTable(2, {("n",): "u"})
+        broken.append({"n": 7}.items())
+        with pytest.raises(RuntimeError):
+            broken.append({"n": bad}.items())
+        assert broken.count == 1 and broken.expand() == [{"n": 7}]
+    for bad in ({"s": "汉汉"}, {"unknown": 1}, {"m": {"unknown": 1}}):
+        broken = bench._HistoryTable(1, {("s",): 4, ("m",): "m", ("m", "n"): "u"})
+        with pytest.raises(RuntimeError):
+            broken.append(bad.items())
+        assert broken.count == 0 and broken.expand() == []
+
+
+def test_s13_complete_synthetic_history_matches_original_fields_and_retains_no_input():
+    import struct
+    import weakref
+    from dataclasses import asdict
+
+    from secure_control.execution.cycle_timing import CycleTiming
+    from secure_control.experiments import communication_benchmark as bench
+
+    class Public:
+        pass
+    history = bench._CompactHistory("Client")
+    buffers = {k: (id(t.buffer), len(t.buffer), len(t.fields)) for k, t in history.tables.items()}
+    expected_cycles, expected_steps, expected_events = [], [], []
+    activity = {k: .125 for k in history.ACTIVITY}
+    before = {k: 0. for k in activity}
+    storage = {k: 0 if k.endswith("count") else 0. for k in history.STORAGE}
+    counts = {"Client->P1": {"frames": 2, "application_bytes": 100},
+              "Client->P2": {"frames": 2, "application_bytes": 101}}
+    for step in range(4000):
+        start = 2**53+17+step*20000000
+        phases = {"input": 0, "stage": 123}
+        if step % 400 == 399 and step < 3999:
+            phases.update(maintenance=123, maintenance_end=1, maintenance_source=2, maintenance_begin=3)
+        timing = CycleTiming("run", "session", "epoch", step//400, step, f"round-{step}",
+            20000000, start, start+1, start+20000000, start+2, start+3, start+4,
+            "confirmed", None, step+1, step+1, phase_durations_ns=phases, queue_levels={"material_slots": 16})
+        expected = asdict(timing)
+        expected.update(public_frame_counts={k: v["frames"] for k, v in counts.items()},
+                        public_byte_counts={k: v["application_bytes"] for k, v in counts.items()})
+        expected_cycles.append(expected)
+        history.cycle(timing, counts, {})
+        record = Public()
+        record.protocol = SimpleNamespace(global_step=step, segment_index=step//400,
+                                          session_id="session", round_id=f"round-{step}")
+        ref = weakref.ref(record)
+        duration = -0.0 if step == 0 else 0.1
+        marks = {"material_bind_ms": 0.125, "prepare_end_ns": start}
+        history.step(record, duration=duration, marks=marks, activity=activity, before_activity=before,
+            counts=counts, before_counts={}, storage=storage, before_storage=storage)
+        expected_steps.append({"global_step": step, "segment_index": step//400, "session_id": "session",
+            "round_id": f"round-{step}", "status": "confirmed", "duration_ms": duration,
+            "components_ms": {"material_bind_ms": .125}, "activity": dict(activity), "sent": counts,
+            "storage": {k: None if k in ("fsync_ms", "fsync_count", "checkpoint_ms") else v for k, v in storage.items()}})
+        del record
+        assert ref() is None
+        for phase in ("INPUT", "ROUND_IN_FLIGHT", "AWAITING_PLANT", "RECORDING_STEP"):
+            history.event(phase, .1, step)
+            expected_events.append({"phase": phase, "duration_ms": .1, "attempt": step})
+    expanded = history.expand()
+    assert expanded == {"steps": expected_steps, "events": expected_events, "cycles": expected_cycles}
+    assert struct.pack('>d', expanded['steps'][0]['duration_ms']) == struct.pack('>d', -0.0)
+    assert buffers == {k: (id(t.buffer), len(t.buffer), len(t.fields)) for k, t in history.tables.items()}
+    assert history.report()["representation_complete"] and history.report()["layout"]["reserved_bound_bytes"] <= 16*1024**2
+    assert sum(bench._CompactHistory.layout(r)["reserved_bound_bytes"] for r in ("Client", "P1", "P2")) <= 48*1024**2
+
+    for role in ("P1", "P2"):
+        party = bench._CompactHistory(role, 1)
+        request = SimpleNamespace(step=2**53+7, round_id="原始公开身份")
+        party.party_step(request, activity, before, counts, {})
+        assert party.expand()["steps"] == [{"step": request.step, "round_id": request.round_id,
+                                            "activity_ms": activity, "sent": counts}]
+
+
+def test_s13_corrupt_or_partial_expansion_reports_valid_prefix_and_preserves_other_tables(monkeypatch):
+    from secure_control.experiments import communication_benchmark as bench
+
+    history = bench._CompactHistory("Client", 2)
+    history.event("INPUT", 0., None)
+    history.event("RUNNING", 1., 0)
+    table = history.tables["events"]
+    table.buffer[table.row_bytes] = 3
+    expanded = history.expand()
+    assert expanded["events"] == [{"phase": "INPUT", "duration_ms": 0., "attempt": None}]
+    assert table.count == 2 and table.expanded_count == 1 and table.expansion_error_type == "ValueError"
+    assert not history.report()["representation_complete"]
+    def failed():
+        raise OSError("private expansion message")
+    monkeypatch.setattr(history.tables["cycles"], "expand", failed)
+    assert history.expand()["cycles"] == [] and history.error_type == "OSError"
+    assert "private" not in str(history.report())
+
+
+def test_s13_guard_and_cli_reject_conflicts_before_resources(tmp_path, monkeypatch):
+    from secure_control.experiments import communication_benchmark as bench
+    from secure_control.experiments import lan_runner
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("软件guard不得启动候选或端口")
+    monkeypatch.setattr(bench, "_ports", forbidden)
+    monkeypatch.setattr(bench, "_run_material_comparison", forbidden)
+    base = {"steps": 4000, "delay_ms": 0, "segment_steps": 400, "optimized": True, "recording_mode": "light",
+            "compact_history_candidate": True}
+    for change in ({"compact_history_candidate": 1}, {"stage_wait_diagnostic": True}, {"server_gc_candidate": True},
+            {"worker_wait_diagnostic": True}, {"worker_long_run": True}, {"worker_timeout_diagnostic": True},
+            {"gc_trial_policy": "baseline"}, {"timeout_trace": True}, {"material_candidate": "worker"},
+            {"diagnostic": True}, {"steps": 20}, {"steps": 4000.}, {"segment_steps": True},
+            {"material_slots": 4}, {"preload_steps": 16}, {"preload_execution": "staged"}, {"role_config": "other"},
+            {"tcp_nodelay": False}, {"commit_policy": "serial"}, {"recording_mode": "full"},
+            {"optimized": False}, {"delay_ms": False}):
+        with pytest.raises((ValueError, TypeError)):
+            bench.run_continuous_observation(**(base | change))
+    calls = []
+    monkeypatch.setattr(bench, "run_continuous_observation", lambda **kw:
+        calls.append(kw) or {"status": "stopped", "cycle_timing": {"p50_ms": 1.}})
+    args = ["secure-control", "benchmark", "--compact-history-candidate", "--steps", "4000",
+            "--recording", "light", "--output", str(tmp_path / "raw.json")]
+    for route in (["--case", "dynamic"], ["--case", "cycle", "--mode", "legacy"], ["--case", "full-observation"]):
+        monkeypatch.setattr("sys.argv", args+route)
+        assert lan_runner._run() == 5 and not calls and not (tmp_path / "raw.json").exists()
+    monkeypatch.setattr("sys.argv", args+["--case", "cycle", "--mode", "batch"])
+    assert lan_runner._run() == 0 and calls[0]["compact_history_candidate"] is True
+    assert calls[0]["stage_wait_diagnostic"] is False
+
+
+def test_s13_thread_registry_uses_only_original_factory_identity_and_observed_lifetime(monkeypatch):
+    from secure_control.experiments import communication_benchmark as bench
+
+    stamp = [10]
+    monkeypatch.setattr(bench.time, "perf_counter_ns", lambda: stamp[0])
+    history = bench._CompactHistory("Client", 1)
+    alive = [True]
+    pool = SimpleNamespace(_receiver=SimpleNamespace(native_id=111, ident=222, is_alive=lambda: alive[0]),
+        _notifier=SimpleNamespace(native_id=333, ident=444, is_alive=lambda: alive[0]))
+    history.worker_threads(pool)
+    stamp[0], alive[0] = 100, False
+    history.worker_threads(pool, ending=True)
+    history.expand()
+    registry = history.report()["threads"]
+    assert [(r["thread_role"], r["native_id"]) for r in registry][1:] == [("material-receiver", 111), ("material-credit", 333)]
+    assert all(r["registered_at_qpc_ns"] == 10 and r["observation_end_qpc_ns"] == 100 for r in registry)
+    assert [r["alive_at_observation_end"] for r in registry] == [True, False, False]
+    assert all(pool is not value and pool._receiver is not value for value in history.__dict__.values())
+    with pytest.raises(RuntimeError):
+        history.worker_threads(pool)
+
+
+@pytest.mark.parametrize("fault", ("input", "transport", "after_apply"))
+def test_s13_real_callbacks_match_original_and_canonical_late_tail_without_live_roles(monkeypatch, fault):
+    from secure_control.execution import lan_runtime
+    from secure_control.execution.cycle_timing import (
+        AbsoluteCycleClock,
+        CycleTiming,
+        check_deadline,
+    )
+    from secure_control.experiments import communication_benchmark as bench
+    from secure_control.experiments import lan_continuous_profile, lan_runner
+    from secure_control.scenarios.cart_pole.interactive import InteractiveSession
+
+    prepared = lan_continuous_profile.load_segmented_experiment(
+        bench._config("Client", (101, 102, 103)).experiment_config, 400, InteractiveSession())
+    original_runner = lan_runner._run_prepared_segmented
+    original_replace = bench.replace
+    original_asdict = bench.asdict
+    def exercise(compact):
+        with monkeypatch.context() as patcher:
+            now, samples = [2**53+17], [0]
+            class Runtime:
+                def __init__(self, *args, **kwargs):
+                    self.phase, self.run_id = "RUNNING", "run"
+                    self.confirmed_step_count = self.protocol_committed_count = 0
+                    self.resource_counts = {"products_consumed": 0, "truncations_consumed": 0}
+                    self.public_setup = None
+                    self.cycle_phase_ns, self.cycle_queue_levels = {}, {}
+                    self.segment = SimpleNamespace(_material_pool=None)
+                def snapshot(self):
+                    n = self.confirmed_step_count
+                    return lan_runtime.LanLifecycleSnapshot(self.phase, "run", "session", "epoch", 0, 0,
+                        n, f"round-{n}", self.protocol_committed_count, n, 30*n, 4*n, 0)
+                @property
+                def segment_full(self):
+                    return False
+                def step(self, value, **kwargs):
+                    n = self.confirmed_step_count
+                    if n == 2 and fault == "transport":
+                        self.phase = "UNCERTAIN"
+                        raise OSError("private protocol failure")
+                    self.protocol_committed_count += 1
+                    return SimpleNamespace(global_step=n, raw_control=(0.,), round_id=f"round-{n}",
+                                           segment_index=0, session_id="session")
+                def enable_material_preparation(self, **kwargs):
+                    assert kwargs == {"slots": 16, "_candidate": "worker"}
+                def _begin_material_control(self):
+                    pass
+                def confirm_applied(self, identity):
+                    self.confirmed_step_count += 1
+                    self.resource_counts = {"products_consumed": 30*self.confirmed_step_count,
+                                            "truncations_consumed": 4*self.confirmed_step_count}
+                def close(self):
+                    lan_runtime.LanContinuousRuntime.close(self.segment)
+            def controller_input():
+                n = samples[0]
+                samples[0] += 1
+                now[0] += 21000000 if n == 2 and fault == "input" else 1000
+                return [0.]
+            def advance(*args, **kwargs):
+                now[0] += 1000
+                return {}
+            scene = SimpleNamespace(period=.02, controller_input=controller_input, advance=advance)
+            def runner(*args, **kwargs):
+                callback = kwargs["on_cycle"]
+                def cycle(timing):
+                    callback(timing)
+                    if timing.global_step == 2 and fault == "after_apply":
+                        now[0] += 20000000  # 原runner的回调后期限检查/唯一尾部校正。
+                return original_runner(*args, **(kwargs | {"on_cycle": cycle}))
+            def no_asdict(value):
+                assert not isinstance(value, CycleTiming)
+                return original_asdict(value)
+            def no_timing_replace(value, **kwargs):
+                assert not isinstance(value, CycleTiming)
+                return original_replace(value, **kwargs)
+            context = SimpleNamespace(Queue=lambda: SimpleNamespace(close=lambda: None),
+                Process=lambda **kwargs: SimpleNamespace(start=lambda: None, join=lambda **kwargs: None,
+                                                         is_alive=lambda: False))
+            patcher.setattr(bench.mp, "get_context", lambda method: context)
+            patcher.setattr(bench, "_party_outcomes", lambda queue: [{"role": r, "directions": {}} for r in ("P1", "P2")])
+            patcher.setattr(bench, "_ports", lambda: (101, 102, 103))
+            patcher.setattr(bench, "_process_memory", lambda: {"current_rss_bytes": 1024})
+            patcher.setattr(lan_runner, "LanSegmentedRuntime", Runtime)
+            patcher.setattr(lan_runner, "_run_prepared_segmented", runner)
+            patcher.setattr(bench.time, "perf_counter_ns", lambda: now[0])
+            patcher.setattr(lan_runner, "perf_counter_ns", lambda: now[0])
+            patcher.setattr(lan_runner, "AbsoluteCycleClock", lambda period:
+                AbsoluteCycleClock(period, now=lambda: now[0], sleep=lambda seconds:
+                                   now.__setitem__(0, now[0]+round(seconds*1e9))))
+            patcher.setattr(lan_runner, "check_deadline", lambda deadline, phase:
+                check_deadline(deadline, phase, now=lambda: now[0]))
+            patcher.setattr(lan_runner.gc, "collect", lambda generation: 0)
+            patcher.setattr(lan_continuous_profile, "load_segmented_experiment", lambda *args: replace(prepared, scene=scene))
+            before = _s12_hook_snapshot()
+            if compact:
+                patcher.setattr(bench, "asdict", no_asdict)
+                patcher.setattr(bench, "replace", no_timing_replace)
+            result = bench.run_continuous_observation(steps=4000, delay_ms=0, segment_steps=400, optimized=True,
+                recording_mode="light", **({"compact_history_candidate": True} if compact else {"stage_wait_diagnostic": True}))
+            assert _s12_hook_snapshot() == before and samples[0] == 3
+            assert len(result["cycles"]) == 3 and result["cycles"][-1]["cycle_completed_ns"] is None
+            assert result["failure_category"] == ("OSError" if fault == "transport" else "CycleDeadlineExceeded")
+            assert result["failed_attempts"] == 1 and not result["qualification_pass"]
+            if fault == "after_apply":
+                assert result["cycles"][-1]["status"] == "miss_after_apply"
+                assert result["failed_phase"] == "CYCLE_OBSERVATION" and len(result["steps"]) == 3
+            if compact:
+                meta = result["compact_history_candidate"]
+                assert meta["invocation_budget_consumed"] and not meta["finite_sample_pass"]
+                assert meta["roles"][0]["tables"]["cycles"]["captured"] == 3
+            return {k: result[k] for k in ("steps", "events", "cycles", "cycle_summary",
+                "failure_category", "failed_phase", "successful_steps", "failed_attempts",
+                "protocol_committed_count", "physically_confirmed_count", "resource_counts")}
+    assert exercise(False) == exercise(True)
+
+
+def test_s13_role_export_failure_keeps_original_control_error_and_restores_hooks(monkeypatch):
+    from secure_control.experiments import communication_benchmark as bench
+
+    def run(*args, **kwargs):
+        raise OSError("private control failure")
+    def expand(self):
+        raise ValueError("private export failure")
+    monkeypatch.setattr(bench, "run_party_single_step", run)
+    monkeypatch.setattr(bench._CompactHistory, "expand", expand)
+    monkeypatch.setattr(bench, "_process_memory", lambda: {"current_rss_bytes": 1024})
+    for role in ("P1", "P2"):
+        before = _s12_hook_snapshot()
+        queue = Queue()
+        bench._party_job(SimpleNamespace(role=role), (101, 102, 103), 0, True, queue,
+            material_comparison=True, stage_wait_diagnostic=True, compact_history_candidate=True)
+        result = queue.get_nowait()
+        assert result["error_type"] == "OSError" and result["status"] == "failed"
+        assert result["compact_history"]["error_type"] == "ValueError"
+        assert not result["compact_history"]["representation_complete"] and "private" not in str(result)
+        assert _s12_hook_snapshot() == before
+
+
+def test_s13_finite_sample_is_independent_of_gc_coverage_and_rejects_bad_evidence():
+    from copy import deepcopy
+
+    from secure_control.experiments import communication_benchmark as bench
+
+    initial, numeric = _s11_public_result()
+    initial["steps"] = [{"global_step": c["global_step"], "session_id": c["session_id"],
+        "round_id": c["round_id"], "status": "confirmed"} for c in initial["cycles"]]
+    initial["numeric_profile"] = {"fractional_bits": 32, "security_parameter": 80, "period_s": .02,
+        "modulus_bits": 256, "state_dimension": 4, "input_dimension": 2, "output_dimension": 1}
+    sample = {"memory_guard_failed": False, "cleanup_failed": False, "producer_exited": True}
+    def history_report(role):
+        threads = []
+        for name, native in (("control", 1), ("material-receiver", 99), ("material-credit", 100)):
+            if role != "Client" and name != "control":
+                continue
+            threads.append({"thread_role": name, "pid": 10, "native_id": native,
+                "registered_at_qpc_ns": 0, "observation_end_qpc_ns": 80000000000})
+        return {"role": role, "representation_complete": True, "layout": {"reserved_bound_bytes": 100},
+            "tables": {k: {"captured": 4000, "expanded": 4000} for k in ("steps", "cycles")}, "threads": threads}
+    for fault in ("normal", "covered", "missing", "overflow", "thread", "numeric", "phase", "bad_stop",
+                  "bool", "missing_step", "missing_capture", "control", "partial_commit", "cleanup"):
+        result, report = deepcopy(initial), dict(sample)
+        client = history_report("Client")
+        observer = _s12_software_observer("Client")
+        if fault == "covered":
+            observer.gc_observer.slots[0] = (100, 200, 99, 2, 0, 0)
+            observer.gc_observer.count = 1
+        for party in result["party_outcomes"]:
+            party.pop("server_gc")
+            stage = _s12_software_observer(party["role"])
+            stage.gc_observer.normal_stop_ack_sent = True
+            party["stage_wait"] = stage.report()
+            party["compact_history"] = history_report(party["role"])
+        if fault == "missing":
+            result["party_outcomes"][0].pop("compact_history")
+        elif fault == "overflow":
+            client["representation_complete"] = False
+        elif fault == "thread":
+            client["threads"][1]["native_id"] = None
+        elif fault == "phase":
+            result["cycles"][799].pop("phase_durations_ns")
+        elif fault == "bad_stop":
+            result["party_outcomes"][0]["stage_wait"]["gc"]["normal_stop_ack_sent"] = False
+        elif fault == "bool":
+            result["cycles"][0]["global_step"] = False
+        elif fault == "missing_step":
+            result["steps"].pop()
+        elif fault == "missing_capture":
+            client["tables"]["cycles"]["captured"] = 3999
+        elif fault == "partial_commit":
+            result["last_commit_observation"]["parties"]["P2"]["valid_ack_received"] = False
+        elif fault == "control":
+            result.update(status="uncertain", failure_category="OSError", failed_phase="ROUND_IN_FLIGHT", failed_attempts=1)
+        elif fault == "cleanup":
+            report["cleanup_failed"] = True
+        meta = deepcopy(numeric)
+        if fault == "numeric":
+            meta["numeric_contract"]["runtime_payload_bits"] = 45
+        bench._finish_stage_wait(result, report, meta, [observer])
+        original_cycles = result["cycles"]
+        bench._finish_compact_history(result, report, SimpleNamespace(expansion_ns=1, report=lambda client=client: client))
+        compact = result["compact_history_candidate"]
+        assert compact["finite_sample_pass"] == (fault in ("normal", "covered")), fault
+        assert compact["runtime_gen2_coverage"]["Client"] == (fault == "covered")
+        if fault == "covered":
+            assert compact["gc_thread_matches"][0]["thread_role"] == "material-receiver"
+        assert result["cycles"] is original_cycles
+        assert result["diagnostic"] and result["comparison_only"]
+        assert not any(result[k] for k in ("server_gc_candidate_gate_pass", "candidate_gate_pass", "worker_long_run_gate_pass",
+                                           "stage_pass", "qualification_pass"))
+        if fault == "control":
+            assert result["failure_category"] == "OSError" and result["failed_phase"] == "ROUND_IN_FLIGHT"
+
+
+def test_s13_initialization_failure_does_not_start_roles_and_restores_factory(monkeypatch):
+    from secure_control.execution import lan_runtime
+    from secure_control.experiments import communication_benchmark as bench
+
+    before = _s12_hook_snapshot()
+    factory = lan_runtime._MaterialWorkerPool.__init__
+    def forbidden(*args, **kwargs):
+        pytest.fail("初始化失败不得启动端口或角色")
+    monkeypatch.setattr(bench, "_ports", forbidden)
+    monkeypatch.setattr(bench, "_process_memory", lambda: {"current_rss_bytes": 257*1024**2})
+    result = bench.run_continuous_observation(steps=4000, delay_ms=0, segment_steps=400,
+        optimized=True, recording_mode="light", compact_history_candidate=True)
+    assert result["failure_category"] == "RuntimeError" and result["cycles"] == []
+    assert result["compact_history_candidate"]["actual_attempts"] == 0
+    assert not result["compact_history_candidate"]["finite_sample_pass"]
+    assert result["compact_history_candidate"]["invocation_budget_consumed"]
+    assert _s12_hook_snapshot() == before and lan_runtime._MaterialWorkerPool.__init__ is factory

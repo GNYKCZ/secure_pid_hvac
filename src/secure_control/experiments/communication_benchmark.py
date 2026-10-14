@@ -8,6 +8,7 @@ import multiprocessing as mp
 import os
 import platform
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -30,6 +31,289 @@ from secure_control.execution.lan_runtime import LanContinuousRuntime, run_party
 from secure_control.execution.lan_scalar_runtime import LanScalarRuntime
 
 _ROOT = Path(__file__).resolve().parents[3]
+
+
+class _HistoryTable:
+    """S13私有固定行；0缺失/1None/2值，完整写入后才发布count。"""
+
+    def __init__(self, capacity, schema):
+        if type(capacity) is not int or capacity < 1:
+            raise ValueError("非法历史容量")
+        self.capacity, self.count = capacity, 0
+        self.fields, self.row_bytes = {}, 0
+        for path, code in schema.items():
+            width = code + 2 if type(code) is int else 8 if code in ("u", "d") else 0
+            if not isinstance(path, tuple) or not path or (code != "m" and width < 1):
+                raise ValueError("非法历史字段表")
+            self.fields[path] = (code, self.row_bytes, width)
+            self.row_bytes += width + 1
+        self.buffer = bytearray(capacity * self.row_bytes)
+        self.error_type = self.expansion_error_type = None
+        self.expanded_count = None
+
+    def _write(self, base, path, value):
+        code, offset, _width = self.fields[path]
+        offset += base
+        if any(self.buffer[base+self.fields[path[:n]][1]] != 2 for n in range(1, len(path))):
+            raise ValueError("历史父映射缺失")
+        if self.buffer[offset] != 0:
+            raise ValueError("重复历史字段")
+        if value is None:
+            self.buffer[offset] = 1
+            return
+        if code == "m":
+            if type(value) is not dict:
+                raise TypeError("历史映射类型")
+            self.buffer[offset] = 2
+            for name, child in value.items():
+                self._write(base, (*path, name), child)
+        elif code == "u":
+            if type(value) is not int or not 0 <= value < 2**64:
+                raise ValueError("历史整数范围")
+            struct.pack_into(">Q", self.buffer, offset+1, value)
+        elif code == "d":
+            if type(value) is not float or not isfinite(value):
+                raise ValueError("历史浮点类型或范围")
+            struct.pack_into(">d", self.buffer, offset+1, value)
+        else:
+            if type(value) is not str:
+                raise TypeError("历史字符串类型")
+            encoded = value.encode("utf-8")
+            if len(encoded) > code:
+                raise ValueError("历史UTF8超长")
+            struct.pack_into(">H", self.buffer, offset+1, len(encoded))
+            self.buffer[offset+3:offset+3+len(encoded)] = encoded
+        self.buffer[offset] = 2
+
+    def append(self, values):
+        try:
+            if self.error_type is not None or self.count >= self.capacity:
+                raise ValueError("历史容量或前次写入失败")
+            base = self.count * self.row_bytes
+            for path, value in values:
+                self._write(base, (path,) if type(path) is str else path, value)
+            self.count += 1
+        except Exception as error:
+            self.error_type = self.error_type or type(error).__name__
+            raise RuntimeError("紧凑历史捕获失败") from error
+
+    def expand(self):
+        rows = []
+        try:
+            for index in range(self.count):
+                row = {}
+                for path, (code, offset, width) in self.fields.items():
+                    offset += index * self.row_bytes
+                    tag = self.buffer[offset]
+                    if tag == 0:
+                        continue
+                    if tag not in (1, 2):
+                        raise ValueError("历史标记损坏")
+                    owner = row
+                    for parent in path[:-1]:
+                        owner = owner[parent]
+                    if tag == 1:
+                        value = None
+                    elif code == "m":
+                        value = {}
+                    elif code in ("u", "d"):
+                        value = struct.unpack_from(">Q" if code == "u" else ">d", self.buffer, offset+1)[0]
+                    else:
+                        size = struct.unpack_from(">H", self.buffer, offset+1)[0]
+                        if size > code:
+                            raise ValueError("历史UTF8长度损坏")
+                        value = bytes(self.buffer[offset+3:offset+3+size]).decode("utf-8")
+                    owner[path[-1]] = value
+                rows.append(row)
+        except Exception as error:  # noqa: BLE001 - 只保留完整展开前缀和公开错误类别
+            self.expansion_error_type = type(error).__name__
+        self.expanded_count = len(rows)
+        return rows
+
+
+class _CompactHistory:
+    """仅有限实验历史；字段白名单/容量在端口与t0之前固定，不保存输入DTO。"""
+
+    ACTIVITY = ("send_ms", "receive_ms", "encode_ms", "decode_ms", "recovery_ms",
+                "local_arithmetic_ms", "peer_exchange_ms", "plan_digest_ms", "dto_validation_ms")
+    PHASES = ("input", "material_bind", "material_prepare", "online_distribution", "stage", "reconstruct",
+              "commit", "p1_commit_send", "p1_commit_ack_wait", "p1_commit_latency",
+              "p2_commit_send", "p2_commit_ack_wait", "p2_commit_latency", "device", "recording",
+              "maintenance", "maintenance_end", "maintenance_source", "maintenance_begin", "maintenance_release",
+              "maintenance_seal", "p1_commit", "p2_commit")
+    STORAGE = ("fsync_ms", "fsync_count", "checkpoint_ms", "source_check_ms", "source_check_control_ms",
+               "source_check_writer_ms", "source_check_control_count", "source_check_writer_count")
+    QUEUE = ("material_slots", "material_high_water", "inventory_inflight_high_water", "material_reserved_bytes",
+             "material_encoded_bound_high_water", "material_prepare_ns", "material_cpu_ns", "ipc_bytes",
+             "current_round_bytes_high_water", "ipc_temporary_bytes_high_water", "credits_sent", "startup_duration_ns",
+             "material_slots_before_close", "cancelled_credit_slots", "generated_received", "claimed", "inventory_inflight")
+    DIRECTIONS = ("Client->P1", "Client->P2", "P1->Client", "P1->P2", "P2->Client", "P2->P1")
+
+    @classmethod
+    def schemas(cls, role, steps):
+        if role not in ("Client", "P1", "P2") or type(steps) is not int or not 1 <= steps <= 4000:
+            raise ValueError("非法紧凑历史范围")
+        def mapping(schema, name, children):
+            schema[(name,)] = "m"
+            schema.update({(name, k): code for k, code in children})
+        row = {("global_step" if role == "Client" else "step",): "u", ("round_id",): 128}
+        activity_name = "activity" if role == "Client" else "activity_ms"
+        if role == "Client":
+            row.update({("segment_index",): "u", ("session_id",): 128, ("status",): 64,
+                        ("duration_ms",): "d", ("failure_phase",): 64, ("error_type",): 64})
+            mapping(row, "components_ms", ((k+"_ms", "d") for k in cls.PHASES))
+            mapping(row, "storage", ((k, "u" if k.endswith("count") else "d") for k in cls.STORAGE))
+        mapping(row, activity_name, ((k, "d") for k in cls.ACTIVITY))
+        row[("sent",)] = "m"
+        for direction in cls.DIRECTIONS:
+            row[("sent", direction)] = "m"
+            for name in ("frames", "application_bytes"):
+                row[("sent", direction, name)] = "u"
+        tables = {"steps": (steps+1, row)}
+        if role == "Client":
+            cycle = { (k,): 128 for k in ("run_id", "session_id", "controller_epoch", "round_id") }
+            cycle.update({(k,): "u" for k in ("segment_index", "global_step", "period_ns", "scheduled_start_ns",
+                "actual_sample_start_ns", "deadline_ns", "device_completed_ns", "bookkeeping_completed_ns",
+                "cycle_completed_ns", "protocol_committed_count", "physically_confirmed_count", "durable_step_count",
+                "format_version")})
+            cycle.update({("status",): 64, ("failure_phase",): 64})
+            mapping(cycle, "phase_durations_ns", ((k, "u") for k in cls.PHASES))
+            mapping(cycle, "queue_levels", ((k, "u") for k in cls.QUEUE))
+            for name in ("public_frame_counts", "public_byte_counts"):
+                mapping(cycle, name, ((k, "u") for k in cls.DIRECTIONS))
+            tables.update(cycles=(steps+1, cycle), events=(16*steps+64,
+                {("phase",): 32, ("duration_ms",): "d", ("attempt",): "u"}))
+        return tables
+
+    @classmethod
+    def layout(cls, role, steps=4000):
+        tables = {}
+        for name, (capacity, schema) in cls.schemas(role, steps).items():
+            row_bytes = sum(1 + (code+2 if type(code) is int else 8 if code in ("u", "d") else 0)
+                            for code in schema.values())
+            tables[name] = {"capacity": capacity, "row_bytes": row_bytes, "buffer_bytes": capacity*row_bytes,
+                            "fields": [{"path": list(path), "code": code} for path, code in schema.items()]}
+        # 固定白名单表/计数/线程登记/报告的保守上界；不随样本数增长，不是测得的RSS。
+        buffer_bytes = sum(t["buffer_bytes"] for t in tables.values())
+        reserved = buffer_bytes + 512*1024
+        if reserved > 16*1024*1024:
+            raise ValueError("历史布局超出16MiB")
+        return {"role": role, "tables": tables, "buffer_bytes": buffer_bytes,
+                "metadata_bound_bytes": 512*1024, "reserved_bound_bytes": reserved, "limit_bytes": 16*1024*1024}
+
+    def __init__(self, role, steps=4000):
+        self.role, self.target = role, steps
+        self.layout_info = self.layout(role, steps)
+        self.tables = {k: _HistoryTable(n, schema) for k, (n, schema) in self.schemas(role, steps).items()}
+        self.threads, self.error_type = [], None
+        self.tail_correction = None
+        self.expansion_ns, self.expansion_memory = None, None
+        self.preallocated_memory = _process_memory()
+        if self.preallocated_memory["current_rss_bytes"] > 256*1024*1024:
+            raise RuntimeError("历史预分配RSS超限")
+        self.register_thread("control", native=get_native_id(), ident=get_ident(), alive=True)
+
+    def register_thread(self, role, *, native, ident, alive):
+        if len(self.threads) >= 3 or any(row["thread_role"] == role for row in self.threads):
+            raise RuntimeError("线程登记重复或超限")
+        self.threads.append({"thread_role": role, "pid": os.getpid(), "native_id": native,
+            "ident": ident, "registered_at_qpc_ns": time.perf_counter_ns(), "alive_at_registration": alive,
+            "observation_end_qpc_ns": None, "alive_at_observation_end": None})
+
+    def worker_threads(self, pool, *, ending=False):
+        for name, thread in (("material-receiver", pool._receiver), ("material-credit", pool._notifier)):
+            if ending:
+                row = next((r for r in self.threads if r["thread_role"] == name), None)
+                if row is not None and row["observation_end_qpc_ns"] is None:
+                    row.update(observation_end_qpc_ns=time.perf_counter_ns(), alive_at_observation_end=thread.is_alive())
+            else:
+                self.register_thread(name, native=thread.native_id, ident=thread.ident, alive=thread.is_alive())
+
+    @staticmethod
+    def deltas(activity, before, counts, before_counts, *, activity_name):
+        yield (activity_name,), {}
+        for k, value in activity.items():
+            yield (activity_name, k), value-before[k]
+        yield ("sent",), {}
+        for direction, fields in counts.items():
+            yield ("sent", direction), {}
+            for k, value in fields.items():
+                yield ("sent", direction, k), value-before_counts.get(direction, {}).get(k, 0)
+
+    def event(self, phase, duration, attempt):
+        self.tables["events"].append((("phase", phase), ("duration_ms", duration), ("attempt", attempt)))
+
+    def step(self, record, *, duration, marks, activity, before_activity, counts, before_counts,
+             storage, before_storage, failure_phase=None, error_type=None):
+        def values():
+            if record is None:
+                yield "global_step", self.tables["steps"].count
+                yield "status", "failed"
+                yield "failure_phase", failure_phase
+                yield "error_type", error_type
+            else:
+                for name in ("global_step", "segment_index", "session_id", "round_id"):
+                    yield name, getattr(record.protocol, name)
+                yield "status", "confirmed"
+            yield "duration_ms", duration
+            yield "components_ms", {}
+            for k, value in marks.items():
+                if k.endswith("_ms"):
+                    yield ("components_ms", k), value
+            yield from self.deltas(activity, before_activity, counts, before_counts, activity_name="activity")
+            yield "storage", {}
+            for k, value in storage.items():
+                yield ("storage", k), None if k in ("fsync_ms", "fsync_count", "checkpoint_ms") else value-before_storage[k]
+        self.tables["steps"].append(values())
+
+    def party_step(self, request, activity, before, counts, before_counts):
+        def values():
+            yield "step", request.step
+            yield "round_id", request.round_id
+            yield from self.deltas(activity, before, counts, before_counts, activity_name="activity_ms")
+        self.tables["steps"].append(values())
+
+    def cycle(self, timing, counts, before_counts):
+        def values():
+            for name in timing.__dataclass_fields__:
+                if name not in ("public_frame_counts", "public_byte_counts"):
+                    yield name, getattr(timing, name)
+            for name, field in (("public_frame_counts", "frames"), ("public_byte_counts", "application_bytes")):
+                yield name, {}
+                for direction, counters in counts.items():
+                    yield (name, direction), counters[field]-before_counts.get(direction, {}).get(field, 0)
+        self.tables["cycles"].append(values())
+
+    def expand(self):
+        started = time.perf_counter_ns()
+        for row in self.threads:
+            if row["thread_role"] == "control" and row["observation_end_qpc_ns"] is None:
+                row.update(observation_end_qpc_ns=started, alive_at_observation_end=True)
+        rows = {}
+        for name, table in self.tables.items():
+            try:
+                rows[name] = table.expand()
+            except Exception as error:  # noqa: BLE001 - 单表展开失败仍恢复其他完整表
+                self.error_type = self.error_type or type(error).__name__
+                rows[name] = []
+        self.expansion_ns = time.perf_counter_ns()-started
+        try:
+            self.expansion_memory = _process_memory()
+            if self.expansion_memory["current_rss_bytes"] > 256*1024*1024:
+                self.error_type = "HistoryExpansionMemory"
+        except Exception as error:  # noqa: BLE001 - 退出观察不能覆盖控制首错
+            self.error_type = type(error).__name__
+        return rows
+
+    def report(self):
+        tables = {name: {"captured": t.count, "expanded": t.expanded_count, "error_type": t.error_type,
+                         "expansion_error_type": t.expansion_error_type} for name, t in self.tables.items()}
+        return {"role": self.role, "format_version": 1, "layout": self.layout_info, "tables": tables,
+            "representation_complete": self.error_type is None and all(t.error_type is None
+                and t.expansion_error_type is None and t.expanded_count == t.count for t in self.tables.values()),
+            "error_type": self.error_type, "threads": self.threads, "preallocated_memory": self.preallocated_memory,
+            "expansion_memory": self.expansion_memory, "expansion_ns": self.expansion_ns,
+            "tail_correction": self.tail_correction}
 
 
 class _ServerGCObservation:
@@ -1273,7 +1557,7 @@ def _config(role: str, ports: tuple[int, int, int]) -> LanConfig:
 
 
 def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=None,
-           diagnostic=None, full_observation=False, gc_boundaries=None):
+           diagnostic=None, full_observation=False, gc_boundaries=None, compact_history=None):
     """包住既有 framing 最外层，只数发送次数/字节，不解码或保存 payload。"""
     from secure_control.execution import lan_scalar_runtime, localhost_transport
 
@@ -1475,7 +1759,7 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
                     scalar_counts = {k: dict(v) for k, v in counts.items()}
                 return result
             observations.enter_context(patch.object(lan_scalar_runtime, "_send", scalar_reply))
-    if role_steps is not None:
+    if role_steps is not None or compact_history is not None:
         reply = lan_runtime._party_reply
         previous = dict(activity)
         previous_counts = {}
@@ -1485,7 +1769,10 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
             value = reply(sock, request, *args, **kwargs)
             if (request.operation == "endpoint"
                     and getattr(request.payload, "operation", None) == "commit"):
-                role_steps.append({"step": request.step, "round_id": request.round_id,
+                if compact_history is not None:
+                    compact_history.party_step(request, activity, previous, counts, previous_counts)
+                else:
+                    role_steps.append({"step": request.step, "round_id": request.round_id,
                                    "activity_ms": {k: activity[k] - v for k, v in previous.items()},
                                    "sent": {k: {field: v[field] - previous_counts.get(k, {}).get(field, 0)
                                                 for field in v} for k, v in counts.items()}})
@@ -1519,9 +1806,19 @@ def _party_job(
     config: LanConfig, ports: tuple[int, int, int], delay_ms: float, batch: bool, queue,
     diagnostic_enabled=False, full_observation=False, tcp_nodelay=None, supply_diagnostic=False,
     timeout_trace=False, material_comparison=False, worker_wait_diagnostic=False, server_gc_candidate=False,
-    stage_wait_diagnostic=False,
+    stage_wait_diagnostic=False, compact_history_candidate=False,
 ) -> None:
     role_steps = []
+    history = None
+    if compact_history_candidate:
+        try:
+            history = _CompactHistory(config.role)
+        except Exception as error:  # noqa: BLE001 - 启动失败不建角色，不隐去缺失记录
+            queue.put({"role": config.role, "status": "failed", "error_type": type(error).__name__,
+                       "steps": [], "directions": {}, "activity_ms": {},
+                       "compact_history": {"role": config.role, "representation_complete": False,
+                                           "error_type": type(error).__name__}})
+            return
     diagnostic = (_TimeoutDiagnostic(config.role, ports, wait_profile=worker_wait_diagnostic) if timeout_trace else
                   _Diagnostic(config.role, supply=supply_diagnostic) if diagnostic_enabled else None)
     observations = ExitStack()
@@ -1532,8 +1829,9 @@ def _party_job(
         observations.enter_context(diagnostic.installed())
         if timeout_trace:
             observations.enter_context(diagnostic.sockets())
-    counts, activity, restore = _meter(config.role, ports, delay_ms, role_steps, diagnostic,
-                                       full_observation=full_observation, gc_boundaries=gc_boundaries)
+    counts, activity, restore = _meter(config.role, ports, delay_ms, None if history else role_steps, diagnostic,
+        full_observation=full_observation, gc_boundaries=gc_boundaries,
+        **({"compact_history": history} if history else {}))
     outcome = {"role": config.role}
     server_gc = _ServerGCObservation(config.role) if server_gc_candidate or stage_wait_diagnostic else None
     stage_wait = _StageWaitDiagnostic(config.role, ports, gc_observer=server_gc) if stage_wait_diagnostic else None
@@ -1579,6 +1877,12 @@ def _party_job(
                 gc_boundaries["end"] = {"stats": gc.get_stats(), "enabled": gc.isenabled(),
                                          "threshold": list(gc.get_threshold())}
             outcome["gc_boundaries"] = gc_boundaries
+        if history is not None:
+            try:
+                outcome["steps"] = history.expand()["steps"]
+            except Exception as error:  # noqa: BLE001 - 报告错误不取代原角色首错
+                history.error_type = type(error).__name__
+            outcome["compact_history"] = history.report()
         queue.put(outcome)
 
 
@@ -2010,7 +2314,8 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                                commit_policy="default", gc_trial_policy=None, timeout_trace=False,
                                material_candidate=None, worker_timeout_diagnostic=False,
                                worker_long_run=False, worker_wait_diagnostic=False,
-                               server_gc_candidate=False, stage_wait_diagnostic=False) -> dict[str, object]:
+                               server_gc_candidate=False, stage_wait_diagnostic=False,
+                               compact_history_candidate=False) -> dict[str, object]:
     # 所有试验参数在任何端口/角色/材料创建前拒绝；默认入口走原路径。
     options = {"steps": steps, "delay_ms": delay_ms, "segment_steps": segment_steps,
                "optimized": optimized, "material_slots": material_slots, "role_config": role_config,
@@ -2022,9 +2327,11 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
         raise ValueError("S11候选选择必须为严格bool。")
     if type(stage_wait_diagnostic) is not bool:
         raise ValueError("S12定位选择必须为严格bool。")
-    if server_gc_candidate or stage_wait_diagnostic:
+    if type(compact_history_candidate) is not bool:
+        raise ValueError("S13候选选择必须为严格bool。")
+    if server_gc_candidate or stage_wait_diagnostic or compact_history_candidate:
         if (optimized is not True or recording_mode != "light" or diagnostic is not False
-                or server_gc_candidate and stage_wait_diagnostic
+                or sum((server_gc_candidate, stage_wait_diagnostic, compact_history_candidate)) != 1
                 or worker_long_run is not False or worker_timeout_diagnostic is not False
                 or worker_wait_diagnostic is not False or material_candidate is not None
                 or gc_trial_policy is not None or timeout_trace is not False
@@ -2037,7 +2344,8 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                 or not gc.isenabled() or gc.get_threshold() != (700, 10, 10)
                 or gc.get_freeze_count() or gc.get_debug() or gc.callbacks):
             raise ValueError("S11/S12只允许独立正常GC的worker/cycle/batch/light/4000/400/16/无预送/默认通信。")
-        selector = "stage_wait_diagnostic" if stage_wait_diagnostic else "server_gc_candidate"
+        selector = ("compact_history_candidate" if compact_history_candidate else
+                    "stage_wait_diagnostic" if stage_wait_diagnostic else "server_gc_candidate")
         return _run_material_comparison({**options, selector: True}, "worker", target_steps=4000)
     if type(worker_wait_diagnostic) is not bool:
         raise ValueError("S10诊断选择必须为严格bool。")
@@ -2401,6 +2709,105 @@ def _finish_stage_wait(result, report, metadata, observers):
         result.update(status="failed", failure_category="StageWaitObservation", failed_phase="DIAGNOSTIC_REPORT")
 
 
+def _compact_sample_pass(result, report, metadata):
+    """复用原身份/材料检查；独立补充本候选的数值、维护和观察完整性。"""
+    if not (metadata["representation_complete"] and metadata["thread_registration_complete"]
+            and (result.get("stage_wait_diagnostic") or {}).get("evidence_complete") is True
+            and _material_run_gate(result, report, "worker", 4000, strict=True, numeric_key="stage_wait_diagnostic")):
+        return False
+    numeric = metadata["numeric_contract"] or {}
+    if any(numeric.get(k) != v for k, v in (("block_steps", 19), ("parameter_bits", 40), ("runtime_payload_bits", 46))):
+        return False
+    if result.get("numeric_profile") != {"fractional_bits": 32, "security_parameter": 80, "period_s": .02,
+            "modulus_bits": 256, "state_dimension": 4, "input_dimension": 2, "output_dimension": 1}:
+        return False
+    integer_fields = ("global_step", "segment_index", "period_ns", "scheduled_start_ns", "actual_sample_start_ns",
+        "deadline_ns", "device_completed_ns", "bookkeeping_completed_ns", "cycle_completed_ns",
+        "protocol_committed_count", "physically_confirmed_count")
+    if any(type(row.get(k)) is not int or row[k] < 0 for row in result["cycles"] for k in integer_fields):
+        return False
+    if any(type(result.get(k)) is not int for k in ("requested_steps", "successful_steps", "failed_attempts",
+            "protocol_committed_count", "physically_confirmed_count")):
+        return False
+    if any(type(result["cycle_summary"].get(k)) is not int for k in ("attempts", "misses")):
+        return False
+    rows = result.get("steps", [])
+    if len(rows) != 4000 or any(r.get("status") != "confirmed" or r.get("global_step") != step
+            or r.get("session_id") != result["cycles"][step]["session_id"]
+            or r.get("round_id") != result["cycles"][step]["round_id"] for step, r in enumerate(rows)):
+        return False
+    for role in metadata["roles"]:
+        if role["tables"]["steps"]["captured"] != 4000 or role["tables"]["steps"]["expanded"] != 4000:
+            return False
+        if role["role"] == "Client" and (role["tables"]["cycles"]["captured"] != 4000
+                                         or role["tables"]["cycles"]["expanded"] != 4000):
+            return False
+    maintenance = [r for r in result["cycles"] if "maintenance" in r.get("phase_durations_ns", {})]
+    return ({r["global_step"] for r in maintenance} == set(range(399, 3999, 400))
+        and all(type(r["phase_durations_ns"]["maintenance"]) is int and r["phase_durations_ns"]["maintenance"] >= 0
+                for r in maintenance)
+        and all((r.get("gc") or {}).get("normal_stop_ack_sent") is True
+                for r in result["stage_wait_diagnostic"]["roles"] if r.get("role") in ("P1", "P2")))
+
+
+def _finish_compact_history(result, report, history):
+    """S13完整展开与有限样本检查独立记账，绝不借用原资格flag。"""
+    if history is not None and history.expansion_ns is None:
+        expanded = history.expand()
+        if "steps" not in result:
+            result.update(steps=expanded["steps"], events=expanded["events"], cycles=expanded["cycles"])
+            if any(expanded.values()):
+                history.error_type = history.error_type or "HistoryControlResultMissing"
+    roles = [history.report()] if history is not None else []
+    roles.extend(p.pop("compact_history") for p in result.get("party_outcomes", []) if "compact_history" in p)
+    cycles = result.get("cycles", [])
+    attempts = (result.get("cycle_summary") or {}).get("attempts", len(cycles))
+    stage = result.get("stage_wait_diagnostic") or {}
+    meta = {"format_version": 1, "target_steps": 4000, "maximum_attempts": 4000,
+        "first_failure_stop": True, "actual_attempts": attempts, "captured_cycles": len(cycles),
+        "failed_attempts": result.get("failed_attempts"), "invocation_budget_consumed": True,
+        "field_codec": "checked-u64-binary64-utf8-presence-v1",
+        "equivalence_validation": "software same-input oracle; runtime checked complete rows and expansion",
+        "role_limit_bytes": 16*1024*1024, "combined_limit_bytes": 48*1024*1024, "roles": roles,
+        "numeric_contract": stage.get("numeric_contract"), "representation_complete": False,
+        "finite_sample_pass": False, "thread_registration_complete": False,
+        "runtime_gen2_coverage": {}, "gc_thread_matches": []}
+    meta["combined_reserved_bound_bytes"] = sum((r.get("layout") or {}).get("reserved_bound_bytes", 0) for r in roles)
+    meta["representation_complete"] = (len(roles) == 3 and {r.get("role") for r in roles} == {"Client", "P1", "P2"}
+        and all(r.get("representation_complete") is True and r.get("layout", {}).get("reserved_bound_bytes", 2**63)
+                <= 16*1024*1024 for r in roles) and meta["combined_reserved_bound_bytes"] <= 48*1024*1024
+        and len(cycles) == attempts)
+    meta["thread_registration_complete"] = len(roles) == 3 and all(
+        {t["thread_role"] for t in r.get("threads", [])} == (
+            {"control", "material-receiver", "material-credit"} if r["role"] == "Client" else {"control"})
+        and all(type(t.get("pid")) is int and t["pid"] > 0 and type(t.get("native_id")) is int and t["native_id"] > 0
+                and t.get("observation_end_qpc_ns") is not None
+                and t["observation_end_qpc_ns"] >= t["registered_at_qpc_ns"] for t in r.get("threads", [])) for r in roles)
+    start = cycles[0]["scheduled_start_ns"] if cycles else None
+    end = cycles[-1]["deadline_ns"] if cycles else None
+    for observed in stage.get("roles", []):
+        role = observed["role"]
+        registry = next((r.get("threads", []) for r in roles if r.get("role") == role), [])
+        events = (observed.get("gc") or {}).get("events", [])
+        meta["runtime_gen2_coverage"][role] = bool(start is not None and any(e[0] < end and e[1] > start for e in events))
+        for event in events:
+            match = [r for r in registry if r["native_id"] == event[2] and r["registered_at_qpc_ns"] <= event[0]
+                and r["observation_end_qpc_ns"] is not None and event[1] <= r["observation_end_qpc_ns"]]
+            meta["gc_thread_matches"].append({"role": role, "start_qpc_ns": event[0], "end_qpc_ns": event[1],
+                "native_id": event[2], "thread_role": match[0]["thread_role"] if len(match) == 1 else None,
+                "pid": match[0]["pid"] if len(match) == 1 else None,
+                "scope": "registered identity/lifetime; not allocation stack or exclusive CPU"})
+    result["compact_history_candidate"] = meta
+    if result.get("status") == "stopped" and not meta["representation_complete"]:
+        result.update(status="failed", failure_category="CompactHistoryObservation", failed_phase="HISTORY_EXPANSION")
+    try:
+        meta["finite_sample_pass"] = _compact_sample_pass(result, report, meta)
+    except (KeyError, TypeError, ValueError, IndexError):
+        meta["finite_sample_pass"] = False
+    result.update(diagnostic=True, comparison_only=True, server_gc_candidate_gate_pass=False,
+                  candidate_gate_pass=False, worker_long_run_gate_pass=False, stage_pass=False, qualification_pass=False)
+
+
 def _run_material_comparison(options, candidate, *, target_steps=1000):
     """S5仅边界快照；S6独立持有既有探针退出栈，不改变GC策略。"""
     from secure_control.execution import lan_runtime
@@ -2410,7 +2817,11 @@ def _run_material_comparison(options, candidate, *, target_steps=1000):
     started_cpu = time.process_time_ns()
     wait_diagnostic = options.get("worker_wait_diagnostic", False)
     server_gc_candidate = options.get("server_gc_candidate", False)
-    stage_wait_diagnostic = options.get("stage_wait_diagnostic", False)
+    compact_candidate = options.get("compact_history_candidate", False)
+    history = None
+    stage_wait_diagnostic = options.get("stage_wait_diagnostic", False) or compact_candidate
+    if compact_candidate:
+        options = {**options, "stage_wait_diagnostic": True}
     traced = options.get("worker_timeout_diagnostic", False) or wait_diagnostic
     long_run = target_steps == 10000
     long_metadata = {"format_version": 1, "target_steps": 10000, "maximum_attempts": 10000,
@@ -2426,6 +2837,10 @@ def _run_material_comparison(options, candidate, *, target_steps=1000):
     stage_observers = []
     trace_observers = []
     original_close = lan_runtime.LanContinuousRuntime.close
+    original_pool_init = lan_runtime._MaterialWorkerPool.__init__
+    def initialized(pool, *args, **kwargs):
+        original_pool_init(pool, *args, **kwargs)
+        history.worker_threads(pool)
     def sample(moment):
         value = {"moment": moment, **_process_memory()}
         report["memory"].append(value)
@@ -2451,6 +2866,8 @@ def _run_material_comparison(options, candidate, *, target_steps=1000):
         finally:
             try:
                 original_close(runtime)
+                if history is not None and isinstance(pool, lan_runtime._MaterialWorkerPool):
+                    history.worker_threads(pool, ending=True)
                 if isinstance(pool, lan_runtime._OnlineResourcePool):
                     report["producer_exited"] = not pool._thread.is_alive()
                 elif pool is not None:
@@ -2462,7 +2879,11 @@ def _run_material_comparison(options, candidate, *, target_steps=1000):
         # 保留公开附加失败并执行原关闭，返回后统一门禁；无原失败也不能因此获得成功资格。
     try:
         with ExitStack() as cleanup:
+            if compact_candidate:
+                history = _CompactHistory("Client")
             cleanup.enter_context(patch.object(lan_runtime.LanContinuousRuntime, "close", close))
+            if history is not None:
+                cleanup.enter_context(patch.object(lan_runtime._MaterialWorkerPool, "__init__", initialized))
             def register(callback):
                 # 初始化尚未进入runner也要逆序还原；附加清理失败不能抹掉已返回的周期。
                 def restored():
@@ -2478,6 +2899,7 @@ def _run_material_comparison(options, candidate, *, target_steps=1000):
                                         if long_run or wait_diagnostic or server_gc_candidate or stage_wait_diagnostic else {}),
                 **({"_register_trace_cleanup": register} if traced or long_run or server_gc_candidate or stage_wait_diagnostic else {}),
                 **({"_stage_observers": stage_observers} if stage_wait_diagnostic else {}),
+                **({"_compact_history": history} if history is not None else {}),
                 **({"_trace_observers": trace_observers} if traced else {}))
     except Exception as error:  # noqa: BLE001 - 初始化/清理失败也保留，不启动替代路线
         result = {"schema": "cycle-qualification-v1", "case": "cycle", "mode": "batch",
@@ -2506,6 +2928,8 @@ def _run_material_comparison(options, candidate, *, target_steps=1000):
         _finish_server_gc(result, report, server_gc_metadata)
     if stage_wait_diagnostic:
         _finish_stage_wait(result, report, stage_metadata, stage_observers)
+    if compact_candidate:
+        _finish_compact_history(result, report, history)
     if traced:
         result["diagnostic"] = True
         if result.get("diagnostic_report") is None:
@@ -2573,7 +2997,8 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
                                material_candidate=None, _material_event=None, worker_timeout_diagnostic=False,
                                _register_trace_cleanup=None, _trace_observers=None,
                                _long_run_metadata=None, worker_wait_diagnostic=False,
-                               server_gc_candidate=False, stage_wait_diagnostic=False, _stage_observers=None) -> dict[str, object]:
+                               server_gc_candidate=False, stage_wait_diagnostic=False, _stage_observers=None,
+                               compact_history_candidate=False, _compact_history=None) -> dict[str, object]:
     """实际持续动态循环及原同步 writer；退出后报告观察，不发布图或更改调度。"""
     from secure_control.execution.lan_runtime import RunControl
     from secure_control.scenarios.cart_pole.interactive import InteractiveSession
@@ -2640,9 +3065,12 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
     parties = [context.Process(target=_party_job, args=(
         _config(role, ports), ports, delay_ms, True, queue, diagnostic, False, tcp_nodelay,
         supply_diagnostic, timeout_trace, material_candidate is not None, worker_wait_diagnostic, server_gc_candidate,
-        stage_wait_diagnostic,
+        stage_wait_diagnostic, compact_history_candidate,
     )) for role in ("P1", "P2")] if role_config is None else []
     records, events, outcomes, writer_batches = [], [], [], []
+    history = _compact_history
+    def record_count():
+        return history.tables["steps"].count if history is not None else len(records)
     socket_options = []
     cycles = []
     marks, storage = {}, {"fsync_ms": 0., "fsync_count": 0, "checkpoint_ms": 0.,
@@ -2684,7 +3112,7 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
     def phase(name):
         nonlocal current_phase, phase_start, attempt, before_activity, before_storage, before_counts
         nonlocal diagnostic_phase
-        if _material_event and (name == "RUNNING" and not records or name == "INPUT" and len(records) % 100 == 0):
+        if _material_event and (name == "RUNNING" and record_count() == 0 or name == "INPUT" and record_count() % 100 == 0):
             _material_event("control_begin" if name == "RUNNING" else "before_input")
         if _gc_trial and name == "RUNNING":
             if timeout_trace:
@@ -2697,18 +3125,21 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
             if not supply_diagnostic or name == "INPUT":
                 diagnostic_observer.end(diagnostic_phase)
             if name == "INPUT":
-                diagnostic_observer.select(len(records))
+                diagnostic_observer.select(record_count())
             if not supply_diagnostic or name == "INPUT":
                 diagnostic_phase = diagnostic_observer.begin("control_cycle" if supply_diagnostic else name)
-        if _gc_trial and name == "INPUT" and len(records) % 100 == 0:
-            _gc_trial.memory("before_input", step=len(records), guard=True)
+        if _gc_trial and name == "INPUT" and record_count() % 100 == 0:
+            _gc_trial.memory("before_input", step=record_count(), guard=True)
         now = time.perf_counter_ns()
         if current_phase is not None:
-            events.append({"phase": current_phase, "duration_ms": (now - phase_start) / 1e6,
-                           "attempt": len(records) if attempt is not None else None})
+            if history is not None:
+                history.event(current_phase, (now-phase_start)/1e6, record_count() if attempt is not None else None)
+            else:
+                events.append({"phase": current_phase, "duration_ms": (now - phase_start) / 1e6,
+                               "attempt": record_count() if attempt is not None else None})
         if name == "INPUT":
             if stage_wait:
-                stage_wait.select(len(records))
+                stage_wait.select(record_count())
             attempt = now
             marks.clear()
             before_activity, before_storage = dict(activity), dict(storage)
@@ -2720,7 +3151,12 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
         if sink is not None:
             sink.record_step(record)
         now = time.perf_counter_ns()
-        records.append({"global_step": record.protocol.global_step,
+        if history is not None:
+            history.step(record, duration=(now-attempt)/1e6, marks=marks, activity=activity,
+                before_activity=before_activity, counts=counts, before_counts=before_counts,
+                storage=storage, before_storage=before_storage)
+        else:
+            records.append({"global_step": record.protocol.global_step,
                         "segment_index": record.protocol.segment_index,
                         "session_id": record.protocol.session_id,
                         "round_id": record.protocol.round_id, "status": "confirmed",
@@ -2732,7 +3168,7 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
                         "storage": {k: None if light and k in ("fsync_ms", "fsync_count", "checkpoint_ms")
                                     else storage[k] - v for k, v in before_storage.items()}})
         attempt = None
-        if len(records) >= steps:
+        if record_count() >= steps:
             control.request_stop()
 
     def observed_cycle(timing):
@@ -2742,12 +3178,15 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
             diagnostic_phase = None
             if supply_diagnostic:
                 diagnostic_observer.finish_control()
-        sent = {k: v["frames"] - before_counts.get(k, {}).get("frames", 0)
-                for k, v in counts.items()}
-        byte_counts = {k: v["application_bytes"] - before_counts.get(k, {}).get("application_bytes", 0)
-                       for k, v in counts.items()}
-        timing = replace(timing, public_frame_counts=sent, public_byte_counts=byte_counts)
-        cycles.append(asdict(timing))
+        if history is not None:
+            history.cycle(timing, counts, before_counts)
+        else:
+            sent = {k: v["frames"] - before_counts.get(k, {}).get("frames", 0)
+                    for k, v in counts.items()}
+            byte_counts = {k: v["application_bytes"] - before_counts.get(k, {}).get("application_bytes", 0)
+                           for k, v in counts.items()}
+            timing = replace(timing, public_frame_counts=sent, public_byte_counts=byte_counts)
+            cycles.append(asdict(timing))
         if writer is not None:
             writer.record_cycle(timing)
 
@@ -2850,7 +3289,16 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
                     except OSError:
                         result["checkpoint_error"] = "OSError"
             if attempt is not None:
-                records.append({"global_step": len(records), "status": "failed",
+                if history is not None:
+                    try:
+                        history.step(None, duration=(time.perf_counter_ns()-attempt)/1e6, marks=marks,
+                            activity=activity, before_activity=before_activity, counts=counts, before_counts=before_counts,
+                            storage=storage, before_storage=before_storage,
+                            failure_phase=result.get("failure_phase"), error_type=result.get("category"))
+                    except RuntimeError:
+                        pass  # 已记录捕获失败；不覆盖runner原控制首错或伪造一行。
+                else:
+                    records.append({"global_step": record_count(), "status": "failed",
                                 "duration_ms": (time.perf_counter_ns() - attempt) / 1e6,
                                 "failure_phase": result.get("failure_phase"),
                                 "error_type": result.get("category"),
@@ -2860,7 +3308,13 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
                                              for field in v} for k, v in counts.items()},
                                 "storage": {k: None if light and k in ("fsync_ms", "fsync_count", "checkpoint_ms")
                                             else storage[k] - v for k, v in before_storage.items()}})
-            events.append({"phase": current_phase,
+            if history is not None:
+                try:
+                    history.event(current_phase, (time.perf_counter_ns()-phase_start)/1e6, None)
+                except RuntimeError:
+                    pass  # 有效事件前缀仍展开，报告不完整。
+            else:
+                events.append({"phase": current_phase,
                            "duration_ms": (time.perf_counter_ns() - phase_start) / 1e6,
                            "attempt": None})
             outcomes = _party_outcomes(queue) if parties else []
@@ -2877,11 +3331,23 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
         if socket_context is not None:
             socket_close()
         stop_roles()
+    if history is not None:
+        try:
+            expanded = history.expand()
+        except Exception as error:  # noqa: BLE001 - 完整展开故障不能替换runner已有首错
+            history.error_type = type(error).__name__
+            history.expansion_ns = 0
+            expanded = {"steps": [], "events": [], "cycles": []}
+        records, events, cycles = expanded["steps"], expanded["events"], expanded["cycles"]
     directions = dict(counts)
     for item in outcomes:
         directions.update(item["directions"])
     # on_cycle之后的成本仍可超期：两种模式均以原runner最终事实校正。
+    captured_cycles = len(cycles)
     _correct_cycle_tail(cycles, result, project=dict)
+    if history is not None:
+        history.tail_correction = {"captured_cycles": captured_cycles, "exported_cycles": len(cycles),
+            "canonical_last_cycle_present": (result.get("cycle_summary") or {}).get("last_cycle") is not None}
     cycle_timing = _timing([(row["cycle_completed_ns"] - row["scheduled_start_ns"]) / 1e6
                             for row in cycles if row["cycle_completed_ns"] is not None])
     device_timing = _timing([(row["device_completed_ns"] - row["scheduled_start_ns"]) / 1e6
