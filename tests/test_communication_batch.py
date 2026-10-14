@@ -3424,3 +3424,442 @@ def test_s11_cli_rejects_other_routes_and_transfers_only_candidate_flag(tmp_path
     monkeypatch.setattr("sys.argv", base + ["--case", "cycle", "--mode", "batch"])
     assert lan_runner._run() == 0
     assert calls[0]["server_gc_candidate"] is True and calls[0]["worker_wait_diagnostic"] is False
+
+
+def _s12_hook_snapshot():
+    import gc
+
+    from secure_control.execution import (
+        _localhost_peer,
+        _localhost_workers,
+        lan_runtime,
+        localhost_transport,
+    )
+
+    return ([getattr(owner, name) for owner, names in (
+        (localhost_transport, ("_send_exact", "_receive_exact", "_set_remaining_timeout", "encode_envelope", "decode_envelope")),
+        (lan_runtime, ("_party_reply", "receive_envelope", "stage_protocol3_batch")),
+        (lan_runtime.LanSegmentedRuntime, ("close",)),
+        (_localhost_workers._ClientPartyEndpoint, ("start_stage_batch", "finish_stage_batch")),
+        (_localhost_peer.LocalhostProtocol3PeerPort, ("exchange_products", "product_complete", "send_truncations", "receive_truncations", "state_complete")),
+    ) for name in names], list(gc.callbacks))
+
+
+def test_s12_party_failure_restores_all_hooks_before_report_and_preserves_original_error(monkeypatch):
+    import gc
+
+    from secure_control.execution import lan_runtime
+    from secure_control.experiments import communication_benchmark as bench
+
+    def reply(*args, **kwargs):
+        return None
+    def run(config, *, batch):
+        assert batch
+        lan_runtime._party_reply(object(), SimpleNamespace(operation="offline"), None, 30)
+        raise OSError("private control failure")
+    monkeypatch.setattr(lan_runtime, "_party_reply", reply)
+    monkeypatch.setattr(bench, "run_party_single_step", run)
+    monkeypatch.setattr(bench, "_process_memory", lambda: {"current_rss_bytes": 1024})
+    monkeypatch.setattr(gc, "collect", lambda generation: 6)
+    before = _s12_hook_snapshot()
+    queue = Queue()
+    bench._party_job(SimpleNamespace(role="P2"), (101, 102, 103), 0, True, queue,
+        material_comparison=True, stage_wait_diagnostic=True)
+    result = queue.get_nowait()
+    assert result["status"] == "failed" and result["error_type"] == "OSError"
+    assert _s12_hook_snapshot() == before
+    assert "private" not in str(result) and "server_gc" not in result
+    report = result["stage_wait"]
+    assert report["hooks_restored"] and report["gc"]["callback_and_hook_restored"]
+    assert report["gc"]["startup_collect"]["completed"] and report["gc"]["startup_collect"]["collected"] == 6
+
+
+def test_s12_guard_and_reverse_conflicts_reject_before_resources(monkeypatch):
+    import gc
+
+    from secure_control.experiments import communication_benchmark as bench
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("S12非法选择不能启动端口或材料")
+    monkeypatch.setattr(bench, "_ports", forbidden)
+    base = {"steps": 4000, "delay_ms": 0, "segment_steps": 400, "optimized": True,
+            "recording_mode": "light", "stage_wait_diagnostic": True}
+    for change in ({"stage_wait_diagnostic": 1}, {"steps": 20}, {"steps": 1000}, {"steps": 10000},
+            {"steps": 4000.}, {"material_slots": True}, {"segment_steps": 400.}, {"delay_ms": False},
+            {"preload_steps": False}, {"preload_steps": 1}, {"preload_execution": "staged"},
+            {"optimized": False}, {"recording_mode": "full"}, {"diagnostic": True}, {"timeout_trace": True},
+            {"server_gc_candidate": True}, {"worker_wait_diagnostic": True}, {"worker_long_run": True},
+            {"worker_timeout_diagnostic": True}, {"material_candidate": "worker"}, {"gc_trial_policy": "baseline"},
+            {"role_config": "unused"}, {"tcp_nodelay": False}, {"commit_policy": "serial"}):
+        with pytest.raises(ValueError):
+            bench.run_continuous_observation(**(base | change))
+    for name, value in (("isenabled", False), ("get_threshold", (701, 10, 10)),
+                        ("get_freeze_count", 1), ("get_debug", 1), ("callbacks", [object()])):
+        with monkeypatch.context() as patcher:
+            patcher.setattr(gc, name, value if name == "callbacks" else lambda value=value: value)
+            with pytest.raises(ValueError):
+                bench.run_continuous_observation(**base)
+    calls = []
+    monkeypatch.setattr(bench, "_run_material_comparison", lambda options, candidate, **kw:
+        calls.append((options, candidate, kw)) or {})
+    bench.run_continuous_observation(**base)
+    assert calls[0][1:] == ("worker", {"target_steps": 4000})
+    assert calls[0][0]["stage_wait_diagnostic"] and not calls[0][0]["diagnostic"]
+    assert "server_gc_candidate" not in calls[0][0] and not calls[0][0]["timeout_trace"]
+
+
+def test_s12_native_partial_frames_keep_entry_first_error_and_never_retry():
+    import struct
+
+    from secure_control.execution import localhost_transport as transport
+    from secure_control.execution.cycle_timing import _CycleDeadline
+    from secure_control.experiments.communication_benchmark import _StageWaitDiagnostic
+
+    for operation, fail_at, part in (("recv", 2, "header"), ("recv", 4, "body"), ("send", 2, "header_and_body")):
+        observer = _StageWaitDiagnostic("Client", (101, 102, 103))
+        sock = _S10Socket(struct.pack("!I", 5)+b"abcde", fail_at)
+        deadline = _CycleDeadline(time.perf_counter_ns()+1_000_000_000)
+        before = _s12_hook_snapshot()
+        with observer.installed(), pytest.raises(transport.LocalhostTransportTimeout) as caught:
+            if operation == "recv":
+                transport.receive_frame(sock, deadline=deadline, limit=10)
+            else:
+                transport.send_frame(sock, b"abcde", deadline=deadline, limit=10)
+        assert caught.value.__cause__ is sock.failure and len(sock.calls) == fail_at
+        assert _s12_hook_snapshot() == before
+        first = dict(zip(observer.FIELDS, observer.first_failure, strict=True))
+        entry = dict(zip(observer.ENTRY_FIELDS, first["entry"], strict=True))
+        assert first["operation"] == operation and first["frame_part"] == part and first["peer"] == "P2"
+        assert first["error_type"] == "TimeoutError" and first["native_progress_unknown"]
+        assert first["native_in_flight"] is False  # 事件在原调用已抛出之后保存
+        assert entry["native_called"] and entry["remaining_at_entry_ns"] > 0
+        assert entry["clock_domain"] == "qpc_cycle" and entry["monotonic_entry_ns"] is None
+        assert entry["confirmed_bytes_before"] == 2 and entry["requested_timeout_s"] == entry["observed_timeout_s"] > 0
+        saved = observer.first_failure
+        observer.marker("runtime_close_begin")
+        observer.failed(tuple(None for _ in observer.FIELDS))
+        assert observer.first_failure is saved
+        report = observer.report()
+        assert report["events"] == [] and report["in_flight"] == []  # 非stage只保留首错
+        assert report["hooks_restored"] and "private" not in str(report)
+
+
+def test_s12_expired_precheck_and_native_eof_have_different_first_error_evidence():
+    from secure_control.execution import localhost_transport as transport
+    from secure_control.execution.cycle_timing import _CycleDeadline
+    from secure_control.experiments.communication_benchmark import _StageWaitDiagnostic
+
+    for expired in (True, False):
+        observer = _StageWaitDiagnostic("Client", (101, 102, 103))
+        sock = _S10Socket()
+        deadline = _CycleDeadline(time.perf_counter_ns()+(-1_000_000 if expired else 1_000_000_000))
+        expected = transport.LocalhostTransportTimeout if expired else transport.LocalhostTransportDisconnected
+        with observer.installed(), pytest.raises(expected):
+            transport.receive_frame(sock, deadline=deadline, limit=10)
+        first = dict(zip(observer.FIELDS, observer.first_failure, strict=True))
+        entry = dict(zip(observer.ENTRY_FIELDS, first["entry"], strict=True))
+        assert entry["native_called"] == (not expired)
+        if expired:
+            assert not sock.calls and entry["remaining_at_entry_ns"] < 0
+            assert first["timeout_origin"] == "absolute_precheck"
+        else:
+            assert sock.calls == [("recv", 4)] and first["last_native_returned_bytes"] == 0
+            assert not first["native_progress_unknown"] and first["error_type"] == "LocalhostTransportDisconnected"
+
+
+def test_s12_real_client_stage_methods_separate_frame_return_from_validated_receipt():
+    import struct
+
+    import numpy as np
+
+    from secure_control.execution._localhost_workers import _ClientPartyEndpoint
+    from secure_control.execution.cycle_timing import _CycleDeadline
+    from secure_control.execution.localhost_codec import PartyStageResult
+    from secure_control.experiments.communication_benchmark import _StageWaitDiagnostic
+    from secure_control.protocol.messages import ControlShareMessage, Protocol3StageReceipt
+
+    plan = SimpleNamespace(session_id="public-session", round_id="public-round", step=7)
+    receipt = Protocol3StageReceipt(0, plan.session_id, plan.round_id, 7, 1, 1)
+    share = ControlShareMessage(0, plan.session_id, plan.round_id, 7, 8, AdditiveShare(np.array([123456789], dtype=object)))
+    reply = WireEnvelope(SCHEMA_VERSION, "reply", "P1", "Client", 5, "endpoint",
+        plan.session_id, plan.round_id, 7, None, PartyStageResult(receipt, share))
+    encoded = encode_envelope(reply)
+    sock = _S10Socket(struct.pack("!I", len(encoded))+encoded)
+    sock.getpeername = lambda: ("127.0.0.1", 101)
+    def sent(value):
+        sock.calls.append(("send", len(value)))
+        return len(value)
+    def received(length):
+        sock.calls.append(("recv", length))
+        value = bytes(sock.data[:length])
+        del sock.data[:length]
+        return value
+    sock.send, sock.recv = sent, received
+    endpoint = _ClientPartyEndpoint(sock, 0, plan, 5, 10000, 30,
+                                    _CycleDeadline(time.perf_counter_ns()+1_000_000_000))
+    observer = _StageWaitDiagnostic("Client", (101, 102, 103))
+    before = _s12_hook_snapshot()
+    with observer.installed():
+        assert endpoint.start_stage_batch() is None
+        assert endpoint.finish_stage_batch() == receipt
+    assert _s12_hook_snapshot() == before and len(sock.calls) == 3
+    report = observer.report()
+    events = [dict(zip(observer.FIELDS, row, strict=True)) for row in report["events"]]
+    phases = [e for e in events if e["kind"] == "phase"]
+    assert {e["operation"] for e in phases} == {"start_stage_batch", "finish_stage_batch"}
+    assert all(report["contexts"][e["context"]][8] == 5 for e in phases)
+    body = next(e for e in events if e["operation"] == "frame_recv" and e["frame_part"] == "body")
+    completed = next(e for e in phases if e["operation"] == "finish_stage_batch" and e["end_qpc_ns"] is not None)
+    assert body["end_qpc_ns"] <= completed["end_qpc_ns"] and completed["error_type"] is None
+    assert report["first_failure"] is None and report["encoded_bytes"] <= 65536
+    assert "123456789" not in str(report) and endpoint.share == share
+
+
+def test_s12_party_stage_peer_and_reply_forward_each_original_once(monkeypatch):
+    from secure_control.execution import _localhost_peer, lan_runtime
+    from secure_control.experiments.communication_benchmark import _StageWaitDiagnostic
+
+    plan = SimpleNamespace(session_id="session", round_id="round", step=3)
+    peer = SimpleNamespace(_peer="P2")
+    endpoint = SimpleNamespace(plan=plan)
+    answer, calls = object(), []
+    def exchange(self, value, masks):
+        assert self is peer and value is plan and masks is answer
+        calls.append("peer")
+        return answer
+    def stage(ep, port):
+        assert ep is endpoint and port is peer
+        calls.append("stage")
+        assert _localhost_peer.LocalhostProtocol3PeerPort.exchange_products(peer, plan, answer) is answer
+        return answer
+    def reply(sock, request, value, timeout, *, deadline=None):
+        assert value is answer and timeout == 30 and deadline == 123
+        calls.append("reply")
+        return answer
+    monkeypatch.setattr(lan_runtime, "stage_protocol3_batch", stage)
+    monkeypatch.setattr(lan_runtime, "_party_reply", reply)
+    monkeypatch.setattr(_localhost_peer.LocalhostProtocol3PeerPort, "exchange_products", exchange)
+    before = _s12_hook_snapshot()
+    observer = _StageWaitDiagnostic("P1", (101, 102, 103))
+    request = SimpleNamespace(operation="endpoint", payload=SimpleNamespace(operation="stage_batch"),
+        sender="Client", recipient="P1", session_id="session", round_id="round", step=3, sequence=9)
+    with observer.installed():
+        assert lan_runtime.stage_protocol3_batch(endpoint, peer) is answer
+        assert lan_runtime._party_reply(object(), request, answer, 30, deadline=123) is answer
+    assert calls == ["stage", "peer", "reply"] and _s12_hook_snapshot() == before
+    events = [dict(zip(observer.FIELDS, row, strict=True)) for row in observer.report()["events"]]
+    assert {e["operation"] for e in events} == {"party_stage", "exchange_products", "stage_reply"}
+    assert all(e["peer"] == "Client" for e in events if e["operation"] == "stage_reply")
+
+
+def test_s12_legacy_entry_never_uses_qpc_as_legacy_deadline_clock():
+    import struct
+
+    from secure_control.execution import localhost_transport as transport
+    from secure_control.experiments.communication_benchmark import _StageWaitDiagnostic
+
+    observer = _StageWaitDiagnostic("P2", (101, 102, 103), wall=lambda: 10**18)
+    sock = _S10Socket(struct.pack("!I", 1)+b"a", fail_at=1)
+    sock.getsockname = lambda: ("127.0.0.1", 102)
+    sock.getpeername = lambda: ("127.0.0.1", 9000)
+    observer.contexts[("Client", "P2")] = ("old", "Client", "P2", "online", None, "old-session", "old-round", 2, 1)
+    with observer.installed(), pytest.raises(transport.LocalhostTransportTimeout):
+        transport.receive_frame(sock, deadline=time.monotonic()+1, limit=10)
+    row = dict(zip(observer.FIELDS, observer.first_failure, strict=True))
+    entry = dict(zip(observer.ENTRY_FIELDS, row["entry"], strict=True))
+    assert entry["clock_domain"] == "legacy_monotonic" and entry["remaining_at_entry_ns"] > 0
+    assert entry["entry_qpc_ns"] == 10**18 and entry["monotonic_entry_ns"] != 10**18
+    assert row["context"] is None  # 解码前不能拿旧round补造当前身份
+
+
+def test_s12_bounded_stage_history_retains_first_error_through_eviction_and_encoding():
+    from secure_control.experiments.communication_benchmark import _StageWaitDiagnostic
+
+    observer = _StageWaitDiagnostic("Client", (101, 102, 103))
+    observer.state.phase = "finish_stage_batch"
+    row = ("io", "recv", 1, 2, 1, 1, "P1", "P1->Client", "body", None,
+           "finish_stage_batch", (1, "qpc_cycle", 100, 99, .01, .01, True, 10, 2, None, 1, 1),
+           None, "TimeoutError", None, None, None, "socket_recv", True, None, False)
+    observer.failed(row)
+    for _ in range(1000):
+        observer.put("socket", row)
+    saved = observer.first_failure
+    report = observer.report()
+    assert len(report["events"]) == 128 and report["evicted_count"] == 872
+    assert report["first_failure"][11] == row[11] and observer.first_failure is saved
+    assert report["encoded_bytes"] <= 65536
+    # 仅退出编码预算压力，独立首错必须保留，普通历史省略需显式标记。
+    observer.slots = [row[:2]+(10**300, 10**300+1)+row[4:]]*128
+    pressured = observer.report()
+    assert pressured["budget_failed"] and pressured["encoded_omitted"] > 0
+    assert pressured["first_failure"][11] == row[11] and pressured["encoded_bytes"] <= 65536
+
+
+def test_s12_clock_observation_failure_does_not_replace_successful_io():
+    from secure_control.execution import localhost_transport as transport
+    from secure_control.execution.cycle_timing import _CycleDeadline
+    from secure_control.experiments.communication_benchmark import _StageWaitDiagnostic
+
+    def broken_clock():
+        raise OSError("private observer clock failure")
+    observer = _StageWaitDiagnostic("Client", (101, 102, 103), wall=broken_clock)
+    sock = _S10Socket()
+    with observer.installed():
+        transport.send_frame(sock, b"hello", deadline=_CycleDeadline(time.perf_counter_ns()+1_000_000_000), limit=10)
+    assert len(sock.calls) == 5 and observer.first_failure is None
+    assert observer.report()["observation_error_type"] == "OSError"
+    assert "private" not in str(observer.report())
+
+
+def test_s12_role_report_encoding_fault_preserves_control_error_and_restores_both_roles(monkeypatch):
+    import gc
+
+    from secure_control.experiments import communication_benchmark as bench
+
+    def run(config, *, batch):
+        raise RuntimeError("private primary control failure")
+    def report(self):
+        raise OSError("private report encoding failure")
+    monkeypatch.setattr(bench, "run_party_single_step", run)
+    monkeypatch.setattr(bench._StageWaitDiagnostic, "report", report)
+    monkeypatch.setattr(bench, "_process_memory", lambda: {"current_rss_bytes": 1024})
+    monkeypatch.setattr(gc, "collect", lambda generation: 0)
+    for role in ("P1", "P2"):
+        before = _s12_hook_snapshot()
+        queue = Queue()
+        bench._party_job(SimpleNamespace(role=role), (101, 102, 103), 0, True, queue,
+            material_comparison=True, stage_wait_diagnostic=True)
+        result = queue.get_nowait()
+        assert result["error_type"] == "RuntimeError" and result["stage_wait"]["observation_error_type"] == "OSError"
+        assert _s12_hook_snapshot() == before and "private" not in str(result)
+
+
+def _s12_software_observer(role):
+    """只生成公开软件fixture，未启动角色/材料/端口或主动GC。"""
+    from secure_control.experiments import communication_benchmark as bench
+
+    gc_observer = bench._ServerGCObservation(role)
+    gc_observer.gc_before = gc_observer.gc_after = gc_observer.state()
+    gc_observer.restored = True
+    if role != "Client":
+        gc_observer.startup_attempted = True
+        gc_observer.startup = {"start_ns": 1, "end_ns": 2, "completed": True, "collected": 0, "error_type": None}
+    observer = bench._StageWaitDiagnostic(role, (101, 102, 103), gc_observer=gc_observer)
+    observer.trace_restored = True
+    return observer
+
+
+def test_s12_result_never_grants_any_qualification_and_rejects_incomplete_evidence():
+    import json
+    from copy import deepcopy
+
+    from secure_control.experiments import communication_benchmark as bench
+
+    original, numeric = _s11_public_result()
+    for party in original["party_outcomes"]:
+        party.pop("server_gc")
+        party["stage_wait"] = _s12_software_observer(party["role"]).report()
+    sample = {"memory_guard_failed": False, "cleanup_failed": False, "producer_exited": True}
+    for fault in ("normal", "missing", "hooks", "gc", "pending", "memory", "worker", "control"):
+        result = deepcopy(original)
+        observer = _s12_software_observer("Client")
+        report = dict(sample)
+        if fault == "missing":
+            result["party_outcomes"][0].pop("stage_wait")
+        elif fault == "hooks":
+            observer.trace_restored = False
+        elif fault == "gc":
+            observer.gc_observer.gc_after = observer.gc_observer.state() | {"enabled": False}
+        elif fault == "pending":
+            observer.gc_observer.pending = (1, 1)
+        elif fault == "memory":
+            report["memory_guard_failed"] = True
+        elif fault == "worker":
+            result["material_summary"]["worker_exited"] = False
+        elif fault == "control":
+            result.update(status="uncertain", failure_category="OSError", failed_phase="ROUND_IN_FLIGHT", failed_attempts=1)
+        metadata = {"format_version": 1, "maximum_attempts": 4000, "numeric_contract": numeric["numeric_contract"]}
+        cycles = result["cycles"]
+        bench._finish_stage_wait(result, report, metadata, [observer])
+        assert result["cycles"] is cycles and metadata["evidence_complete"] == (fault in {"normal", "control"})
+        assert result["diagnostic"] and result["comparison_only"] and metadata["actual_attempts"] == 4000
+        assert metadata["encoded_bytes"] <= 192 * 1024 and metadata["invocation_budget_consumed"]
+        assert result["timeout_trace"] is None
+        if fault == "normal":
+            def size(value):
+                return len(json.dumps(value, separators=(",", ":"), allow_nan=False).encode())
+            for role in metadata["roles"]:
+                assert role["gc"]["encoded_bytes"] == size(role["gc"])
+                assert role["encoded_bytes"] == size(role)
+            assert metadata["encoded_bytes"] == size({"stage_wait_diagnostic": metadata,
+                                                      "diagnostic_report": result["diagnostic_report"]})
+        assert not any(result[k] for k in ("server_gc_candidate_gate_pass", "candidate_gate_pass", "worker_long_run_gate_pass",
+                                           "stage_pass", "qualification_pass"))
+        if fault == "control":
+            assert result["failure_category"] == "OSError" and result["failed_phase"] == "ROUND_IN_FLIGHT"
+            assert metadata["control_failure_observed"]
+
+    # 实际编码压力，不伪造编码器计数；超大公开时间模拟坏观察数据，不能丢独立首错。
+    result = deepcopy(original)
+    client = _s12_software_observer("Client")
+    first = ["io", "recv", 1, 2, 1, 1, "P1", "P1->Client", "body", 1, "finish_stage_batch",
+             [1, "qpc_cycle", 100, 99, .01, .01, True, 10, 2, None, 1, 1], None,
+             "TimeoutError", None, None, None, "socket_recv", True, None, False]
+    for party in result["party_outcomes"]:
+        role = party["stage_wait"]
+        role.update(contexts=[("unused",), ("expected-stage",)], first_failure=list(first),
+                    events=[first[:2]+[10**500, 10**500+1]+first[4:]]*128)
+    result.update(status="uncertain", failure_category="LocalhostTransportTimeout", failed_phase="ROUND_IN_FLIGHT", failed_attempts=1)
+    metadata = {"format_version": 1, "maximum_attempts": 4000, "numeric_contract": numeric["numeric_contract"]}
+    bench._finish_stage_wait(result, sample, metadata, [client])
+    assert metadata["budget_failed"] and not metadata["evidence_complete"] and metadata["encoded_bytes"] <= 192*1024
+    assert result["failure_category"] == "LocalhostTransportTimeout" and result["failed_phase"] == "ROUND_IN_FLIGHT"
+    for role in metadata["roles"]:
+        if role["role"] != "Client":
+            assert role["first_failure"][11] == first[11] and role["events"] == []
+            assert role["contexts"] == [("expected-stage",)] and role["first_failure"][9] == 0
+
+
+def test_s12_initialization_failure_closes_queue_and_all_observers_without_starting_roles(monkeypatch):
+    from secure_control.execution import lan_runtime
+    from secure_control.experiments import communication_benchmark as bench
+    from secure_control.experiments import lan_continuous_profile
+
+    for fault in ("control", "profile"):
+        with monkeypatch.context() as patcher:
+            closed = []
+            before = _s12_hook_snapshot()
+            def failed(*args, **kwargs):
+                raise OSError("private startup failure")
+            def forbidden(*args, **kwargs):
+                pytest.fail("S12软件检查不得启动真实角色")
+            context = SimpleNamespace(Queue=lambda closed=closed: SimpleNamespace(close=lambda: closed.append(True)),
+                Process=lambda **kwargs: SimpleNamespace(start=forbidden, join=forbidden, is_alive=lambda: False))
+            patcher.setattr(bench.mp, "get_context", lambda method, context=context: context)
+            patcher.setattr(bench, "_ports", lambda: (101, 102, 103))
+            patcher.setattr(lan_runtime if fault == "control" else lan_continuous_profile,
+                "RunControl" if fault == "control" else "load_segmented_experiment", failed)
+            result = bench.run_continuous_observation(steps=4000, delay_ms=0, segment_steps=400,
+                optimized=True, recording_mode="light", stage_wait_diagnostic=True)
+            assert result["failure_category"] == "OSError" and result["cycles"] == [] and closed == [True]
+            assert result["stage_wait_diagnostic"]["actual_attempts"] == 0
+            assert result["stage_wait_diagnostic"]["evidence_complete"] is False
+            assert result["diagnostic"] and "private" not in str(result)
+            assert _s12_hook_snapshot() == before
+
+
+def test_s12_cli_rejects_other_routes_and_transfers_only_stage_flag(tmp_path, monkeypatch):
+    from secure_control.experiments import communication_benchmark as bench
+    from secure_control.experiments import lan_runner
+
+    calls = []
+    monkeypatch.setattr(bench, "run_continuous_observation", lambda **kw:
+        calls.append(kw) or {"status": "stopped", "cycle_timing": {"p50_ms": 1.}})
+    base = ["secure-control", "benchmark", "--stage-wait-diagnostic", "--steps", "4000",
+            "--recording", "light", "--output", str(tmp_path / "raw.json")]
+    for route in (["--case", "dynamic"], ["--case", "cycle", "--mode", "legacy"], ["--case", "full-observation"]):
+        monkeypatch.setattr("sys.argv", base + route)
+        assert lan_runner._run() == 5 and not calls and not (tmp_path / "raw.json").exists()
+    monkeypatch.setattr("sys.argv", base + ["--case", "cycle", "--mode", "batch"])
+    assert lan_runner._run() == 0 and calls[0]["stage_wait_diagnostic"] is True
+    assert calls[0]["server_gc_candidate"] is False and calls[0]["worker_wait_diagnostic"] is False

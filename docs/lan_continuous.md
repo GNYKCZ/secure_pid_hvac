@@ -744,6 +744,59 @@ A/B，不分配单项收益。始终`comparison_only=true`，旧candidate/worker
 stage/qualification保持false。原10000、完整路线、认证三机网络和硬件验收仍需
 独立完成，软件设备确认不等于真实施力，不据此推广正式默认或合并PR。
 
+### 计算阶段与首个通信错误定位（S12）
+
+`--stage-wait-diagnostic`默认关闭，只允许独立cycle/batch/worker/light、4000周期、
+段400、16槽、无预送、零注入、原配置/初态/持续proof、默认TCP/双提交、正常
+GC700/10/10/freeze0/debug0及无外部callback。严格bool及互斥检查在端口/材料创建
+前执行；与S5–S11及通用diagnostic/timeout_trace/GC试验/外部配置和通信覆盖双向
+互斥。原预算不放宽，不能与`--server-gc-candidate`同时选择。
+
+```powershell
+uv run secure-control benchmark --case cycle --mode batch --steps 4000 --delay-ms 0 --segment-steps 400 --material-slots 16 --preload-steps 0 --recording light --stage-wait-diagnostic --output .tmp/issue120-s12-stage-wait-diagnostic.json
+```
+
+[D12批准](https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6162360598)
+只授权四文件定位及软件/独立核查通过后一次最多4000周期。先发布并全文读回新
+完整SHA、来源/配置/依赖锁/初态/持续proof/输入策略/环境钟域/GC和观察预算及
+完整命令，新raw/log不得已存在；启动失败也耗预算，首失败停，不预热、20步、
+补步、重跑或第二组/无探针对照。D11已用完，3/3不重置，新有效Finding不自动
+第四轮。完成后公开全部尝试和可恢复原件/hash，交Design只读分析后停止。
+
+复用S11两服务器offline ACK前各一次collect2及正常gen2观察；Client原启动清理
+不改。Client新增gen2报告另标`client-gen2-light-v1`，可能包含t0前原启动区间，
+不能把它算运行覆盖；服务器保持原`server-gen2-light-v1`语义。GC仍64完成+1pending。
+只补Client原start/finish_stage_batch、服务器原stage/批量peer交换/计算回执区间，
+方法入口与原返回/异常分列，原返回表示原验证已完成，收齐body并不等于验证。
+透明复用原socket包装与canonical framing，原buffer/deadline/参数/返回/异常一次
+透传，不多读、不重试、不改变blocking/cursor。回执send返回不是Client收到。
+
+每角色128个stage滚动事件、4连接在途槽、1独立首个I/O错误；非stage I/O不存
+滚动历史，只保留当前framing的最新入口与独立首错。调用已返回/报错的事件不
+标为native仍在途；部分帧的已确认字节与失败native未知进度分别保存。原precheck
+失败native_called=false；真正send/recv入口为true，不由事后余量倒填入口预算。
+每次只作必要QPC/legacy单次读值，无S10 CPU/每次双钟配对/全阶段重探针。
+
+公开字段限定时间整数ns、枚举、线程、限长身份、peer/方向/header/body、字节进度、
+deadline域、入口余量/timeout及错误/cause类别/errno/winerror；不读对象图、locals、
+秘密值、任意异常文本或traceback，不在控制中JSON/写盘。服务器解码前身份未知，
+stage只用当前已验证plan/request的期望身份，期望不等于收到的帧已验证。legacy保护
+按原monotonic计算、QPC单列，不当周期deadline，也不直接跨主机相减。
+
+`stage_wait_diagnostic`格式1/profile `stage-wait-light-v1`包含三角色schema、去重
+公开身份表、阶段记录、独立首错/外层错、close锚点、原gen2及丢失/恢复状态。
+stage+GC+元数据每角色64KiB，合并192KiB（含诊断描述字段），全部CycleTiming/raw另计。普通环淘汰
+及编码省略单列；超预算会压缩普通历史而保留首错，并标证据不完整。观察/编码/
+恢复/GC状态/内存/退出错误不覆盖原控制首错。只判evidence_complete、控制故障及
+首个I/O错误是否观察到；无故障也只是有限未复现，不称修复或定位成功。
+
+`diagnostic=true`、`comparison_only=true`，原S11有限gate及candidate/worker_long_run/
+stage/qualification均false，timeout_trace=null表示没有旧全量trace。原20Mns绝对
+周期、迟采样/继续维护占预算、正常停止另计、16库存+在途/8MiB/256MiB/有界退出、
+一次性材料/秘密状态/原精度/模数/输入守卫/reachability horizonNone block19/双提交
+和过期输出拒绝保持。新观察会影响分配和故障轮，不是无探针A/B；并行/嵌套区间
+不能相加为独占成本，不排他归因OS/GIL/内核，不推广默认或替代原长期/三机/硬件验收。
+
 早期有限诊断预算为fused/stock1000/段400的零注入406步和1ms每帧1步，各一次，现已使用，不能复用；
 失败即停，退出集中输出。未复现也不得循环追样本或用诊断PASS代替1000/10k验收。
 
