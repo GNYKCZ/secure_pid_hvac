@@ -207,6 +207,7 @@ class _CompactHistory:
         self.tables = {k: _HistoryTable(n, schema) for k, (n, schema) in self.schemas(role, steps).items()}
         self.threads, self.error_type = [], None
         self.tail_correction = None
+        self.last_confirmed_step = self.last_confirmed_return_qpc_ns = self.normal_stop_start_qpc_ns = None
         self.expansion_ns, self.expansion_memory = None, None
         self.preallocated_memory = _process_memory()
         if self.preallocated_memory["current_rss_bytes"] > 256*1024*1024:
@@ -313,7 +314,10 @@ class _CompactHistory:
                 and t.expansion_error_type is None and t.expanded_count == t.count for t in self.tables.values()),
             "error_type": self.error_type, "threads": self.threads, "preallocated_memory": self.preallocated_memory,
             "expansion_memory": self.expansion_memory, "expansion_ns": self.expansion_ns,
-            "tail_correction": self.tail_correction}
+            "tail_correction": self.tail_correction,
+            "control_observation": {"last_confirmed_step": self.last_confirmed_step,
+                "last_confirmed_return_qpc_ns": self.last_confirmed_return_qpc_ns,
+                "normal_stop_start_qpc_ns": self.normal_stop_start_qpc_ns}}
 
 
 class _ServerGCObservation:
@@ -2750,6 +2754,32 @@ def _compact_sample_pass(result, report, metadata):
                 for r in result["stage_wait_diagnostic"]["roles"] if r.get("role") in ("P1", "P2")))
 
 
+def _compact_gc_boundary(cycles, roles):
+    """只用实际观察出口；保护检查到STOPPING间隙不冒充精确控制结束。"""
+    client = next((r for r in roles if r.get("role") == "Client"), {})
+    observed = client.get("control_observation") or {}
+    start = cycles[0].get("scheduled_start_ns") if cycles else None
+    step, end, stop = (observed.get(k) for k in
+        ("last_confirmed_step", "last_confirmed_return_qpc_ns", "normal_stop_start_qpc_ns"))
+    def stamp(value):
+        return type(value) is int and value >= 0
+    row = next((c for c in reversed(cycles) if c.get("global_step") == step), {}) if type(step) is int else {}
+    control = next((t for t in client.get("threads", []) if t.get("thread_role") == "control"), {})
+    life_end = control.get("observation_end_qpc_ns")
+    valid = (stamp(start) and stamp(end) and stamp(life_end) and start <= end <= life_end
+        and row.get("status") in {"confirmed", "miss_after_apply"}
+        and stamp(row.get("scheduled_start_ns")) and start <= row["scheduled_start_ns"] <= end
+        and (row.get("cycle_completed_ns") is None or
+             stamp(row["cycle_completed_ns"]) and row["cycle_completed_ns"] <= end)
+        and (stop is None or stamp(stop) and end <= stop <= life_end))
+    return {"classification_version": 2, "start_qpc_ns": start, "last_confirmed_step": step,
+        "confirmed_observation_end_qpc_ns": end, "normal_stop_start_qpc_ns": stop,
+        "control_boundary_valid": bool(valid),
+        "normal_stop_boundary_valid": bool(valid and stop is not None),
+        "failure_extension": "none; failed I/O and cleanup do not extend the confirmed observation",
+        "scope": "local QPC; post-callback guard to STOPPING is unknown; no deadline fallback"}
+
+
 def _finish_compact_history(result, report, history):
     """S13完整展开与有限样本检查独立记账，绝不借用原资格flag。"""
     if history is not None and history.expansion_ns is None:
@@ -2783,19 +2813,33 @@ def _finish_compact_history(result, report, history):
         and all(type(t.get("pid")) is int and t["pid"] > 0 and type(t.get("native_id")) is int and t["native_id"] > 0
                 and t.get("observation_end_qpc_ns") is not None
                 and t["observation_end_qpc_ns"] >= t["registered_at_qpc_ns"] for t in r.get("threads", [])) for r in roles)
-    start = cycles[0]["scheduled_start_ns"] if cycles else None
-    end = cycles[-1]["deadline_ns"] if cycles else None
+    boundary = meta["control_observation_boundary"] = _compact_gc_boundary(cycles, roles)
+    start, end, stop = (boundary[k] for k in
+        ("start_qpc_ns", "confirmed_observation_end_qpc_ns", "normal_stop_start_qpc_ns"))
     for observed in stage.get("roles", []):
         role = observed["role"]
         registry = next((r.get("threads", []) for r in roles if r.get("role") == role), [])
         events = (observed.get("gc") or {}).get("events", [])
-        meta["runtime_gen2_coverage"][role] = bool(start is not None and any(e[0] < end and e[1] > start for e in events))
+        meta["runtime_gen2_coverage"][role] = False
         for event in events:
+            classification = "overlap_or_unknown"
+            ordered = type(event[0]) is int and type(event[1]) is int and 0 <= event[0] <= event[1]
+            if ordered and type(start) is int and event[1] <= start:
+                classification = "outside"
+            elif ordered and boundary["control_boundary_valid"] and start <= event[0] and event[1] <= end:
+                classification = "control"
+            elif ordered and boundary["normal_stop_boundary_valid"] and stop <= event[0]:
+                classification = "normal_stop"
+            # 时间归属与完整性独立；缺配对/淘汰/省略/恢复证据不授予肯定覆盖。
+            reliable = stage.get("evidence_complete") is True and event[3] == 2
+            if classification == "control" and reliable:
+                meta["runtime_gen2_coverage"][role] = True
             match = [r for r in registry if r["native_id"] == event[2] and r["registered_at_qpc_ns"] <= event[0]
                 and r["observation_end_qpc_ns"] is not None and event[1] <= r["observation_end_qpc_ns"]]
             meta["gc_thread_matches"].append({"role": role, "start_qpc_ns": event[0], "end_qpc_ns": event[1],
                 "native_id": event[2], "thread_role": match[0]["thread_role"] if len(match) == 1 else None,
                 "pid": match[0]["pid"] if len(match) == 1 else None,
+                "classification": classification, "coverage_evidence_complete": reliable,
                 "scope": "registered identity/lifetime; not allocation stack or exclusive CPU"})
     result["compact_history_candidate"] = meta
     if result.get("status") == "stopped" and not meta["representation_complete"]:
@@ -3112,6 +3156,8 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
     def phase(name):
         nonlocal current_phase, phase_start, attempt, before_activity, before_storage, before_counts
         nonlocal diagnostic_phase
+        if history is not None and name == "STOPPING" and history.normal_stop_start_qpc_ns is None:
+            history.normal_stop_start_qpc_ns = time.perf_counter_ns()
         if _material_event and (name == "RUNNING" and record_count() == 0 or name == "INPUT" and record_count() % 100 == 0):
             _material_event("control_begin" if name == "RUNNING" else "before_input")
         if _gc_trial and name == "RUNNING":
@@ -3189,6 +3235,9 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
             cycles.append(asdict(timing))
         if writer is not None:
             writer.record_cycle(timing)
+        if history is not None and timing.status == "confirmed":
+            history.last_confirmed_step = timing.global_step
+            history.last_confirmed_return_qpc_ns = time.perf_counter_ns()
 
     def measured_fsync(fd):
         start = time.perf_counter_ns()

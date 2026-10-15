@@ -4031,7 +4031,7 @@ def test_s13_thread_registry_uses_only_original_factory_identity_and_observed_li
         history.worker_threads(pool)
 
 
-@pytest.mark.parametrize("fault", ("input", "transport", "after_apply"))
+@pytest.mark.parametrize("fault", ("input", "transport", "after_apply", "stop", "maintenance", "callback_gc", "callback_miss"))
 def test_s13_real_callbacks_match_original_and_canonical_late_tail_without_live_roles(monkeypatch, fault):
     from secure_control.execution import lan_runtime
     from secure_control.execution.cycle_timing import (
@@ -4051,6 +4051,9 @@ def test_s13_real_callbacks_match_original_and_canonical_late_tail_without_live_
     def exercise(compact):
         with monkeypatch.context() as patcher:
             now, samples = [2**53+17], [0]
+            captured_history, gc_events, stop_entries, runner_results = [], [], [], []
+            continuing = [False]
+            original_cycle = bench._CompactHistory.cycle
             class Runtime:
                 def __init__(self, *args, **kwargs):
                     self.phase, self.run_id = "RUNNING", "run"
@@ -4058,14 +4061,21 @@ def test_s13_real_callbacks_match_original_and_canonical_late_tail_without_live_
                     self.resource_counts = {"products_consumed": 0, "truncations_consumed": 0}
                     self.public_setup = None
                     self.cycle_phase_ns, self.cycle_queue_levels = {}, {}
-                    self.segment = SimpleNamespace(_material_pool=None)
+                    self.segment = SimpleNamespace(_material_pool=None, _sockets=[], _preloaded=None)
                 def snapshot(self):
                     n = self.confirmed_step_count
                     return lan_runtime.LanLifecycleSnapshot(self.phase, "run", "session", "epoch", 0, 0,
                         n, f"round-{n}", self.protocol_committed_count, n, 30*n, 4*n, 0)
                 @property
                 def segment_full(self):
-                    return False
+                    return fault == "maintenance" and self.confirmed_step_count == 2 and not continuing[0]
+                def end_segment(self, **kwargs):
+                    now[0] += 1000
+                    if kwargs.get("deadline_ns") is None:
+                        self.phase = "STOPPED"
+                    return lan_runtime.SegmentRecord(None, "session", (), (), None, 0., None, None, None)
+                def next_segment(self, **kwargs):
+                    continuing[0] = True
                 def step(self, value, **kwargs):
                     n = self.confirmed_step_count
                     if n == 2 and fault == "transport":
@@ -4092,14 +4102,37 @@ def test_s13_real_callbacks_match_original_and_canonical_late_tail_without_live_
             def advance(*args, **kwargs):
                 now[0] += 1000
                 return {}
-            scene = SimpleNamespace(period=.02, controller_input=controller_input, advance=advance)
+            scene = SimpleNamespace(period=.02, controller_input=controller_input, advance=advance,
+                                    terminal_summary=dict)
             def runner(*args, **kwargs):
                 callback = kwargs["on_cycle"]
+                original_phase = kwargs["phase"]
+                def phase(name):
+                    if name == "STOPPING":
+                        stop_entries.append(now[0])
+                    original_phase(name)
+                    if name == "ENDING_SEGMENT":
+                        assert not captured_history or captured_history[0].normal_stop_start_qpc_ns is None
+                    if name == "STOPPING":
+                        assert not compact or captured_history[0].normal_stop_start_qpc_ns == now[0]
+                        gc_events.append((now[0]+1, now[0]+500, 1, 2, 0, 0))
+                        now[0] += 1000
                 def cycle(timing):
                     callback(timing)
                     if timing.global_step == 2 and fault == "after_apply":
                         now[0] += 20000000  # 原runner的回调后期限检查/唯一尾部校正。
-                return original_runner(*args, **(kwargs | {"on_cycle": cycle}))
+                    if timing.global_step == 2 and fault in ("stop", "maintenance", "callback_gc"):
+                        kwargs["control"].request_stop()
+                result = original_runner(*args, **(kwargs | {"on_cycle": cycle, "phase": phase}))
+                runner_results.append(result)
+                return result
+            def history_cycle(self, timing, counts, before):
+                if not captured_history:
+                    captured_history.append(self)
+                if fault in ("callback_gc", "callback_miss"):
+                    gc_events.append((now[0]+1, now[0]+500, 1, 2, 0, 0))
+                    now[0] += 20000000 if fault == "callback_miss" and timing.global_step == 2 else 1000
+                return original_cycle(self, timing, counts, before)
             def no_asdict(value):
                 assert not isinstance(value, CycleTiming)
                 return original_asdict(value)
@@ -4128,23 +4161,43 @@ def test_s13_real_callbacks_match_original_and_canonical_late_tail_without_live_
             if compact:
                 patcher.setattr(bench, "asdict", no_asdict)
                 patcher.setattr(bench, "replace", no_timing_replace)
+                patcher.setattr(bench._CompactHistory, "cycle", history_cycle)
             result = bench.run_continuous_observation(steps=4000, delay_ms=0, segment_steps=400, optimized=True,
                 recording_mode="light", **({"compact_history_candidate": True} if compact else {"stage_wait_diagnostic": True}))
             assert _s12_hook_snapshot() == before and samples[0] == 3
-            assert len(result["cycles"]) == 3 and result["cycles"][-1]["cycle_completed_ns"] is None
-            assert result["failure_category"] == ("OSError" if fault == "transport" else "CycleDeadlineExceeded")
-            assert result["failed_attempts"] == 1 and not result["qualification_pass"]
-            if fault == "after_apply":
+            assert len(result["cycles"]) == 3 and not result["qualification_pass"]
+            successful = fault in ("stop", "maintenance", "callback_gc")
+            if successful:
+                assert runner_results[0]["status"] == "stopped" and result["failed_attempts"] == 0 and len(stop_entries) == 1
+                # 未启动真实角色的fixture缺少其报告，不能获得实际候选完整门禁。
+                assert result["failure_category"] == "StageWaitObservation"
+                if fault == "maintenance":
+                    assert continuing[0] and "maintenance" in result["cycles"][1]["phase_durations_ns"]
+            else:
+                assert result["cycles"][-1]["cycle_completed_ns"] is None
+                assert result["failure_category"] == ("OSError" if fault == "transport" else "CycleDeadlineExceeded")
+                assert result["failed_attempts"] == 1
+            if fault in ("after_apply", "callback_miss"):
                 assert result["cycles"][-1]["status"] == "miss_after_apply"
                 assert result["failed_phase"] == "CYCLE_OBSERVATION" and len(result["steps"]) == 3
             if compact:
                 meta = result["compact_history_candidate"]
                 assert meta["invocation_budget_consumed"] and not meta["finite_sample_pass"]
                 assert meta["roles"][0]["tables"]["cycles"]["captured"] == 3
+                boundary = meta["control_observation_boundary"]
+                assert boundary["control_boundary_valid"]
+                assert boundary["last_confirmed_step"] == (2 if successful or fault in ("after_apply", "callback_miss") else 1)
+                assert boundary["normal_stop_start_qpc_ns"] == (stop_entries[0] if successful else None)
+                if fault == "callback_gc":
+                    assert all(e[1] <= boundary["confirmed_observation_end_qpc_ns"] for e in gc_events[:-1])
+                    assert result["cycles"][-1]["cycle_completed_ns"] < gc_events[-2][0]
             return {k: result[k] for k in ("steps", "events", "cycles", "cycle_summary",
                 "failure_category", "failed_phase", "successful_steps", "failed_attempts",
                 "protocol_committed_count", "physically_confirmed_count", "resource_counts")}
-    assert exercise(False) == exercise(True)
+    if fault in ("callback_gc", "callback_miss"):
+        exercise(True)  # 真实on_cycle内注入公开虚拟GC时段，不启动角色或主动GC。
+    else:
+        assert exercise(False) == exercise(True)
 
 
 def test_s13_role_export_failure_keeps_original_control_error_and_restores_hooks(monkeypatch):
@@ -4189,13 +4242,21 @@ def test_s13_finite_sample_is_independent_of_gc_coverage_and_rejects_bad_evidenc
                 "registered_at_qpc_ns": 0, "observation_end_qpc_ns": 80000000000})
         return {"role": role, "representation_complete": True, "layout": {"reserved_bound_bytes": 100},
             "tables": {k: {"captured": 4000, "expanded": 4000} for k in ("steps", "cycles")}, "threads": threads}
-    for fault in ("normal", "covered", "missing", "overflow", "thread", "numeric", "phase", "bad_stop",
+    for fault in ("normal", "covered", "normal_stop", "missing", "overflow", "thread", "numeric", "phase", "bad_stop",
                   "bool", "missing_step", "missing_capture", "control", "partial_commit", "cleanup"):
         result, report = deepcopy(initial), dict(sample)
         client = history_report("Client")
+        last = result["cycles"][-1]
+        observed_end = last["cycle_completed_ns"] + 10
+        client["control_observation"] = {"last_confirmed_step": 3999,
+            "last_confirmed_return_qpc_ns": observed_end, "normal_stop_start_qpc_ns": observed_end + 10}
         observer = _s12_software_observer("Client")
         if fault == "covered":
             observer.gc_observer.slots[0] = (100, 200, 99, 2, 0, 0)
+            observer.gc_observer.count = 1
+        elif fault == "normal_stop":
+            assert observed_end + 40 < last["deadline_ns"]
+            observer.gc_observer.slots[0] = (observed_end + 20, observed_end + 30, 1, 2, 0, 0)
             observer.gc_observer.count = 1
         for party in result["party_outcomes"]:
             party.pop("server_gc")
@@ -4232,7 +4293,7 @@ def test_s13_finite_sample_is_independent_of_gc_coverage_and_rejects_bad_evidenc
         original_cycles = result["cycles"]
         bench._finish_compact_history(result, report, SimpleNamespace(expansion_ns=1, report=lambda client=client: client))
         compact = result["compact_history_candidate"]
-        assert compact["finite_sample_pass"] == (fault in ("normal", "covered")), fault
+        assert compact["finite_sample_pass"] == (fault in ("normal", "covered", "normal_stop")), fault
         assert compact["runtime_gen2_coverage"]["Client"] == (fault == "covered")
         if fault == "covered":
             assert compact["gc_thread_matches"][0]["thread_role"] == "material-receiver"
@@ -4242,6 +4303,73 @@ def test_s13_finite_sample_is_independent_of_gc_coverage_and_rejects_bad_evidenc
                                            "stage_pass", "qualification_pass"))
         if fault == "control":
             assert result["failure_category"] == "OSError" and result["failed_phase"] == "ROUND_IN_FLIGHT"
+
+
+@pytest.mark.parametrize("case", ("control", "callback", "stop", "startup", "touch_start", "touch_end",
+    "cross_start", "cross_end", "gap", "cross_stop", "missing", "no_cycles", "wrong_step", "bool",
+    "reverse", "late_stop", "pending", "evicted", "unpaired", "omitted", "disabled", "unknown_thread",
+    "failed_io", "stop_io"))
+def test_rv003_gc_classification_retains_unknown_and_never_extends_to_cleanup(case):
+    from copy import deepcopy
+
+    from secure_control.experiments import communication_benchmark as bench
+
+    cycles = [{"global_step": 0, "scheduled_start_ns": 100, "cycle_completed_ns": 800,
+               "deadline_ns": 2000, "status": "confirmed"}]
+    boundary = {"last_confirmed_step": 0, "last_confirmed_return_qpc_ns": 900,
+                "normal_stop_start_qpc_ns": 1000}
+    event = {"startup": (10, 90), "touch_start": (100, 200), "touch_end": (800, 900),
+             "cross_start": (90, 110), "cross_end": (890, 910), "gap": (920, 950),
+             "cross_stop": (990, 1010), "stop": (1100, 1200), "callback": (810, 850),
+             "stop_io": (1100, 1200), "failed_io": (1100, 1200)}.get(case, (200, 300))
+    observer = _s12_software_observer("Client")
+    gc_record = observer.gc_observer
+    gc_record.slots[0], gc_record.count = (*event, 1, 2, 0, 0), 1
+    if case in ("pending", "evicted", "unpaired"):
+        setattr(gc_record, {"pending": "pending", "evicted": "evicted", "unpaired": "unpaired"}[case],
+                (400, 1) if case == "pending" else 1)
+    stage_role = observer.report()
+    if case == "omitted":
+        stage_role["gc"]["encoded_omitted"] = 1
+    if case == "disabled":
+        stage_role["gc"]["gc_after"]["enabled"] = False
+    if case == "missing":
+        boundary.pop("last_confirmed_return_qpc_ns")
+    elif case == "no_cycles":
+        cycles.clear()
+    elif case == "wrong_step":
+        boundary["last_confirmed_step"] = 1
+    elif case == "bool":
+        boundary["last_confirmed_return_qpc_ns"] = True
+    elif case == "reverse":
+        boundary["normal_stop_start_qpc_ns"] = 899
+    elif case == "late_stop":
+        boundary["normal_stop_start_qpc_ns"] = 5001
+    if case == "failed_io":
+        boundary["normal_stop_start_qpc_ns"] = None
+        cycles.append({"global_step": 1, "scheduled_start_ns": 1050, "deadline_ns": 3050,
+                       "cycle_completed_ns": None, "status": "miss_before_apply"})
+    if case in ("failed_io", "stop_io"):
+        stage_role["first_failure"] = ["frame_recv", 1100, 1300]  # 不用未核验首错延长窗口。
+    threads = [{"thread_role": "control", "pid": 10, "native_id": 99 if case == "unknown_thread" else 1,
+                "registered_at_qpc_ns": 0, "observation_end_qpc_ns": 5000}]
+    history = {"role": "Client", "threads": threads, "control_observation": boundary}
+    complete = case not in ("pending", "evicted", "unpaired", "omitted", "disabled")
+    result = {"status": "uncertain", "failure_category": "OSError", "failed_phase": "ROUND_IN_FLIGHT",
+              "cycles": cycles, "stage_wait_diagnostic": {"roles": [stage_role], "evidence_complete": complete}}
+    original = deepcopy(result)
+    bench._finish_compact_history(result, {}, SimpleNamespace(expansion_ns=1, report=lambda: history))
+    meta = result["compact_history_candidate"]
+    known = case in ("control", "callback", "touch_start", "touch_end", "unknown_thread")
+    assert meta["runtime_gen2_coverage"]["Client"] == known
+    match = meta["gc_thread_matches"][0]
+    expected = ("control" if known or not complete else "normal_stop" if case in ("stop", "stop_io")
+                else "outside" if case == "startup" else "overlap_or_unknown")
+    assert match["classification"] == expected
+    assert match["thread_role"] == (None if case == "unknown_thread" else "control")
+    assert result["cycles"] == original["cycles"] and result["stage_wait_diagnostic"] == original["stage_wait_diagnostic"]
+    assert result["failure_category"] == "OSError" and result["failed_phase"] == "ROUND_IN_FLIGHT"
+    assert not meta["finite_sample_pass"] and not result["qualification_pass"]
 
 
 def test_s13_initialization_failure_does_not_start_roles_and_restores_factory(monkeypatch):

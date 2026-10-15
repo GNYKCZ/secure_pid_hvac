@@ -848,6 +848,12 @@ JSON编码及独占文件写入的退出后耗时另存命令末行 `history_exp
 `finite_sample_pass` 单独检查4000按时完整、原身份/数值/材料/资源、9次继续维护、正常STOP双ACK、
 worker/receiver/credit退出与完整恢复。无运行 gen2 只能说未覆盖，不能说GC成本降为0。
 
+GC分类版本2使用Client原on_cycle正常confirmed出口的私有QPC锚点与终末STOPPING入口；
+继续段ENDING_SEGMENT仍属原控制周期。完整GC区间须全落在已证实的控制/观察范围且原观察证据完整，
+才贡献`runtime_gen2_coverage=true`。正常停止、启动外部、跨边界或末观察到STOPPING间隙分别标为
+`normal_stop`、`outside`、`overlap_or_unknown`，全部原区间及线程匹配保留。缺失/乱序锚点不能
+退回最后计划deadline；失败I/O和清理不延长已确认观察范围。原callback成本及miss_after_apply保护不变。
+
 仅软件和新head独立核查通过、目录释放、完整预声明发布且全文读回后允许：
 
 ```powershell
