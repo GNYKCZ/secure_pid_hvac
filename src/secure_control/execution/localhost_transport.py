@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import select
 import socket
+import ssl
 import struct
 import time
 from dataclasses import dataclass
 from math import isfinite
 
-from .cycle_timing import remaining_seconds
+from .cycle_timing import _CycleDeadline, remaining_seconds
 from .localhost_codec import WireEnvelope, decode_envelope, encode_envelope
 
 _HEADER = struct.Struct("!I")
@@ -207,6 +209,8 @@ def _send_exact(sock: socket.socket, payload: bytes, deadline: float) -> None:
 
 
 def _receive_exact(sock: socket.socket, length: int, deadline: float) -> bytes:
+    if isinstance(deadline, _CycleDeadline):
+        return _receive_qpc_exact(sock, length, deadline)
     data = bytearray()
     while len(data) < length:
         _set_remaining_timeout(sock, deadline)
@@ -220,6 +224,122 @@ def _receive_exact(sock: socket.socket, length: int, deadline: float) -> bytes:
             raise LocalhostTransportDisconnected("对端在完整 frame 到达前关闭连接。")
         data.extend(chunk)
     return bytes(data)
+
+
+def _receive_qpc_exact(sock, length, deadline, *, _observe=None):
+    """同一QPC期限/字节游标；仅无就绪和非阻塞续读可等待，不重试事务。"""
+    if (not isinstance(deadline, _CycleDeadline) or type(deadline.deadline_ns) is not int
+            or deadline.deadline_ns < 0 or type(length) is not int or length < 1):
+        raise ValueError("QPC接收需要原绝对deadline和正整数字节数。")
+    data, no_progress, reason = bytearray(), 0, "native_error"
+    primary = None
+    # TLS内部可推进数据不一定对应底层可读；透明socket包装也保留pending接口。
+    want = None if callable(getattr(sock, "pending", None)) else "read"
+
+    def budget():
+        nonlocal reason
+        remaining = remaining_seconds(deadline)
+        if remaining <= 0:
+            reason = "deadline"
+            raise LocalhostTransportTimeout("接收超过原QPC deadline。")
+        return remaining
+
+    def note(operation, started, *, remaining=None, wait=None, ready=None, outcome, error=None):
+        if _observe is not None:
+            _observe(operation, started, remaining=remaining, wait=wait, ready=ready,
+                     no_progress=no_progress, outcome=outcome, error=error)
+
+    def failed(error):
+        try:
+            note("failure", time.perf_counter_ns(), outcome=reason, error=error)
+        except BaseException:  # noqa: BLE001 - 观察失败只附注，保留已经发生的接收/模式首错。
+            BaseException.add_note(error, "QPC接收错误观察未完成。")
+
+    try:
+        budget()
+    except BaseException as error:
+        failed(error)
+        raise
+    previous = sock.gettimeout()
+    try:
+        sock.settimeout(0.)
+        while len(data) < length:
+            budget()
+            if want is not None:
+                started = time.perf_counter_ns()
+                reason = "select_error"
+                remaining = budget()
+                readers, writers = ([sock], []) if want == "read" else ([], [sock])
+                try:
+                    readable, writable, exceptional = select.select(readers, writers, [], remaining)
+                except TimeoutError as error:
+                    raise LocalhostTransportTimeout("QPC接收就绪等待异常超时。") from error
+                except OSError as error:
+                    raise LocalhostTransportDisconnected("QPC接收就绪等待失败。") from error
+                budget()
+                if exceptional or readable not in ([], readers) or writable not in ([], writers):
+                    raise ValueError("接收就绪结果与当前通道不匹配。")
+                ready = len(readable)+len(writable)
+                if not ready:
+                    no_progress += 1
+                note("select", started, remaining=round(remaining*1e9), wait=round(remaining*1e9),
+                     ready=ready, outcome="ready" if ready else "empty")
+                budget()  # 包括可选观察成本；迟到结果不再开始读取。
+                if not ready:
+                    if no_progress >= 8:
+                        reason = "no_progress_guard"
+                        raise LocalhostTransportError("QPC接收连续8次无进展。")
+                    continue
+            reason = "native_error"
+            started = time.perf_counter_ns()
+            budget()
+            try:
+                chunk = sock.recv(length-len(data))
+            except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError) as error:
+                want = "write" if isinstance(error, ssl.SSLWantWriteError) else "read"
+                no_progress += 1
+                outcome = ("want_write" if want == "write" else "want_read"
+                           if isinstance(error, ssl.SSLWantReadError) else "would_block")
+                note("recv", started, outcome=outcome)
+            except TimeoutError as error:
+                raise LocalhostTransportTimeout("QPC非阻塞接收异常超时。") from error
+            except OSError as error:
+                raise LocalhostTransportDisconnected("QPC接收时连接或TLS失败。") from error
+            else:
+                if not chunk:
+                    reason = "eof"
+                    raise LocalhostTransportDisconnected("对端在完整frame到达前关闭连接。")
+                data.extend(chunk)
+                no_progress = 0
+                want = None if callable(getattr(sock, "pending", None)) else "read"
+            budget()
+            if no_progress >= 8:
+                reason = "no_progress_guard"
+                raise LocalhostTransportError("QPC接收连续8次无进展。")
+        budget()
+        result = bytes(data)
+    except BaseException as error:
+        primary = error
+        failed(error)
+        raise
+    finally:
+        try:
+            sock.settimeout(previous)
+        except BaseException as error:
+            try:
+                note("restore_error", time.perf_counter_ns(), outcome="restore_error", error=error)
+            except BaseException:  # noqa: BLE001 - 模式错误观察不能覆盖原接收首错。
+                BaseException.add_note(primary if primary is not None else error, "QPC模式恢复观察未完成。")
+            if primary is None:
+                reason = "restore_error"
+                failed(error)
+                raise
+    try:
+        budget()  # 收齐、转换和模式恢复均占同一期限。
+    except BaseException as error:
+        failed(error)
+        raise
+    return result
 
 
 def _set_remaining_timeout(sock: socket.socket, deadline: float) -> None:

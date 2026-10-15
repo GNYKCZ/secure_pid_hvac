@@ -866,13 +866,13 @@ uv run secure-control benchmark --case cycle --mode batch --steps 4000 --delay-m
 正常GC、算法/协议/精度、20ms及正式默认不变；新旧SHA/随机负载不同，不是同SHA A/B。
 即使有限样本通过，也不授原10000、完整路线、认证三机或真实硬件资格，不自动进入下一试验或合并。
 
-## S15：仅实验 Client stage 回复的 QPC 接收候选
+## S15：实验 Client stage 回复观察（历史D15预算已消费）
 
 `--qpc-stage-receive-candidate` 默认关闭，只有显式获批的 cycle/batch/fused/worker/light、
 delay0/preload0、slots16/segment400、本机 insecure_tcp、1..1000 steps 可用；与其余诊断候选互斥。
-不改变正式 transport、共享 runner/runtime、发送、服务器、TLS、数学/材料/GC 或正式默认。
-仅 Client 的 `finish_stage_batch`、当前 P1/P2 原通道与同一 `_CycleDeadline` 选择私有收齐实现；
-非该阶段原样调用 canonical 接收。未知身份、通道、TLS 或 legacy deadline 不纳入候选。
+S15原始SHA没有改变正式transport；当前S17已将算法移到canonical owner，见下一节。
+此选项仅在Client的`finish_stage_batch`、当前P1/P2原通道与同一`_CycleDeadline`上增加公开观察，
+委托与正式路径相同的收齐实现；非该阶段走canonical默认。未知身份、通道、TLS或legacy deadline不纳入此实验观察。
 
 仍由原 receive_frame 读取/验证4B长度头、长度上限、body及原信封身份。保存原timeout并暂用
 非阻塞recv；select每次使用原remaining_seconds，不刷新20ms。空就绪/would-block只续收当前
@@ -904,4 +904,45 @@ uv run secure-control benchmark --case cycle --mode batch --steps 1000 --delay-m
 
 首次失败停，启动失败也消费，不补步/热身/20步/重跑/第二组/额外D14或baseline。
 原D13/D14预算不恢复；一次满1000也仅有限样本，不证明S13内部根因或长期10000/完整路线/
-真实认证三机/硬件达标，不推广默认或合并。没有新的直接人工批准，不开启第6次自动返工。
+真实认证三机/硬件达标，不据此推广或合并。D13/D14/D15及第6次原生定位预算均已消费，不可重跑。
+
+## S17：正式QPC接收加固与唯一10000本机动态资格
+
+第7次直接人工批准改变的是工程前置：不再等待S13历史故障复现。
+S13内部原因仍未知，第6次真实根因闭环仍未完成；本节故障模型回归不称历史故障重放或内核修复证明。
+
+正式`localhost_transport._receive_exact`遇到`_CycleDeadline`时，使用同一owner的
+`_receive_qpc_exact`，S15和新资格观察也委托该实现，不保留第二套实验接收算法。
+公共签名、长度头/body、信封身份、发送、控制/材料/双提交不改；旧float monotonic启动/保护路径保持原实现。
+这是正式QPC接收行为的改变，不等于完整路线或认证部署已经验收。
+
+保存原timeout、暂用非阻塞接收，在同一个绝对截止内推进当前字节游标；等待前后、读取前后、
+收齐/转换和模式恢复后都查原截止。空就绪/would-block只续当前接收，不重发、不重建20ms；
+正字节清零连续无进展，8次保护明确报错。真正TimeoutError/OSError/EOF/SSL错误仍立即失败，
+恢复错误不覆盖先前首错，也不由传输helper关闭runtime拥有的通道。
+TLS先尝试读取内部可推进数据，再按WantRead/WantWrite等待相应方向；pending为0也不能仅凭底层可读决定是否尝试。
+保持已有TLS认证与关闭语义，不降级裸TCP。控制调用串行拥有通道，材料辅助线程只读其IPC；
+不为任意外部并发/别名新增锁或线程。
+
+`--qpc-dynamic-qualification`仅启用完整记录/验收门禁，接收仍是同一正式实现。
+限定cycle/batch/fused/worker/light、10000步、400段/16库存/preload0/delay0、原本机insecure_tcp、
+正常GC700/10/10/freeze0/debug0，与其它诊断候选互斥。没有Frida、原生桥接或辅助跟踪进程。
+启动前核真实原schema布局：Client31159895B、各party3894625B、总38949145B；
+仅此profile的Client上限32MiB，party16MiB/总48MiB、RSS256MiB、材料8MiB/16份保持。
+原S13/S15仍原容量上限。只在内存捕获，退出卸载后完整展开/一次写盘，不筛慢步/失败/null。
+
+新`canonical-qpc-receive-v1`公开观察覆盖Client所有QPC周期回复，仍为16项滚动/首异常及原stage/首IO/GC，
+角色64KiB/合并192KiB不提高。完整10000路径应有120192次exact接收（12/步、24次维护各8）；
+计数、恢复、首异常、预算/省略和全部历史/线程/数值/身份/材料/退出均须过门禁。
+`local_dynamic_qualification_pass`只代表声明环境下本机动态资格；所有既有整体资格flags保持false，
+三机TLS网络、完整路线/切换和真实设备资格另列。Client运行gen2及早empty实际覆盖独立报告，未出现不补造。
+
+仅新SHA直接/完整检查及独立Review通过、目录释放、唯一预声明全文远端读回后才运行：
+
+```powershell
+uv run secure-control benchmark --case cycle --mode batch --steps 10000 --delay-ms 0 --segment-steps 400 --material-slots 16 --preload-steps 0 --recording light --qpc-dynamic-qualification --output .tmp/issue120-s17-qpc-dynamic-qualification.json
+```
+
+这使用原未消费的一次10000额度，不新增定位/短测/性能次数；首失败停，启动失败也消费。
+24次继续维护g399..g9599只有实际到达才确认，g9999终末STOP；不热身/短测/对照/额外D14/补跑。
+任一失败仍未完成，不自动第8次源码返工、推广全线默认、合并/关闭或开始下一Issue。

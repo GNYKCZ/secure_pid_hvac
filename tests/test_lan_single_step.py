@@ -33,6 +33,7 @@ def test_all_lan_tcp_links_enable_nodelay_and_close_failed_options(deployment, m
     from threading import Thread
 
     from secure_control.execution import lan_transport, localhost_transport
+    from secure_control.execution.cycle_timing import network_deadline
 
     configs = {r: replace(load_lan_config(deployment[r], r), transport=transport)
                for r in ("Client", "P1", "P2")}
@@ -58,6 +59,12 @@ def test_all_lan_tcp_links_enable_nodelay_and_close_failed_options(deployment, m
             assert not thread.is_alive() and not errors and len(accepted) == 1
             assert all(s.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) == 1
                        for s in (client, accepted[0]))
+            # 复用已认证连接验证真实TCP/mTLS新接收；不是控制或性能测量。
+            for source, destination in ((client, accepted[0]), (accepted[0], client)):
+                localhost_transport.send_frame(source, b"qpc-framed-reply", deadline=time.monotonic()+2, limit=1024)
+                deadline = network_deadline(2, time.perf_counter_ns()+2000000000)
+                assert localhost_transport.receive_frame(destination, deadline=deadline, limit=1024) == b"qpc-framed-reply"
+                assert destination.gettimeout() != 0
         finally:
             if client is not None:
                 client.close()

@@ -1800,7 +1800,19 @@ def test_gc_trial_real_gc_isolated_process_reclaims_new_cycles_and_restores_on_f
         assert result.returncode == 0, (case, result.stdout, result.stderr)
 
 
-def test_timeout_trace_forwards_partial_frames_native_errors_and_never_retries():
+def _qpc_fake_readable(monkeypatch):
+    """无端口旧观察fixture接入正式QPC就绪；不改字节/首错oracle。"""
+    from secure_control.execution import localhost_transport as transport
+
+    def ready(read, write, errors, timeout):
+        assert len(read) == 1 and not write and not errors and timeout > 0
+        assert read[0].gettimeout() == 0
+        return read, [], []
+    monkeypatch.setattr(transport.select, "select", ready)
+
+
+def test_timeout_trace_forwards_partial_frames_native_errors_and_never_retries(monkeypatch):
+    _qpc_fake_readable(monkeypatch)
     import struct
 
     from secure_control.execution import localhost_transport as transport
@@ -2845,7 +2857,8 @@ class _S10Socket:
 
 @pytest.mark.parametrize(("operation", "fail_at", "part", "confirmed"),
                          [("recv", 2, "header", 2), ("recv", 4, "body", 2), ("send", 2, "header_and_body", 2)])
-def test_s10_native_entry_preserves_partial_progress_original_error_and_first_failure(operation, fail_at, part, confirmed):
+def test_s10_native_entry_preserves_partial_progress_original_error_and_first_failure(monkeypatch, operation, fail_at, part, confirmed):
+    _qpc_fake_readable(monkeypatch)
     import struct
 
     from secure_control.execution import localhost_transport as transport
@@ -2878,7 +2891,8 @@ def test_s10_native_entry_preserves_partial_progress_original_error_and_first_fa
     assert entry["native_called"] and entry["remaining_at_entry_ns"] > 0
     assert dict(zip(observer.FIELDS, observer.first_failure, strict=True))["remaining_ns"] < 0
     assert entry["confirmed_bytes_before"] == confirmed
-    assert entry["actual_timeout_s"] == entry["requested_timeout_s"] > 0
+    assert entry["actual_timeout_s"] == entry["requested_timeout_s"]
+    assert entry["actual_timeout_s"] == 0 if operation == "recv" else entry["actual_timeout_s"] > 0
     assert entry["deadline_ns"] == deadline.deadline_ns and entry["clock_domain"] == "qpc_cycle"
     assert entry["qpc_before_ns"] <= entry["qpc_after_ns"]
     saved = observer.first_failure_entry
@@ -3508,7 +3522,8 @@ def test_s12_guard_and_reverse_conflicts_reject_before_resources(monkeypatch):
     assert "server_gc_candidate" not in calls[0][0] and not calls[0][0]["timeout_trace"]
 
 
-def test_s12_native_partial_frames_keep_entry_first_error_and_never_retry():
+def test_s12_native_partial_frames_keep_entry_first_error_and_never_retry(monkeypatch):
+    _qpc_fake_readable(monkeypatch)
     import struct
 
     from secure_control.execution import localhost_transport as transport
@@ -3534,7 +3549,8 @@ def test_s12_native_partial_frames_keep_entry_first_error_and_never_retry():
         assert first["native_in_flight"] is False  # 事件在原调用已抛出之后保存
         assert entry["native_called"] and entry["remaining_at_entry_ns"] > 0
         assert entry["clock_domain"] == "qpc_cycle" and entry["monotonic_entry_ns"] is None
-        assert entry["confirmed_bytes_before"] == 2 and entry["requested_timeout_s"] == entry["observed_timeout_s"] > 0
+        assert entry["confirmed_bytes_before"] == 2 and entry["requested_timeout_s"] == entry["observed_timeout_s"]
+        assert entry["requested_timeout_s"] == 0 if operation == "recv" else entry["requested_timeout_s"] > 0
         saved = observer.first_failure
         observer.marker("runtime_close_begin")
         observer.failed(tuple(None for _ in observer.FIELDS))
@@ -3544,7 +3560,8 @@ def test_s12_native_partial_frames_keep_entry_first_error_and_never_retry():
         assert report["hooks_restored"] and "private" not in str(report)
 
 
-def test_s12_expired_precheck_and_native_eof_have_different_first_error_evidence():
+def test_s12_expired_precheck_and_native_eof_have_different_first_error_evidence(monkeypatch):
+    _qpc_fake_readable(monkeypatch)
     from secure_control.execution import localhost_transport as transport
     from secure_control.execution.cycle_timing import _CycleDeadline
     from secure_control.experiments.communication_benchmark import _StageWaitDiagnostic
@@ -3567,7 +3584,8 @@ def test_s12_expired_precheck_and_native_eof_have_different_first_error_evidence
             assert not first["native_progress_unknown"] and first["error_type"] == "LocalhostTransportDisconnected"
 
 
-def test_s12_real_client_stage_methods_separate_frame_return_from_validated_receipt():
+def test_s12_real_client_stage_methods_separate_frame_return_from_validated_receipt(monkeypatch):
+    _qpc_fake_readable(monkeypatch)
     import struct
 
     import numpy as np
@@ -4404,6 +4422,153 @@ def test_s13_initialization_failure_does_not_start_roles_and_restores_factory(mo
     assert _s12_hook_snapshot() == before and lan_runtime._MaterialWorkerPool.__init__ is factory
 
 
+def test_s17_qualification_guard_layout_and_cli_never_start_unapproved_routes(monkeypatch, tmp_path):
+    import sys
+    from pathlib import Path
+
+    from secure_control.experiments import communication_benchmark as bench
+    from secure_control.experiments import lan_runner
+
+    common = {"steps": 10000, "delay_ms": 0, "segment_steps": 400, "optimized": True,
+              "material_slots": 16, "recording_mode": "light", "qpc_dynamic_qualification": True}
+    def forbidden(*args, **kwargs):
+        pytest.fail("软件门禁不得打开端口或启动资格")
+    monkeypatch.setattr(bench, "_ports", forbidden)
+    for changes in ({"steps": 1000}, {"steps": True}, {"qpc_dynamic_qualification": 1},
+                    {"qpc_stage_receive_candidate": True}, {"compact_history_candidate": True},
+                    {"worker_long_run": True}, {"preload_steps": 1}, {"material_slots": 4},
+                    {"recording_mode": "full"}, {"delay_ms": 1}, {"role_config": Path("unused.yaml")}):
+        with pytest.raises((ValueError, TypeError)):
+            bench.run_continuous_observation(**(common | changes))
+    layouts = {r: bench._CompactHistory.layout(r, 10000, qualification=True) for r in ("Client", "P1", "P2")}
+    assert [layouts[r]["reserved_bound_bytes"] for r in ("Client", "P1", "P2")] == [31159895, 3894625, 3894625]
+    assert sum(x["reserved_bound_bytes"] for x in layouts.values()) == 38949145
+    assert layouts["Client"]["limit_bytes"] == 32*1024**2 and layouts["P1"]["limit_bytes"] == 16*1024**2
+    with pytest.raises(ValueError):
+        bench._CompactHistory.layout("Client", 10000)
+    with pytest.raises(ValueError):
+        bench._CompactHistory.layout("Client", 1000, qualification=True)
+    captured = []
+    def selected(options, candidate, *, target_steps):
+        captured.append((options, candidate, target_steps))
+        return {"status": "stopped", "cycle_timing": {"p50_ms": 0}}
+    monkeypatch.setattr(bench, "_run_material_comparison", selected)
+    result = bench.run_continuous_observation(**common)
+    assert result["status"] == "stopped" and captured[0][1:] == ("worker", 10000)
+    assert captured[0][0]["qpc_dynamic_qualification"] is True
+    monkeypatch.setattr(sys, "argv", ["secure-control", "benchmark", "--case", "cycle", "--mode", "batch",
+        "--steps", "10000", "--delay-ms", "0", "--segment-steps", "400", "--material-slots", "16",
+        "--preload-steps", "0", "--recording", "light", "--qpc-dynamic-qualification", "--output", str(tmp_path/"software.json")])
+    assert lan_runner._run() == 0 and len(captured) == 2
+
+
+def test_s17_qualification_preallocation_failure_never_launches_roles(monkeypatch):
+    from secure_control.experiments import communication_benchmark as bench
+
+    before = _s12_hook_snapshot()
+    monkeypatch.setattr(bench, "_ports", lambda: pytest.fail("RSS guard后不得建端口"))
+    monkeypatch.setattr(bench, "_process_memory", lambda: {"current_rss_bytes": 257*1024**2})
+    result = bench.run_continuous_observation(steps=10000, delay_ms=0, segment_steps=400,
+        optimized=True, recording_mode="light", qpc_dynamic_qualification=True)
+    assert result["cycles"] == [] and result["failure_category"] == "RuntimeError"
+    assert not result["local_dynamic_qualification_pass"] and not result["qpc_dynamic_qualification"]["finite_sample_pass"]
+    assert result["stage_wait_diagnostic"]["profile"] == "canonical-qpc-receive-v1"
+    assert _s12_hook_snapshot() == before
+
+
+def test_s17_qualification_gate_requires_full_10000_route_layout_and_24_maintenance():
+    """纯公开fixture/布局，无端口/材料/控制；拒绝不完整资格，不改旧oracle。"""
+    from copy import deepcopy
+
+    from secure_control.experiments import communication_benchmark as bench
+
+    base = _s9_public_result()
+    _, metadata = _s11_public_result()
+    metadata.update(profile="canonical-qpc-receive-v1", target_steps=10000, maximum_attempts=10000)
+    base.pop("worker_long_run")
+    base["numeric_profile"] = {"fractional_bits": 32, "security_parameter": 80, "period_s": .02,
+        "modulus_bits": 256, "state_dimension": 4, "input_dimension": 2, "output_dimension": 1}
+    base["steps"] = [{"global_step": c["global_step"], "session_id": c["session_id"],
+        "round_id": c["round_id"], "status": "confirmed"} for c in base["cycles"]]
+    for step in range(399, 9999, 400):
+        base["cycles"][step]["phase_durations_ns"] = {"maintenance": 1}
+    def history_report(role):
+        end = base["cycles"][-1]["deadline_ns"]+100
+        return {"role": role, "representation_complete": True,
+            "layout": bench._CompactHistory.layout(role, 10000, qualification=True),
+            "tables": {k: {"captured": 10000, "expanded": 10000} for k in ("steps", "cycles")},
+            "threads": [{"thread_role": name, "pid": 10, "native_id": i,
+                "registered_at_qpc_ns": 0, "observation_end_qpc_ns": end}
+                for i, name in enumerate(("control", "material-receiver", "material-credit"), 1)
+                if role == "Client" or name == "control"],
+            "control_observation": {"last_confirmed_step": 9999,
+                "last_confirmed_return_qpc_ns": base["cycles"][-1]["cycle_completed_ns"]+1,
+                "normal_stop_start_qpc_ns": base["cycles"][-1]["cycle_completed_ns"]+2}}
+    sample = {"memory_guard_failed": False, "cleanup_failed": False, "producer_exited": True}
+    for fault in ("normal", "partial_route", "profile", "layout", "maintenance", "late", "restore", "float_route", "missing_history"):
+        result, numeric = deepcopy(base), deepcopy(metadata)
+        observer = bench._StageWaitDiagnostic("Client", (101, 102, 103),
+            gc_observer=_s12_software_observer("Client").gc_observer,
+            qpc_receive_candidate=True, all_qpc_receives=True)
+        observer.trace_restored = True
+        observer.qpc_calls = observer.qpc_completed = 120192
+        for party in result["party_outcomes"]:
+            stage = _s12_software_observer(party["role"])
+            stage.gc_observer.normal_stop_ack_sent = True
+            party["stage_wait"], party["compact_history"] = stage.report(), history_report(party["role"])
+        client_history = history_report("Client")
+        if fault == "partial_route":
+            observer.qpc_completed -= 1
+        elif fault == "profile":
+            numeric["profile"] = "stage-wait-light-v1"
+        elif fault == "layout":
+            client_history["layout"]["limit_bytes"] = 16*1024**2
+        elif fault == "maintenance":
+            result["cycles"][9599].pop("phase_durations_ns")
+        elif fault == "late":
+            result["cycles"][0]["cycle_completed_ns"] = result["cycles"][0]["deadline_ns"]
+        elif fault == "restore":
+            observer.qpc_restore_error_type = "OSError"
+        elif fault == "float_route":
+            observer.qpc_calls = 120192.
+        elif fault == "missing_history":
+            result["party_outcomes"][0].pop("compact_history")
+        bench._finish_stage_wait(result, sample, numeric, [observer])
+        history = SimpleNamespace(expansion_ns=1, report=lambda client_history=client_history: client_history)
+        bench._finish_compact_history(result, sample, history, qpc_dynamic_qualification=True)
+        assert result["local_dynamic_qualification_pass"] == (fault == "normal"), fault
+        assert result["qpc_dynamic_qualification"]["target_steps"] == 10000
+        assert not any(result[k] for k in ("candidate_gate_pass", "worker_long_run_gate_pass", "stage_pass", "qualification_pass"))
+
+
+def test_s17_all_cycle_reply_observation_delegates_same_canonical_algorithm(monkeypatch):
+    from secure_control.execution import localhost_transport as transport
+
+    original, calls = transport._receive_qpc_exact, []
+    def delegated(sock, length, deadline, **kwargs):
+        calls.append((sock, length, deadline, kwargs.get("_observe")))
+        return original(sock, length, deadline, **kwargs)
+    monkeypatch.setattr(transport, "_receive_qpc_exact", delegated)
+    for phase in (None, "online_reply", "finish_stage_batch"):
+        f = _s15_receive_fixture(monkeypatch, [b"data"], all_qpc_receives=True,
+                                 waits=[(3000000, "empty"), (4000000, "ready")])
+        f.observer.state.phase = phase
+        assert f.observer.qpc_receive(f.original, f.probe, 4, f.deadline) == b"data"
+        assert f.observer.qpc_calls == f.observer.qpc_completed == 1 and f.observer.qpc_empty == 1
+        assert f.observer.report()["profile"] == "canonical-qpc-receive-v1" and f.raw.timeout == .5
+        assert calls[-1][:3] == (f.probe, 4, f.deadline) and callable(calls[-1][3])
+    assert len(calls) == 3
+    assert f.observer.qpc_receive(lambda *args: b"legacy", f.probe, 4, 1.0) == b"legacy"
+    assert len(calls) == 3
+    failure = OSError(9, "private select error")
+    f = _s15_receive_fixture(monkeypatch, [BlockingIOError()], all_qpc_receives=True,
+                             waits=[(1000000, "ready"), (1000000, failure)])
+    with pytest.raises(transport.LocalhostTransportDisconnected) as caught:
+        f.observer.qpc_receive(f.original, f.probe, 4, f.deadline)
+    assert caught.value.__cause__ is failure and f.raw.read_lengths == [4] and f.raw.timeout == .5
+    assert f.observer.first_failure[17] == "qpc_select" and f.observer.first_failure[11] is None
+
+
 def test_s15_early_empty_continues_same_frame_under_original_deadline(monkeypatch):
     f = _s15_receive_fixture(monkeypatch, [b"test"], waits=[(3000000, "empty"), (4000000, "ready")])
     assert f.observer.qpc_receive(f.original, f.probe, 4, f.deadline) == b"test"
@@ -4415,7 +4580,7 @@ def test_s15_early_empty_continues_same_frame_under_original_deadline(monkeypatc
 
 
 def _s15_receive_fixture(monkeypatch, chunks, *, deadline_ns=11000000, waits=(), restore_error=None,
-                         recv_delay_ns=0, restore_delay_ns=0):
+                         recv_delay_ns=0, restore_delay_ns=0, all_qpc_receives=False):
     """可控时钟/假裸socket，只调用真实观察与framing，不打开网络或执行控制。"""
     from secure_control.execution.cycle_timing import _CycleDeadline
     from secure_control.experiments import communication_benchmark as bench
@@ -4451,17 +4616,20 @@ def _s15_receive_fixture(monkeypatch, chunks, *, deadline_ns=11000000, waits=(),
             pytest.fail("候选接收不得重发事务")
     raw = RawSocket()
     def ready(read, write, errors, timeout):
-        assert read == [raw] and not write and not errors and timeout > 0 and raw.timeout == 0
+        assert len(read) == 1 and read[0].sock is raw and not write and not errors and timeout > 0 and raw.timeout == 0
         selected.append((now[0], timeout))
         delta, kind = remaining_waits.pop(0) if remaining_waits else (1000000, "ready")
         now[0] += delta
         if isinstance(kind, BaseException):
             raise kind
-        return ([raw] if kind == "ready" else [], [], [])
+        return (read if kind == "ready" else [], [], [])
     monkeypatch.setattr(bench.socket, "socket", RawSocket)
-    monkeypatch.setattr(bench.select, "select", ready)
+    from secure_control.execution import localhost_transport
+
+    monkeypatch.setattr(localhost_transport.select, "select", ready)
     monkeypatch.setattr(bench.time, "perf_counter_ns", lambda: now[0])
-    observer = bench._StageWaitDiagnostic("Client", (101, 102, 103), qpc_receive_candidate=True)
+    observer = bench._StageWaitDiagnostic("Client", (101, 102, 103), qpc_receive_candidate=True,
+                                         all_qpc_receives=all_qpc_receives)
     context = ("expected_from_validated_stage_plan", "Client", "P1", "stage", None,
                "session", "round", 0, 1, "run", "epoch", 0, 0)
     observer.state.phase, observer.state.context = "finish_stage_batch", context

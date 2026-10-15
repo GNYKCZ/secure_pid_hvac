@@ -696,6 +696,166 @@ def test_framing_handles_fragmented_and_coalesced_tcp_bytes() -> None:
         sender.close()
 
 
+def _qpc_receive_model(monkeypatch, chunks, *, waits=(), tls=False, restore_error=None,
+                       read_delay=0, restore_delay=0):
+    """故障模型：只用虚拟时钟/就绪/字节，不打开socket或执行控制。"""
+    from types import SimpleNamespace
+
+    from secure_control.execution import cycle_timing
+    from secure_control.execution import localhost_transport as transport
+
+    now, selected, pending = [0], [], list(chunks)
+    schedule = list(waits)
+    class Channel:
+        timeout = .5
+        def __init__(self):
+            self.read_lengths, self.modes = [], []
+            if tls:
+                self.pending = lambda: 0
+        def gettimeout(self):
+            return self.timeout
+        def settimeout(self, value):
+            self.modes.append(value)
+            if value == .5:
+                now[0] += restore_delay
+                if restore_error:
+                    raise restore_error
+            self.timeout = value
+        def recv(self, length):
+            self.read_lengths.append(length)
+            if self.timeout != 0:
+                raise TimeoutError("model: relative wait ended before QPC deadline")
+            now[0] += read_delay
+            value = pending.pop(0)
+            if isinstance(value, BaseException):
+                raise value
+            assert len(value) <= length
+            return value
+        def send(self, *args):
+            pytest.fail("接收不能重发事务")
+    channel = Channel()
+    def ready(read, write, errors, timeout):
+        assert (read == [channel]) != (write == [channel]) and not errors
+        assert timeout > 0 and channel.timeout == 0
+        selected.append(("read" if read else "write", timeout))
+        delay, result = schedule.pop(0) if schedule else (1000000, "ready")
+        now[0] += delay
+        if isinstance(result, BaseException):
+            raise result
+        return (read, write, []) if result == "ready" else ([], [], [])
+    monkeypatch.setattr(cycle_timing.time, "perf_counter_ns", lambda: now[0])
+    # select导入也是待加固职责的一部分，旧实现未导入时先不设置它。
+    if hasattr(transport, "select"):
+        monkeypatch.setattr(transport.select, "select", ready)
+    return SimpleNamespace(now=now, selected=selected, channel=channel, ready=ready,
+        deadline=cycle_timing._CycleDeadline(11000000), transport=transport)
+
+
+def test_canonical_qpc_model_early_empty_keeps_same_deadline_and_frame(monkeypatch):
+    f = _qpc_receive_model(monkeypatch, [b"ab", b"cd"], waits=[(3000000, "empty"), (2000000, "ready"), (2000000, "ready")])
+    assert f.transport._receive_exact(f.channel, 4, f.deadline) == b"abcd"
+    assert f.channel.read_lengths == [4, 2] and f.channel.timeout == .5
+    assert [round(t*1e9) for _, t in f.selected] == [11000000, 8000000, 6000000]
+    assert f.now[0] == 7000000
+
+
+@pytest.mark.parametrize("boundary", ("before", "wait_equal", "wait_late", "read_equal", "restore_equal"))
+def test_canonical_qpc_model_rejects_expiry_at_every_exit(monkeypatch, boundary):
+    f = _qpc_receive_model(monkeypatch, [b"data"],
+        waits=[(11000000 if boundary == "wait_equal" else 12000000, "ready")] if boundary.startswith("wait") else (),
+        read_delay=10000000 if boundary == "read_equal" else 0,
+        restore_delay=10000000 if boundary == "restore_equal" else 0)
+    if boundary == "before":
+        f.now[0] = 11000000
+    with pytest.raises(LocalhostTransportTimeout):
+        f.transport._receive_exact(f.channel, 4, f.deadline)
+    assert f.channel.timeout == .5
+    assert len(f.channel.read_lengths) == (1 if boundary in ("read_equal", "restore_equal") else 0)
+
+
+@pytest.mark.parametrize("case", ("empty8", "would_block8", "reset", "eof", "native_timeout", "native_error",
+                                  "select_error", "restore_only", "primary_and_restore"))
+def test_canonical_qpc_model_progress_error_and_mode_ownership(monkeypatch, case):
+    from secure_control.execution.localhost_transport import LocalhostTransportError
+
+    original = TimeoutError("primary") if case in ("native_timeout", "primary_and_restore") else OSError(9, "primary")
+    restore = OSError(8, "restore") if case in ("restore_only", "primary_and_restore") else None
+    chunks, waits, expected = [b"data"], (), LocalhostTransportDisconnected
+    if case == "empty8":
+        chunks, waits, expected = [], [(1000000, "empty")]*8, LocalhostTransportError
+    elif case == "would_block8":
+        chunks, expected = [BlockingIOError()]*8, LocalhostTransportError
+    elif case == "reset":
+        chunks = [BlockingIOError()]*3 + [b"ab"] + [BlockingIOError()]*3 + [b"cd"]
+    elif case == "eof":
+        chunks = [b"ab", b""]
+    elif case in ("native_timeout", "primary_and_restore"):
+        chunks, expected = [original], LocalhostTransportTimeout
+    elif case == "native_error":
+        chunks = [original]
+    elif case == "select_error":
+        chunks, waits = [], [(1000000, original)]
+    elif case == "restore_only":
+        expected = OSError
+    f = _qpc_receive_model(monkeypatch, chunks, waits=waits, restore_error=restore)
+    if case == "reset":
+        assert f.transport._receive_exact(f.channel, 4, f.deadline) == b"abcd"
+        assert f.channel.read_lengths == [4]*4+[2]*4
+    else:
+        with pytest.raises(expected) as caught:
+            f.transport._receive_exact(f.channel, 4, f.deadline)
+        if case in ("native_timeout", "native_error", "select_error", "primary_and_restore"):
+            assert caught.value.__cause__ is original
+        if case in ("empty8", "would_block8"):
+            assert type(caught.value) is LocalhostTransportError and len(f.selected) == 8 and f.now[0] < 11000000
+        if case == "restore_only":
+            assert caught.value is restore
+    assert f.channel.timeout == (0 if restore else .5)
+
+
+@pytest.mark.parametrize("case", ("internal_data", "want_read", "want_write", "closed", "certificate", "ssl_error"))
+def test_canonical_qpc_tls_model_drains_before_select_and_waits_requested_direction(monkeypatch, case):
+    import ssl
+
+    error = (ssl.SSLCertVerificationError(1, "authentication failed") if case == "certificate"
+             else ssl.SSLError(1, "TLS failure"))
+    chunks = {"internal_data": [b"ab", b"cd"], "want_read": [ssl.SSLWantReadError(), b"data"],
+              "want_write": [ssl.SSLWantWriteError(), b"data"], "closed": [b""],
+              "certificate": [error], "ssl_error": [error]}[case]
+    f = _qpc_receive_model(monkeypatch, chunks, tls=True)
+    if case in ("closed", "certificate", "ssl_error"):
+        with pytest.raises(LocalhostTransportDisconnected) as caught:
+            f.transport._receive_exact(f.channel, 4, f.deadline)
+        if case != "closed":
+            assert caught.value.__cause__ is error
+        assert not f.selected
+    else:
+        expected = b"abcd" if case == "internal_data" else b"data"
+        assert f.transport._receive_exact(f.channel, 4, f.deadline) == expected
+        assert [direction for direction, _ in f.selected] == ([] if case == "internal_data" else ["write" if case == "want_write" else "read"])
+    assert f.channel.timeout == .5 and f.channel.pending() == 0
+
+
+def test_canonical_qpc_legacy_float_keeps_original_relative_failure(monkeypatch):
+    f = _qpc_receive_model(monkeypatch, [b"data"])
+    monkeypatch.setattr(f.transport, "remaining_seconds", lambda deadline: .01)
+    with pytest.raises(LocalhostTransportTimeout):
+        f.transport._receive_exact(f.channel, 4, 1.0)
+    assert f.channel.modes == [.01] and f.channel.read_lengths == [4] and not f.selected
+
+
+def test_canonical_qpc_observation_and_restore_errors_keep_primary_cause(monkeypatch):
+    original, restore = TimeoutError("original"), OSError(9, "restore")
+    f = _qpc_receive_model(monkeypatch, [original], restore_error=restore)
+    def broken_observer(operation, *args, **kwargs):
+        if operation in ("failure", "restore_error"):
+            raise KeyboardInterrupt("observer")
+    with pytest.raises(LocalhostTransportTimeout) as caught:
+        f.transport._receive_qpc_exact(f.channel, 4, f.deadline, _observe=broken_observer)
+    assert caught.value.__cause__ is original and f.channel.timeout == 0
+    assert len(caught.value.__notes__) == 2
+
+
 @pytest.mark.integration
 def test_framing_rejects_empty_oversized_and_incomplete_frames_with_total_deadline() -> None:
     receiver, sender = socket.socketpair()
