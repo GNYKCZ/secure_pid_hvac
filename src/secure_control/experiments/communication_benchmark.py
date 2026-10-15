@@ -7,6 +7,7 @@ import json
 import multiprocessing as mp
 import os
 import platform
+import select
 import socket
 import struct
 import subprocess
@@ -1194,8 +1195,13 @@ class _StageWaitDiagnostic(_TimeoutDiagnostic):
                     "requested_timeout_s", "observed_timeout_s", "native_called", "requested_bytes",
                     "confirmed_bytes_before", "monotonic_entry_ns", "thread_id", "native_thread_id")
     CONTEXT = (*_TimeoutDiagnostic.CONTEXT, "run_id", "controller_epoch", "segment_index", "global_step")
+    QPC_FIELDS = ("operation", "start_qpc_ns", "end_qpc_ns", "peer", "frame_part", "context",
+                  "deadline_ns", "remaining_before_ns", "requested_wait_ns", "ready_count",
+                  "confirmed_bytes", "no_progress_count", "outcome", "error_type", "errno", "winerror")
 
-    def __init__(self, role, ports, *, wall=None, gc_observer=None):
+    def __init__(self, role, ports, *, wall=None, gc_observer=None, qpc_receive_candidate=False):
+        if type(qpc_receive_candidate) is not bool or qpc_receive_candidate and role != "Client":
+            raise ValueError("S15仅选择Client裸TCP接收。")
         # 不调用父类init：避免304槽、CPU和旧GC/阶段探针。
         self.role, self.ports, self.state = role, ports, local()
         self._wall = wall or time.perf_counter_ns
@@ -1208,6 +1214,140 @@ class _StageWaitDiagnostic(_TimeoutDiagnostic):
         self.close_begin_ns = self.close_end_ns = None
         self.gc_observer = gc_observer
         self.run_identity = [None, None, None]
+        self.qpc_receive_candidate, self.qpc_receiving = qpc_receive_candidate, False
+        if qpc_receive_candidate:
+            self.qpc_slots, self.qpc_seen = [None] * 16, 0
+            self.qpc_first_anomaly = self.qpc_first_exception = self.qpc_restore_error_type = None
+            self.qpc_calls = self.qpc_completed = self.qpc_empty = self.qpc_would_block = self.qpc_guards = 0
+
+    def _qpc_note(self, probe, operation, started, *, remaining=None, wait=None, ready=None,
+                  no_progress=0, outcome, error=None):
+        # 只保存有界公开tuple；socket/bytes/异常对象不进入历史。
+        row = (operation, started, self.wall(), probe.peer, probe.part, probe.context,
+               probe.deadline.deadline_ns, remaining, wait, ready, probe.confirmed, no_progress,
+               outcome, self.error_type(error), getattr(error, "errno", None), getattr(error, "winerror", None))
+        self.qpc_slots[self.qpc_seen % 16] = row
+        self.qpc_seen += 1
+        if outcome != "ready" and self.qpc_first_anomaly is None:
+            self.qpc_first_anomaly = row
+        if error is not None and self.qpc_first_exception is None:
+            self.qpc_first_exception = row
+
+    def qpc_receive(self, original, probe, length, deadline):
+        """S15只续收当前stage同一frame；原framing/身份/会话仍由canonical拥有。"""
+        from secure_control.execution.cycle_timing import _CycleDeadline, remaining_seconds
+        from secure_control.execution.localhost_transport import (
+            LocalhostTransportDisconnected,
+            LocalhostTransportError,
+            LocalhostTransportTimeout,
+        )
+
+        if not self.qpc_receive_candidate or self.role != "Client" or getattr(self.state, "phase", None) != "finish_stage_batch":
+            return original(probe, length, deadline)
+        context, expected = getattr(probe, "context", None), getattr(self.state, "context", None)
+        if (not isinstance(probe, _StageTraceSocket) or probe.diagnostic is not self or probe.peer not in {"P1", "P2"}
+                or type(probe.sock) is not socket.socket or not isinstance(deadline, _CycleDeadline)
+                or type(deadline.deadline_ns) is not int or deadline.deadline_ns < 0 or probe.deadline is not deadline
+                or type(length) is not int or length <= 0 or context is None or expected is None
+                or context[1:5] != ("Client", probe.peer, "endpoint", "stage_batch")
+                or context[5:8] != expected[5:8]):
+            raise ValueError("S15接收作用域/身份/裸TCP/deadline不匹配。")
+        if (probe.sock.getpeername()[:2] != ("127.0.0.1", self.ports[0 if probe.peer == "P1" else 1])
+                or probe.sock.getsockname()[0] != "127.0.0.1"):
+            raise ValueError("S15只接收当前本机P1/P2通道。")
+        self.qpc_calls += 1
+        self.qpc_receiving = True
+        previous, saved, primary = None, False, None
+        no_progress, reason, data = 0, "native_error", bytearray()
+
+        def budget():
+            nonlocal reason
+            remaining = remaining_seconds(deadline)
+            if remaining <= 0:
+                reason, probe.native_error = "deadline", "qpc_deadline"
+                self.entry(probe, "qpc_deadline", requested=length-len(data))
+                raise LocalhostTransportTimeout("S15原QPC接收截止已到。")
+            if self.observation_error_type is not None:
+                reason = "observation_error"
+                raise RuntimeError("S15接收观察损坏。")
+            return remaining
+
+        def failure(error):
+            self._qpc_note(probe, "failure", self.wall(), no_progress=no_progress, outcome=reason, error=error)
+            self.failed(self.values(probe, "qpc_receive", self.wall(), self.wall(), error=error,
+                                    origin=probe.native_error or reason))
+        try:
+            previous, saved = probe.gettimeout(), True
+            probe.settimeout(0.)
+            while len(data) < length:
+                started = self.wall()
+                reason, probe.native_error = "select_error", "qpc_select"
+                remaining = budget()
+                try:
+                    readable, writable, exceptional = select.select([probe.sock], [], [], remaining)
+                except TimeoutError as error:
+                    raise LocalhostTransportTimeout("S15就绪等待异常超时。") from error
+                except OSError as error:
+                    raise LocalhostTransportDisconnected("S15就绪等待连接错误。") from error
+                budget()  # 早/晚唤醒都先核原截止，迟到结果不读出采用。
+                if writable or exceptional or readable not in ([], [probe.sock]):
+                    raise ValueError("S15就绪结果与当前socket不匹配。")
+                if not readable:
+                    self.qpc_empty += 1
+                    no_progress += 1
+                self._qpc_note(probe, "select", started, remaining=round(remaining*1e9),
+                    wait=round(remaining*1e9), ready=len(readable), no_progress=no_progress,
+                    outcome="ready" if readable else "empty")
+                if readable:
+                    budget()  # 观察成本仍占周期；不能在观察后过期却开始recv。
+                    reason, probe.native_error = "native_error", None
+                    try:
+                        chunk = probe.recv(length-len(data))
+                    except BlockingIOError:
+                        self.qpc_would_block += 1
+                        no_progress += 1
+                        self._qpc_note(probe, "recv", self.wall(), no_progress=no_progress, outcome="would_block")
+                    except TimeoutError as error:
+                        raise LocalhostTransportTimeout("S15非阻塞recv异常超时。") from error
+                    except OSError as error:
+                        raise LocalhostTransportDisconnected("S15非阻塞recv连接错误。") from error
+                    else:
+                        if not chunk:
+                            reason = "eof"
+                            raise LocalhostTransportDisconnected("S15当前frame未收齐即断连。")
+                        data.extend(chunk)
+                        no_progress = 0
+                    budget()
+                if no_progress >= 8:
+                    self.qpc_guards += 1
+                    reason, probe.native_error = "no_progress_guard", "qpc_no_progress_guard"
+                    raise LocalhostTransportError("S15连续8次无进展，停止当前会话。")
+            budget()
+            result = bytes(data)
+        except BaseException as error:
+            primary = error
+            failure(error)  # 恢复前锁定首错，恢复失败不能抢先或覆盖。
+            raise
+        finally:
+            try:
+                if saved:
+                    last_native_entry, probe.current_entry = probe.current_entry, None
+                    probe.settimeout(previous)
+                    probe.current_entry = last_native_entry
+            except BaseException as error:
+                self.qpc_restore_error_type = self.error_type(error)
+                self._qpc_note(probe, "restore", self.wall(), outcome="restore_error", error=error)
+                if primary is None:
+                    raise
+            finally:
+                self.qpc_receiving = False
+        try:
+            budget()  # 恢复原模式的成本也不能逃出原截止。
+        except BaseException as error:
+            failure(error)
+            raise
+        self.qpc_completed += 1
+        return result
 
     def _observe_error(self, error):
         self.observation_error_type = self.observation_error_type or self.error_type(error)
@@ -1268,6 +1408,8 @@ class _StageWaitDiagnostic(_TimeoutDiagnostic):
             self.seen += 1
 
     def failed(self, values):
+        if self.qpc_receiving and values[1] == "recv" and values[13] == "BlockingIOError":
+            return  # S15预期would-block仍写环，不伪作终止首错。
         if self.first_failure is None:
             self.first_failure = values
             self.first_failure_entry = values[11]
@@ -1445,7 +1587,7 @@ class _StageWaitDiagnostic(_TimeoutDiagnostic):
             gc_report.update(profile="client-gen2-light-v1", scope="Client gen2; original startup may appear before control window; no phase/round identity")
             for _ in range(3):
                 gc_report["encoded_bytes"] = len(json.dumps(gc_report, separators=(",", ":"), allow_nan=False).encode())
-        result = {"format_version": 1, "profile": "stage-wait-light-v1", "role": self.role,
+        result = {"format_version": 1, "profile": "qpc-stage-receive-v1" if self.qpc_receive_candidate else "stage-wait-light-v1", "role": self.role,
             "schemas": {"event": self.FIELDS, "entry": self.ENTRY_FIELDS, "context": self.CONTEXT},
             "event_limit": 128, "in_flight_limit": 4, "first_error_limit": 1,
             "evicted_count": max(0, self.seen-128), "encoded_omitted": 0,
@@ -1457,17 +1599,26 @@ class _StageWaitDiagnostic(_TimeoutDiagnostic):
         in_flight = [self.values(p, "in_flight", p.current_entry[0], None) for p in self.probes.values() if p.current_entry]
         def encode():
             contexts = []
-            def packed(row):
+            def packed(row, context_index=9):
                 if row is None:
                     return None
                 row = list(row)
-                if row[9] is not None:
-                    if row[9] not in contexts:
-                        contexts.append(row[9])
-                    row[9] = contexts.index(row[9])
+                if row[context_index] is not None:
+                    if row[context_index] not in contexts:
+                        contexts.append(row[context_index])
+                    row[context_index] = contexts.index(row[context_index])
                 return row
             result.update(first_failure=packed(self.first_failure), outer_failure=packed(self.outer_failure),
                 in_flight=[packed(row) for row in in_flight], events=[packed(row) for row in events], contexts=contexts)
+            if self.qpc_receive_candidate:
+                result["qpc_receive"] = {"fields": self.QPC_FIELDS, "event_limit": 16,
+                    "events": [packed(row, 5) for row in sorted((r for r in self.qpc_slots if r), key=lambda r: r[2])],
+                    "evicted_count": max(0, self.qpc_seen-16), "encoded_omitted": 0,
+                    "first_anomaly": packed(self.qpc_first_anomaly, 5), "first_exception": packed(self.qpc_first_exception, 5),
+                    "selected_exact_calls": self.qpc_calls, "completed_exact_calls": self.qpc_completed,
+                    "empty_count": self.qpc_empty, "would_block_count": self.qpc_would_block,
+                    "no_progress_guard_count": self.qpc_guards, "restore_error_type": self.qpc_restore_error_type,
+                    "scope": "nonblocking recv timeout0; select wait separate; no transaction resend; QPC original deadline"}
             for _ in range(3):
                 result["encoded_bytes"] = len(json.dumps(result, separators=(",", ":"), allow_nan=False).encode())
         encode()
@@ -1561,7 +1712,7 @@ def _config(role: str, ports: tuple[int, int, int]) -> LanConfig:
 
 
 def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=None,
-           diagnostic=None, full_observation=False, gc_boundaries=None, compact_history=None):
+           diagnostic=None, full_observation=False, gc_boundaries=None, compact_history=None, qpc_receiver=None):
     """包住既有 framing 最外层，只数发送次数/字节，不解码或保存 payload。"""
     from secure_control.execution import lan_scalar_runtime, localhost_transport
 
@@ -1639,7 +1790,9 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
 
     localhost_transport._send_exact = (diagnostic.wrap("send_ms", measured)
                                        if diagnostic else measured)
-    localhost_transport._receive_exact = timed("receive_ms", originals["receive"])
+    def received(sock, length, deadline):
+        return qpc_receiver(originals["receive"], sock, length, deadline)
+    localhost_transport._receive_exact = timed("receive_ms", received if qpc_receiver else originals["receive"])
     localhost_transport.encode_envelope = (encoded if diagnostic and diagnostic.supply
                                           else timed("encode_ms", originals["encode"]))
     localhost_transport.decode_envelope = timed("decode_ms", originals["decode"])
@@ -1810,13 +1963,13 @@ def _party_job(
     config: LanConfig, ports: tuple[int, int, int], delay_ms: float, batch: bool, queue,
     diagnostic_enabled=False, full_observation=False, tcp_nodelay=None, supply_diagnostic=False,
     timeout_trace=False, material_comparison=False, worker_wait_diagnostic=False, server_gc_candidate=False,
-    stage_wait_diagnostic=False, compact_history_candidate=False,
+    stage_wait_diagnostic=False, compact_history_candidate=False, compact_history_steps=4000,
 ) -> None:
     role_steps = []
     history = None
     if compact_history_candidate:
         try:
-            history = _CompactHistory(config.role)
+            history = _CompactHistory(config.role, compact_history_steps)
         except Exception as error:  # noqa: BLE001 - 启动失败不建角色，不隐去缺失记录
             queue.put({"role": config.role, "status": "failed", "error_type": type(error).__name__,
                        "steps": [], "directions": {}, "activity_ms": {},
@@ -2319,7 +2472,7 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
                                material_candidate=None, worker_timeout_diagnostic=False,
                                worker_long_run=False, worker_wait_diagnostic=False,
                                server_gc_candidate=False, stage_wait_diagnostic=False,
-                               compact_history_candidate=False) -> dict[str, object]:
+                               compact_history_candidate=False, qpc_stage_receive_candidate=False) -> dict[str, object]:
     # 所有试验参数在任何端口/角色/材料创建前拒绝；默认入口走原路径。
     options = {"steps": steps, "delay_ms": delay_ms, "segment_steps": segment_steps,
                "optimized": optimized, "material_slots": material_slots, "role_config": role_config,
@@ -2333,6 +2486,23 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
         raise ValueError("S12定位选择必须为严格bool。")
     if type(compact_history_candidate) is not bool:
         raise ValueError("S13候选选择必须为严格bool。")
+    if type(qpc_stage_receive_candidate) is not bool:
+        raise ValueError("S15候选选择必须为严格bool。")
+    if qpc_stage_receive_candidate:
+        if (optimized is not True or recording_mode != "light" or diagnostic is not False
+                or any(v is not False for v in (server_gc_candidate, stage_wait_diagnostic, compact_history_candidate,
+                    worker_long_run, worker_timeout_diagnostic, worker_wait_diagnostic, timeout_trace))
+                or material_candidate is not None or gc_trial_policy is not None
+                or type(steps) is not int or not 1 <= steps <= 1000
+                or type(segment_steps) is not int or segment_steps != 400
+                or type(material_slots) is not int or material_slots != 16
+                or type(preload_steps) is not int or preload_steps != 0 or preload_execution != "fused"
+                or type(delay_ms) not in (int, float) or delay_ms != 0 or role_config is not None
+                or tcp_nodelay is not None or commit_policy != "default"
+                or not gc.isenabled() or gc.get_threshold() != (700, 10, 10)
+                or gc.get_freeze_count() or gc.get_debug() or gc.callbacks):
+            raise ValueError("S15只允许独立正常GC的本机worker/cycle/batch/light/1..1000/400/16/默认裸TCP。")
+        return _run_material_comparison({**options, "qpc_stage_receive_candidate": True}, "worker", target_steps=steps)
     if server_gc_candidate or stage_wait_diagnostic or compact_history_candidate:
         if (optimized is not True or recording_mode != "light" or diagnostic is not False
                 or sum((server_gc_candidate, stage_wait_diagnostic, compact_history_candidate)) != 1
@@ -2660,7 +2830,8 @@ def _finish_stage_wait(result, report, metadata, observers):
             return (isinstance(state, dict) and state.get("enabled") is True and state.get("threshold") == [700, 10, 10]
                     and state.get("freeze_count") == 0 and state.get("debug") == 0)
         return (role.get("hooks_restored") is True and role.get("observation_error_type") is None
-            and role.get("format_version") == 1 and role.get("profile") == "stage-wait-light-v1"
+            and role.get("format_version") == 1 and role.get("profile") == (
+                metadata.get("profile", "stage-wait-light-v1") if role.get("role") == "Client" else "stage-wait-light-v1")
             and role.get("budget_failed") is False and observation.get("error_type") is None
             and observation.get("callback_and_hook_restored") is True and observation.get("budget_failed") is False
             and normal(observation.get("gc_before")) and normal(observation.get("gc_after"))
@@ -2676,8 +2847,9 @@ def _finish_stage_wait(result, report, metadata, observers):
         and (material.get("worker") or {}).get("memory_guard_failed") is False
         and (result.get("failure_category") not in {"LocalhostTransportTimeout", "LocalhostTransportDisconnected"}
              or metadata["first_io_error_observed"]))
-    descriptor = {"profile": "stage-wait-light-v1", "roles_location": "stage_wait_diagnostic.roles",
-                  "scope": "stage and first I/O error; no S10 heavy probes"}
+    descriptor = {"profile": metadata.get("profile", "stage-wait-light-v1"), "roles_location": "stage_wait_diagnostic.roles",
+                  "scope": ("S15 nonblocking stage receive/select QPC; first I/O and original GC" if
+                    metadata.get("profile") == "qpc-stage-receive-v1" else "stage and first I/O error; no S10 heavy probes")}
     def size():
         for _ in range(3):
             metadata["encoded_bytes"] = len(json.dumps({"stage_wait_diagnostic": metadata,
@@ -2690,18 +2862,23 @@ def _finish_stage_wait(result, report, metadata, observers):
             role["events"] = []
             # 普通事件去除后同时移除无引用身份，首错/外层错/在途引用原样重映射。
             old_contexts, contexts = role.get("contexts", []), []
-            def packed(row, old_contexts=old_contexts, contexts=contexts):
+            def packed(row, old_contexts=old_contexts, contexts=contexts, context_index=9):
                 if row is None:
                     return None
                 row = list(row)
-                if row[9] is not None:
-                    context = old_contexts[row[9]]
+                if row[context_index] is not None:
+                    context = old_contexts[row[context_index]]
                     if context not in contexts:
                         contexts.append(context)
-                    row[9] = contexts.index(context)
+                    row[context_index] = contexts.index(context)
                 return row
             role.update(first_failure=packed(role.get("first_failure")), outer_failure=packed(role.get("outer_failure")),
                         in_flight=[packed(row) for row in role.get("in_flight", [])], contexts=contexts)
+            if role.get("qpc_receive") is not None:
+                receive = role["qpc_receive"]
+                receive.update(events=[packed(row, context_index=5) for row in receive["events"]],
+                    first_anomaly=packed(receive["first_anomaly"], context_index=5),
+                    first_exception=packed(receive["first_exception"], context_index=5))
             for _ in range(3):
                 role["encoded_bytes"] = len(json.dumps(role, separators=(",", ":"), allow_nan=False).encode())
         size()
@@ -2713,11 +2890,11 @@ def _finish_stage_wait(result, report, metadata, observers):
         result.update(status="failed", failure_category="StageWaitObservation", failed_phase="DIAGNOSTIC_REPORT")
 
 
-def _compact_sample_pass(result, report, metadata):
+def _compact_sample_pass(result, report, metadata, *, target_steps=4000):
     """复用原身份/材料检查；独立补充本候选的数值、维护和观察完整性。"""
     if not (metadata["representation_complete"] and metadata["thread_registration_complete"]
             and (result.get("stage_wait_diagnostic") or {}).get("evidence_complete") is True
-            and _material_run_gate(result, report, "worker", 4000, strict=True, numeric_key="stage_wait_diagnostic")):
+            and _material_run_gate(result, report, "worker", target_steps, strict=True, numeric_key="stage_wait_diagnostic")):
         return False
     numeric = metadata["numeric_contract"] or {}
     if any(numeric.get(k) != v for k, v in (("block_steps", 19), ("parameter_bits", 40), ("runtime_payload_bits", 46))):
@@ -2736,18 +2913,18 @@ def _compact_sample_pass(result, report, metadata):
     if any(type(result["cycle_summary"].get(k)) is not int for k in ("attempts", "misses")):
         return False
     rows = result.get("steps", [])
-    if len(rows) != 4000 or any(r.get("status") != "confirmed" or r.get("global_step") != step
+    if len(rows) != target_steps or any(r.get("status") != "confirmed" or r.get("global_step") != step
             or r.get("session_id") != result["cycles"][step]["session_id"]
             or r.get("round_id") != result["cycles"][step]["round_id"] for step, r in enumerate(rows)):
         return False
     for role in metadata["roles"]:
-        if role["tables"]["steps"]["captured"] != 4000 or role["tables"]["steps"]["expanded"] != 4000:
+        if role["tables"]["steps"]["captured"] != target_steps or role["tables"]["steps"]["expanded"] != target_steps:
             return False
-        if role["role"] == "Client" and (role["tables"]["cycles"]["captured"] != 4000
-                                         or role["tables"]["cycles"]["expanded"] != 4000):
+        if role["role"] == "Client" and (role["tables"]["cycles"]["captured"] != target_steps
+                                         or role["tables"]["cycles"]["expanded"] != target_steps):
             return False
     maintenance = [r for r in result["cycles"] if "maintenance" in r.get("phase_durations_ns", {})]
-    return ({r["global_step"] for r in maintenance} == set(range(399, 3999, 400))
+    return ({r["global_step"] for r in maintenance} == set(range(399, target_steps-1, 400))
         and all(type(r["phase_durations_ns"]["maintenance"]) is int and r["phase_durations_ns"]["maintenance"] >= 0
                 for r in maintenance)
         and all((r.get("gc") or {}).get("normal_stop_ack_sent") is True
@@ -2780,7 +2957,7 @@ def _compact_gc_boundary(cycles, roles):
         "scope": "local QPC; post-callback guard to STOPPING is unknown; no deadline fallback"}
 
 
-def _finish_compact_history(result, report, history):
+def _finish_compact_history(result, report, history, *, qpc_stage_receive_candidate=False):
     """S13完整展开与有限样本检查独立记账，绝不借用原资格flag。"""
     if history is not None and history.expansion_ns is None:
         expanded = history.expand()
@@ -2793,7 +2970,8 @@ def _finish_compact_history(result, report, history):
     cycles = result.get("cycles", [])
     attempts = (result.get("cycle_summary") or {}).get("attempts", len(cycles))
     stage = result.get("stage_wait_diagnostic") or {}
-    meta = {"format_version": 1, "target_steps": 4000, "maximum_attempts": 4000,
+    target = result.get("requested_steps", 1000) if qpc_stage_receive_candidate else 4000
+    meta = {"format_version": 1, "target_steps": target, "maximum_attempts": 1000 if qpc_stage_receive_candidate else 4000,
         "first_failure_stop": True, "actual_attempts": attempts, "captured_cycles": len(cycles),
         "failed_attempts": result.get("failed_attempts"), "invocation_budget_consumed": True,
         "field_codec": "checked-u64-binary64-utf8-presence-v1",
@@ -2803,6 +2981,8 @@ def _finish_compact_history(result, report, history):
         "finite_sample_pass": False, "thread_registration_complete": False,
         "runtime_gen2_coverage": {}, "gc_thread_matches": []}
     meta["combined_reserved_bound_bytes"] = sum((r.get("layout") or {}).get("reserved_bound_bytes", 0) for r in roles)
+    if qpc_stage_receive_candidate:
+        meta.update(profile="qpc-stage-receive-v1", qpc_receive_location="stage_wait_diagnostic.roles[Client].qpc_receive")
     meta["representation_complete"] = (len(roles) == 3 and {r.get("role") for r in roles} == {"Client", "P1", "P2"}
         and all(r.get("representation_complete") is True and r.get("layout", {}).get("reserved_bound_bytes", 2**63)
                 <= 16*1024*1024 for r in roles) and meta["combined_reserved_bound_bytes"] <= 48*1024*1024
@@ -2841,13 +3021,26 @@ def _finish_compact_history(result, report, history):
                 "pid": match[0]["pid"] if len(match) == 1 else None,
                 "classification": classification, "coverage_evidence_complete": reliable,
                 "scope": "registered identity/lifetime; not allocation stack or exclusive CPU"})
-    result["compact_history_candidate"] = meta
+    result["qpc_stage_receive_candidate" if qpc_stage_receive_candidate else "compact_history_candidate"] = meta
     if result.get("status") == "stopped" and not meta["representation_complete"]:
         result.update(status="failed", failure_category="CompactHistoryObservation", failed_phase="HISTORY_EXPANSION")
     try:
-        meta["finite_sample_pass"] = _compact_sample_pass(result, report, meta)
+        meta["finite_sample_pass"] = _compact_sample_pass(result, report, meta, target_steps=target)
+        if qpc_stage_receive_candidate:
+            client = next((r for r in stage.get("roles", []) if r.get("role") == "Client"), {})
+            receive = client.get("qpc_receive") or {}
+            meta["finite_sample_pass"] = (meta["finite_sample_pass"] and stage.get("profile") == "qpc-stage-receive-v1"
+                and client.get("profile") == "qpc-stage-receive-v1"
+                and all(type(receive.get(k)) is int and receive[k] >= 0 for k in
+                    ("selected_exact_calls", "completed_exact_calls", "empty_count", "would_block_count",
+                     "no_progress_guard_count", "evicted_count", "encoded_omitted"))
+                and receive.get("selected_exact_calls") == receive.get("completed_exact_calls") == 4*target
+                and receive.get("first_exception") is None and receive.get("restore_error_type") is None
+                and receive.get("no_progress_guard_count") == receive.get("encoded_omitted") == 0)
     except (KeyError, TypeError, ValueError, IndexError):
         meta["finite_sample_pass"] = False
+    if qpc_stage_receive_candidate and result.get("status") == "stopped" and not meta["finite_sample_pass"]:
+        result.update(status="failed", failure_category="QPCReceiveObservation", failed_phase="QPC_RECEIVE_REPORT")
     result.update(diagnostic=True, comparison_only=True, server_gc_candidate_gate_pass=False,
                   candidate_gate_pass=False, worker_long_run_gate_pass=False, stage_pass=False, qualification_pass=False)
 
@@ -2861,7 +3054,8 @@ def _run_material_comparison(options, candidate, *, target_steps=1000):
     started_cpu = time.process_time_ns()
     wait_diagnostic = options.get("worker_wait_diagnostic", False)
     server_gc_candidate = options.get("server_gc_candidate", False)
-    compact_candidate = options.get("compact_history_candidate", False)
+    qpc_candidate = options.get("qpc_stage_receive_candidate", False)
+    compact_candidate = options.get("compact_history_candidate", False) or qpc_candidate
     history = None
     stage_wait_diagnostic = options.get("stage_wait_diagnostic", False) or compact_candidate
     if compact_candidate:
@@ -2876,7 +3070,8 @@ def _run_material_comparison(options, candidate, *, target_steps=1000):
                      "numeric_contract": None} if wait_diagnostic else None
     server_gc_metadata = {"format_version": 1, "target_steps": 4000, "maximum_attempts": 4000,
         "first_failure_stop": True, "numeric_contract": None} if server_gc_candidate else None
-    stage_metadata = {"format_version": 1, "profile": "stage-wait-light-v1", "maximum_attempts": 4000,
+    stage_metadata = {"format_version": 1, "profile": "qpc-stage-receive-v1" if qpc_candidate else "stage-wait-light-v1",
+        "maximum_attempts": 1000 if qpc_candidate else 4000,
         "first_failure_stop": True, "numeric_contract": None} if stage_wait_diagnostic else None
     stage_observers = []
     trace_observers = []
@@ -2924,7 +3119,7 @@ def _run_material_comparison(options, candidate, *, target_steps=1000):
     try:
         with ExitStack() as cleanup:
             if compact_candidate:
-                history = _CompactHistory("Client")
+                history = _CompactHistory("Client", target_steps if qpc_candidate else 4000)
             cleanup.enter_context(patch.object(lan_runtime.LanContinuousRuntime, "close", close))
             if history is not None:
                 cleanup.enter_context(patch.object(lan_runtime._MaterialWorkerPool, "__init__", initialized))
@@ -2973,7 +3168,7 @@ def _run_material_comparison(options, candidate, *, target_steps=1000):
     if stage_wait_diagnostic:
         _finish_stage_wait(result, report, stage_metadata, stage_observers)
     if compact_candidate:
-        _finish_compact_history(result, report, history)
+        _finish_compact_history(result, report, history, **({"qpc_stage_receive_candidate": True} if qpc_candidate else {}))
     if traced:
         result["diagnostic"] = True
         if result.get("diagnostic_report") is None:
@@ -3042,7 +3237,8 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
                                _register_trace_cleanup=None, _trace_observers=None,
                                _long_run_metadata=None, worker_wait_diagnostic=False,
                                server_gc_candidate=False, stage_wait_diagnostic=False, _stage_observers=None,
-                               compact_history_candidate=False, _compact_history=None) -> dict[str, object]:
+                               compact_history_candidate=False, _compact_history=None,
+                               qpc_stage_receive_candidate=False) -> dict[str, object]:
     """实际持续动态循环及原同步 writer；退出后报告观察，不发布图或更改调度。"""
     from secure_control.execution.lan_runtime import RunControl
     from secure_control.scenarios.cart_pole.interactive import InteractiveSession
@@ -3063,7 +3259,7 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
     if type(recording_mode) is not str or recording_mode not in ("light", "full") or recording_mode == "light" and not optimized:
         raise ValueError("轻量记录只支持cycle动态持续观察。")
     light = recording_mode == "light"
-    minimum = 1 if diagnostic else 2
+    minimum = 1 if diagnostic or qpc_stage_receive_candidate else 2
     if type(diagnostic) is not bool or (diagnostic and (not optimized or role_config is not None)):
         raise ValueError("有限诊断只支持本机canonical cycle观察。")
     if type(steps) is not int or not minimum <= steps <= maximum:
@@ -3083,6 +3279,8 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
                               or worker_wait_diagnostic))
     ports = _ports()
     config = _config("Client", ports) if role_config is None else load_lan_config(role_config, "Client")
+    if qpc_stage_receive_candidate and config.transport != "insecure_tcp":
+        raise ValueError("S15不适用于TLS或未知传输。")
     if role_config is not None:
         ports = tuple(endpoint.port for endpoint in (
             config.topology.p1_client, config.topology.p2_client, config.topology.p1_peer,
@@ -3109,7 +3307,8 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
     parties = [context.Process(target=_party_job, args=(
         _config(role, ports), ports, delay_ms, True, queue, diagnostic, False, tcp_nodelay,
         supply_diagnostic, timeout_trace, material_candidate is not None, worker_wait_diagnostic, server_gc_candidate,
-        stage_wait_diagnostic, compact_history_candidate,
+        stage_wait_diagnostic, compact_history_candidate or qpc_stage_receive_candidate,
+        steps if qpc_stage_receive_candidate else 4000,
     )) for role in ("P1", "P2")] if role_config is None else []
     records, events, outcomes, writer_batches = [], [], [], []
     history = _compact_history
@@ -3133,15 +3332,18 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
             _trace_observers.append(diagnostic_observer)
         socket_close = register_cleanup(socket_context.close)
         socket_context.enter_context(diagnostic_observer.sockets())
-    counts, activity, restore = _meter("Client", ports, delay_ms, diagnostic=diagnostic_observer)
+    qpc_observer = (_StageWaitDiagnostic("Client", ports, gc_observer=_ServerGCObservation("Client"),
+                    qpc_receive_candidate=True) if qpc_stage_receive_candidate else None)
+    counts, activity, restore = _meter("Client", ports, delay_ms, diagnostic=diagnostic_observer,
+        **({"qpc_receiver": qpc_observer.qpc_receive} if qpc_observer else {}))
     if register_cleanup:
         restore = register_cleanup(restore)
     stage_wait, stage_close = None, None
     if stage_wait_diagnostic:
         stage_context = ExitStack()
         stage_close = register_cleanup(stage_context.close)
-        client_gc = _ServerGCObservation("Client")
-        stage_wait = _StageWaitDiagnostic("Client", ports, gc_observer=client_gc)
+        client_gc = qpc_observer.gc_observer if qpc_observer else _ServerGCObservation("Client")
+        stage_wait = qpc_observer or _StageWaitDiagnostic("Client", ports, gc_observer=client_gc)
         _stage_observers.append(stage_wait)
         stage_context.enter_context(client_gc.installed(server_startup=False))
         stage_context.enter_context(stage_wait.installed())

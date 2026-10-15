@@ -4031,8 +4031,7 @@ def test_s13_thread_registry_uses_only_original_factory_identity_and_observed_li
         history.worker_threads(pool)
 
 
-@pytest.mark.parametrize("fault", ("input", "transport", "after_apply", "stop", "maintenance", "callback_gc", "callback_miss"))
-def test_s13_real_callbacks_match_original_and_canonical_late_tail_without_live_roles(monkeypatch, fault):
+def _check_history_real_callbacks(monkeypatch, fault, *, qpc=False):
     from secure_control.execution import lan_runtime
     from secure_control.execution.cycle_timing import (
         AbsoluteCycleClock,
@@ -4162,8 +4161,10 @@ def test_s13_real_callbacks_match_original_and_canonical_late_tail_without_live_
                 patcher.setattr(bench, "asdict", no_asdict)
                 patcher.setattr(bench, "replace", no_timing_replace)
                 patcher.setattr(bench._CompactHistory, "cycle", history_cycle)
-            result = bench.run_continuous_observation(steps=4000, delay_ms=0, segment_steps=400, optimized=True,
-                recording_mode="light", **({"compact_history_candidate": True} if compact else {"stage_wait_diagnostic": True}))
+            result = bench.run_continuous_observation(steps=1000 if qpc and compact else 4000,
+                delay_ms=0, segment_steps=400, optimized=True, recording_mode="light",
+                **({"qpc_stage_receive_candidate" if qpc else "compact_history_candidate": True}
+                    if compact else {"stage_wait_diagnostic": True}))
             assert _s12_hook_snapshot() == before and samples[0] == 3
             assert len(result["cycles"]) == 3 and not result["qualification_pass"]
             successful = fault in ("stop", "maintenance", "callback_gc")
@@ -4181,9 +4182,11 @@ def test_s13_real_callbacks_match_original_and_canonical_late_tail_without_live_
                 assert result["cycles"][-1]["status"] == "miss_after_apply"
                 assert result["failed_phase"] == "CYCLE_OBSERVATION" and len(result["steps"]) == 3
             if compact:
-                meta = result["compact_history_candidate"]
+                meta = result["qpc_stage_receive_candidate" if qpc else "compact_history_candidate"]
                 assert meta["invocation_budget_consumed"] and not meta["finite_sample_pass"]
                 assert meta["roles"][0]["tables"]["cycles"]["captured"] == 3
+                if qpc:
+                    assert meta["roles"][0]["layout"]["tables"]["cycles"]["capacity"] == 1001
                 boundary = meta["control_observation_boundary"]
                 assert boundary["control_boundary_valid"]
                 assert boundary["last_confirmed_step"] == (2 if successful or fault in ("after_apply", "callback_miss") else 1)
@@ -4198,6 +4201,16 @@ def test_s13_real_callbacks_match_original_and_canonical_late_tail_without_live_
         exercise(True)  # 真实on_cycle内注入公开虚拟GC时段，不启动角色或主动GC。
     else:
         assert exercise(False) == exercise(True)
+
+
+@pytest.mark.parametrize("fault", ("input", "transport", "after_apply", "stop", "maintenance", "callback_gc", "callback_miss"))
+def test_s13_real_callbacks_match_original_and_canonical_late_tail_without_live_roles(monkeypatch, fault):
+    _check_history_real_callbacks(monkeypatch, fault)
+
+
+@pytest.mark.parametrize("fault", ("input", "transport", "after_apply"))
+def test_s15_real_runner_preserves_failure_prefix_and_observation_deadline(monkeypatch, fault):
+    _check_history_real_callbacks(monkeypatch, fault, qpc=True)
 
 
 def test_s13_role_export_failure_keeps_original_control_error_and_restores_hooks(monkeypatch):
@@ -4389,3 +4402,432 @@ def test_s13_initialization_failure_does_not_start_roles_and_restores_factory(mo
     assert not result["compact_history_candidate"]["finite_sample_pass"]
     assert result["compact_history_candidate"]["invocation_budget_consumed"]
     assert _s12_hook_snapshot() == before and lan_runtime._MaterialWorkerPool.__init__ is factory
+
+
+def test_s15_early_empty_continues_same_frame_under_original_deadline(monkeypatch):
+    f = _s15_receive_fixture(monkeypatch, [b"test"], waits=[(3000000, "empty"), (4000000, "ready")])
+    assert f.observer.qpc_receive(f.original, f.probe, 4, f.deadline) == b"test"
+    assert f.raw.read_lengths == [4] and f.raw.timeout == .5 and [r[1] for r in f.selected] == [.011, .008]
+    report = f.observer.report()
+    assert report["profile"] == "qpc-stage-receive-v1" and report["qpc_receive"]["empty_count"] == 1
+    assert report["qpc_receive"]["completed_exact_calls"] == 1
+    assert report["qpc_receive"]["first_exception"] is None
+
+
+def _s15_receive_fixture(monkeypatch, chunks, *, deadline_ns=11000000, waits=(), restore_error=None,
+                         recv_delay_ns=0, restore_delay_ns=0):
+    """可控时钟/假裸socket，只调用真实观察与framing，不打开网络或执行控制。"""
+    from secure_control.execution.cycle_timing import _CycleDeadline
+    from secure_control.experiments import communication_benchmark as bench
+
+    now, selected, remaining_chunks, remaining_waits = [0], [], list(chunks), list(waits)
+    class RawSocket:
+        def __init__(self):
+            self.timeout, self.read_lengths, self.mode_changes = .5, [], []
+        def gettimeout(self):
+            return self.timeout
+        def getpeername(self):
+            return "127.0.0.1", 101
+        def getsockname(self):
+            return "127.0.0.1", 9000
+        def settimeout(self, value):
+            self.mode_changes.append(value)
+            if value == .5:
+                now[0] += restore_delay_ns
+                if restore_error is not None:
+                    raise restore_error
+            self.timeout = value
+        def recv(self, length):
+            assert self.timeout == 0
+            self.read_lengths.append(length)
+            now[0] += recv_delay_ns
+            assert remaining_chunks, "不能重读/重发或超出批准的同一frame数据"
+            value = remaining_chunks.pop(0)
+            if isinstance(value, BaseException):
+                raise value
+            assert len(value) <= length
+            return value
+        def send(self, *args):
+            pytest.fail("候选接收不得重发事务")
+    raw = RawSocket()
+    def ready(read, write, errors, timeout):
+        assert read == [raw] and not write and not errors and timeout > 0 and raw.timeout == 0
+        selected.append((now[0], timeout))
+        delta, kind = remaining_waits.pop(0) if remaining_waits else (1000000, "ready")
+        now[0] += delta
+        if isinstance(kind, BaseException):
+            raise kind
+        return ([raw] if kind == "ready" else [], [], [])
+    monkeypatch.setattr(bench.socket, "socket", RawSocket)
+    monkeypatch.setattr(bench.select, "select", ready)
+    monkeypatch.setattr(bench.time, "perf_counter_ns", lambda: now[0])
+    observer = bench._StageWaitDiagnostic("Client", (101, 102, 103), qpc_receive_candidate=True)
+    context = ("expected_from_validated_stage_plan", "Client", "P1", "stage", None,
+               "session", "round", 0, 1, "run", "epoch", 0, 0)
+    observer.state.phase, observer.state.context = "finish_stage_batch", context
+    probe = bench._StageTraceSocket(raw, observer, "P1")
+    probe.context = ("expected_from_last_request", "Client", "P1", "endpoint", "stage_batch", *context[5:])
+    probe.direction, probe.part, probe.deadline = "P1->Client", "header", _CycleDeadline(deadline_ns)
+    probe.frame_requested = 4
+    def forbidden(*args):
+        pytest.fail("选择当前候选后不能回退原生timeout循环")
+    return SimpleNamespace(now=now, raw=raw, observer=observer, probe=probe, deadline=probe.deadline,
+                           selected=selected, original=forbidden, remaining_chunks=remaining_chunks)
+
+
+@pytest.mark.parametrize("case", ("expired", "select_equal", "select_late", "recv_equal", "recv_late", "restore_equal"))
+def test_s15_original_deadline_checked_before_after_wait_read_and_restore(monkeypatch, case):
+    from secure_control.execution.localhost_transport import LocalhostTransportTimeout
+
+    waits = [(11000000 if case == "select_equal" else 12000000, "ready")] if case.startswith("select") else ()
+    f = _s15_receive_fixture(monkeypatch, [b"data"], waits=waits,
+        recv_delay_ns=10000000 if case == "recv_equal" else 11000000 if case == "recv_late" else 0,
+        restore_delay_ns=10000000 if case == "restore_equal" else 0)
+    if case == "expired":
+        f.now[0] = 11000000
+    with pytest.raises(LocalhostTransportTimeout):
+        f.observer.qpc_receive(f.original, f.probe, 4, f.deadline)
+    assert len(f.raw.read_lengths) == (1 if case.startswith("recv") or case == "restore_equal" else 0)
+    assert f.raw.timeout == .5 and f.observer.qpc_completed == 0
+    report = f.observer.report()
+    row = dict(zip(f.observer.QPC_FIELDS, report["qpc_receive"]["first_exception"], strict=True))
+    assert row["outcome"] == "deadline" and row["deadline_ns"] == 11000000
+
+
+@pytest.mark.parametrize("case", ("empty_guard", "would_block_guard", "eof", "native_timeout", "native_oserror",
+                                  "select_error", "restore_only", "primary_and_restore", "progress_resets"))
+def test_s15_no_progress_errors_and_restoration_preserve_first_error(monkeypatch, case):
+    from secure_control.execution.localhost_transport import (
+        LocalhostTransportDisconnected,
+        LocalhostTransportError,
+        LocalhostTransportTimeout,
+    )
+
+    original = TimeoutError("private native text") if case in ("native_timeout", "primary_and_restore") else OSError(10054, "private socket text")
+    restore = OSError(9, "private restore text") if case in ("restore_only", "primary_and_restore") else None
+    chunks, waits, expected = [b"data"], (), OSError
+    if case == "empty_guard":
+        chunks, waits, expected = [], [(1000000, "empty")] * 8, LocalhostTransportError
+    elif case == "would_block_guard":
+        chunks, expected = [BlockingIOError()] * 8, LocalhostTransportError
+    elif case == "eof":
+        chunks, expected = [b"ab", b""], LocalhostTransportDisconnected
+    elif case in ("native_timeout", "primary_and_restore"):
+        chunks, expected = [original], LocalhostTransportTimeout
+    elif case == "native_oserror":
+        chunks, expected = [b"a", original], LocalhostTransportDisconnected
+    elif case == "select_error":
+        chunks, waits, expected = [], [(1000000, original)], LocalhostTransportDisconnected
+    elif case == "progress_resets":
+        chunks = [BlockingIOError()] * 7 + [b"ab"] + [BlockingIOError()] * 7 + [b"cd"]
+    f = _s15_receive_fixture(monkeypatch, chunks, waits=waits, restore_error=restore,
+                            deadline_ns=100000000 if case == "progress_resets" else 11000000)
+    if case == "progress_resets":
+        assert f.observer.qpc_receive(f.original, f.probe, 4, f.deadline) == b"abcd"
+        assert len(f.selected) == 16 and f.observer.qpc_would_block == 14 and f.observer.first_failure is None
+    else:
+        with pytest.raises(expected) as caught:
+            f.observer.qpc_receive(f.original, f.probe, 4, f.deadline)
+        if case in ("native_timeout", "primary_and_restore", "native_oserror", "select_error"):
+            assert caught.value.__cause__ is original
+        if case in ("empty_guard", "would_block_guard"):
+            assert type(caught.value) is LocalhostTransportError and len(f.selected) == 8 and f.now[0] < 11000000
+        if case == "primary_and_restore":
+            assert f.observer.first_failure[13] == "TimeoutError"
+        assert f.observer.qpc_completed == 0
+    report = f.observer.report()
+    assert len(report["qpc_receive"]["events"]) <= 16 and report["qpc_receive"]["encoded_omitted"] == 0
+    assert report["qpc_receive"]["restore_error_type"] == ("OSError" if restore else None)
+    assert f.raw.timeout == (0 if restore else .5)
+    assert "private" not in str(report)
+
+
+def test_s15_real_framing_partial_header_body_meter_and_restore(monkeypatch):
+    import struct
+
+    from secure_control.execution import localhost_transport
+
+    f = _s15_receive_fixture(monkeypatch, [b"\x00", b"\x00\x00\x04", b"d", b"at", b"a"], deadline_ns=100000000)
+    monkeypatch.setattr(localhost_transport, "_receive_exact", lambda sock, length, deadline:
+        f.observer.frame(lambda probe, n, d: f.observer.qpc_receive(f.original, probe, n, d),
+                         sock, length, deadline, sending=False))
+    f.observer.contexts[("Client", "P1")] = f.probe.context
+    assert localhost_transport.receive_frame(f.raw, deadline=f.deadline, limit=4) == b"data"
+    assert f.raw.read_lengths == [4, 3, 4, 3, 1] and f.observer.qpc_completed == 2 and f.raw.timeout == .5
+    for header in (0, 5):
+        f = _s15_receive_fixture(monkeypatch, [struct.pack("!I", header)], deadline_ns=100000000)
+        f.observer.contexts[("Client", "P1")] = f.probe.context
+        with pytest.raises(localhost_transport.LocalhostTransportProtocolError):
+            localhost_transport.receive_frame(f.raw, deadline=f.deadline, limit=4)
+        assert f.raw.read_lengths == [4]
+
+
+def test_s15_scope_and_default_guard_before_ports_and_cli(monkeypatch, tmp_path):
+    import sys
+
+    from secure_control.experiments import communication_benchmark as bench
+    from secure_control.experiments import lan_runner
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("非法选择不得建端口/角色/材料")
+    monkeypatch.setattr(bench, "_ports", forbidden)
+    valid = {"steps": 1000, "delay_ms": 0, "segment_steps": 400, "material_slots": 16,
+             "recording_mode": "light", "optimized": True, "qpc_stage_receive_candidate": True}
+    for change in ({"qpc_stage_receive_candidate": 1}, {"steps": 1001}, {"steps": True}, {"steps": 0},
+                   {"compact_history_candidate": True}, {"stage_wait_diagnostic": True}, {"server_gc_candidate": True},
+                   {"worker_long_run": True}, {"diagnostic": True}, {"timeout_trace": True}, {"preload_steps": 1},
+                   {"preload_execution": "staged"}, {"role_config": "tls.yaml"}, {"tcp_nodelay": False},
+                   {"segment_steps": 1000}, {"material_slots": 4}, {"delay_ms": 1}, {"recording_mode": "full"}):
+        with pytest.raises((TypeError, ValueError)):
+            bench.run_continuous_observation(**(valid | change))
+    selected = []
+    monkeypatch.setattr(bench, "_run_material_comparison", lambda options, candidate, **kwargs:
+        selected.append((options, candidate, kwargs)) or {"status": "stopped"})
+    bench.run_continuous_observation(**valid)
+    assert selected[0][1:] == ("worker", {"target_steps": 1000}) and selected[0][0]["qpc_stage_receive_candidate"]
+    calls = []
+    monkeypatch.setattr(bench, "run_continuous_observation", lambda **kwargs:
+        calls.append(kwargs) or {"status": "stopped", "cycle_timing": {"p50_ms": None}})
+    args = ["secure-control", "benchmark", "--qpc-stage-receive-candidate", "--steps", "1000", "--output", str(tmp_path / "result.json")]
+    for bad in (["--case", "dynamic"], ["--case", "cycle", "--mode", "legacy"], ["--case", "cycle", "--fixed-proof-cache"]):
+        monkeypatch.setattr(sys, "argv", args + bad)
+        assert lan_runner._run() == 5 and not calls
+    monkeypatch.setattr(sys, "argv", args + ["--case", "cycle", "--mode", "batch"])
+    assert lan_runner._run() == 0 and calls[0]["qpc_stage_receive_candidate"] is True
+
+
+def test_s15_meter_keeps_original_receive_cost_and_restores_hooks(monkeypatch):
+    from secure_control.execution import localhost_transport
+    from secure_control.experiments import communication_benchmark as bench
+
+    f = _s15_receive_fixture(monkeypatch, [b"\x00\x00\x00\x04", b"data"])
+    before = _s12_hook_snapshot()
+    _, activity, restore = bench._meter("Client", (101, 102, 103), 0, qpc_receiver=f.observer.qpc_receive)
+    try:
+        with f.observer.installed():
+            f.observer.contexts[("Client", "P1")] = f.probe.context
+            assert localhost_transport.receive_frame(f.raw, deadline=f.deadline, limit=4) == b"data"
+    finally:
+        restore()
+    assert _s12_hook_snapshot() == before and activity["receive_ms"] == 2.0 and f.observer.qpc_completed == 2
+    report = f.observer.report()
+    assert report["hooks_restored"] and report["first_failure"] is None and f.raw.timeout == .5
+    native = [dict(zip(f.observer.FIELDS, e, strict=True)) for e in report["events"] if e[1] == "recv"]
+    assert len(native) == 2
+    assert all(dict(zip(f.observer.ENTRY_FIELDS, e["entry"], strict=True))["observed_timeout_s"] == 0 for e in native)
+    assert all(dict(zip(f.observer.ENTRY_FIELDS, e["entry"], strict=True))["requested_timeout_s"] == 0 for e in native)
+
+
+@pytest.mark.parametrize("case", ("phase", "off", "peer", "legacy", "bool_deadline", "context", "tls", "foreign_socket"))
+def test_s15_exact_scope_rejects_unknown_and_passes_unselected_once(monkeypatch, case):
+    f = _s15_receive_fixture(monkeypatch, [b"data"])
+    marker, calls = object(), []
+    def original(*args):
+        calls.append(args)
+        return marker
+    if case == "phase":
+        f.observer.state.phase = "online_wait_P1"
+    elif case == "off":
+        f.observer.qpc_receive_candidate = False
+    elif case == "peer":
+        f.probe.peer = "unknown"
+    elif case == "legacy":
+        f.deadline = 3.
+    elif case == "bool_deadline":
+        f.deadline.deadline_ns = True
+    elif case == "context":
+        f.probe.context = (*f.probe.context[:6], "other-round", *f.probe.context[7:])
+    elif case == "tls":
+        class TLS(type(f.raw)):
+            pass
+        f.raw.__class__ = TLS
+    elif case == "foreign_socket":
+        f.raw.getpeername = lambda: ("127.0.0.1", 9999)
+    if case in ("phase", "off"):
+        assert f.observer.qpc_receive(original, f.probe, 4, f.deadline) is marker and len(calls) == 1
+    else:
+        with pytest.raises(ValueError):
+            f.observer.qpc_receive(original, f.probe, 4, f.deadline)
+        assert not calls
+    assert not f.selected and not f.raw.mode_changes
+
+
+def test_s15_startup_failure_keeps_new_profile_and_never_starts_roles(monkeypatch):
+    from secure_control.execution import lan_runtime
+    from secure_control.experiments import communication_benchmark as bench
+
+    before, factory = _s12_hook_snapshot(), lan_runtime._MaterialWorkerPool.__init__
+    def forbidden(*args):
+        pytest.fail("预分配保护失败不能启动角色/网络")
+    monkeypatch.setattr(bench, "_ports", forbidden)
+    monkeypatch.setattr(bench, "_process_memory", lambda: {"current_rss_bytes": 257*1024**2})
+    result = bench.run_continuous_observation(steps=1000, delay_ms=0, segment_steps=400,
+        optimized=True, recording_mode="light", qpc_stage_receive_candidate=True)
+    assert result["failure_category"] == "RuntimeError" and result["cycles"] == []
+    meta = result["qpc_stage_receive_candidate"]
+    assert meta["profile"] == "qpc-stage-receive-v1" and meta["target_steps"] == meta["maximum_attempts"] == 1000
+    assert not meta["finite_sample_pass"] and meta["actual_attempts"] == 0
+    assert "compact_history_candidate" not in result and _s12_hook_snapshot() == before
+    assert lan_runtime._MaterialWorkerPool.__init__ is factory
+
+
+def test_s15_finite_gate_requires_own_profile_full_route_and_maintenance_without_weakening_s13():
+    from copy import deepcopy
+
+    from secure_control.experiments import communication_benchmark as bench
+
+    base, numeric = _s11_public_result()
+    base["cycles"] = base["cycles"][:1000]
+    base.update(requested_steps=1000, successful_steps=1000, protocol_committed_count=1000,
+        physically_confirmed_count=1000, cycle_summary={"attempts": 1000, "misses": 0},
+        resource_counts={"products_consumed": 30000, "truncations_consumed": 4000},
+        numeric_profile={"fractional_bits": 32, "security_parameter": 80, "period_s": .02,
+                         "modulus_bits": 256, "state_dimension": 4, "input_dimension": 2, "output_dimension": 1})
+    base["steps"] = [{"global_step": c["global_step"], "session_id": c["session_id"],
+                      "round_id": c["round_id"], "status": "confirmed"} for c in base["cycles"]]
+    base["material_summary"].update(claimed=1000, generated_received=1016)
+    base["last_commit_observation"].update(round_id="round-999", step=999, global_step=999)
+    def history_report(role):
+        threads = [{"thread_role": name, "pid": 10, "native_id": native, "registered_at_qpc_ns": 0,
+                    "observation_end_qpc_ns": 80000000000} for name, native in
+                   (("control", 1), ("material-receiver", 99), ("material-credit", 100))
+                   if role == "Client" or name == "control"]
+        return {"role": role, "representation_complete": True, "layout": {"reserved_bound_bytes": 100},
+            "tables": {k: {"captured": 1000, "expanded": 1000} for k in ("steps", "cycles")}, "threads": threads,
+            "control_observation": {"last_confirmed_step": 999,
+                "last_confirmed_return_qpc_ns": base["cycles"][-1]["cycle_completed_ns"]+1,
+                "normal_stop_start_qpc_ns": base["cycles"][-1]["cycle_completed_ns"]+2}}
+    sample = {"memory_guard_failed": False, "cleanup_failed": False, "producer_exited": True}
+    for fault in ("normal", "missing_route", "incomplete_route", "restore", "guard", "maintenance", "bool",
+                  "bool_route", "exception", "profile", "s13"):
+        result, metadata = deepcopy(base), deepcopy(numeric)
+        metadata.update(profile="qpc-stage-receive-v1", target_steps=1000, maximum_attempts=1000)
+        observer = bench._StageWaitDiagnostic("Client", (101, 102, 103),
+            gc_observer=_s12_software_observer("Client").gc_observer, qpc_receive_candidate=True)
+        observer.trace_restored = True
+        observer.qpc_calls = observer.qpc_completed = 4000
+        for party in result["party_outcomes"]:
+            party.pop("server_gc")
+            party["steps"] = party["steps"][:1000]
+            stage = _s12_software_observer(party["role"])
+            stage.gc_observer.normal_stop_ack_sent = True
+            party["stage_wait"] = stage.report()
+            party["compact_history"] = history_report(party["role"])
+        if fault == "missing_route":
+            observer.qpc_calls = observer.qpc_completed = 0
+        elif fault == "incomplete_route":
+            observer.qpc_completed -= 1
+        elif fault == "restore":
+            observer.qpc_restore_error_type = "OSError"
+        elif fault == "guard":
+            observer.qpc_guards = 1
+        elif fault == "maintenance":
+            result["cycles"][799].pop("phase_durations_ns")
+        elif fault == "bool":
+            result["cycles"][0]["protocol_committed_count"] = True
+        elif fault == "bool_route":
+            observer.qpc_completed = 4000.
+        elif fault == "exception":
+            observer.qpc_first_exception = ("failure", 0, 1, "P1", "header", None, 11000000,
+                11000000, None, None, 0, 0, "native_error", "TimeoutError", None, None)
+        elif fault in ("profile", "s13"):
+            metadata["profile"] = "stage-wait-light-v1"
+            if fault == "s13":
+                observer.qpc_receive_candidate = False
+        bench._finish_stage_wait(result, sample, metadata, [observer])
+        if fault == "s13":
+            assert metadata["evidence_complete"] and result["status"] == "stopped"
+        history = SimpleNamespace(expansion_ns=1, report=lambda: history_report("Client"))
+        bench._finish_compact_history(result, sample, history, qpc_stage_receive_candidate=fault != "s13")
+        meta = result["compact_history_candidate" if fault == "s13" else "qpc_stage_receive_candidate"]
+        assert meta["finite_sample_pass"] == (fault == "normal"), fault
+        assert meta["target_steps"] == (4000 if fault == "s13" else 1000)
+        assert not any(result[k] for k in ("server_gc_candidate_gate_pass", "candidate_gate_pass", "worker_long_run_gate_pass",
+                                         "stage_pass", "qualification_pass"))
+
+
+def test_s15_budget_never_silently_omits_first_error_gc_or_qpc_exception():
+    from secure_control.experiments import communication_benchmark as bench
+
+    observer = bench._StageWaitDiagnostic("Client", (101, 102, 103),
+        gc_observer=_s12_software_observer("Client").gc_observer, qpc_receive_candidate=True)
+    def context(step):
+        return ("expected_from_validated_stage_plan", "Client", "P1", "stage", None,
+                "s"*128, (str(step)+"r"*128)[:128], step, step, "u"*128, "e"*128, 0, step)
+    for step in range(128):
+        observer.slots[step] = ("phase", "finish_stage_batch", step, step+1, 1, 1, "P1", None, None,
+            context(step), "finish_stage_batch", None, None, None, None, None, None, None, False, None, False)
+    observer.seen = 128
+    for step in range(16):
+        observer.qpc_slots[step] = ("select", step, step+1, "P1", "header", context(step),
+                                  20000000, 10000000, 10000000, 0, 0, 1, "empty", None, None, None)
+    observer.qpc_seen = 16
+    observer.qpc_first_anomaly = observer.qpc_slots[0]
+    observer.qpc_first_exception = observer.qpc_slots[1]
+    observer.first_failure = (*observer.slots[0][:13], "TimeoutError", None, None, None, "socket_recv", True, None, False)
+    gc_observer = observer.gc_observer
+    gc_observer.slots = [(step*10, step*10+1, 1, 2, 0, 0) for step in range(64)]
+    gc_observer.count = 64
+    result = observer.report()
+    assert result["budget_failed"] and result["encoded_omitted"] > 0 and result["encoded_bytes"] <= 64*1024
+    assert result["first_failure"] is not None and len(result["gc"]["events"]) == 64
+    assert result["qpc_receive"]["first_exception"] is not None and len(result["qpc_receive"]["events"]) == 16
+    assert result["gc"]["encoded_omitted"] == result["qpc_receive"]["encoded_omitted"] == 0
+    # 总预算拒绝/重建context表时也不能留下指向旧表的QPC identity索引。
+    aggregate = {"status": "uncertain", "failure_category": "OSError", "cycles": [], "failed_attempts": 1}
+    metadata = {"format_version": 1, "profile": "qpc-stage-receive-v1", "scope_fixture": "x"*200000}
+    bench._finish_stage_wait(aggregate, {"cleanup_failed": False, "memory_guard_failed": False}, metadata, [observer])
+    client = aggregate["stage_wait_diagnostic"]["roles"][0]
+    assert metadata["budget_failed"] and not metadata["evidence_complete"]
+    assert len(client["gc"]["events"]) == 64 and client["first_failure"] is not None
+    for row in client["qpc_receive"]["events"]:
+        assert client["contexts"][row[5]] == list(context(row[1])) or client["contexts"][row[5]] == context(row[1])
+
+
+@pytest.mark.parametrize("valid_identity", (True, False))
+def test_s15_real_endpoint_preserves_reply_validation_and_never_resends(monkeypatch, valid_identity):
+    import struct
+
+    import numpy as np
+
+    from secure_control.execution._localhost_workers import _ClientPartyEndpoint
+    from secure_control.execution.localhost_codec import PartyStageResult
+    from secure_control.experiments import communication_benchmark as bench
+    from secure_control.protocol.messages import ControlShareMessage, Protocol3StageReceipt
+
+    reply_round = "round" if valid_identity else "other-round"
+    receipt = Protocol3StageReceipt(0, "session", reply_round, 0, 1, 1)
+    share = ControlShareMessage(0, "session", reply_round, 0, 8, AdditiveShare(np.array([123456789], dtype=object)))
+    reply = WireEnvelope(SCHEMA_VERSION, "reply", "P1", "Client", 5, "endpoint", "session", reply_round,
+                         0, None, PartyStageResult(receipt, share))
+    encoded = encode_envelope(reply)
+    header = struct.pack("!I", len(encoded))
+    f = _s15_receive_fixture(monkeypatch, [header[:1], header[1:], encoded[:2], encoded[2:]],
+                            waits=[(3000000, "empty")])
+    sent = []
+    def send(data):
+        sent.append(bytes(data))
+        return len(data)
+    f.raw.send = send
+    endpoint = _ClientPartyEndpoint(f.raw, 0, SimpleNamespace(session_id="session", round_id="round", step=0),
+                                    5, 10000, 30., f.deadline)
+    f.observer.state.phase = f.observer.state.context = None
+    before = _s12_hook_snapshot()
+    _, activity, restore = bench._meter("Client", (101, 102, 103), 0, qpc_receiver=f.observer.qpc_receive)
+    try:
+        with f.observer.installed():
+            endpoint.start_stage_batch()
+            if valid_identity:
+                assert endpoint.finish_stage_batch() == receipt and endpoint.share == share
+                assert endpoint._pending_batch is None
+            else:
+                with pytest.raises(ValueError):
+                    endpoint.finish_stage_batch()
+                assert endpoint._pending_batch is not None
+    finally:
+        restore()
+    assert _s12_hook_snapshot() == before and len(sent) == 1
+    assert f.observer.qpc_completed == 2 and f.observer.qpc_empty == 1 and activity["receive_ms"] == 7.0
+    report = f.observer.report()
+    assert "123456789" not in str(report) and report["qpc_receive"]["first_exception"] is None
+    assert report["profile"] == "qpc-stage-receive-v1" and report["encoded_bytes"] <= 65536

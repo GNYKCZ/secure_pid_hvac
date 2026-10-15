@@ -597,6 +597,8 @@ def _run() -> int:
                            help="S12独立stage/首个通信错误定位，固定4000/400/16/light，非资格")
     benchmark.add_argument("--compact-history-candidate", action="store_true",
                            help="S13紧凑实验历史候选，固定4000/400/16/light，保留S12观察，非长期资格")
+    benchmark.add_argument("--qpc-stage-receive-candidate", action="store_true",
+                           help="S15仅实验Client stage回复按原QPC截止续收；默认关闭")
     benchmark.add_argument("--fixed-proof-cache", action="store_true",
                            help="full-observation固定精确矩阵计算的显式候选对照")
     benchmark.add_argument("--role-config", type=Path)
@@ -611,6 +613,8 @@ def _run() -> int:
         )
 
         try:
+            if args.qpc_stage_receive_candidate and (args.case != "cycle" or args.mode != "batch" or args.fixed_proof_cache):
+                raise ValueError("qpc-stage-receive-candidate只支持独立cycle/batch候选。")
             if args.compact_history_candidate and (args.case != "cycle" or args.mode != "batch" or args.fixed_proof_cache):
                 raise ValueError("compact-history-candidate只支持独立cycle/batch候选。")
             if args.stage_wait_diagnostic and (args.case != "cycle" or args.mode != "batch" or args.fixed_proof_cache):
@@ -664,6 +668,7 @@ def _run() -> int:
                     server_gc_candidate=args.server_gc_candidate,
                     stage_wait_diagnostic=args.stage_wait_diagnostic,
                     compact_history_candidate=args.compact_history_candidate,
+                    qpc_stage_receive_candidate=args.qpc_stage_receive_candidate,
                 )
             else:
                 if args.preload_steps or args.diagnostic:
@@ -671,7 +676,7 @@ def _run() -> int:
                 report = run_local_benchmark(
                     args.case, args.mode, steps=args.steps, delay_ms=args.delay_ms,
                 )
-            export_started = perf_counter_ns() if args.compact_history_candidate else None
+            export_started = perf_counter_ns() if args.compact_history_candidate or args.qpc_stage_receive_candidate else None
             with args.output.open("x", encoding="utf-8") as stream:
                 json.dump(report, stream, ensure_ascii=False, indent=2, allow_nan=False)
             export_ns = perf_counter_ns()-export_started if export_started is not None else None
@@ -684,7 +689,7 @@ def _run() -> int:
                           "p50_ms": display_timing["p50_ms"],
                           **({"history_export_ns": export_ns,
                               "history_export_scope": "after control/observer exit; JSON encoding and exclusive file write"}
-                             if args.compact_history_candidate else {})},
+                             if args.compact_history_candidate or args.qpc_stage_receive_candidate else {})},
                          ensure_ascii=False, sort_keys=True))
         return 0 if observed_ok else 5
     if args.role == "redraw":
