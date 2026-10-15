@@ -8,6 +8,7 @@ import multiprocessing as mp
 import os
 import platform
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -947,6 +948,8 @@ class _TimeoutDiagnostic(_Diagnostic):
         return value
 
     def frame(self, original, sock, value, deadline, *, sending):
+        from secure_control.execution.cycle_timing import _CycleDeadline
+
         probe = self.probe(sock)
         probe.deadline, probe.confirmed, probe.native_error = deadline, 0, None
         probe.direction = f"{self.role}->{probe.peer}" if sending else f"{probe.peer}->{self.role}"
@@ -967,6 +970,9 @@ class _TimeoutDiagnostic(_Diagnostic):
         probe.frame_requested = requested
         if self.wait_profile and not sending and hasattr(deadline, "deadline_ns"):
             self.entry(probe, "timeout_precheck", requested=requested)
+        previous_qpc_probe = getattr(self.state, "qpc_receive_probe", None)
+        # 仅本线程当前canonical QPC接收可恢复瞬态；发送/旧float及其它通道不借用此状态。
+        self.state.qpc_receive_probe = probe if not sending and isinstance(deadline, _CycleDeadline) else None
         try:
             result = original(probe, value, deadline)
         except BaseException as error:
@@ -995,6 +1001,8 @@ class _TimeoutDiagnostic(_Diagnostic):
                 requested=requested, returned=probe.confirmed,
                 cpu=None if cpu is None or final_cpu is None else final_cpu-cpu))
             return result
+        finally:
+            self.state.qpc_receive_probe = previous_qpc_probe
 
     @contextmanager
     def sockets(self):
@@ -1150,14 +1158,19 @@ class _TraceSocket:
         except BaseException as error:
             ended = observer.wall()
             origin = "socket_send" if operation == "send" else "socket_recv" if operation == "recv" else "unknown"
-            self.native_error = origin
+            recoverable = (operation == "recv" and getattr(observer.state, "qpc_receive_probe", None) is self
+                           and isinstance(error, (BlockingIOError, ssl.SSLWantReadError, ssl.SSLWantWriteError)))
+            self.native_error = None if recoverable else origin
             record = observer.values(self, operation, started, ended, requested=requested,
                                      error=error, origin=origin,
                                      timeout=args[0] if operation == "settimeout" else None)
             observer.put("socket", record, entry=entry)
-            if entry is not None and observer.first_failure_entry is None:
-                observer.first_failure_entry = entry
-            observer.failed(record)
+            if recoverable:
+                self.current_entry = None  # 保留原生环事件，但不能把瞬态入口借作后续终止首错。
+            else:
+                if entry is not None and observer.first_failure_entry is None:
+                    observer.first_failure_entry = entry
+                observer.failed(record)
             raise
         else:
             ended, final_cpu = observer.wall(), observer._cpu()

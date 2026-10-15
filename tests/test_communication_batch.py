@@ -2855,6 +2855,83 @@ class _S10Socket:
         return min(2, len(data))
 
 
+@pytest.mark.parametrize("wait_profile", (False, True))
+def test_rv004_recoverable_qpc_receive_keeps_legacy_diagnostics_live(monkeypatch, wait_profile):
+    """真实canonical/旧观察器配合；假字节/就绪，不打开网络或运行控制。"""
+    import ssl
+
+    from secure_control.execution import localhost_transport as transport
+    from secure_control.execution.cycle_timing import _CycleDeadline
+    from secure_control.experiments.communication_benchmark import _TimeoutDiagnostic
+
+    monkeypatch.setattr(transport.select, "select", lambda read, write, errors, timeout: (read, write, []))
+    for transient in (BlockingIOError, ssl.SSLWantReadError, ssl.SSLWantWriteError):
+        for ending in ("success", "timeout", "disconnect", "eof"):
+            observer = _TimeoutDiagnostic("Client", (101, 102, 103), wait_profile=wait_profile)
+            observer.select(0)
+            channel = _S10Socket()
+            channel.timeout = .5
+            terminal = TimeoutError("terminal") if ending == "timeout" else OSError(9, "terminal")
+            chunks = [b"ab", transient(), b"cd" if ending == "success" else b"" if ending == "eof" else terminal]
+            if transient is not BlockingIOError:
+                channel.pending = lambda: 0
+            def receive(length, channel=channel, chunks=chunks):
+                channel.calls.append(("recv", length))
+                item = chunks.pop(0)
+                if isinstance(item, BaseException):
+                    raise item
+                assert len(item) <= length
+                return item
+            channel.recv = receive
+            with observer.sockets():
+                deadline = _CycleDeadline(time.perf_counter_ns()+10**9)
+                if ending == "success":
+                    assert transport._receive_exact(channel, 4, deadline) == b"abcd"
+                    assert observer.first_failure is observer.first_failure_entry is None
+                    assert not observer.latched and observer.outer_failure is None
+                    # 原生瞬态仍在有界环中；恢复后普通I/O和新GC区间继续记录。
+                    socket_count, gc_count = observer.seen["socket"], observer.seen["gc"]
+                    chunks.append(b"efgh")
+                    assert transport._receive_exact(channel, 4, deadline) == b"efgh"
+                    observer._supply_gc("start", 2)
+                    observer._supply_gc("stop", 2, 0, 0)
+                    assert observer.seen["socket"] > socket_count and observer.seen["gc"] == gc_count+1
+                else:
+                    error_type = transport.LocalhostTransportTimeout if ending == "timeout" else transport.LocalhostTransportDisconnected
+                    with pytest.raises(error_type) as caught:
+                        transport._receive_exact(channel, 4, deadline)
+                    first = dict(zip(observer.FIELDS, observer.first_failure, strict=True))
+                    outer = dict(zip(observer.FIELDS, observer.outer_failure, strict=True))
+                    assert observer.latched and first["confirmed_bytes_before"] == 2
+                    assert first["error_type"] == ("LocalhostTransportDisconnected" if ending == "eof" else type(terminal).__name__)
+                    assert outer["error_type"] == error_type.__name__
+                    assert caught.value.__cause__ is (None if ending == "eof" else terminal)
+                    if wait_profile and ending != "eof":
+                        entry = dict(zip(observer.ENTRY_FIELDS, observer.first_failure_entry, strict=True))
+                        assert entry["operation"] == "recv" and entry["native_called"]
+                        assert entry["confirmed_bytes_before"] == 2 and entry["requested_bytes"] == 2
+                assert getattr(observer.state, "qpc_receive_probe", None) is None
+            report = observer.report()
+            assert channel.timeout == .5 and report["socket_hooks_restored"]
+            native = [dict(zip(observer.FIELDS, row[2], strict=True)) for row in observer.slots
+                      if row and row[0] == "trace" and row[1] == "socket"]
+            assert any(row["error_type"] == transient.__name__ for row in native)
+            assert report["encoded_bytes"] <= report["encoded_limit"]
+    # 同类异常在旧float接收/发送中会终止，不能因为修复QPC续收而被全局忽略。
+    for operation in ("legacy_receive", "qpc_send"):
+        observer = _TimeoutDiagnostic("Client", (101, 102, 103), wait_profile=wait_profile)
+        observer.select(0)
+        channel = _S10Socket(fail_at=1)
+        channel.failure = BlockingIOError()
+        with observer.sockets(), pytest.raises(transport.LocalhostTransportDisconnected) as caught:
+            if operation == "legacy_receive":
+                transport._receive_exact(channel, 4, time.monotonic()+1)
+            else:
+                transport._send_exact(channel, b"abcd", _CycleDeadline(time.perf_counter_ns()+10**9))
+        assert caught.value.__cause__ is channel.failure and observer.latched
+        assert dict(zip(observer.FIELDS, observer.first_failure, strict=True))["error_type"] == "BlockingIOError"
+
+
 @pytest.mark.parametrize(("operation", "fail_at", "part", "confirmed"),
                          [("recv", 2, "header", 2), ("recv", 4, "body", 2), ("send", 2, "header_and_body", 2)])
 def test_s10_native_entry_preserves_partial_progress_original_error_and_first_failure(monkeypatch, operation, fail_at, part, confirmed):
