@@ -121,6 +121,85 @@ def test_encoded_material_matches_original_codec_and_rejects_copied_capabilities
         assert decode_envelope(encode_envelope(fast)).payload.plan == escaped
 
 
+@pytest.mark.parametrize(("dimensions", "ell", "shift"), (((1, 2, 1), 0, 0), ((2, 1, 3), 7, 0), ((4, 2, 1), 32, 32)))
+def test_s19_public_plan_digest_matches_independent_old_bytes_for_every_field(monkeypatch, dimensions, ell, shift):
+    """旧asdict/JSON/domain/SHA独立oracle；逐字段及资源次序变化都必须参与。"""
+    import hashlib
+    import json
+    from copy import copy
+    from dataclasses import asdict, fields, is_dataclass
+
+    from secure_control.protocol import Client, messages
+
+    ledger = messages.ControllerScaleLedger(ell, ell, shift, shift, ell+1, ell+1,
+        ell+shift, shift, 2*ell+1, 2*ell+1)
+    plan = Client._resource_plan(messages.ControllerLayout(*dimensions, ledger),
+        '会话"\\\n', '轮次\\"\t', 2**80+3)
+    recorded = []
+    def digest(encoded):
+        recorded.append(encoded)
+        return hashlib.sha256(encoded)
+    monkeypatch.setattr(messages, "sha256", digest)
+    def check(value):
+        expected = b"control-batch-v1-plan\0"+json.dumps(asdict(value), sort_keys=True,
+            separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+        assert messages.public_step_plan_sha256(value) == hashlib.sha256(expected).hexdigest()
+        assert recorded.pop() == expected
+        return expected
+    original = check(plan)
+    def changes(value):
+        if is_dataclass(value):
+            for item in fields(value):
+                for child in changes(getattr(value, item.name)):
+                    changed = copy(value)
+                    # 摘要原本不再验证ledger；独立改变每一字段检查是否被遗漏。
+                    object.__setattr__(changed, item.name, child)
+                    yield changed
+        elif isinstance(value, tuple):
+            for i, child in enumerate(value):
+                for changed in changes(child):
+                    yield value[:i]+(changed,)+value[i+1:]
+            if len(value)>1 and value != value[::-1]:
+                yield value[::-1]
+        else:
+            yield value+1 if type(value) is int else value+"变" if type(value) is str else 0
+    for changed in changes(plan):
+        assert check(changed) != original
+
+
+def test_s19_plan_digest_avoids_recursive_copy_but_preserves_failure_types(monkeypatch):
+    import hashlib
+    import json
+    from dataclasses import asdict
+
+    from test_two_party_protocol import make_stack
+
+    from secure_control.protocol import Client, messages
+
+    _, _, _, _, distribution = make_stack()
+    plan = Client._resource_plan(distribution.p1.layout, "会话", "round", 0)
+    expected = hashlib.sha256(b"control-batch-v1-plan\0"+json.dumps(asdict(plan), sort_keys=True,
+        separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()).hexdigest()
+    def forbidden(value):
+        pytest.fail("摘要不得先递归深复制整棵计划")
+    monkeypatch.setattr(messages, "asdict", forbidden)
+    assert messages.public_step_plan_sha256(plan) == expected
+    for invalid in (None, {}, messages.StepResourcePlan, SimpleNamespace()):
+        with pytest.raises(TypeError, match="StepResourcePlan"):
+            messages.public_step_plan_sha256(invalid)
+    cyclic = []
+    cyclic.append(cyclic)
+    for invalid in (replace(plan, step=float("nan")), replace(plan, round_id=object()),
+                    replace(plan, scale_ledger=messages.ControllerScaleLedger), replace(plan, state_shape=cyclic)):
+        try:
+            json.dumps(asdict(invalid), sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError, RecursionError) as old_error:
+            with pytest.raises(type(old_error)):
+                messages.public_step_plan_sha256(invalid)
+        else:
+            pytest.fail("非法fixture必须被旧oracle拒绝")
+
+
 def test_worker_take_shortage_never_waits_for_ipc_or_creates_material():
     from collections import deque
     from threading import Condition

@@ -953,3 +953,25 @@ uv run secure-control benchmark --case cycle --mode batch --steps 10000 --delay-
 可恢复原生事件不占终止首错或其入口，后续普通I/O/GC继续；真正错误保留原入口、
 部分字节与cause。此批准不增加试验次数；仍须新head软件检查和独立复审通过后，
 才使用上面原未消费的一次10000预算。不自动第9次源码返工或新增定位/短测/重跑。
+
+## S19：公开计划摘要减负与新授权单次资格
+
+第9次直接人工单次批准仅减少`public_step_plan_sha256`的中间对象构造：标准JSON按需
+投影公开dataclass字段，替代预先`asdict`递归深复制整棵计划；有限缓存仅含三种类型的字段名，
+不缓存plan/round/摘要/能力，不删除任何资源或字段。原domain零字节、UTF-8、排序/分隔符、
+Unicode与NaN拒绝及SHA256保持，worker/Client/peer仍独立调用同一个canonical实现。
+非法循环仍按旧asdict的RecursionError拒绝，不改为JSON循环检查的另一异常类别。
+消息/wire、来源与一次性能力、owner/锁/生命周期、数值/控制/期限/GC/内存预算均不改。
+
+旧S17资格9807尝试/9806确认/1超期及全部原件保持，原预算已消费；本次另有一次最多10000
+的新预算，不能拼接剩余193步。沿同一有效场景/worker/正常GC/20ms/400段/库存16/light，
+软件检查及新head独立审查通过、目录释放和新SHA/源码/配置/环境唯一预声明全文读回后才可用：
+
+```powershell
+uv run secure-control benchmark --case cycle --mode batch --steps 10000 --delay-ms 0 --segment-steps 400 --material-slots 16 --preload-steps 0 --recording light --qpc-dynamic-qualification --output .tmp/issue120-s19-qpc-dynamic-qualification.json
+```
+
+新结果与独占log事前必须不存在；首次失败即停，启动失败也消费，不热身/短测/定位/对照/补跑。
+完整周期/24维护/正常STOP/材料/状态/资源/历史与退出门禁不改；少分配可能只推迟gen2，
+未覆盖Client运行期GC不等于消除停顿，退出GC不能充作控制内覆盖。原历史S13内部仍未知，
+有限本机动态结果不授完整路线/真实TLS三机/Wi-Fi/硬件资格，不自动第10次源码续接或合并关闭。
