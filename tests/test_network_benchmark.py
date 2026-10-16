@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import os
 import socket
 import subprocess
 import sys
@@ -189,6 +190,8 @@ def test_windows_relay_due_does_not_depend_on_positive_select_timer(monkeypatch,
             self.mapping.clear()
 
         def select(self, timeout):
+            if scheduled_due[0] is not None and clock[0] >= scheduled_due[0] and not blocked[0]:
+                pytest.fail("到期队头首次发送不应再经过 selector")
             if not startup_idle[0]:
                 assert timeout > 0  # 没有数据时不忙轮询。
                 startup_idle[0] = True
@@ -251,6 +254,89 @@ def test_windows_relay_due_does_not_depend_on_positive_select_timer(monkeypatch,
     else:
         assert not sleeps
     assert report["ring"][0][7] >= report["ring"][0][6]
+    assert report["ring_version"] == 2 and report["ring"][0][13] == -1
+    if late_sleep:
+        snapshot = dict(zip(report["first_anomaly_timing_fields"], report["first_anomaly_timing"], strict=True))
+        assert snapshot["wait_kind"] == 2
+        assert snapshot["wait_returned_ns"] > snapshot["planned_wake_ns"]
+        assert snapshot["send_ended_ns"] >= snapshot["send_started_ns"]
+
+
+def test_due_first_is_fair_bounded_and_blocked_heads_require_real_writable(monkeypatch):
+    calls = []
+    clock = [100]
+    monkeypatch.setattr(emulator.time, "perf_counter_ns", lambda: clock[0])
+    class Writer:
+        def __init__(self, name):
+            self.name = name
+        def send(self, data):
+            calls.append(self.name)
+            if self.name == emulator.DIRECTIONS[0]:
+                raise BlockingIOError()
+            return 1 if self.name == emulator.DIRECTIONS[1] else len(data)
+    directions = []
+    for name in emulator.DIRECTIONS:
+        direction = emulator.Direction(None, Writer(name), name, None)
+        direction.queue.extend((emulator.Block(b"ab", 0, 0, 0, 0, 100),
+                                emulator.Block(b"cd", 2, 0, 0, 0, 100)))
+        direction.queued = 4
+        directions.append(direction)
+    ring = emulator.PublicRing()
+    serviced = emulator._serve_due(directions, 3, ring)
+    assert calls == list(emulator.DIRECTIONS[3:]+emulator.DIRECTIONS[:3])
+    assert serviced == set(emulator.DIRECTIONS) and all(row[13] == -1 for row in ring.rows())
+    assert all(d.queued >= 2 for d in directions)  # 每方向一块，不贪婪排空。
+    calls.clear()
+    directions[2].queue[0].due = 200
+    emulator._serve_due(directions, 4, ring)
+    assert not set(emulator.DIRECTIONS[:3]).intersection(calls)
+    assert directions[0].queue[0].first_attempt == directions[1].queue[0].first_attempt == 100
+    for direction in directions[:2]:
+        with pytest.raises(RuntimeError, match="真实可写"):
+            emulator._progress(direction, 100, None, ring)
+    emulator._progress(directions[1], 100, 100, ring)
+    assert ring.rows()[-1][13] == 100 and directions[1].queue[0].offset == 2
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows memory API binding")
+def test_windows_memory_binding_once_but_each_sample_queries_os(monkeypatch):
+    import ctypes
+    calls, samples = [], []
+    def memory(_handle, pointer, _size):
+        samples.append(True)
+        if len(samples) == 3:
+            return 0
+        pointer._obj.peak = 300
+        pointer._obj.current = len(samples)*100
+        return 1
+    def dll(name, **_kwargs):
+        calls.append(name)
+        return SimpleNamespace(GetCurrentProcess=lambda: 17) if name == "kernel32" else SimpleNamespace(GetProcessMemoryInfo=memory)
+    benchmark._windows_memory_api.cache_clear()
+    try:
+        monkeypatch.setattr(ctypes, "WinDLL", dll)
+        assert benchmark._process_memory()["current_rss_bytes"] == 100
+        assert benchmark._process_memory()["current_rss_bytes"] == 200
+        assert benchmark._process_memory() == {"peak_rss_bytes": None, "scope": "unavailable"}
+        assert calls == ["kernel32", "psapi"] and len(samples) == 3
+    finally:
+        benchmark._windows_memory_api.cache_clear()
+
+
+@pytest.mark.parametrize("memory", [{"peak_rss_bytes": None}, {"current_rss_bytes": 257*1024**2}])
+def test_relay_missing_or_excess_rss_still_fails_before_wait(monkeypatch, memory):
+    reports = []
+    class Socket:
+        def __getattr__(self, _name):
+            return lambda *a: None
+    selector = SimpleNamespace(register=lambda *a: None, close=lambda: None)
+    monkeypatch.setattr(emulator.socket, "socket", lambda *a: Socket())
+    monkeypatch.setattr(emulator.selectors, "DefaultSelector", lambda: selector)
+    monkeypatch.setattr(benchmark, "_process_memory", lambda: memory)
+    emulator._relay_main("N2", [("127.0.0.1", p, "127.0.0.2") for p in (1, 2, 3)],
+        SimpleNamespace(is_set=lambda: False), SimpleNamespace(send=reports.append, close=lambda: None))
+    assert reports[-1]["error_type"] == "MemoryError" and not reports[-1]["model_valid"]
+    assert reports[-1]["first_failure"]["operation"] == "rss"
 
 
 def _entry(profile, *, passed=True, head="a", sources=None, phase="discovery"):
@@ -374,6 +460,14 @@ def test_network_gate_requires_shared_full_evidence_tls_and_model(monkeypatch):
     manifest = {"wire_profile": network._COMPACT_PROFILE}
     assert network.assemble(copy.deepcopy(compact), profile="N2", phase="qualification", manifest=manifest,
                             relay=relay)["network_dynamic_qualification_pass"]
+    software_only = copy.deepcopy(compact)
+    software_only["wire_profile"] = network._COMPACT_PROFILE_V2
+    software_only["material_summary"] = {"encoding_profile": network._COMPACT_PROFILE_V2,
+        "worker": {"encoding_profile": network._COMPACT_PROFILE_V2}}
+    for outcome in software_only["party_outcomes"]:
+        outcome["wire_profile"] = network._COMPACT_PROFILE_V2
+    assert not network.assemble(software_only, profile="N2", phase="qualification",
+        manifest={"wire_profile": network._COMPACT_PROFILE_V2}, relay=relay)["network_dynamic_qualification_pass"]
     for remove in (lambda r: r.pop("wire_profile"), lambda r: r["material_summary"]["worker"].clear(),
                    lambda r: r["party_outcomes"][1].pop("wire_profile")):
         bad = copy.deepcopy(compact)
@@ -393,6 +487,8 @@ def test_new_shared_entry_keeps_old_bare_tcp_guard_and_rejects_mixed_configs(tmp
     assert captured[-1][0][0]["network_wire_profile"] == network._COMPACT_PROFILE
     with pytest.raises(ValueError):
         benchmark.run_network_observation(configs=configs, steps=1000, wire_profile="unknown")
+    with pytest.raises(ValueError):
+        benchmark.run_network_observation(configs=configs, steps=1000, wire_profile=network._COMPACT_PROFILE_V2)
     for bad in (configs[:2], (replace(configs[0], transport="insecure_tcp"), *configs[1:]),
                 (configs[0], replace(configs[1], topology=replace(configs[1].topology, digest="different")), configs[2])):
         with pytest.raises(ValueError):
@@ -528,13 +624,35 @@ def test_three_tls_links_cross_opaque_relay_and_wrong_role_still_fails(tmp_path)
         lan_transport._verify_identity(WrongPeer(), "client.secure-control.test")
 
 
+def _tls_protocol_party_fixture(config, ports, queue, wire_profile):
+    """子进程实际 framing 计数；不使用协议常数代替发包事实。"""
+    operations = []
+    original = localhost_transport.send_frame
+    def sent(sock, data, **kwargs):
+        operations.append(localhost_transport.decode_envelope(data).operation)
+        return original(sock, data, **kwargs)
+    def put(outcome):
+        outcome["fixture_sent_operations"] = operations
+        queue.put(outcome)
+    localhost_transport.send_frame = sent
+    try:
+        benchmark._party_job(config, ports, 0., True, SimpleNamespace(put=put),
+            network_observation=True, wire_profile=wire_profile, stage_wait_diagnostic=True)
+    finally:
+        localhost_transport.send_frame = original
+
+
 @pytest.mark.integration
-@pytest.mark.parametrize("wire_profile,expected_frames", ((None, 19), (network._COMPACT_PROFILE, 15)))
+@pytest.mark.parametrize("wire_profile,expected_frames,fault", (
+    (None, 19, None), (network._COMPACT_PROFILE, 15, None),
+    ("control-dynamic-compact-v2", 15, None), ("control-dynamic-compact-v2", 15, "bad_epoch"),
+    ("control-dynamic-compact-v2", 15, "bad_global"), ("control-dynamic-compact-v2", 15, "duplicate")))
 def test_tls_protocol_fixture_preserves_fused_frames_worker_cleanup_segments_and_stop(
-        tmp_path, wire_profile, expected_frames):
-    """仅三轮协议功能夹具，无 plant、20ms周期或性能资格入口。"""
+        tmp_path, monkeypatch, wire_profile, expected_frames, fault):
+    """仅五轮协议功能夹具，无 plant、20ms周期或性能资格入口。"""
     import multiprocessing as mp
 
+    from secure_control.execution import lan_runtime as runtime_module
     from secure_control.execution.lan_runtime import LanSegmentedRuntime, RunControl
     from secure_control.experiments.lan_continuous_profile import load_segmented_experiment
     from secure_control.scenarios.cart_pole.interactive import InteractiveSession
@@ -545,10 +663,8 @@ def test_tls_protocol_fixture_preserves_fused_frames_worker_cleanup_segments_and
     configs = network.role_configs(tmp_path, ports, "N0")
     context = mp.get_context("spawn")
     queue = context.Queue()
-    parties = [context.Process(target=benchmark._party_job,
-        args=(config, ports, 0., True, queue),
-        kwargs={"network_observation": True, "wire_profile": wire_profile,
-                "stage_wait_diagnostic": True}) for config in configs[1:]]
+    parties = [context.Process(target=_tls_protocol_party_fixture,
+        args=(config, ports, queue, wire_profile)) for config in configs[1:]]
     runtime = None
     restore = lambda: None
     try:
@@ -562,22 +678,53 @@ def test_tls_protocol_fixture_preserves_fused_frames_worker_cleanup_segments_and
             **({"wire_profile": wire_profile} if wire_profile else {}))
         runtime.enable_material_preparation(slots=16, _candidate="worker")
         before = sum(row["frames"] for row in counts.values())
-        for step in range(3):
+        operations = []
+        previous_advance = []
+        original_send = runtime_module.localhost_transport.send_frame
+        def sent(sock, data, **kwargs):
+            request = runtime_module.localhost_transport.decode_envelope(data)
+            operations.append(request.operation)
+            if request.operation == "segment_advance" and request.recipient == "P2":
+                if fault == "duplicate" and previous_advance:
+                    data = previous_advance[0]
+                elif fault in {"bad_epoch", "bad_global"}:
+                    value = json.loads(data)
+                    value["payload"]["begin"]["controller_epoch" if fault == "bad_epoch" else "global_start"] = (
+                        "f"*64 if fault == "bad_epoch" else 999)
+                    data = json.dumps(value, separators=(",", ":")).encode()
+                previous_advance.append(data)
+            return original_send(sock, data, **kwargs)
+        monkeypatch.setattr(runtime_module.localhost_transport, "send_frame", sent)
+        boundaries = []
+        for step in range(5):
             result = runtime.step([0., 0.])
             assert result.global_step == step and result.products == 30 and result.truncations == 4
             runtime.confirm_applied(result)  # 测试只验证确认门禁；不创建物理完成证据。
             if step == 0:
                 client_frames = sum(row["frames"] for row in counts.values()) - before
             if runtime.segment_full:
-                runtime.end_segment()
+                start = sum(row["frames"] for row in counts.values())
+                if fault is not None and (fault != "duplicate" or boundaries):
+                    with pytest.raises((ValueError, OSError, EOFError, RuntimeError)):
+                        runtime.end_segment()
+                    assert runtime.phase == "UNCERTAIN" and len(runtime.last_segment_receipts) == 1
+                    assert runtime.confirmed_step_count == step+1
+                    assert runtime.last_segment_receipts[0].end.global_end_exclusive == step+1
+                    with pytest.raises(RuntimeError):
+                        runtime.step([0., 0.])
+                    return
+                record = runtime.end_segment()
                 runtime.next_segment()
+                boundaries.append(sum(row["frames"] for row in counts.values()) - start)
+                assert record.hello.segment_index == len(boundaries)-1
+                assert len(record.steps) == 2 and record.receipts[0].end.segment_index == record.hello.segment_index
         control.request_stop()
         runtime.end_segment()
-        assert runtime.phase == "STOPPED" and runtime.confirmed_step_count == 3
+        assert runtime.phase == "STOPPED" and runtime.confirmed_step_count == 5
         runtime.close()
         summary = runtime.material_summary
         assert all(summary[name] for name in ("worker_exited", "receiver_exited", "credit_thread_exited"))
-        assert summary["claimed"] == 3 and not summary["cleanup_failed"]
+        assert summary["claimed"] == 5 and not summary["cleanup_failed"]
         outcomes = [queue.get(timeout=15.) for _ in parties]
         for process in parties:
             process.join(10.)
@@ -585,11 +732,18 @@ def test_tls_protocol_fixture_preserves_fused_frames_worker_cleanup_segments_and
         assert all(outcome["status"] == "closed" for outcome in outcomes), outcomes
         party_frames = sum(sum(row["frames"] for row in outcome["steps"][0]["sent"].values())
                            for outcome in outcomes)
+        assert boundaries == ([2, 2] if wire_profile == "control-dynamic-compact-v2" else [4, 4])
+        if wire_profile == "control-dynamic-compact-v2":
+            assert operations.count("segment_advance") == 4 and "segment_begin" not in operations
+            replies = [o["fixture_sent_operations"].count("segment_advance") for o in outcomes]
+            assert replies == [2, 2]  # 每段双方各一个实际回复，额外四帧。
+            assert all("segment_begin" not in o["fixture_sent_operations"] for o in outcomes)
+            assert client_frames + party_frames + boundaries[0] + sum(replies)//2 == 19
         assert client_frames + party_frames == expected_frames
         assert client_frames == (4 if wire_profile else 6)
         if wire_profile:
             assert all(outcome["wire_profile"] == wire_profile for outcome in outcomes)
-        assert len(outcomes) == 2 and all(len(o["steps"]) == 3 for o in outcomes)
+        assert len(outcomes) == 2 and all(len(o["steps"]) == 5 for o in outcomes)
         assert all(o["stage_wait"]["first_failure"] is None and o["stage_wait"]["hooks_restored"]
                    for o in outcomes)
     finally:

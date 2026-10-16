@@ -64,6 +64,8 @@ from .lan_config import LanConfig, Role
 from .lan_transport import accept_role, connect_role, listener
 from .localhost_codec import (
     _COMPACT_PROFILE,
+    _COMPACT_PROFILE_V2,
+    _COMPACT_PROFILES,
     SCHEMA_VERSION,
     BatchHelloPayload,
     LanContinuousSetupPayload,
@@ -78,6 +80,8 @@ from .localhost_codec import (
     PreloadedInputPayload,
     PreloadedReadyPayload,
     RemoteErrorPayload,
+    SegmentAdvancePayload,
+    SegmentAdvanceReceipt,
     SegmentBeginPayload,
     SegmentEndPayload,
     SegmentEndReceipt,
@@ -474,8 +478,8 @@ class LanContinuousRuntime:
         v2 = _segment_hello is not None and _segment_hello.mode in {
             "lan-segmented-v2", "lan-full-v3",
         }
-        if wire_profile not in {"control-batch-v1", _COMPACT_PROFILE} or (
-            wire_profile == _COMPACT_PROFILE and (not batch or preload_steps
+        if wire_profile not in {"control-batch-v1", *_COMPACT_PROFILES} or (
+            wire_profile in _COMPACT_PROFILES and (not batch or preload_steps
                 or _segment_hello is None or _segment_hello.mode != "lan-segmented-v2")
         ):
             raise ValueError("紧凑动态候选仅允许显式批量 v2 且不预送")
@@ -533,15 +537,15 @@ class LanContinuousRuntime:
                       LanHelloPayload(config.topology.digest, secrets.token_hex(32),
                                       "lan-continuous-v1"))
         hello = BatchHelloPayload(base_hello) if batch else base_hello
-        if wire_profile == _COMPACT_PROFILE:
-            hello = _CompactHelloPayload(hello)
+        if wire_profile in _COMPACT_PROFILES:
+            hello = _CompactHelloPayload(hello, wire_profile)
         if preload_steps:
             hello = PreloadedHelloPayload(hello, preload_steps, preload_execution)
         self._preload_steps, self._preload_execution = preload_steps, preload_execution
         self._preloaded = None
         self._preload_digest = None
         self._preload_statistics = {}
-        self.setup_run_id = base_hello.run_id if preload_steps or wire_profile == _COMPACT_PROFILE else None
+        self.setup_run_id = base_hello.run_id if preload_steps or wire_profile in _COMPACT_PROFILES else None
         self._last_result = None
         self._round_started = False
         self._material_pool = None
@@ -728,7 +732,7 @@ class LanContinuousRuntime:
                 deadline = deadline_after(self.config.step_timeout)
             online_started = time.perf_counter_ns()
             endpoints: list[_ClientPartyEndpoint] = []
-            compact = self._wire_profile == _COMPACT_PROFILE
+            compact = self._wire_profile in _COMPACT_PROFILES
             if compact and not encoded_current:
                 raise ValueError("紧凑动态候选必须使用原专属材料工人")
             fused = compact or self._preload_steps and self._preload_execution == "fused"
@@ -743,7 +747,7 @@ class LanContinuousRuntime:
                 if compact:
                     digest = public_step_plan_sha256(plan)
                     materials = tuple(_CompactOnlinePayload(inp, self.setup_run_id,
-                        self.setup.controller_epoch, digest, fragment) for inp, fragment in
+                        self.setup.controller_epoch, digest, fragment, self._wire_profile) for inp, fragment in
                         zip((current.p1_input, current.p2_input), current.prepared.fragments, strict=True))
                     prepared_requests = _prepare_requests(materials, "online_stage", self.session_id,
                         plan.round_id, self._step, self._sequences, _FRAME_LIMIT)
@@ -866,14 +870,20 @@ class LanContinuousRuntime:
             for party, (sock, request) in enumerate(zip(self._sockets, pending, strict=True)):
                 _receive_reply(sock, request, deadline=deadline, expected_payload=begin)
                 self._sequences[party] += 1
-            self._segment_start = self._step
-            self._confirmed_steps.clear()
-            self._confirmed_plans.clear()
+            self._accept_segment_begin(begin)
             check_deadline(deadline_ns, "SEGMENT_BEGIN")
         except Exception:
             self._failed = True
             self.close()
             raise
+
+    def _accept_segment_begin(self, begin: SegmentBeginPayload) -> None:
+        """仅在完整维护确认及调用者本地检查后更新记录边界。"""
+        if (not self._v2 or self._failed or self._finished or begin.global_start != self._step):
+            raise RuntimeError("v2 本地切段身份或状态无效")
+        self._segment_start = self._step
+        self._confirmed_steps.clear()
+        self._confirmed_plans.clear()
 
     def finish(self) -> None:
         """只在全部 N 步、plant 更新成功后双角色关闭确认。"""
@@ -1005,8 +1015,8 @@ class LanSegmentedRuntime:
         check_deadline(deadline_ns, "DYNAMIC_SETUP")
         self._v2 = spec.state_dimension != 0
         self._full_v3 = full_run_id is not None
-        if wire_profile not in {"control-batch-v1", _COMPACT_PROFILE} or (
-            wire_profile == _COMPACT_PROFILE and (not self._v2 or self._full_v3 or preload_steps)
+        if wire_profile not in {"control-batch-v1", *_COMPACT_PROFILES} or (
+            wire_profile in _COMPACT_PROFILES and (not self._v2 or self._full_v3 or preload_steps)
         ):
             raise ValueError("紧凑动态候选仅允许 v2 且不预送")
         self._wire_profile = wire_profile
@@ -1047,6 +1057,9 @@ class LanSegmentedRuntime:
         self._last_end_round_id: str | None = None
         self._last_closed_segment_count = 0
         self.last_sealed_record: SegmentRecord | None = None
+        self.last_segment_receipts: tuple[SegmentEndReceipt, ...] = ()
+        self._advance_begin: SegmentBeginPayload | None = None
+        self.last_maintenance_operation = "end"
         self._attempted_round: int | None = None
         self.phase = "CONNECTING"
         if deadline_ns is None:
@@ -1069,7 +1082,7 @@ class LanSegmentedRuntime:
             _segment_capacity=self.segment_capacity if self._v2 else None,
             _controller_epoch=self.controller_epoch,
             preload_steps=self.preload_steps, preload_execution=self.preload_execution,
-            **({"wire_profile": self._wire_profile} if self._wire_profile == _COMPACT_PROFILE else {}),
+            **({"wire_profile": self._wire_profile} if self._wire_profile in _COMPACT_PROFILES else {}),
             **({"deadline_ns": deadline_ns} if deadline_ns is not None else {}),
         )
         self.connection_seconds = time.monotonic() - started
@@ -1127,13 +1140,13 @@ class LanSegmentedRuntime:
             raise RuntimeError("材料池不存在或已经安装。")
         if _candidate not in (None, "thread", "worker") or _candidate and self._full_v3:
             raise ValueError("实验供料只支持动态v2")
-        if self._wire_profile == _COMPACT_PROFILE and _candidate != "worker":
+        if self._wire_profile in _COMPACT_PROFILES and _candidate != "worker":
             raise ValueError("紧凑动态候选必须使用专属材料工人")
         if _candidate == "worker":
             try:
                 segment._material_pool = _MaterialWorkerPool(segment.client, segment.distribution,
                     run_id=self.run_id, epoch=self.controller_epoch, start=segment._step, slots=slots,
-                    **({"encoding_profile": self._wire_profile} if self._wire_profile == _COMPACT_PROFILE else {}))
+                    **({"encoding_profile": self._wire_profile} if self._wire_profile in _COMPACT_PROFILES else {}))
             except Exception as error:
                 segment._material_statistics = getattr(error, "_public_material_summary", {})
                 raise
@@ -1236,35 +1249,45 @@ class LanSegmentedRuntime:
             if action == "continue" and not self.segment_full:
                 raise RuntimeError("只有满段才能继续。")
             self.phase = "STOPPING" if action == "stop" else "ENDING_SEGMENT"
-        end = SegmentEndPayload(
-            self.run_id, self.segment_index, self.global_start, len(self._records),
-            self.confirmed_step_count,
-            self._records[-1].round_id if self._records else None, action,
-        )
-        deadline = network_deadline(self.config.shutdown_timeout, deadline_ns)
-        requests = []
+            advance = self._wire_profile == _COMPACT_PROFILE_V2 and action == "continue"
+            self.last_maintenance_operation = "advance" if advance else "end"
         completed = False
+        self.last_segment_receipts = ()
         try:
-            for party, sock in enumerate(segment._sockets):
-                request = WireEnvelope(
-                    SCHEMA_VERSION, "request", "Client", "P1" if party == 0 else "P2",
-                    segment._sequences[party], "segment_end", segment.session_id,
-                    None, None, None, end,
-                )
-                requests.append(request)
-                send_envelope(sock, request, deadline=deadline, limit=_FRAME_LIMIT)
+            end = SegmentEndPayload(
+                self.run_id, self.segment_index, self.global_start, len(self._records),
+                self.confirmed_step_count,
+                self._records[-1].round_id if self._records else None, action,
+            )
+            begin = (SegmentBeginPayload(self.run_id, self.segment_index + 1,
+                     self.confirmed_step_count, self.controller_epoch, end.last_round_id)
+                     if advance else None)
+            payload = SegmentAdvancePayload(end, begin) if advance else end
+            operation = "segment_advance" if advance else "segment_end"
+            deadline = network_deadline(self.config.shutdown_timeout, deadline_ns)
+            # 两份完整请求均先完成编码/预算核查，才允许发送第一字节。
+            prepared = (_prepare_requests((payload, payload), operation, segment.session_id,
+                         None, None, segment._sequences, _FRAME_LIMIT) if advance else [
+                         (WireEnvelope(SCHEMA_VERSION, "request", "Client", role,
+                          segment._sequences[party], operation, segment.session_id,
+                          None, None, None, payload), None) for party, role in enumerate(("P1", "P2"))])
+            for sock, (request, encoded) in zip(segment._sockets, prepared, strict=True):
+                if advance:
+                    localhost_transport.send_frame(sock, encoded, deadline=deadline, limit=_FRAME_LIMIT)
+                else:
+                    send_envelope(sock, request, deadline=deadline, limit=_FRAME_LIMIT)
             receipts = []
-            for sock, request in zip(segment._sockets, requests, strict=True):
+            for sock, (request, _) in zip(segment._sockets, prepared, strict=True):
                 response = receive_envelope(sock, deadline=deadline, limit=_FRAME_LIMIT)
                 _validate_party_reply(response, request)
-                receipt = response.payload
                 expected = SegmentEndReceipt(
                     request.recipient, segment.session_id, end, self.confirmed_step_count,
                     segment._products, segment._truncations,
                 )
-                if receipt != expected:
+                if response.payload != (SegmentAdvanceReceipt(expected, begin) if advance else expected):
                     raise ValueError("段关闭回执与双提交/物理确认前缀不一致。")
-                receipts.append(receipt)
+                receipts.append(expected)
+                self.last_segment_receipts = tuple(receipts)
                 segment._sequences[0 if request.recipient == "P1" else 1] += 1
             setup = segment.setup
             record = SegmentRecord(
@@ -1276,8 +1299,9 @@ class LanSegmentedRuntime:
             self._last_end_round_id = end.last_round_id
             self._last_closed_segment_count = self.confirmed_step_count
             # 双方密封是独立事实；周期出口超期也不能丢掉刚收到的真实回执。
-            if self._full_v3:
+            if self._full_v3 or self._wire_profile == _COMPACT_PROFILE_V2:
                 self.last_sealed_record = record
+            self._advance_begin = begin
             self.phase = ("SWITCHED" if action == "switch" else
                           "STOPPED" if action == "stop" else "CONNECTING_NEXT")
             check_deadline(deadline_ns, "SEGMENT_END")
@@ -1296,22 +1320,28 @@ class LanSegmentedRuntime:
             raise RuntimeError("段过渡未确认，禁止重连。")
         assert self._segment is not None
         if self._v2:
-            self.global_start = self.confirmed_step_count
-            self.segment_index += 1
             begin = SegmentBeginPayload(
-                self.run_id, self.segment_index, self.global_start,
+                self.run_id, self.segment_index + 1, self.confirmed_step_count,
                 self.controller_epoch, self._last_end_round_id,
             )
             try:
-                if deadline_ns is None:
+                if self._wire_profile == _COMPACT_PROFILE_V2:
+                    if self._advance_begin != begin:
+                        raise RuntimeError("复合维护未完整确认，禁止激活下一段")
+                    check_deadline(deadline_ns, "SEGMENT_ADVANCE_LOCAL")
+                    self._segment._accept_segment_begin(begin)
+                elif deadline_ns is None:
                     self._segment.begin_segment(begin)
                 else:
                     self._segment.begin_segment(begin, deadline_ns=deadline_ns)
+                self.global_start = begin.global_start
+                self.segment_index = begin.segment_index
                 self.hello = LanSegmentedHelloPayload(
                     self.hello.profile_sha256, self.hello.nonce, self.run_id,
                     self.segment_index, self.global_start, self._segment.session_id,
                     "lan-full-v3" if self._full_v3 else "lan-segmented-v2",
                 )
+                self._advance_begin = None
                 self.phase = "RUNNING"
             except Exception:
                 self.phase = "UNCERTAIN"
@@ -1331,10 +1361,19 @@ class LanSegmentedRuntime:
 
     def close(self) -> None:
         """故障清理只关闭连接，不能产生正常停止结果。"""
+        if self._advance_begin is not None and self.phase != "STOPPED":
+            self.phase = "UNCERTAIN"
         if self.phase not in {"STOPPED", "SWITCHED", "FAILED", "UNCERTAIN", "CANCELLED"}:
             self.phase = "FAILED"
         if self._segment is not None:
             self._segment.close()
+
+    def abort_segment_transition(self) -> None:
+        """维护已发出后，本地回调或原周期出口失败只能异常关闭。"""
+        if self._wire_profile != _COMPACT_PROFILE_V2 or self.last_maintenance_operation != "advance":
+            raise RuntimeError("当前没有 compact-v2 复合维护")
+        self.phase = "UNCERTAIN"
+        self.close()
 
 
 def run_party_single_step(config: LanConfig, *, batch: bool = True,
@@ -1342,8 +1381,8 @@ def run_party_single_step(config: LanConfig, *, batch: bool = True,
     """P1/P2 默认只接受批量能力；旧 wire 须由双方显式选择诊断模式。"""
     if config.role not in {"P1", "P2"}:
         raise ValueError("角色命令必须是 P1 或 P2。")
-    if wire_profile not in {"control-batch-v1", _COMPACT_PROFILE} or (
-        wire_profile == _COMPACT_PROFILE and not batch
+    if wire_profile not in {"control-batch-v1", *_COMPACT_PROFILES} or (
+        wire_profile in _COMPACT_PROFILES and not batch
     ):
         raise ValueError("紧凑动态 profile 必须显式协商原批量内核")
     role: Literal["P1", "P2"] = config.role
@@ -1401,10 +1440,11 @@ def _validate_segment_chain(hello: LanSegmentedHelloPayload, session: str,
         raise ValueError("段链存在外来 run、跳段或旧 session。")
 
 
-def _restore_compact_online(value, *, layout, session, round_id, step, modulus, run_id, epoch_id, party):
+def _restore_compact_online(value, *, layout, session, round_id, step, modulus, run_id, epoch_id, party,
+                            wire_profile=_COMPACT_PROFILE):
     """只从认证 setup 与当前信封恢复公开计划，再交给原资源 recovery。"""
     plan = Client._resource_plan(layout, session, round_id, step)
-    if not isinstance(value, _CompactOnlinePayload) or (
+    if not isinstance(value, _CompactOnlinePayload) or value.version != wire_profile or (
         value.run_id, value.epoch_id, value.plan_sha256
     ) != (run_id, epoch_id, public_step_plan_sha256(plan)):
         raise ValueError("紧凑材料的 run、epoch 或公开计划不匹配")
@@ -1439,8 +1479,8 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
             startup_deadline,
         )
         compact_hello = wire_hello if isinstance(wire_hello, _CompactHelloPayload) else None
-        if (expected_wire_profile not in {"control-batch-v1", _COMPACT_PROFILE}
-                or (compact_hello is not None) != (expected_wire_profile == _COMPACT_PROFILE)):
+        if (expected_wire_profile not in {"control-batch-v1", *_COMPACT_PROFILES}
+                or (compact_hello.version if compact_hello else "control-batch-v1") != expected_wire_profile):
             raise ValueError("LAN Client 与 Party 动态编码 profile 不一致")
         preload_hello = wire_hello if isinstance(wire_hello, PreloadedHelloPayload) else None
         inner_hello = (compact_hello.base if compact_hello is not None else
@@ -1642,11 +1682,18 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                 last_round = None
                 awaiting_begin = False
                 continue
-            if segmented and online_request.operation == "segment_end":
-                _check_request(online_request, role, sequence, "segment_end", session)
-                end = online_request.payload
+            if segmented and online_request.operation in {"segment_end", "segment_advance"}:
+                advance = online_request.operation == "segment_advance"
+                _check_request(online_request, role, sequence, online_request.operation, session)
+                if advance and (expected_wire_profile != _COMPACT_PROFILE_V2
+                                or not isinstance(online_request.payload, SegmentAdvancePayload)):
+                    raise ValueError("复合维护必须精确协商 compact-v2")
+                end = online_request.payload.end if advance else online_request.payload
                 if not isinstance(end, SegmentEndPayload):
                     raise TypeError("段结束请求类型错误。")
+                if (expected_wire_profile == _COMPACT_PROFILE_V2 and end.action == "continue"
+                        and not advance):
+                    raise ValueError("compact-v2 满段 continue 必须使用复合维护")
                 if end.action == "switch" and hello.mode != "lan-full-v3":
                     raise ValueError("旧分段模式不得执行 v3 epoch switch")
                 actual = SegmentEndPayload(
@@ -1657,6 +1704,21 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                     raise ValueError("段结束与本方实际提交前缀不一致。")
                 receipt = SegmentEndReceipt(role, session, actual,
                                             hello.global_start + committed, products, truncations)
+                if advance:
+                    begin = online_request.payload.begin
+                    expected = SegmentBeginPayload(hello.run_id, hello.segment_index + 1,
+                        global_committed, setup.controller_epoch, last_round)
+                    if end.action != "continue" or begin != expected:
+                        raise ValueError("复合维护 Begin 与本方段尾/epoch 不匹配")
+                    # 整份请求验证完成后才更新公开账本；秘密状态、全局序号和资源不变。
+                    hello = LanSegmentedHelloPayload(hello.profile_sha256, hello.nonce,
+                        hello.run_id, begin.segment_index, begin.global_start, session, "lan-segmented-v2")
+                    committed = 0
+                    last_round = None
+                    _party_reply(client_socket, online_request, SegmentAdvanceReceipt(receipt, begin),
+                                 config.shutdown_timeout)
+                    sequence += 1
+                    continue
                 _party_reply(client_socket, online_request, receipt, config.shutdown_timeout)
                 if v2 and end.action == "continue":
                     sequence += 1
@@ -1698,7 +1760,8 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
             if compact_hello is not None:
                 online_material = _restore_compact_online(online_material, layout=material.layout,
                     session=session, round_id=online_request.round_id, step=expected_step,
-                    modulus=fixed.modulus, run_id=hello.run_id, epoch_id=setup.controller_epoch, party=party)
+                    modulus=fixed.modulus, run_id=hello.run_id, epoch_id=setup.controller_epoch, party=party,
+                    wire_profile=expected_wire_profile)
             if not isinstance(online_material, PartyOnlineMaterial):
                 raise TypeError("在线单方材料类型错误。")
             online = recovery.restore(online_material)

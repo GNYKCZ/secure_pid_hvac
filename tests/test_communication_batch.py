@@ -1352,7 +1352,8 @@ def test_compact_residues_and_wire_reject_noncanonical_structure_before_restore(
             replace(frame, **{field: bad})
 
 
-def test_compact_restore_and_peer_bind_original_plan_input_and_phase():
+@pytest.mark.parametrize("profile", ["control-dynamic-compact-v1", "control-dynamic-compact-v2"])
+def test_compact_restore_and_peer_bind_original_plan_input_and_phase(profile):
     from test_two_party_protocol import make_stack
 
     from secure_control.execution import lan_runtime as lan
@@ -1362,11 +1363,12 @@ def test_compact_restore_and_peer_bind_original_plan_input_and_phase():
     current = client.prepare_online(distribution, [.25], step=0)
     plan, q = current.p1_resources.plan, client.fixed_point.modulus
     raw = codec._encode_preloaded_values(current.p1_resources, q)
-    value = codec._CompactOnlinePayload(current.p1_input, "run", "epoch", public_step_plan_sha256(plan), raw)
+    value = codec._CompactOnlinePayload(current.p1_input, "run", "epoch", public_step_plan_sha256(plan), raw, profile)
     args = {"layout": distribution.p1.layout, "session": plan.session_id, "round_id": plan.round_id,
-            "step": 0, "modulus": q, "run_id": "run", "epoch_id": "epoch", "party": 0}
+            "step": 0, "modulus": q, "run_id": "run", "epoch_id": "epoch", "party": 0, "wire_profile": profile}
     assert lan._restore_compact_online(value, **args).plan == plan
-    for changed in (replace(value, run_id="other"), replace(value, epoch_id="other"),
+    for changed in (replace(value, version=next(p for p in codec._COMPACT_PROFILES if p != profile)),
+                    replace(value, run_id="other"), replace(value, epoch_id="other"),
                     replace(value, plan_sha256="0"*64), replace(value, values=raw[:-1]),
                     replace(value, input_message=replace(value.input_message, recipient=1)),
                     replace(value, input_message=replace(value.input_message, round_id="old"))):
@@ -1376,7 +1378,7 @@ def test_compact_restore_and_peer_bind_original_plan_input_and_phase():
         codec._encode_preloaded_values(replace(current.p1_resources,
             product_resources=tuple(reversed(current.p1_resources.product_resources))), q)
     peer = LocalhostProtocol3PeerPort(None, "P1", 8*1024*1024, 1.,
-                                      batch_enabled=True, wire_profile=codec._COMPACT_PROFILE)
+                                      batch_enabled=True, wire_profile=profile)
     peer.bind(plan.session_id)
     peer.set_batch_round(plan, modulus=q, run_id="run", epoch_id="epoch", physical_step=7)
     ids = tuple(r.resource_id for r in plan.product_resources)
@@ -1386,7 +1388,8 @@ def test_compact_restore_and_peer_bind_original_plan_input_and_phase():
     frame = WireEnvelope(SCHEMA_VERSION, "request", "P2", "P1", 1, "peer_batch",
                           plan.session_id, plan.round_id, 0, None, compact)
     for changed in (replace(frame, sequence=2), replace(frame, round_id="old"), replace(frame, step=1),
-                    replace(frame, payload=old), replace(frame, payload=replace(compact, run_id="old")),
+                    replace(frame, payload=old),
+                    replace(frame, payload=replace(compact, version=next(p for p in codec._COMPACT_PROFILES if p != profile))), replace(frame, payload=replace(compact, run_id="old")),
                     replace(frame, payload=replace(compact, epoch_id="old")),
                     replace(frame, payload=replace(compact, physical_step=8)),
                     replace(frame, payload=replace(compact, plan_sha256="0"*64)),
@@ -1400,20 +1403,21 @@ def test_compact_restore_and_peer_bind_original_plan_input_and_phase():
     client.abort_round(current)
 
 
-def test_compact_worker_packet_and_original_capability_bind_encoding_profile():
+@pytest.mark.parametrize("profile", ["control-dynamic-compact-v1", "control-dynamic-compact-v2"])
+def test_compact_worker_packet_and_original_capability_bind_encoding_profile(profile):
     from copy import copy
 
     from test_two_party_protocol import make_stack
 
     from secure_control.execution import _material_worker as worker
-    from secure_control.execution.localhost_codec import _COMPACT_PROFILE, _encode_preloaded_values
+    from secure_control.execution.localhost_codec import _COMPACT_PROFILES, _encode_preloaded_values
 
     client, _, _, _, distribution = make_stack()
     owner = client._material_owner(distribution)
     prepared = owner.create(0, rng=random.Random(31))
     plan = prepared.p1_resources.plan
     spec = worker._WorkerSpec(owner.layout, client.fixed_point.modulus, 8, 8, None, None,
-        "run", distribution.session_id, "epoch", 0, 16, _COMPACT_PROFILE)
+        "run", distribution.session_id, "epoch", 0, 16, profile)
     worker._check_spec(spec)
     with pytest.raises(ValueError, match="预留"):
         worker._check_spec(replace(spec, modulus=1 << 100000))
@@ -1421,18 +1425,19 @@ def test_compact_worker_packet_and_original_capability_bind_encoding_profile():
                       for r in (prepared.p1_resources, prepared.p2_resources))
     packet = worker._package(spec, plan, fragments, 10, 5)
     assert worker._unpack(spec, packet, 0)[:2] == (plan, fragments)
-    for changed in (replace(spec, encoding_profile="control-batch-v1"), replace(spec, epoch="old")):
+    for changed in (replace(spec, encoding_profile=next(p for p in _COMPACT_PROFILES if p != profile)),
+                    replace(spec, encoding_profile="control-batch-v1"), replace(spec, epoch="old")):
         with pytest.raises(ValueError):
             worker._unpack(changed, packet, 0)
     wrong = worker._package(spec, plan, (b'{"old":"json"}', fragments[1]), 10, 5)
     with pytest.raises(ValueError, match="长度"):
         worker._unpack(spec, wrong, 0)
     source = object()
-    owner.open_encoded_source(source, encoding_profile=_COMPACT_PROFILE)
+    owner.open_encoded_source(source, encoding_profile=profile)
     with pytest.raises(ValueError):
         owner.register_encoded(source, plan, fragments)
-    cap = owner.register_encoded(source, plan, fragments, encoding_profile=_COMPACT_PROFILE)
-    assert cap.encoding_profile == _COMPACT_PROFILE
+    cap = owner.register_encoded(source, plan, fragments, encoding_profile=profile)
+    assert cap.encoding_profile == profile
     for invalid in (copy(cap), replace(cap, encoding_profile="control-batch-v1")):
         with pytest.raises(ValueError, match="原始"):
             client._bind_encoded_input(distribution, invalid, [.25], step=0)
@@ -1524,12 +1529,13 @@ def test_compact_and_original_kernel_exact_shares_across_two_400_boundaries(monk
     from secure_control.execution import _localhost_peer as peer_module
     from secure_control.execution.localhost_codec import (
         _COMPACT_PROFILE,
+        _COMPACT_PROFILE_V2,
         _decode_preloaded_values,
         _encode_preloaded_values,
     )
 
     client, _, _, _, distribution = make_stack()
-    profiles = ("control-batch-v1", _COMPACT_PROFILE)
+    profiles = ("control-batch-v1", _COMPACT_PROFILE, _COMPACT_PROFILE_V2)
     roles = [[role_type(rehydrate_offline_material(PartyOfflineMaterial.from_message(material),
                 distribution.range_contract)) for role_type, material in ((P1, distribution.p1), (P2, distribution.p2))]
              for _ in profiles]
@@ -1539,12 +1545,12 @@ def test_compact_and_original_kernel_exact_shares_across_two_400_boundaries(monk
     frames = {profile: [] for profile in profiles}
     original_send, original_exchange = peer_module.send_envelope, peer_module._exchange_frame
     def sent(sock, frame, **kwargs):
-        frames["control-batch-v1" if isinstance(frame.payload, Protocol3BatchPayload) else _COMPACT_PROFILE].append(
+        frames["control-batch-v1" if isinstance(frame.payload, Protocol3BatchPayload) else frame.payload.version].append(
             (frame.payload.phase, len(encode_envelope(frame))+4))
         return original_send(sock, frame, **kwargs)
     def exchanged(sock, data, **kwargs):
         frame = decode_envelope(data)
-        frames[_COMPACT_PROFILE].append((frame.payload.phase, len(data)+4))
+        frames[frame.payload.version].append((frame.payload.phase, len(data)+4))
         return original_exchange(sock, data, **kwargs)
     monkeypatch.setattr(peer_module, "send_envelope", sent)
     monkeypatch.setattr(peer_module, "_exchange_frame", exchanged)
@@ -1564,7 +1570,7 @@ def test_compact_and_original_kernel_exact_shares_across_two_400_boundaries(monk
                 inp, plan, client.fixed_point.modulus) for inp, resources in (
                     (current.p1_input, current.p1_resources), (current.p2_input, current.p2_resources))]
             results = []
-            for index, materials in enumerate((original, compact)):
+            for index, materials in enumerate((original, compact, compact)):
                 outputs = [[], []]
                 local = [rehydrate_online_material(m, modulus=client.fixed_point.modulus, security_parameter=8)
                          for m in materials]
@@ -1587,8 +1593,9 @@ def test_compact_and_original_kernel_exact_shares_across_two_400_boundaries(monk
                 results.append([outputs[i][0].value.value for i in (0, 1)])
                 assert all(r.resources.consumed_count == plan.triple_count+plan.truncation_count for r in local)
             for i in (0, 1):
-                assert np.array_equal(results[0][i], results[1][i])
-                assert np.array_equal(roles[0][i].state_share.value, roles[1][i].state_share.value)
+                for index in (1, 2):
+                    assert np.array_equal(results[0][i], results[index][i])
+                    assert np.array_equal(roles[0][i].state_share.value, roles[index][i].state_share.value)
             client.abort_round(current)
         for profile in profiles:
             assert len(frames[profile]) == 801*7
@@ -4388,6 +4395,26 @@ def test_s13_fixed_history_preserves_types_presence_precision_and_atomic_prefix(
         with pytest.raises(RuntimeError):
             broken.append(bad.items())
         assert broken.count == 0 and broken.expand() == []
+
+
+def test_compact_v2_history_preserves_advance_and_original_layout():
+    from secure_control.execution.cycle_timing import CycleTiming
+    from secure_control.experiments import communication_benchmark as bench
+
+    assert bench._CompactHistory.layout("Client", 10000, qualification=True)["reserved_bound_bytes"] == 31159895
+    history = bench._CompactHistory("Client", steps=2, wire_profile="control-dynamic-compact-v2")
+    timing = CycleTiming("run", "session", "epoch", 0, 399, "round", 20_000_000,
+        1_000_000_000, 1_000_000_001, 1_020_000_000, status="miss_after_apply",
+        phase_durations_ns={"maintenance": 6_000_000, "maintenance_advance": 5_000_000})
+    history.cycle(timing, {}, {})
+    rows = history.expand()
+    phases = rows["cycles"][0]["phase_durations_ns"]
+    assert phases == timing.phase_durations_ns
+    assert "maintenance_end" not in phases and "maintenance_begin" not in phases
+    assert rows["cycles"][0]["cycle_completed_ns"] is None
+    report = history.report()
+    assert report["format_version"] == 2 and report["representation_complete"]
+    assert report["layout"]["reserved_bound_bytes"] < report["layout"]["limit_bytes"]
 
 
 def test_s13_complete_synthetic_history_matches_original_fields_and_retains_no_input():

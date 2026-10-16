@@ -18,7 +18,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from secure_control.execution.lan_config import LanEndpoint, LanTopology
-from secure_control.execution.localhost_codec import _COMPACT_PROFILE
+from secure_control.execution.localhost_codec import (
+    _COMPACT_PROFILE,
+    _COMPACT_PROFILE_V2,
+    _COMPACT_PROFILES,
+)
 
 from . import communication_benchmark as benchmark
 from ._network_emulator import SEED, NetworkRelay, models
@@ -257,14 +261,16 @@ def assemble(result, *, profile, phase, manifest, relay):
             result.get("network_history") or {}, target_steps=target)
     except (KeyError, TypeError, ValueError, IndexError):
         complete = False
-    compact = manifest.get("wire_profile") == _COMPACT_PROFILE
+    wire_profile = manifest.get("wire_profile")
+    compact = wire_profile in _COMPACT_PROFILES
     material = result.get("material_summary") or {}
-    wire_valid = not compact or (result.get("wire_profile") == _COMPACT_PROFILE
-        and material.get("encoding_profile") == _COMPACT_PROFILE
-        and (material.get("worker") or {}).get("encoding_profile") == _COMPACT_PROFILE
+    wire_valid = wire_profile is None or compact and (result.get("wire_profile") == wire_profile
+        and material.get("encoding_profile") == wire_profile
+        and (material.get("worker") or {}).get("encoding_profile") == wire_profile
         and len(result.get("party_outcomes", [])) == 2
-        and all(row.get("wire_profile") == _COMPACT_PROFILE for row in result["party_outcomes"]))
+        and all(row.get("wire_profile") == wire_profile for row in result["party_outcomes"]))
     sample = (result.get("status") == "stopped" and result.get("requested_steps") == target
+        and wire_profile != _COMPACT_PROFILE_V2  # v2 本轮只有软件许可，不能获得性能资格。
         and complete and wire_valid and (result.get("network_history") or {}).get("finite_sample_pass") is True and _tls_pass(result)
         and relay.get("model_valid") is True and relay.get("process_exited") is True
         and not relay.get("forced_termination"))

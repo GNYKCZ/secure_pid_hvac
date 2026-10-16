@@ -112,19 +112,26 @@ class PublicRing:
               "progress_ns", "sent_bytes", "queued_bytes", "unexplained_excess_ns", "backpressure",
               "first_attempt_ns", "writable_return_ns", "eligible_ns")
     CAPACITY = 256
+    TIMING_FIELDS = ("wait_kind", "wait_started_ns", "wait_returned_ns", "planned_wake_ns",
+                     "loop_started_ns", "rss_started_ns", "rss_ended_ns", "send_started_ns", "send_ended_ns")
 
     def __init__(self):
         self.data = array("q", [0]) * (self.CAPACITY * len(self.FIELDS))
         self.seen = 0
         self.first_anomaly = None
+        self.first_anomaly_timing = None
+        self.timing = [0, -1, -1, -1, -1, -1, -1]
+        self.active_direction = None
 
-    def append(self, values):
+    def append(self, values, *, send_started_ns=None):
         start = self.seen % self.CAPACITY * len(self.FIELDS)
         for index, value in enumerate(values):
             self.data[start + index] = value
         self.seen += 1
         if (values[10] > MODEL_TOLERANCE_NS or values[7] < values[6]) and self.first_anomaly is None:
             self.first_anomaly = tuple(values)
+            self.first_anomaly_timing = (*self.timing,
+                values[12] if send_started_ns is None else send_started_ns, values[7])
 
     def rows(self):
         width = len(self.FIELDS)
@@ -160,6 +167,8 @@ def _progress(direction, now, writable_at, ring):
         raise RuntimeError("禁止提前转发字节。")
     eligible = max(block.due, direction.previous_completed)
     first = block.first_attempt is None
+    if not first and writable_at is None:
+        raise RuntimeError("已尝试块只能由真实可写事件推进")
     if first:
         block.first_attempt = now
     # 首次尝试必须及时；发生真实would-block后，另记录等待及返回就绪后的派发开销。
@@ -176,7 +185,7 @@ def _progress(direction, now, writable_at, ring):
         block.blocked = True
         ring.append((DIRECTIONS.index(direction.name), block.offset, len(block.data), block.arrival, block.tx,
                      block.propagation, block.due, observed, 0, direction.queued, residual, 1,
-                     block.first_attempt, writable_at, eligible))
+                     block.first_attempt, -1 if writable_at is None else writable_at, eligible), send_started_ns=now)
         return
     if sent <= 0:
         raise ConnectionError("网络字节流写端已关闭。")
@@ -194,13 +203,28 @@ def _progress(direction, now, writable_at, ring):
     direction.queued -= sent
     ring.append((DIRECTIONS.index(direction.name), block.offset, len(block.data), block.arrival, block.tx,
                  block.propagation, block.due, completed, sent, direction.queued, residual, int(block.blocked),
-                 block.first_attempt, writable_at, eligible))
+                  block.first_attempt, -1 if writable_at is None else writable_at, eligible), send_started_ns=now)
     if block.cursor == len(block.data):
         stats["completed_chunks"] += 1
         stats["fifo_wait_ns"] += max(0, direction.previous_completed-block.due)
         stats["blocked_release_count"] += block.blocked
         direction.previous_completed = completed
         direction.queue.popleft()
+
+
+def _serve_due(directions, rotation, ring):
+    """每方向每遍至多一个原读块；只直接首次尝试，短写/背压等待可写事件。"""
+    serviced = set()
+    for offset in range(len(directions)):
+        direction = directions[(rotation + offset) % len(directions)]
+        now = time.perf_counter_ns()
+        if (direction.queue and direction.queue[0].first_attempt is None
+                and direction.queue[0].due <= now):
+            ring.active_direction = direction.name
+            _progress(direction, now, None, ring)
+            serviced.add(direction.name)
+    ring.active_direction = None
+    return serviced
 
 
 def _relay_main(profile, endpoints, stop, pipe):
@@ -213,6 +237,8 @@ def _relay_main(profile, endpoints, stop, pipe):
     failure_at, operation, event_direction, error_errno, error_winerror = None, "startup", None, None, None
     peak, next_memory, stopping_at = 0, 0, None
     accepted = set()
+    outgoing_by_socket, incoming_by_socket = {}, {}
+    rotation = 0
     connection_attempts = [0, 0, 0]
     gc_before = {"enabled": gc.isenabled(), "threshold": list(gc.get_threshold()),
                  "freeze_count": gc.get_freeze_count(), "debug": gc.get_debug()}
@@ -232,8 +258,16 @@ def _relay_main(profile, endpoints, stop, pipe):
         ready = True
         while True:
             now = time.perf_counter_ns()
+            ring.timing[4] = now
+            operation, event_direction = "due_first", None
+            serviced = _serve_due(directions, rotation, ring)
+            rotation = (rotation + 1) % max(1, len(directions))
+            now = time.perf_counter_ns()
             if now >= next_memory:
+                operation, event_direction = "rss", None
+                ring.timing[5] = time.perf_counter_ns()
                 memory = _process_memory()
+                ring.timing[6] = time.perf_counter_ns()
                 current = memory.get("current_rss_bytes", memory.get("peak_rss_bytes"))
                 if type(current) is not int or current > 256*1024*1024:
                     raise MemoryError("网络子进程RSS保护触发。")
@@ -270,8 +304,8 @@ def _relay_main(profile, endpoints, stop, pipe):
                     else:
                         selector.register(rear, selectors.EVENT_WRITE, ("connect", index))
             for sock in sockets:
-                outgoing = next(d for d in directions if d.source is sock)
-                incoming = next(d for d in directions if d.destination is sock)
+                outgoing = outgoing_by_socket[sock]
+                incoming = incoming_by_socket[sock]
                 mask = (selectors.EVENT_READ if not outgoing.eof and outgoing.queued < QUEUE_LIMIT
                         and not stop.is_set() else 0)
                 if incoming.queue:
@@ -301,19 +335,34 @@ def _relay_main(profile, endpoints, stop, pipe):
             if sys.platform == "win32" and any(d.queue and d.queue[0].due > now for d in directions):
                 # 正select timeout不能充当亚毫秒定时器；先处理即时就绪，无事件才阻塞让出CPU。
                 # Python3.11在Windows以waitable timer执行正sleep；每次最多250us后重新核对QPC。
-                selected = selector.select(0) if selector.get_map() else []
+                selected = []
+                if selector.get_map():
+                    ring.timing[:4] = [1, time.perf_counter_ns(), -1, 0]
+                    ring.timing[3] = ring.timing[1]
+                    selected = selector.select(0)
+                    ring.timing[2] = time.perf_counter_ns()
                 if not selected:
                     remaining = (next_due-time.perf_counter_ns())/1e9
                     if remaining > 0:
                         operation = "release_wait"
-                        time.sleep(min(remaining, .00025))
+                        delay = min(remaining, .00025)
+                        ring.timing[:4] = [2, time.perf_counter_ns(), -1, 0]
+                        ring.timing[3] = ring.timing[1] + int(delay * 1e9)
+                        time.sleep(delay)
+                        ring.timing[2] = time.perf_counter_ns()
                     continue
             else:
                 # Windows select不接受空集合；空闲或已到期但不可写时保留原阻塞等待。
                 if not selector.get_map():
+                    ring.timing[:4] = [3, time.perf_counter_ns(), -1, 0]
+                    ring.timing[3] = ring.timing[1] + int(wait * 1e9)
                     stop.wait(wait)
+                    ring.timing[2] = time.perf_counter_ns()
                     continue
+                ring.timing[:4] = [1, time.perf_counter_ns(), -1, 0]
+                ring.timing[3] = ring.timing[1] + int(wait * 1e9)
                 selected = selector.select(wait)
+                ring.timing[2] = time.perf_counter_ns()
             writable_at = time.perf_counter_ns()
             for key, mask in selected:
                 if key.data[0] == "accept":
@@ -348,16 +397,21 @@ def _relay_main(profile, endpoints, stop, pipe):
                         sock.setblocking(False)
                     for source, destination, name in ((front, rear, DIRECTIONS[2*index]),
                                                        (rear, front, DIRECTIONS[2*index+1])):
-                        directions.append(Direction(source, destination, name, Schedule(link_models[name], name)))
+                        direction = Direction(source, destination, name, Schedule(link_models[name], name))
+                        directions.append(direction)
+                        outgoing_by_socket[source] = incoming_by_socket[destination] = direction
                     continue
                 _, outgoing, incoming = key.data
                 if mask & selectors.EVENT_READ:
                     operation, event_direction = "recv", outgoing.name
                     _read(outgoing)
-                if mask & selectors.EVENT_WRITE and incoming.queue:
+                if (mask & selectors.EVENT_WRITE and incoming.queue and incoming.name not in serviced
+                        and incoming.queue[0].due <= time.perf_counter_ns()):
                     operation, event_direction = "send", incoming.name
                     _progress(incoming, time.perf_counter_ns(), writable_at, ring)
     except Exception as failure:  # noqa: BLE001 - 不保存载荷、异常对象或异常原文。
+        if operation == "due_first":
+            event_direction = ring.active_direction
         error = type(failure).__name__
         failure_at = time.perf_counter_ns()
         error_errno, error_winerror = getattr(failure, "errno", None), getattr(failure, "winerror", None)
@@ -381,6 +435,10 @@ def _relay_main(profile, endpoints, stop, pipe):
             "queue_limit_per_direction": QUEUE_LIMIT, "combined_queue_limit": 6*QUEUE_LIMIT,
             "read_block_limit": READ_LIMIT, "model_tolerance_ns": MODEL_TOLERANCE_NS,
             "ring_fields": PublicRing.FIELDS, "ring": ring.rows(), "first_anomaly": ring.first_anomaly,
+            "ring_version": 2, "missing_writable_return_ns": -1,
+            "first_anomaly_timing_fields": PublicRing.TIMING_FIELDS,
+            "first_anomaly_timing": ring.first_anomaly_timing,
+            "wait_kinds": {"0": "none", "1": "selector", "2": "release_wait", "3": "stop_wait"},
             "ring_capacity": ring.CAPACITY, "ring_reserved_bytes": len(ring.data)*ring.data.itemsize,
             "ring_evicted": max(0, ring.seen-ring.CAPACITY), "encoded_limit": 64*1024,
             "first_failure": {"error_type": error, "qpc_ns": failure_at, "operation": operation,

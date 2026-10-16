@@ -17,7 +17,7 @@ from secure_control.protocol.messages import (
 )
 
 from .localhost_codec import (
-    _COMPACT_PROFILE,
+    _COMPACT_PROFILES,
     SCHEMA_VERSION,
     BatchHelloPayload,
     HelloPayload,
@@ -64,8 +64,8 @@ class LocalhostProtocol3PeerPort:
         self._send_sequence = 1
         self._receive_sequence = 1
         self._batch_enabled = batch_enabled
-        if wire_profile not in {"control-batch-v1", _COMPACT_PROFILE} or (
-            wire_profile == _COMPACT_PROFILE and not batch_enabled
+        if wire_profile not in {"control-batch-v1", *_COMPACT_PROFILES} or (
+            wire_profile in _COMPACT_PROFILES and not batch_enabled
         ):
             raise ValueError("peer 编码 profile 无效")
         self._wire_profile = wire_profile
@@ -101,7 +101,7 @@ class LocalhostProtocol3PeerPort:
     ) -> tuple[ProductMaskPayload, ...]:
         ids = tuple(item.resource_id for item in plan.product_resources)
         self._check_batch_values(masks, len(ids), "product", sender=self._role)
-        if self._wire_profile == _COMPACT_PROFILE:
+        if self._wire_profile in _COMPACT_PROFILES:
             incoming = self._exchange_batch(plan, "product", ids, products=masks).products
         elif self._role == "P1":
             self._send_batch(plan, "product", ids, products=masks)
@@ -138,7 +138,7 @@ class LocalhostProtocol3PeerPort:
                       tuple(item.resource_id for item in plan.state_truncation_resources))
 
     def _barrier(self, plan: StepResourcePlan, phase: str, ids: tuple[str, ...]) -> None:
-        if self._wire_profile == _COMPACT_PROFILE:
+        if self._wire_profile in _COMPACT_PROFILES:
             self._exchange_batch(plan, phase, ids)
         elif self._role == "P1":
             self._send_batch(plan, phase, ids)
@@ -205,13 +205,13 @@ class LocalhostProtocol3PeerPort:
         return result
 
     def _wire_batch(self, payload):
-        if self._wire_profile != _COMPACT_PROFILE:
+        if self._wire_profile not in _COMPACT_PROFILES:
             return payload
         values = [share for item in payload.products for share in (item.d, item.e)]
         values.extend(item.value for item in payload.truncations)
         return _CompactBatchPayload(payload.phase, payload.plan_sha256, payload.run_id,
             payload.epoch_id, payload.physical_step, payload.batch_index,
-            _encode_residues(values, self._batch_context[4]))
+            _encode_residues(values, self._batch_context[4]), self._wire_profile)
 
     def _validate_batch(self, message, plan, phase, ids):
         run_id, epoch_id, physical_step, _ = self._batch_identity(plan)
@@ -223,8 +223,8 @@ class LocalhostProtocol3PeerPort:
         ):
             raise ValueError("批量 peer 阶段、顺序或公开身份不匹配")
         payload = message.payload
-        if self._wire_profile == _COMPACT_PROFILE:
-            if not isinstance(payload, _CompactBatchPayload):
+        if self._wire_profile in _COMPACT_PROFILES:
+            if not isinstance(payload, _CompactBatchPayload) or payload.version != self._wire_profile:
                 raise ValueError("紧凑 peer 禁止混入旧批次")
             # 先检验公开身份及精确长度；不得依据字节外观猜测格式。
             if (payload.phase, payload.plan_sha256, payload.run_id, payload.epoch_id,

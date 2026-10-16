@@ -16,6 +16,7 @@ import tempfile
 import time
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, replace
+from functools import cache
 from hashlib import sha256
 from itertools import count, pairwise
 from math import isfinite
@@ -30,6 +31,7 @@ import numpy as np
 from secure_control.execution.lan_config import LanConfig, LanEndpoint, LanTopology, load_lan_config
 from secure_control.execution.lan_runtime import LanContinuousRuntime, run_party_single_step
 from secure_control.execution.lan_scalar_runtime import LanScalarRuntime
+from secure_control.execution.localhost_codec import _COMPACT_PROFILE_V2
 
 _ROOT = Path(__file__).resolve().parents[3]
 
@@ -151,7 +153,10 @@ class _CompactHistory:
     DIRECTIONS = ("Client->P1", "Client->P2", "P1->Client", "P1->P2", "P2->Client", "P2->P1")
 
     @classmethod
-    def schemas(cls, role, steps, *, qualification=False):
+    def schemas(cls, role, steps, *, qualification=False, wire_profile=None):
+        if wire_profile not in (None, _COMPACT_PROFILE_V2):
+            raise ValueError("非法维护历史版本")
+        phases = (*cls.PHASES, "maintenance_advance") if wire_profile else cls.PHASES
         if (role not in ("Client", "P1", "P2") or type(steps) is not int or type(qualification) is not bool
                 or not (steps == 10000 if qualification else 1 <= steps <= 4000)):
             raise ValueError("非法紧凑历史范围")
@@ -163,7 +168,7 @@ class _CompactHistory:
         if role == "Client":
             row.update({("segment_index",): "u", ("session_id",): 128, ("status",): 64,
                         ("duration_ms",): "d", ("failure_phase",): 64, ("error_type",): 64})
-            mapping(row, "components_ms", ((k+"_ms", "d") for k in cls.PHASES))
+            mapping(row, "components_ms", ((k+"_ms", "d") for k in phases))
             mapping(row, "storage", ((k, "u" if k.endswith("count") else "d") for k in cls.STORAGE))
         mapping(row, activity_name, ((k, "d") for k in cls.ACTIVITY))
         row[("sent",)] = "m"
@@ -179,7 +184,7 @@ class _CompactHistory:
                 "cycle_completed_ns", "protocol_committed_count", "physically_confirmed_count", "durable_step_count",
                 "format_version")})
             cycle.update({("status",): 64, ("failure_phase",): 64})
-            mapping(cycle, "phase_durations_ns", ((k, "u") for k in cls.PHASES))
+            mapping(cycle, "phase_durations_ns", ((k, "u") for k in phases))
             mapping(cycle, "queue_levels", ((k, "u") for k in cls.QUEUE))
             for name in ("public_frame_counts", "public_byte_counts"):
                 mapping(cycle, name, ((k, "u") for k in cls.DIRECTIONS))
@@ -188,11 +193,12 @@ class _CompactHistory:
         return tables
 
     @classmethod
-    def layout(cls, role, steps=4000, *, qualification=False):
+    def layout(cls, role, steps=4000, *, qualification=False, wire_profile=None):
         if type(qualification) is not bool or qualification and (steps != 10000 or role not in {"Client", "P1", "P2"}):
             raise ValueError("资格历史只支持固定10000及三个原角色。")
         tables = {}
-        for name, (capacity, schema) in cls.schemas(role, steps, **({"qualification": True} if qualification else {})).items():
+        for name, (capacity, schema) in cls.schemas(role, steps, qualification=qualification,
+                                                  wire_profile=wire_profile).items():
             row_bytes = sum(1 + (code+2 if type(code) is int else 8 if code in ("u", "d") else 0)
                             for code in schema.values())
             tables[name] = {"capacity": capacity, "row_bytes": row_bytes, "buffer_bytes": capacity*row_bytes,
@@ -206,13 +212,14 @@ class _CompactHistory:
         return {"role": role, "tables": tables, "buffer_bytes": buffer_bytes,
                 "metadata_bound_bytes": 512*1024, "reserved_bound_bytes": reserved, "limit_bytes": limit}
 
-    def __init__(self, role, steps=4000, *, qualification=False):
+    def __init__(self, role, steps=4000, *, qualification=False, wire_profile=None):
         if type(qualification) is not bool:
             raise ValueError("资格历史选择必须为bool。")
         self.role, self.target = role, steps
-        self.layout_info = self.layout(role, steps, **({"qualification": True} if qualification else {}))
+        self.wire_profile = wire_profile
+        self.layout_info = self.layout(role, steps, qualification=qualification, wire_profile=wire_profile)
         self.tables = {k: _HistoryTable(n, schema) for k, (n, schema) in
-                       self.schemas(role, steps, **({"qualification": True} if qualification else {})).items()}
+                       self.schemas(role, steps, qualification=qualification, wire_profile=wire_profile).items()}
         self.threads, self.error_type = [], None
         self.tail_correction = None
         self.last_confirmed_step = self.last_confirmed_return_qpc_ns = self.normal_stop_start_qpc_ns = None
@@ -317,7 +324,9 @@ class _CompactHistory:
     def report(self):
         tables = {name: {"captured": t.count, "expanded": t.expanded_count, "error_type": t.error_type,
                          "expansion_error_type": t.expansion_error_type} for name, t in self.tables.items()}
-        return {"role": self.role, "format_version": 1, "layout": self.layout_info, "tables": tables,
+        return {"role": self.role, "format_version": 2 if self.wire_profile else 1,
+            **({"wire_profile": self.wire_profile} if self.wire_profile else {}),
+            "layout": self.layout_info, "tables": tables,
             "representation_complete": self.error_type is None and all(t.error_type is None
                 and t.expansion_error_type is None and t.expanded_count == t.count for t in self.tables.values()),
             "error_type": self.error_type, "threads": self.threads, "preallocated_memory": self.preallocated_memory,
@@ -1674,20 +1683,30 @@ def _source_fingerprints(extra=()):
     return {name: sha256((_ROOT / name).read_bytes()).hexdigest() for name in (*paths, *extra)}
 
 
+@cache
+def _windows_memory_api():
+    """每进程只初始化结构和函数签名；不保存任何 RSS 样本。"""
+    import ctypes
+    from ctypes import wintypes
+    class Counters(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("faults", wintypes.DWORD),
+                    *((name, ctypes.c_size_t) for name in (
+                        "peak", "current", "peak_paged", "paged", "peak_nonpaged",
+                        "nonpaged", "pagefile", "peak_pagefile"))]
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    api = ctypes.WinDLL("psapi", use_last_error=True)
+    kernel.GetCurrentProcess.restype = wintypes.HANDLE
+    api.GetProcessMemoryInfo.argtypes = (wintypes.HANDLE, ctypes.POINTER(Counters), wintypes.DWORD)
+    kernel.GetCurrentProcess.argtypes = ()
+    api.GetProcessMemoryInfo.restype = wintypes.BOOL
+    return Counters, kernel, api
+
+
 def _process_memory():
-    """读取本进程 OS 峰值 RSS/working set；不把 canonical 编码预算当成 RSS。"""
+    """每次重新读取 OS RSS/working set；仅缓存平台 API 绑定。"""
     if os.name == "nt":
         import ctypes
-        from ctypes import wintypes
-        class Counters(ctypes.Structure):
-            _fields_ = [("cb", wintypes.DWORD), ("faults", wintypes.DWORD),
-                        *((name, ctypes.c_size_t) for name in (
-                            "peak", "current", "peak_paged", "paged", "peak_nonpaged",
-                            "nonpaged", "pagefile", "peak_pagefile"))]
-        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-        api = ctypes.WinDLL("psapi", use_last_error=True)
-        kernel.GetCurrentProcess.restype = wintypes.HANDLE
-        api.GetProcessMemoryInfo.argtypes = (wintypes.HANDLE, ctypes.POINTER(Counters), wintypes.DWORD)
+        Counters, kernel, api = _windows_memory_api()
         value = Counters()
         value.cb = ctypes.sizeof(value)
         if not api.GetProcessMemoryInfo(kernel.GetCurrentProcess(), ctypes.byref(value), value.cb):

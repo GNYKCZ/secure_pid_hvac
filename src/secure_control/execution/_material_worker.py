@@ -18,7 +18,7 @@ from secure_control.protocol.messages import public_step_plan_sha256
 from secure_control.protocol.roles import Client, _create_resource_pair
 
 from .localhost_codec import (
-    _COMPACT_PROFILE,
+    _COMPACT_PROFILES,
     _canonical_json,
     _encode_online_fragment,
     _encode_preloaded_values,
@@ -50,7 +50,7 @@ class _WorkerSpec:
 
 
 def _check_spec(spec):
-    if (not isinstance(spec, _WorkerSpec) or spec.encoding_profile not in {"control-batch-v1", _COMPACT_PROFILE}
+    if (not isinstance(spec, _WorkerSpec) or spec.encoding_profile not in {"control-batch-v1", *_COMPACT_PROFILES}
             or type(spec.slots) is not int
             or not 1 <= spec.slots <= 16 or type(spec.start) is not int or spec.start < 0
             or any(type(v) is not str or not 1 <= len(v) <= 256
@@ -61,7 +61,7 @@ def _check_spec(spec):
     truncations = n if spec.layout.scale_ledger.state_truncation_bits else 0
     digits = spec.modulus.bit_length() * 30103 // 100000 + 1
     bound = products * (4096 + 12 * digits) + truncations * (4096 + 8 * digits) + 4096 + 512 * m
-    if spec.encoding_profile == _COMPACT_PROFILE:
+    if spec.encoding_profile in _COMPACT_PROFILES:
         row = (3 * products + 2 * truncations) * ((spec.modulus.bit_length() + 7) // 8)
         # 三份 IPC 临时包均计入原槽上限；生成资源前就排除最大合法头的最坏尺寸。
         bound = 3 * (2 * row + _HEADER_LIMIT + 5)
@@ -141,7 +141,7 @@ def _unpack(spec, packet, step):
     plan = Client._resource_plan(spec.layout, spec.session_id, head["round"], step)
     if head["plan"] != public_step_plan_sha256(plan):
         raise ValueError("材料包与父进程公开计划摘要不匹配")
-    if spec.encoding_profile == _COMPACT_PROFILE and head["lengths"] != [
+    if spec.encoding_profile in _COMPACT_PROFILES and head["lengths"] != [
         _preloaded_values_size(plan, spec.modulus)] * 2:
         raise ValueError("紧凑材料片段长度与公开计划不匹配")
     split = 5 + size + head["lengths"][0]
@@ -199,7 +199,7 @@ def _worker_main(spec, credit, output):
             started, cpu = time.perf_counter_ns(), time.process_time_ns()
             plan = Client._resource_plan(spec.layout, spec.session_id, "round-" + secrets.token_hex(16), next_step)
             resources = _create_resource_pair(plan, multiplier, truncation)
-            encoder = _encode_preloaded_values if spec.encoding_profile == _COMPACT_PROFILE else _encode_online_fragment
+            encoder = _encode_preloaded_values if spec.encoding_profile in _COMPACT_PROFILES else _encode_online_fragment
             fragments = tuple(encoder(v, spec.modulus) for v in resources)
             packet = _package(spec, plan, fragments, time.perf_counter_ns() - started,
                               time.process_time_ns() - cpu)

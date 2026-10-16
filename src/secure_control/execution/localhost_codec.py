@@ -53,6 +53,8 @@ from secure_control.protocol.messages import (
 
 SCHEMA_VERSION = 3
 _COMPACT_PROFILE = "control-dynamic-compact-v1"
+_COMPACT_PROFILE_V2 = "control-dynamic-compact-v2"
+_COMPACT_PROFILES = (_COMPACT_PROFILE, _COMPACT_PROFILE_V2)
 _COMPACT_MAX_VALUES = 512 * 1024
 _ROLES = {"Supervisor", "Client", "P1", "P2"}
 _KINDS = {"hello", "ready", "request", "reply", "error", "shutdown"}
@@ -72,6 +74,7 @@ _OPERATIONS = {
     "lan_setup",
     "segment_end",
     "segment_begin",
+    "segment_advance",
     "step",
     "endpoint",
     "peer_product",
@@ -205,7 +208,7 @@ class _CompactHelloPayload:
     version: str = _COMPACT_PROFILE
 
     def __post_init__(self):
-        if (self.version != _COMPACT_PROFILE or not isinstance(self.base, BatchHelloPayload)
+        if (self.version not in _COMPACT_PROFILES or not isinstance(self.base, BatchHelloPayload)
                 or not isinstance(self.base.base, LanSegmentedHelloPayload)
                 or self.base.base.mode != "lan-segmented-v2"):
             raise LocalhostCodecError("动态紧凑 hello 的模式或版本无效")
@@ -220,8 +223,11 @@ class _CompactOnlinePayload:
     epoch_id: str
     plan_sha256: str
     values: bytes = field(repr=False)
+    version: str = _COMPACT_PROFILE
 
     def __post_init__(self):
+        if self.version not in _COMPACT_PROFILES:
+            raise LocalhostCodecError("紧凑数值块版本不匹配")
         if not isinstance(self.input_message, InputShareMessage):
             raise LocalhostCodecError("紧凑输入 DTO 无效")
         _text(self.run_id, "run_id")
@@ -241,8 +247,11 @@ class _CompactBatchPayload:
     physical_step: int | None
     batch_index: int
     values: bytes = field(repr=False)
+    version: str = _COMPACT_PROFILE
 
     def __post_init__(self):
+        if self.version not in _COMPACT_PROFILES:
+            raise LocalhostCodecError("紧凑数值块版本不匹配")
         if self.phase not in {"product", "product_complete", "truncation", "state_complete"}:
             raise LocalhostCodecError("紧凑 peer 阶段无效")
         if type(self.batch_index) is not int or self.batch_index != {
@@ -418,6 +427,35 @@ class SegmentBeginPayload:
 
 
 @dataclass(frozen=True, slots=True)
+class SegmentAdvancePayload:
+    """显式 compact-v2 的同 epoch 满段维护；保留原 End/Begin 身份。"""
+
+    end: SegmentEndPayload
+    begin: SegmentBeginPayload
+
+    def __post_init__(self):
+        if (not isinstance(self.end, SegmentEndPayload)
+                or not isinstance(self.begin, SegmentBeginPayload)):
+            raise LocalhostCodecError("复合维护类型错误")
+        end, begin = self.end, self.begin
+        if (end.action != "continue" or end.confirmed_count == 0
+                or (begin.run_id, begin.segment_index, begin.global_start, begin.previous_round_id)
+                != (end.run_id, end.segment_index + 1, end.global_end_exclusive, end.last_round_id)):
+            raise LocalhostCodecError("复合维护段链不匹配")
+
+
+@dataclass(frozen=True, slots=True)
+class SegmentAdvanceReceipt:
+    end_receipt: SegmentEndReceipt
+    begin: SegmentBeginPayload
+
+    def __post_init__(self):
+        if not isinstance(self.end_receipt, SegmentEndReceipt):
+            raise LocalhostCodecError("复合维护回执类型错误")
+        SegmentAdvancePayload(self.end_receipt.end, self.begin)
+
+
+@dataclass(frozen=True, slots=True)
 class LanContinuousSetupPayload:
     """连续模式公开数值 setup；证书不含任何单方秘密。"""
 
@@ -524,6 +562,8 @@ WirePayload = (
     | SegmentBeginPayload
     | SegmentEndPayload
     | SegmentEndReceipt
+    | SegmentAdvancePayload
+    | SegmentAdvanceReceipt
     | PreloadedResourceManifest
     | PreloadedHelloPayload
     | PreloadedBlock
@@ -859,6 +899,12 @@ def _encode_value(value: object) -> object:
         return {"type": "segment_end_receipt", **asdict(value), "end": _encode_value(value.end)}
     if isinstance(value, SegmentBeginPayload):
         return {"type": "segment_begin", **asdict(value)}
+    if isinstance(value, SegmentAdvancePayload):
+        return {"type": "segment_advance", "end": _encode_value(value.end),
+                "begin": _encode_value(value.begin)}
+    if isinstance(value, SegmentAdvanceReceipt):
+        return {"type": "segment_advance_receipt", "end_receipt": _encode_value(value.end_receipt),
+                "begin": _encode_value(value.begin)}
     if isinstance(value, LanSetupPayload):
         return {
             "type": "lan_setup",
@@ -1165,7 +1211,7 @@ def _decode_value(value: object) -> object:
     if kind in {"compact_online", "compact_batch"}:
         cls = _CompactOnlinePayload if kind == "compact_online" else _CompactBatchPayload
         _exact_fields(mapping, {"type", "version", *cls.__dataclass_fields__}, kind)
-        if mapping["version"] != _COMPACT_PROFILE:
+        if mapping["version"] not in _COMPACT_PROFILES:
             raise LocalhostCodecError("紧凑数值块版本不匹配")
         fields = {name: mapping[name] for name in cls.__dataclass_fields__}
         fields["values"] = _decode_compact_base64(mapping["values"])
@@ -1256,6 +1302,13 @@ def _decode_value(value: object) -> object:
         _exact_fields(mapping, {"type", "capability", "base"}, kind)
         base = _decode_value(mapping["base"])
         return BatchHelloPayload(base, _text(mapping["capability"], "capability"))
+    if kind in {"segment_advance", "segment_advance_receipt"}:
+        receipt = kind == "segment_advance_receipt"
+        name = "end_receipt" if receipt else "end"
+        _exact_fields(mapping, {"type", name, "begin"}, kind)
+        cls = SegmentAdvanceReceipt if receipt else SegmentAdvancePayload
+        return cls(_typed(mapping[name], SegmentEndReceipt if receipt else SegmentEndPayload),
+                   _typed(mapping["begin"], SegmentBeginPayload))
     if kind in {"lan_segmented_hello", "segment_end", "segment_end_receipt",
                 "segment_begin"}:
         cls = {"lan_segmented_hello": LanSegmentedHelloPayload,
@@ -1621,6 +1674,9 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
         ("request", "segment_begin"): to_party,
         ("reply", "segment_begin"): to_client,
         ("error", "segment_begin"): to_client,
+        ("request", "segment_advance"): to_party,
+        ("reply", "segment_advance"): to_client,
+        ("error", "segment_advance"): to_client,
         ("request", "step"): {("Supervisor", "Client")},
         ("reply", "step"): {("Client", "Supervisor")},
         ("error", "step"): {("Client", "Supervisor")},
@@ -1699,6 +1755,10 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
         expected = (SegmentEndPayload,)
     elif key == ("reply", "segment_end"):
         expected = (SegmentEndReceipt,)
+    elif key == ("request", "segment_advance"):
+        expected = (SegmentAdvancePayload,)
+    elif key == ("reply", "segment_advance"):
+        expected = (SegmentAdvanceReceipt,)
     elif key == ("request", "online"):
         expected = (PartyOnlineMaterial, _EncodedOnlinePayload)
     elif (
@@ -1747,11 +1807,12 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
                  or payload.batch_index != {"product": 0, "product_complete": 1,
                                             "truncation": 2, "state_complete": 3}[payload.phase])):
         raise LocalhostCodecError("Protocol 3 批次方向、阶段或身份非法")
-    if message.operation in {"segment_end", "segment_begin", "preload_init", "preload_seal"} and (
+    receipt = payload.end_receipt if isinstance(payload, SegmentAdvanceReceipt) else payload
+    if message.operation in {"segment_end", "segment_begin", "segment_advance", "preload_init", "preload_seal"} and (
         message.session_id is None or message.round_id is not None
         or message.step is not None or message.resource_id is not None
-        or (isinstance(payload, SegmentEndReceipt)
-            and (payload.role != message.sender or payload.session_id != message.session_id))
+        or (isinstance(receipt, SegmentEndReceipt)
+            and (receipt.role != message.sender or receipt.session_id != message.session_id))
     ):
         raise LocalhostCodecError("段结束回执身份不符或携带 round identity。")
     if message.operation == "endpoint" and isinstance(payload, Protocol3EndpointCommand):
