@@ -12,6 +12,7 @@ import time
 from dataclasses import replace
 from fractions import Fraction
 from threading import Event, Thread
+from types import SimpleNamespace
 
 import pytest
 from lan_test_support import ROOT, free_ports
@@ -110,6 +111,146 @@ def test_full_queue_stops_reading_and_admits_only_available_room():
     emulator._read(direction)
     assert source.requests == [3] and direction.queued == emulator.QUEUE_LIMIT
     assert direction.stats["received_bytes"] == 3 and direction.stats["queue_high_water"] == emulator.QUEUE_LIMIT
+
+
+@pytest.mark.parametrize("profile,empty_readers,late_sleep", (
+    ("N1", False, False), ("N2", False, False), ("N3", False, False),
+    ("N2", True, False), ("N2", False, True)))
+def test_windows_relay_due_does_not_depend_on_positive_select_timer(monkeypatch, profile, empty_readers, late_sleep):
+    """驱动真实代理循环：模拟正timeout延后一个tick，不运行socket或性能补测。"""
+    clock = [1_000_000_000]
+    stopped, reports = [False], []
+    payload = b"opaque" * 246 + b"xx"
+    written, idle_waits, sleeps = bytearray(), [], []
+    startup_idle, blocked, waited_for_writable = [False], [False], [False]
+    selectors, sleeps_without_fds = [], []
+    scheduled_due = [None]
+
+    class Socket:
+        def __init__(self, *_args):
+            self.front = None
+            self.read = 0
+
+        def accept(self):
+            return self.front, None
+
+        def connect_ex(self, _address):
+            return 0
+
+        def getsockopt(self, *_args):
+            return 0
+
+        def recv(self, _limit):
+            self.read += 1
+            return payload if self is active_front and self.read == 1 else b""
+
+        def send(self, data):
+            if not blocked[0]:
+                blocked[0] = True
+                raise BlockingIOError
+            written.extend(data)
+            stopped[0] = True
+            return len(data)
+
+        def __getattr__(self, _name):
+            return lambda *_args: None
+
+    fronts = [Socket() for _ in range(3)]
+    active_front = fronts[2] if profile == "N3" else fronts[0]
+    created = []
+
+    def socket_factory(*args):
+        sock = Socket(*args)
+        if len(created) < 3:
+            sock.front = fronts[len(created)]
+        created.append(sock)
+        return sock
+
+    class Selector:
+        def __init__(self):
+            self.mapping = {}
+            selectors.append(self)
+
+        def register(self, sock, events, data):
+            self.mapping[sock] = SimpleNamespace(fileobj=sock, events=events, data=data)
+
+        modify = register
+
+        def unregister(self, sock):
+            del self.mapping[sock]
+
+        def get_key(self, sock):
+            return self.mapping[sock]
+
+        def get_map(self):
+            return self.mapping
+
+        def close(self):
+            self.mapping.clear()
+
+        def select(self, timeout):
+            if not startup_idle[0]:
+                assert timeout > 0  # 没有数据时不忙轮询。
+                startup_idle[0] = True
+                clock[0] += 15_625_000
+                return []
+            if blocked[0] and not waited_for_writable[0]:
+                assert timeout > 0  # 已到期但真正不可写时也应允许阻塞。
+                waited_for_writable[0] = True
+                clock[0] += 15_625_000
+                return []
+            ready = []
+            for key in self.mapping.values():
+                if key.data[0] != "stream":
+                    ready.append((key, key.events))
+                elif key.events & emulator.selectors.EVENT_READ and (
+                        key.fileobj is active_front and not key.fileobj.read
+                        or empty_readers and key.fileobj.read < (2 if key.fileobj is active_front else 1)):
+                    ready.append((key, emulator.selectors.EVENT_READ))
+                elif key.events & emulator.selectors.EVENT_WRITE:
+                    ready.append((key, emulator.selectors.EVENT_WRITE))
+            if ready:
+                clock[0] += 10_000
+            else:
+                idle_waits.append(timeout)
+                clock[0] += 15_625_000 if timeout > 0 else 50_000
+            return ready
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(emulator.socket, "socket", socket_factory)
+    monkeypatch.setattr(emulator.selectors, "DefaultSelector", Selector)
+    monkeypatch.setattr(emulator.time, "perf_counter_ns", lambda: clock[0])
+    enqueue = emulator.Schedule.enqueue
+    def remember_due(self, *args):
+        row = enqueue(self, *args)
+        scheduled_due[0] = row[3]
+        return row
+    monkeypatch.setattr(emulator.Schedule, "enqueue", remember_due)
+    def sleep(delay):
+        assert 0 < delay <= min(.00025, (scheduled_due[0] - clock[0])/1e9)
+        sleeps.append(delay)
+        sleeps_without_fds.append(not selectors[0].mapping)
+        clock[0] += math.ceil(delay * 10**9) + (15_625_000 if late_sleep else 0)
+    monkeypatch.setattr(emulator.time, "sleep", sleep)
+    monkeypatch.setattr(benchmark, "_process_memory", lambda: {"current_rss_bytes": 32 * 1024**2})
+    stop = SimpleNamespace(is_set=lambda: stopped[0], wait=lambda _timeout: pytest.fail("不应丢失活动FD"))
+    pipe = SimpleNamespace(send=reports.append, close=lambda: None)
+    emulator._relay_main(profile, [("127.0.0.1", port, "127.0.0.2") for port in (1, 2, 3)], stop, pipe)
+    report = reports[-1]
+    assert report["error_type"] is None and written == payload
+    direction = report["directions"]["P2->P1" if profile == "N3" else "Client->P1"]
+    assert report["model_valid"] is not late_sleep, direction
+    assert direction["early_sends"] == 0
+    assert direction["backpressure_count"] == 1 and waited_for_writable[0]
+    if late_sleep:
+        assert report["first_anomaly"] is not None and direction["unexplained_over_tolerance"] > 0
+    if profile != "N1":
+        assert all(timeout == 0 for timeout in idle_waits)
+        assert sleeps and len(idle_waits) <= len(sleeps) + 1  # 每次无就绪都阻塞，不忙等。
+        assert any(sleeps_without_fds) is empty_readers
+    else:
+        assert not sleeps
+    assert report["ring"][0][7] >= report["ring"][0][6]
 
 
 def _entry(profile, *, passed=True, head="a", sources=None, phase="discovery"):

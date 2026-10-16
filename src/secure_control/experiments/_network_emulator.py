@@ -10,6 +10,7 @@ import multiprocessing as mp
 import random
 import selectors
 import socket
+import sys
 import time
 from array import array
 from collections import deque
@@ -297,11 +298,22 @@ def _relay_main(profile, endpoints, stop, pipe):
                 break
             wait = max(0., min(.1, (next_due-time.perf_counter_ns())/1e9))
             operation, event_direction = "select", None
-            # Windows select不接受三个空集合；无FD时等待有界启动重试/停止事件。
-            if not selector.get_map():
-                stop.wait(wait)
-                continue
-            selected = selector.select(wait)
+            if sys.platform == "win32" and any(d.queue and d.queue[0].due > now for d in directions):
+                # 正select timeout不能充当亚毫秒定时器；先处理即时就绪，无事件才阻塞让出CPU。
+                # Python3.11在Windows以waitable timer执行正sleep；每次最多250us后重新核对QPC。
+                selected = selector.select(0) if selector.get_map() else []
+                if not selected:
+                    remaining = (next_due-time.perf_counter_ns())/1e9
+                    if remaining > 0:
+                        operation = "release_wait"
+                        time.sleep(min(remaining, .00025))
+                    continue
+            else:
+                # Windows select不接受空集合；空闲或已到期但不可写时保留原阻塞等待。
+                if not selector.get_map():
+                    stop.wait(wait)
+                    continue
+                selected = selector.select(wait)
             writable_at = time.perf_counter_ns()
             for key, mask in selected:
                 if key.data[0] == "accept":
