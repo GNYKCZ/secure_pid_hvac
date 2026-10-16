@@ -567,9 +567,9 @@ def _run() -> int:
     benchmark = commands.add_parser("benchmark")
     benchmark.add_argument("--case", required=True, choices=("dynamic", "scalar", "continuous", "cycle", "full-observation"))
     benchmark.add_argument("--mode", default="batch", choices=("legacy", "batch"))
-    benchmark.add_argument("--steps", required=True, type=int)
+    benchmark.add_argument("--steps", type=int)
     benchmark.add_argument("--delay-ms", type=float, default=0.)
-    benchmark.add_argument("--segment-steps", type=int, default=8)
+    benchmark.add_argument("--segment-steps", type=int)
     benchmark.add_argument("--material-slots", type=int, choices=(0, 4, 16), default=16)
     benchmark.add_argument("--preload-steps", type=int, default=0)
     benchmark.add_argument("--preload-execution", choices=("staged", "fused"), default="fused")
@@ -604,10 +604,38 @@ def _run() -> int:
     benchmark.add_argument("--fixed-proof-cache", action="store_true",
                            help="full-observation固定精确矩阵计算的显式候选对照")
     benchmark.add_argument("--role-config", type=Path)
+    benchmark.add_argument("--network-profile", choices=("N0", "N1", "N2", "N3"))
+    benchmark.add_argument("--network-phase", choices=("discovery", "recheck", "qualification"))
+    benchmark.add_argument("--network-certs", type=Path)
+    benchmark.add_argument("--network-ports", help="预声明的三个固定端口，逗号分隔")
+    benchmark.add_argument("--network-ledger", type=Path)
+    benchmark.add_argument("--network-approval", type=Path)
+    benchmark.add_argument("--network-repair-note")
     benchmark.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     _enable_terminal_progress()
     if args.role == "benchmark":
+        if any(getattr(args, name) is not None for name in ("network_profile", "network_phase", "network_certs",
+                "network_ports", "network_ledger", "network_approval", "network_repair_note")):
+            from .network_benchmark import run_network_benchmark, validate_cli
+
+            try:
+                ports = validate_cli(args)
+                report = run_network_benchmark(profile=args.network_profile, phase=args.network_phase,
+                    certs=args.network_certs, ports=ports, ledger=args.network_ledger,
+                    approval=args.network_approval, output=args.output, repair_note=args.network_repair_note)
+            except (OSError, ValueError, RuntimeError) as error:
+                return _failure("Client", 5, "network_benchmark", error)
+            print(json.dumps({"status": report["status"], "profile": args.network_profile, "phase": args.network_phase,
+                "network_sample_pass": report["network_sample_pass"],
+                "network_dynamic_qualification_pass": report["network_dynamic_qualification_pass"],
+                "attempts": len(report.get("cycles", [])), "history_export_ns": report["network_export_ns"],
+                "report": str(args.output)}, ensure_ascii=False, sort_keys=True))
+            return 0 if report["network_sample_pass"] else 5
+        if args.steps is None:
+            parser.error("benchmark requires --steps outside the fixed network profiles")
+        if args.segment_steps is None:
+            args.segment_steps = 8
         from .communication_benchmark import (
             run_continuous_observation,
             run_full_observation,

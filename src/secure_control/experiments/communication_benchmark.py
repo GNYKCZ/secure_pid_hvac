@@ -1944,7 +1944,7 @@ def _party_job(
     diagnostic_enabled=False, full_observation=False, tcp_nodelay=None, supply_diagnostic=False,
     timeout_trace=False, material_comparison=False, worker_wait_diagnostic=False, server_gc_candidate=False,
     stage_wait_diagnostic=False, compact_history_candidate=False, compact_history_steps=4000,
-    compact_history_qualification=False,
+    compact_history_qualification=False, network_observation=False,
 ) -> None:
     role_steps = []
     history = None
@@ -1961,6 +1961,9 @@ def _party_job(
     diagnostic = (_TimeoutDiagnostic(config.role, ports, wait_profile=worker_wait_diagnostic) if timeout_trace else
                   _Diagnostic(config.role, supply=supply_diagnostic) if diagnostic_enabled else None)
     observations = ExitStack()
+    network_tls = {"links": [], "restored": False}
+    if network_observation:
+        observations.enter_context(_observe_network_tls(config.role, network_tls))
     socket_options = []
     gc_boundaries = {} if material_comparison else None
     observations.enter_context(_observe_tcp(socket_options, tcp_nodelay))
@@ -1998,6 +2001,8 @@ def _party_job(
             restore()
             observations.close()
         outcome["tcp_socket_options"] = socket_options
+        if network_observation:
+            outcome["network_tls"] = network_tls
         if diagnostic:
             outcome["diagnostic"] = diagnostic.report()
         if stage_wait:
@@ -2951,7 +2956,7 @@ def _compact_gc_boundary(cycles, roles):
 
 
 def _finish_compact_history(result, report, history, *, qpc_stage_receive_candidate=False,
-                            qpc_dynamic_qualification=False):
+                            qpc_dynamic_qualification=False, network_observation=False):
     """S13完整展开与有限样本检查独立记账，绝不借用原资格flag。"""
     if history is not None and history.expansion_ns is None:
         expanded = history.expand()
@@ -2964,7 +2969,9 @@ def _finish_compact_history(result, report, history, *, qpc_stage_receive_candid
     cycles = result.get("cycles", [])
     attempts = (result.get("cycle_summary") or {}).get("attempts", len(cycles))
     stage = result.get("stage_wait_diagnostic") or {}
-    target = 10000 if qpc_dynamic_qualification else result.get("requested_steps", 1000) if qpc_stage_receive_candidate else 4000
+    target = (result.get("requested_steps", 1000) if network_observation else
+              10000 if qpc_dynamic_qualification else result.get("requested_steps", 1000) if qpc_stage_receive_candidate else 4000)
+    large_history = qpc_dynamic_qualification or network_observation and target == 10000
     meta = {"format_version": 1, "target_steps": target, "maximum_attempts": (10000 if qpc_dynamic_qualification else
         1000 if qpc_stage_receive_candidate else 4000),
         "first_failure_stop": True, "actual_attempts": attempts, "captured_cycles": len(cycles),
@@ -2979,11 +2986,13 @@ def _finish_compact_history(result, report, history, *, qpc_stage_receive_candid
     if qpc_stage_receive_candidate or qpc_dynamic_qualification:
         meta.update(profile="canonical-qpc-receive-v1" if qpc_dynamic_qualification else "qpc-stage-receive-v1",
                     qpc_receive_location="stage_wait_diagnostic.roles[Client].qpc_receive")
-    if qpc_dynamic_qualification:
+    if network_observation:
+        meta.update(profile="network-cycle-v1", maximum_attempts=target)
+    if large_history:
         meta["client_role_limit_bytes"] = 32*1024*1024
     meta["representation_complete"] = (len(roles) == 3 and {r.get("role") for r in roles} == {"Client", "P1", "P2"}
         and all(r.get("representation_complete") is True and r.get("layout", {}).get("reserved_bound_bytes", 2**63)
-                <= (32 if qpc_dynamic_qualification and r.get("role") == "Client" else 16)*1024*1024
+                <= (32 if large_history and r.get("role") == "Client" else 16)*1024*1024
                 for r in roles) and meta["combined_reserved_bound_bytes"] <= 48*1024*1024
         and len(cycles) == attempts)
     meta["thread_registration_complete"] = len(roles) == 3 and all(
@@ -3020,7 +3029,7 @@ def _finish_compact_history(result, report, history, *, qpc_stage_receive_candid
                 "pid": match[0]["pid"] if len(match) == 1 else None,
                 "classification": classification, "coverage_evidence_complete": reliable,
                 "scope": "registered identity/lifetime; not allocation stack or exclusive CPU"})
-    result["qpc_dynamic_qualification" if qpc_dynamic_qualification else
+    result["network_history" if network_observation else "qpc_dynamic_qualification" if qpc_dynamic_qualification else
            "qpc_stage_receive_candidate" if qpc_stage_receive_candidate else "compact_history_candidate"] = meta
     if result.get("status") == "stopped" and not meta["representation_complete"]:
         result.update(status="failed", failure_category="CompactHistoryObservation", failed_phase="HISTORY_EXPANSION")
@@ -3047,6 +3056,8 @@ def _finish_compact_history(result, report, history, *, qpc_stage_receive_candid
         result.update(status="failed", failure_category="QPCReceiveObservation", failed_phase="QPC_RECEIVE_REPORT")
     if qpc_dynamic_qualification:
         result["local_dynamic_qualification_pass"] = meta["finite_sample_pass"]
+    if network_observation and result.get("status") == "stopped" and not meta["finite_sample_pass"]:
+        result.update(status="failed", failure_category="NetworkObservation", failed_phase="HISTORY_REPORT")
     result.update(diagnostic=True, comparison_only=True, server_gc_candidate_gate_pass=False,
                   candidate_gate_pass=False, worker_long_run_gate_pass=False, stage_pass=False, qualification_pass=False)
 
@@ -3062,13 +3073,15 @@ def _run_material_comparison(options, candidate, *, target_steps=1000):
     server_gc_candidate = options.get("server_gc_candidate", False)
     qpc_candidate = options.get("qpc_stage_receive_candidate", False)
     qpc_qualification = options.get("qpc_dynamic_qualification", False)
-    compact_candidate = options.get("compact_history_candidate", False) or qpc_candidate or qpc_qualification
+    network = options.get("network_configs") is not None
+    large_history = qpc_qualification or network and target_steps == 10000
+    compact_candidate = options.get("compact_history_candidate", False) or qpc_candidate or qpc_qualification or network
     history = None
     stage_wait_diagnostic = options.get("stage_wait_diagnostic", False) or compact_candidate
     if compact_candidate:
         options = {**options, "stage_wait_diagnostic": True}
     traced = options.get("worker_timeout_diagnostic", False) or wait_diagnostic
-    long_run = target_steps == 10000 and not qpc_qualification
+    long_run = target_steps == 10000 and not qpc_qualification and not network
     long_metadata = {"format_version": 1, "target_steps": 10000, "maximum_attempts": 10000,
                      "candidate": "worker", "period_ns": 20000000, "segment_steps": 400,
                      "recording_mode": "light", "first_failure_stop": True,
@@ -3079,7 +3092,7 @@ def _run_material_comparison(options, candidate, *, target_steps=1000):
         "first_failure_stop": True, "numeric_contract": None} if server_gc_candidate else None
     stage_metadata = {"format_version": 1, "profile": ("canonical-qpc-receive-v1" if qpc_qualification else
         "qpc-stage-receive-v1" if qpc_candidate else "stage-wait-light-v1"),
-        "maximum_attempts": 10000 if qpc_qualification else 1000 if qpc_candidate else 4000,
+        "maximum_attempts": target_steps if network else 10000 if qpc_qualification else 1000 if qpc_candidate else 4000,
         "first_failure_stop": True, "numeric_contract": None} if stage_wait_diagnostic else None
     stage_observers = []
     trace_observers = []
@@ -3127,8 +3140,8 @@ def _run_material_comparison(options, candidate, *, target_steps=1000):
     try:
         with ExitStack() as cleanup:
             if compact_candidate:
-                history = _CompactHistory("Client", target_steps if qpc_candidate or qpc_qualification else 4000,
-                    **({"qualification": True} if qpc_qualification else {}))
+                history = _CompactHistory("Client", target_steps if qpc_candidate or qpc_qualification or network else 4000,
+                    **({"qualification": True} if large_history else {}))
             cleanup.enter_context(patch.object(lan_runtime.LanContinuousRuntime, "close", close))
             if history is not None:
                 cleanup.enter_context(patch.object(lan_runtime._MaterialWorkerPool, "__init__", initialized))
@@ -3177,7 +3190,8 @@ def _run_material_comparison(options, candidate, *, target_steps=1000):
     if stage_wait_diagnostic:
         _finish_stage_wait(result, report, stage_metadata, stage_observers)
     if compact_candidate:
-        _finish_compact_history(result, report, history, **({"qpc_dynamic_qualification": True} if qpc_qualification else
+        _finish_compact_history(result, report, history, **({"network_observation": True} if network else
+                                                        {"qpc_dynamic_qualification": True} if qpc_qualification else
                                                         {"qpc_stage_receive_candidate": True} if qpc_candidate else {}))
     if traced:
         result["diagnostic"] = True
@@ -3237,6 +3251,53 @@ def _run_material_comparison(options, candidate, *, target_steps=1000):
     return result
 
 
+@contextmanager
+def _observe_network_tls(role, facts):
+    """仅新实验记录原认证成功事实；证书/SAN/TLS核验仍由transport拥有。"""
+    from secure_control.execution import lan_transport
+
+    original = lan_transport._verify_identity
+    def verified(sock, expected):
+        original(sock, expected)
+        if len(facts["links"]) >= 2:
+            raise RuntimeError("网络实验角色出现额外连接。")
+        facts["links"].append({"role": role, "peer_identity": expected, "version": sock.version(),
+            "peer_san": list(sock.getpeercert()["subjectAltName"]),
+            "tcp_nodelay": sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY),
+            "local": list(sock.getsockname()), "remote": list(sock.getpeername())})
+    try:
+        with patch.object(lan_transport, "_verify_identity", verified):
+            yield
+    finally:
+        facts["restored"] = lan_transport._verify_identity is original
+
+
+def run_network_observation(*, configs, steps):
+    """独立TLS实验共享入口；先严格校验再复用原循环，旧裸TCP门禁不变。"""
+    if (type(configs) is not tuple or len(configs) != 3 or type(steps) is not int or steps not in (1000, 10000)
+            or tuple(getattr(c, "role", None) for c in configs) != ("Client", "P1", "P2")
+            or not all(isinstance(c, LanConfig) and c.transport == "mutual_tls" for c in configs)
+            or any(c.topology != configs[0].topology or c.startup_timeout != 30. or c.step_timeout != 30.
+                   or c.shutdown_timeout != 5. or c.idle_timeout != 30. for c in configs)
+            or configs[0].experiment_config != _ROOT / "configs/cart_pole_observer_lan.example.yaml"
+            or any(c.ca is None or c.certificate is None or c.private_key is None for c in configs)
+            or any(c.controller_config is not None for c in configs)
+            or not gc.isenabled() or gc.get_threshold() != (700, 10, 10)
+            or gc.get_freeze_count() or gc.get_debug() or gc.callbacks):
+        raise ValueError("网络实验只允许原配置、正常GC、三角色TLS及固定1000/10000。")
+    topology = configs[0].topology
+    endpoints = (topology.p1_client, topology.p2_client, topology.p1_peer)
+    if (topology.identities != {r: f"{r.lower()}.secure-control.test" for r in ("Client", "P1", "P2")}
+            or len({e.port for e in endpoints}) != 3
+            or any(e.host != "127.0.0.1" or e.bind not in ("127.0.0.1", "127.0.0.2") for e in endpoints)
+            or len({e.bind for e in endpoints}) != 1):
+        raise ValueError("网络实验拓扑/身份不匹配。")
+    return _run_material_comparison({"steps": steps, "delay_ms": 0., "segment_steps": 400, "optimized": True,
+        "material_slots": 16, "role_config": None, "preload_steps": 0, "preload_execution": "fused", "diagnostic": False,
+        "recording_mode": "light", "tcp_nodelay": None, "commit_policy": "default", "timeout_trace": False,
+        "network_configs": configs}, "worker", target_steps=steps)
+
+
 def _run_continuous_observation(*, steps: int, delay_ms: float,
                                segment_steps: int, optimized=False, material_slots=16,
                                role_config: Path | None = None, preload_steps=0,
@@ -3248,7 +3309,8 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
                                _long_run_metadata=None, worker_wait_diagnostic=False,
                                server_gc_candidate=False, stage_wait_diagnostic=False, _stage_observers=None,
                                compact_history_candidate=False, _compact_history=None,
-                               qpc_stage_receive_candidate=False, qpc_dynamic_qualification=False) -> dict[str, object]:
+                               qpc_stage_receive_candidate=False, qpc_dynamic_qualification=False,
+                               network_configs=None) -> dict[str, object]:
     """实际持续动态循环及原同步 writer；退出后报告观察，不发布图或更改调度。"""
     from secure_control.execution.lan_runtime import RunControl
     from secure_control.scenarios.cart_pole.interactive import InteractiveSession
@@ -3287,8 +3349,10 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
     supply_diagnostic = (diagnostic and light and not preload_steps and material_slots == 16
                          and (not comparison_only or _gc_trial is not None or worker_timeout_diagnostic
                               or worker_wait_diagnostic))
-    ports = _ports()
-    config = _config("Client", ports) if role_config is None else load_lan_config(role_config, "Client")
+    ports = _ports() if network_configs is None else tuple(e.port for e in (
+        network_configs[0].topology.p1_client, network_configs[0].topology.p2_client, network_configs[0].topology.p1_peer))
+    config = (network_configs[0] if network_configs is not None else
+              _config("Client", ports) if role_config is None else load_lan_config(role_config, "Client"))
     if (qpc_stage_receive_candidate or qpc_dynamic_qualification) and config.transport != "insecure_tcp":
         raise ValueError("S15不适用于TLS或未知传输。")
     if role_config is not None:
@@ -3315,16 +3379,19 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
     if _register_trace_cleanup:
         stop_roles = _register_trace_cleanup(stop_roles)
     parties = [context.Process(target=_party_job, args=(
-        _config(role, ports), ports, delay_ms, True, queue, diagnostic, False, tcp_nodelay,
+        network_configs[index+1] if network_configs is not None else _config(role, ports), ports, delay_ms, True, queue, diagnostic, False, tcp_nodelay,
         supply_diagnostic, timeout_trace, material_candidate is not None, worker_wait_diagnostic, server_gc_candidate,
-        stage_wait_diagnostic, compact_history_candidate or qpc_stage_receive_candidate or qpc_dynamic_qualification,
-        steps if qpc_stage_receive_candidate or qpc_dynamic_qualification else 4000, qpc_dynamic_qualification,
-    )) for role in ("P1", "P2")] if role_config is None else []
+        stage_wait_diagnostic, compact_history_candidate or qpc_stage_receive_candidate or qpc_dynamic_qualification or network_configs is not None,
+        steps if qpc_stage_receive_candidate or qpc_dynamic_qualification or network_configs is not None else 4000,
+        qpc_dynamic_qualification or network_configs is not None and steps == 10000,
+        *((True,) if network_configs is not None else ()),
+    )) for index, role in enumerate(("P1", "P2"))] if role_config is None else []
     records, events, outcomes, writer_batches = [], [], [], []
     history = _compact_history
     def record_count():
         return history.tables["steps"].count if history is not None else len(records)
     socket_options = []
+    network_tls = {"links": [], "restored": False}
     cycles = []
     marks, storage = {}, {"fsync_ms": 0., "fsync_count": 0, "checkpoint_ms": 0.,
                           "source_check_ms": 0., "source_check_control_ms": 0.,
@@ -3520,6 +3587,7 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
             for party in parties:
                 party.start()
             with (_observe_dynamic(marks), _commit_policy(commit_policy),
+                  _observe_network_tls("Client", network_tls) if network_configs is not None else nullcontext(),
                   _observe_tcp(socket_options, tcp_nodelay), ExitStack() as io_hooks):
                 if not light:
                     io_hooks.enter_context(patch.object(os, "fsync", measured_fsync))
@@ -3644,6 +3712,7 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
             raise RuntimeError("有限诊断编码超出预声明预算。")
     return {
         "schema": "cycle-qualification-v1" if optimized else "continuous-observation-v1",
+        **({"network_tls": network_tls} if network_configs is not None else {}),
         "recording_mode": recording_mode,
         "evidence_state": "not_recorded" if light else "full_observation_spool",
         "diagnostic": diagnostic, "diagnostic_report": diagnostic_report,
