@@ -145,7 +145,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                             on_cycle=None, cycle_snapshot=None,
                             before_sample=None, preload_steps=0,
                             preload_execution="fused", on_segment_ready=None,
-                            _material_candidate=None) -> dict[str, object]:
+                            _material_candidate=None, _wire_profile=None) -> dict[str, object]:
     """唯一持续循环接收已装配场景；保存/GUI 与 headless 不重复 parse 或创建 plant。"""
     control.bind_stop(session.reject_new)
     if preload_steps and material_slots != 16:
@@ -274,6 +274,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
             segment_capacity=(experiment.segment_capacity
                               if experiment.spec.state_dimension else None),
             preload_steps=preload_steps, preload_execution=preload_execution,
+            **({"wire_profile": _wire_profile} if _wire_profile is not None else {}),
         )
         if on_start is not None:
             on_start(runtime.snapshot(), runtime.public_setup)
@@ -605,25 +606,30 @@ def _run() -> int:
                            help="full-observation固定精确矩阵计算的显式候选对照")
     benchmark.add_argument("--role-config", type=Path)
     benchmark.add_argument("--network-profile", choices=("N0", "N1", "N2", "N3"))
-    benchmark.add_argument("--network-phase", choices=("discovery", "recheck", "qualification"))
+    benchmark.add_argument("--network-phase", choices=("discovery", "recheck", "qualification", "candidate"))
     benchmark.add_argument("--network-certs", type=Path)
     benchmark.add_argument("--network-ports", help="预声明的三个固定端口，逗号分隔")
     benchmark.add_argument("--network-ledger", type=Path)
     benchmark.add_argument("--network-approval", type=Path)
     benchmark.add_argument("--network-repair-note")
+    benchmark.add_argument("--network-wire-profile", choices=("control-dynamic-compact-v1",))
+    benchmark.add_argument("--network-authorization", help="当前 Issue 的直接用户批准登记评论 URL")
     benchmark.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     _enable_terminal_progress()
     if args.role == "benchmark":
         if any(getattr(args, name) is not None for name in ("network_profile", "network_phase", "network_certs",
-                "network_ports", "network_ledger", "network_approval", "network_repair_note")):
+                "network_ports", "network_ledger", "network_approval", "network_repair_note",
+                "network_wire_profile", "network_authorization")):
             from .network_benchmark import run_network_benchmark, validate_cli
 
             try:
                 ports = validate_cli(args)
                 report = run_network_benchmark(profile=args.network_profile, phase=args.network_phase,
                     certs=args.network_certs, ports=ports, ledger=args.network_ledger,
-                    approval=args.network_approval, output=args.output, repair_note=args.network_repair_note)
+                    approval=args.network_approval, output=args.output, repair_note=args.network_repair_note,
+                    **({"wire_profile": args.network_wire_profile, "authorization": args.network_authorization}
+                       if args.network_wire_profile is not None else {}))
             except (OSError, ValueError, RuntimeError) as error:
                 return _failure("Client", 5, "network_benchmark", error)
             print(json.dumps({"status": report["status"], "profile": args.network_profile, "phase": args.network_phase,

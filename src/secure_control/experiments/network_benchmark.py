@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from secure_control.execution.lan_config import LanEndpoint, LanTopology
+from secure_control.execution.localhost_codec import _COMPACT_PROFILE
 
 from . import communication_benchmark as benchmark
 from ._network_emulator import SEED, NetworkRelay, models
@@ -53,10 +54,17 @@ def validate_cli(args):
             or any(getattr(args, name) for name in ("diagnostic", "timeout_trace", "worker_timeout_diagnostic",
                 "worker_long_run", "worker_wait_diagnostic", "server_gc_candidate", "stage_wait_diagnostic",
                 "compact_history_candidate", "qpc_stage_receive_candidate", "qpc_dynamic_qualification", "fixed_proof_cache"))
-            or args.network_profile not in PROFILES or args.network_phase not in ("discovery", "recheck", "qualification")
+            or args.network_profile not in PROFILES or args.network_phase not in ("discovery", "recheck", "qualification", "candidate")
             or any(getattr(args, name) is None for name in ("network_certs", "network_ports", "network_ledger", "network_approval"))
             or args.network_repair_note is not None and args.network_phase != "recheck"):
         raise ValueError("网络实验参数必须独占、固定场景/阶段/正常GC/原动态资源；不能设置任意steps。")
+    wire = getattr(args, "network_wire_profile", None)
+    authorization = getattr(args, "network_authorization", None)
+    if (wire is None and (authorization is not None or args.network_phase == "candidate")
+            or wire is not None and (wire != _COMPACT_PROFILE or args.network_profile != "N2"
+                or args.network_phase not in {"candidate", "qualification"}
+                or not isinstance(authorization, str) or not COMMENT.fullmatch(authorization))):
+        raise ValueError("紧凑候选仅允许用户明确批准的两次 N2 阶段。")
     try:
         ports = tuple(int(p) for p in args.network_ports.split(","))
     except (ValueError, AttributeError) as error:
@@ -132,6 +140,40 @@ def next_call(entries, profile, phase, head, sources, repair_note=None):
     return steps
 
 
+def _next_compact_call(entries, profile, phase, head, sources, continuation):
+    """在同一已停止账本追加一次人工续接；旧循环与失败记录不可重置。"""
+    if (type(entries) is not list or not isinstance(continuation, dict)
+            or continuation.get("wire_profile") != _COMPACT_PROFILE
+            or not COMMENT.fullmatch(continuation.get("authorization_url", ""))
+            or profile != "N2" or phase not in {"candidate", "qualification"}):
+        raise ValueError("紧凑候选续接身份或阶段无效。")
+    prefix = [e for e in entries if "authorization_url" not in e]
+    current = entries[len(prefix):]
+    if (not prefix or entries != prefix + current
+            or any("authorization_url" not in e for e in current)
+            or digest(prefix) != continuation.get("closed_history_sha256")
+            or any(e.get("finished") is not True for e in prefix)
+            or not any(e.get("phase") == "recheck" and e.get("sample_pass") is False for e in prefix)
+            or any(e.get("authorization_url") != continuation["authorization_url"]
+                   or e.get("wire_profile") != _COMPACT_PROFILE for e in current)
+            or len(entries) >= 6 or len(current) >= 2 or any(e.get("finished") is not True for e in current)):
+        raise ValueError("续接必须保留原已停止历史；在途或耗尽不能重跑。")
+    if not current:
+        if phase != "candidate" or head == prefix[-1].get("head") or sources == prefix[-1].get("source_sha256"):
+            raise ValueError("新候选必须先以新已审来源执行唯一1000步。")
+        if sum(e.get("maximum_attempts", 15000) for e in entries) + 1000 > 15000:
+            raise ValueError("候选续接不得突破原总账上限。")
+        return 1000
+    previous = current[0]
+    if (phase != "qualification" or previous.get("phase") != "candidate"
+            or previous.get("maximum_attempts") != 1000 or previous.get("sample_pass") is not True
+            or previous.get("head") != head or previous.get("source_sha256") != sources):
+        raise ValueError("只有同一来源的候选完整成功后才能执行唯一10000步。")
+    if sum(e.get("maximum_attempts", 15000) for e in entries) + 10000 > 15000:
+        raise ValueError("候选续接不得突破原总账上限。")
+    return 10000
+
+
 class RunBudget:
     """磁盘独占锁和启动前持久占项；崩溃在途记录不被自动重跑覆盖。"""
 
@@ -166,13 +208,17 @@ class RunBudget:
             os.fsync(stream.fileno())
         os.replace(temporary, self.path)
 
-    def reserve(self, profile, phase, head, sources, output, repair_note=None, conditions_sha256=None):
-        steps = next_call(self.entries, profile, phase, head, sources, repair_note)
+    def reserve(self, profile, phase, head, sources, output, repair_note=None, conditions_sha256=None,
+                *, continuation=None):
+        steps = (_next_compact_call(self.entries, profile, phase, head, sources, continuation)
+                 if continuation is not None else next_call(self.entries, profile, phase, head, sources, repair_note))
         self.entries.append({"call": len(self.entries)+1, "profile": profile, "phase": phase,
             "head": head, "source_sha256": sources, "maximum_attempts": steps,
             "output": str(Path(output).resolve()), "started_utc": datetime.now(UTC).isoformat(),
             "finished": False, "sample_pass": False, "repair_note": repair_note,
             "conditions_sha256": conditions_sha256})
+        if continuation is not None:
+            self.entries[-1].update(continuation)
         self._save()
         return steps
 
@@ -211,8 +257,15 @@ def assemble(result, *, profile, phase, manifest, relay):
             result.get("network_history") or {}, target_steps=target)
     except (KeyError, TypeError, ValueError, IndexError):
         complete = False
+    compact = manifest.get("wire_profile") == _COMPACT_PROFILE
+    material = result.get("material_summary") or {}
+    wire_valid = not compact or (result.get("wire_profile") == _COMPACT_PROFILE
+        and material.get("encoding_profile") == _COMPACT_PROFILE
+        and (material.get("worker") or {}).get("encoding_profile") == _COMPACT_PROFILE
+        and len(result.get("party_outcomes", [])) == 2
+        and all(row.get("wire_profile") == _COMPACT_PROFILE for row in result["party_outcomes"]))
     sample = (result.get("status") == "stopped" and result.get("requested_steps") == target
-        and complete and (result.get("network_history") or {}).get("finite_sample_pass") is True and _tls_pass(result)
+        and complete and wire_valid and (result.get("network_history") or {}).get("finite_sample_pass") is True and _tls_pass(result)
         and relay.get("model_valid") is True and relay.get("process_exited") is True
         and not relay.get("forced_termination"))
     result.update(network_sample_pass=bool(sample),
@@ -225,7 +278,8 @@ def assemble(result, *, profile, phase, manifest, relay):
     return result
 
 
-def run_network_benchmark(*, profile, phase, certs, ports, ledger, approval, output, repair_note=None):
+def run_network_benchmark(*, profile, phase, certs, ports, ledger, approval, output, repair_note=None,
+                          wire_profile=None, authorization=None):
     """唯一新网络性能入口；校验审查来源和额度后才启动角色/转发器。"""
     head, fingerprints = source()
     approval = json.loads(Path(approval).read_text(encoding="utf-8"))
@@ -235,6 +289,17 @@ def run_network_benchmark(*, profile, phase, certs, ports, ledger, approval, out
             or approval.get("ports") != list(ports) or approval.get("environment") != environment
             or not COMMENT.fullmatch(approval.get("review_url", ""))):
         raise ValueError("缺少当前head/源指纹对应的独立软件审查放行。")
+    continuation = None
+    if wire_profile is not None:
+        if (wire_profile != _COMPACT_PROFILE or approval.get("wire_profile") != wire_profile
+                or not isinstance(authorization, str) or not COMMENT.fullmatch(authorization)
+                or approval.get("authorization_url") != authorization
+                or not isinstance(approval.get("closed_history_sha256"), str)):
+            raise ValueError("缺少绑定本候选编码、人工批准和旧历史的独立审查放行。")
+        continuation = {"wire_profile": wire_profile, "authorization_url": authorization,
+                        "closed_history_sha256": approval["closed_history_sha256"]}
+    elif authorization is not None or phase == "candidate":
+        raise ValueError("候选续接必须显式指定编码 profile 与批准。")
     output = Path(output)
     if output.exists():
         raise ValueError("本轮输出已存在，不允许覆盖或重跑。")
@@ -246,13 +311,15 @@ def run_network_benchmark(*, profile, phase, certs, ports, ledger, approval, out
             raise ValueError("同一闭环的端口/环境/证书/公开seed不能改变。")
         if phase == "qualification":
             candidates = [e for e in budget.entries if e["profile"] == "N2" and e.get("sample_pass")
-                          and e["head"] == head and e["source_sha256"] == fingerprints]
+                          and e["head"] == head and e["source_sha256"] == fingerprints
+                          and (continuation is None or e.get("authorization_url") == authorization)]
             if (approval.get("qualification_allowed") is not True or not candidates
                     or approval.get("n2_result_sha256") != candidates[-1].get("raw_sha256")):
                 raise ValueError("最终资格尚未由当前N2结果和独立审查放行。")
             if hashlib.sha256(Path(candidates[-1]["output"]).read_bytes()).hexdigest() != candidates[-1]["raw_sha256"]:
                 raise ValueError("当前候选的N2原件已变化。")
-        steps = budget.reserve(profile, phase, head, fingerprints, output, repair_note, conditions)
+        steps = budget.reserve(profile, phase, head, fingerprints, output, repair_note, conditions,
+                               continuation=continuation)
         result, relay = {}, None
         manifest = {"profile": profile, "phase": phase, "head": head, "source_sha256": fingerprints,
             "command": list(sys.argv), "seed": SEED, "maximum_attempts": steps,
@@ -264,6 +331,8 @@ def run_network_benchmark(*, profile, phase, certs, ports, ledger, approval, out
             "review_url": approval["review_url"], "started_utc": budget.entries[-1]["started_utc"],
             "conditions_sha256": conditions,
             "scope": "single computer; opaque read-block propagation/rate model; not measured WiFi, packets or hardware"}
+        if continuation is not None:
+            manifest.update(continuation, continuation_maximum_calls=2, continuation_maximum_attempts=11000)
         with output.open("x", encoding="utf-8") as stream:
             try:
                 configs = role_configs(certs, ports, profile)
@@ -274,7 +343,8 @@ def run_network_benchmark(*, profile, phase, certs, ports, ledger, approval, out
                     raise ValueError("公开证书指纹不符合预声明。")
                 relay = NetworkRelay(profile, tuple(("127.0.0.1", port, "127.0.0.2") for port in ports)) if profile != "N0" else None
                 with relay if relay is not None else nullcontext():
-                    result = benchmark.run_network_observation(configs=configs, steps=steps)
+                    result = benchmark.run_network_observation(configs=configs, steps=steps,
+                        **({"wire_profile": wire_profile} if wire_profile is not None else {}))
                 final_head, final_fingerprints = source()
                 if final_head != head or final_fingerprints != fingerprints:
                     result["network_source_integrity_failed"] = True

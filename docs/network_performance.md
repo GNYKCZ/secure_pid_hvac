@@ -23,6 +23,9 @@ Windows代理存在尚未到期的队首时，先以`select(0)`检查即时就�
 
 ## 软件前置与命令
 
+当前旧网络闭环已在唯一 N2 recheck 失败后停止，旧 N3 和旧资格调用不得继续。
+下列原流程说明保留用于解释历史记录；新的候选只能使用文末批准的人工续接。
+
 先做模型独立整数oracle、FIFO/短写/背压/半关闭、原TLS身份与失败软件回归和仓库必要检查，提交/推送新草稿PR并实际交独立Review。pytest不含新1000/10000控制运行；普通socket/TLS功能fixture与正式性能调用分别记账。旧裸TCP资格入口和flags不放宽。
 
 只在控制前，用既有fixture离线创建一次新证书（已有dev依赖，无生产模块导入tests）：
@@ -56,3 +59,37 @@ N1/N2/N3仅替换profile和独占输出名，按顺序各一次。不得传任�
 N0失败先看本机/TLS原路径；N1退化先辨工具开销；N2分析必要依赖、带宽/排队和角色已可用后的处理；N3只是更差peer条件。嵌套区间不能相加，GC/调度重叠不作唯一网络因果。没有可证实的软件问题不制造修复；若只是网络依赖下界或工具/宿主不能执行模型，报告可复核阻挡。需改协议/ACK/屏障、数学/安全/生产架构时，交具体设计决策，不擅改主线。
 
 运行期gen2专项、完整安全起摆/阶段切换、真实TLS三机/Wi-Fi及硬件仍独立未验收。旧失败/S5/S13根因未知和全部旧证据保留，不重标新SHA。新网络PR不自动合并，#120不关闭，闭环完成或触发停止条件后结束，不自动扩展下一支线。
+
+## 已批准的动态紧凑候选续接
+
+本候选依据[减少分发与多轮交互设计](https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6212118129)，
+用户直接批准登记为[本次实施与两次验证授权](https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6212453192)。
+三个角色必须显式协商 `control-dynamic-compact-v1`；默认 `control-batch-v1` 与有限预送格式保持原语义，混用直接拒绝。
+
+动态材料复用预送的定宽无符号大端 residue 编码，再用规范 base64 放入原 JSON 信封和4字节长度帧。
+宽度为 `ceil(q.bit_length()/8)`，严格检查 `0 <= z < q`，禁止 bool、浮点、截断和隐式取模。
+每方材料按原计划的全部 `(a,b,c)`、再全部状态行 `(r,r_prime)` 排列。
+当前 n4/m2/p1、256位模数是98个整数、3136字节、4184个 base64 字节；完整 `online_stage` 应用帧在软件夹具中检查不超过8 KiB。
+公开计划与资源标识由接收方认证布局、session、round、全局步重新派生，再核对原 `public_step_plan_sha256`，交给原 recovery 与生命周期 owner。
+worker 规格、包头、通道来源和原始能力均绑定编码 profile，保留哈希、精确长度、额度、槽与内存保护。
+
+Client 预先构造、编码并检查两方完整 `online_stage` 请求，然后两方均发送后才接收。
+Party 安装当轮材料后直接调用同一个 `stage_protocol3_batch`，返回原暂存结果；没有新协调器算法或有限预送缓存。
+普通轮由 Client 12帧加 peer 7帧的19帧，变为 Client 8帧加 peer 7帧的15帧；分段与停止消息另计。
+peer 在同一连接、同一 owner 线程内非阻塞推进一发一收，支持短读写、TLS WANT 换向和原绝对截止，只有无进展才等待就绪，并恢复 socket timeout。
+依旧保留乘法遮蔽、乘法完成屏障、P2单向截断、状态完成屏障四个依赖阶段。
+观察器将双向 helper 的真实发送帧和4字节帧头纳入计数；双向 native 记录的 confirmed 字节是两方向累计，不能解释为某个单向帧的确认游标。
+这些结构减少不代表固定时延收益，也不代表20 ms已达标。
+
+本次先完成必要软件检查、提交同一 PR #124，并实际交独立 Review。若 Review 确认需要额外源码修复，停止并报告，不自动增加一次返工。
+软件放行记录新增 `wire_profile`、用户登记评论 `authorization_url`，以及原已停止调用列表的规范摘要 `closed_history_sha256`。
+它们和当前 head、源指纹及独立报告绑定；仍只是已核实事实的本地记录，不是新认证或授权机制。
+不得创建空账本或篡改四项旧记录；只在同一个 `issue120-network-budget.json` 后追加新授权的两项状态。
+
+1. 唯一 N2 `candidate`，最多1000次尝试；失败或启动失败均停止，禁止重跑、热身、短测或补跑。
+2. 仅第一项完整通过、模型/证据/资源均满足，并经独立实际结果审查后，同一完整 head/源指纹才可唯一 N2 `qualification`，最多10000次尝试。不能在两项之间修改源码。
+
+网络命令在原显式参数外，须增加 `--network-wire-profile control-dynamic-compact-v1` 和 `--network-authorization`，后者填写上面的真实批准登记 URL；首项使用 `--network-phase candidate`。
+资格项还需原有 `qualification_allowed=true` 和第一项真实原件的 `n2_result_sha256`。
+全部原20 ms/QPC、正常GC、库存16、preload0、段400、light、TLS、N2模型/seed、设备与账务计时条件保持。
+新续接最多2次/11000次尝试，旧四次保留；总账最多6次占项、15000次预留，不复活旧闭环未用配额。

@@ -16,8 +16,20 @@ from secure_control.protocol.messages import (
     public_step_plan_sha256,
 )
 
-from .localhost_codec import SCHEMA_VERSION, BatchHelloPayload, HelloPayload, WireEnvelope
+from .localhost_codec import (
+    _COMPACT_PROFILE,
+    SCHEMA_VERSION,
+    BatchHelloPayload,
+    HelloPayload,
+    WireEnvelope,
+    _CompactBatchPayload,
+    _decode_residues,
+    _encode_residues,
+    decode_envelope,
+    encode_envelope,
+)
 from .localhost_transport import (
+    _exchange_frame,
     accept_loopback,
     connect_loopback,
     deadline_after,
@@ -40,6 +52,7 @@ class LocalhostProtocol3PeerPort:
         timeout: float,
         deadline: float | None = None,
         batch_enabled: bool = False,
+        wire_profile: str = "control-batch-v1",
     ) -> None:
         self._connection = connection
         self._role = role
@@ -51,6 +64,11 @@ class LocalhostProtocol3PeerPort:
         self._send_sequence = 1
         self._receive_sequence = 1
         self._batch_enabled = batch_enabled
+        if wire_profile not in {"control-batch-v1", _COMPACT_PROFILE} or (
+            wire_profile == _COMPACT_PROFILE and not batch_enabled
+        ):
+            raise ValueError("peer 编码 profile 无效")
+        self._wire_profile = wire_profile
         self._batch_context: tuple[StepResourcePlan, str | None, str, int | None, int] | None = None
 
     def bind(self, session_id: str) -> None:
@@ -83,7 +101,9 @@ class LocalhostProtocol3PeerPort:
     ) -> tuple[ProductMaskPayload, ...]:
         ids = tuple(item.resource_id for item in plan.product_resources)
         self._check_batch_values(masks, len(ids), "product", sender=self._role)
-        if self._role == "P1":
+        if self._wire_profile == _COMPACT_PROFILE:
+            incoming = self._exchange_batch(plan, "product", ids, products=masks).products
+        elif self._role == "P1":
             self._send_batch(plan, "product", ids, products=masks)
             incoming = self._receive_batch(plan, "product", ids).products
         else:
@@ -118,7 +138,9 @@ class LocalhostProtocol3PeerPort:
                       tuple(item.resource_id for item in plan.state_truncation_resources))
 
     def _barrier(self, plan: StepResourcePlan, phase: str, ids: tuple[str, ...]) -> None:
-        if self._role == "P1":
+        if self._wire_profile == _COMPACT_PROFILE:
+            self._exchange_batch(plan, phase, ids)
+        elif self._role == "P1":
             self._send_batch(plan, phase, ids)
             self._receive_batch(plan, phase, ids)
         else:
@@ -154,7 +176,7 @@ class LocalhostProtocol3PeerPort:
         send_envelope(self._connection, WireEnvelope(
             SCHEMA_VERSION, "request", self._role, self._peer,
             self._send_sequence, "peer_batch", plan.session_id, plan.round_id,
-            plan.step, None, payload,
+            plan.step, None, self._wire_batch(payload),
         ), deadline=self._deadline if self._deadline is not None
            else deadline_after(self._timeout), limit=self._limit)
         self._send_sequence += 1
@@ -167,14 +189,59 @@ class LocalhostProtocol3PeerPort:
             deadline=self._deadline if self._deadline is not None
             else deadline_after(self._timeout), limit=self._limit,
         )
+        return self._validate_batch(message, plan, phase, ids)
+
+    def _exchange_batch(self, plan, phase, ids, *, products=()):
+        """完整本地消息就绪后，单线程双向推进；完成后仍通过原批次身份检查。"""
+        payload = self._batch_payload(plan, phase, ids, products=products)
+        message = WireEnvelope(SCHEMA_VERSION, "request", self._role, self._peer,
+            self._send_sequence, "peer_batch", plan.session_id, plan.round_id,
+            plan.step, None, self._wire_batch(payload))
+        incoming = decode_envelope(_exchange_frame(self._connection, encode_envelope(message),
+            deadline=self._deadline if self._deadline is not None else deadline_after(self._timeout),
+            limit=self._limit))
+        result = self._validate_batch(incoming, plan, phase, ids)
+        self._send_sequence += 1
+        return result
+
+    def _wire_batch(self, payload):
+        if self._wire_profile != _COMPACT_PROFILE:
+            return payload
+        values = [share for item in payload.products for share in (item.d, item.e)]
+        values.extend(item.value for item in payload.truncations)
+        return _CompactBatchPayload(payload.phase, payload.plan_sha256, payload.run_id,
+            payload.epoch_id, payload.physical_step, payload.batch_index,
+            _encode_residues(values, self._batch_context[4]))
+
+    def _validate_batch(self, message, plan, phase, ids):
         run_id, epoch_id, physical_step, _ = self._batch_identity(plan)
-        payload = message.payload
         if (message.kind, message.sender, message.recipient, message.sequence,
             message.operation, message.session_id, message.round_id, message.step,
             message.resource_id) != (
             "request", self._peer, self._role, self._receive_sequence,
             "peer_batch", plan.session_id, plan.round_id, plan.step, None,
-        ) or not isinstance(payload, Protocol3BatchPayload) or (
+        ):
+            raise ValueError("批量 peer 阶段、顺序或公开身份不匹配")
+        payload = message.payload
+        if self._wire_profile == _COMPACT_PROFILE:
+            if not isinstance(payload, _CompactBatchPayload):
+                raise ValueError("紧凑 peer 禁止混入旧批次")
+            # 先检验公开身份及精确长度；不得依据字节外观猜测格式。
+            if (payload.phase, payload.plan_sha256, payload.run_id, payload.epoch_id,
+                payload.physical_step, payload.batch_index) != (
+                phase, self._batch_digest, run_id, epoch_id, physical_step,
+                {"product": 0, "product_complete": 1, "truncation": 2, "state_complete": 3}[phase]
+            ):
+                raise ValueError("紧凑 peer 阶段或公开身份不匹配")
+            values = iter(_decode_residues(payload.values,
+                len(ids) * (2 if phase == "product" else 1) if phase in {"product", "truncation"} else 0,
+                self._batch_context[4]))
+            payload = Protocol3BatchPayload(payload.phase, payload.plan_sha256, payload.run_id,
+                payload.epoch_id, payload.physical_step, payload.batch_index, ids,
+                tuple(ProductMaskPayload(next(values), next(values), 0 if self._peer == "P1" else 1)
+                      for _ in ids) if phase == "product" else (),
+                tuple(P2TruncationPayload(next(values)) for _ in ids) if phase == "truncation" else ())
+        if not isinstance(payload, Protocol3BatchPayload) or (
             payload.phase, payload.plan_sha256, payload.run_id, payload.epoch_id,
             payload.physical_step, payload.batch_index, payload.resource_ids,
             payload.version,

@@ -1281,6 +1281,326 @@ def test_peer_plan_digest_is_cached_without_accepting_mutated_installed_plan(mon
     client._material_owner(distribution).discard(prepared)
 
 
+def test_compact_residues_and_wire_reject_noncanonical_structure_before_restore():
+    """零/q-1、非整字节模数、最大宽度、填充及重复字段都有独立 oracle。"""
+    import base64
+    import json
+
+    import numpy as np
+    from test_two_party_protocol import make_stack
+
+    from secure_control.execution import localhost_codec as codec
+    from secure_control.protocol import Client
+    from secure_control.protocol.messages import ControllerLayout, InputShareMessage
+
+    for q in (3, 257, 2**256 - 189):
+        width = (q.bit_length() + 7) // 8
+        data = codec._encode_residues([AdditiveShare(0), AdditiveShare(q-1)], q)
+        assert data == bytes(width) + (q-1).to_bytes(width, "big")
+        assert [s.value for s in codec._decode_residues(data, 2, q)] == [0, q-1]
+        for invalid in (True, 1., -1, q):
+            with pytest.raises(ValueError):
+                codec._encode_residues([AdditiveShare(invalid)], q)
+        with pytest.raises(ValueError):
+            codec._decode_residues(q.to_bytes(width, "big"), 1, q)
+        with pytest.raises(ValueError):
+            codec._decode_residues(data[:-1], 2, q)
+    maximum = 512 * 1024
+    assert len(codec._encode_residues([AdditiveShare(0)], 1 << (maximum*8-1))) == maximum
+    with pytest.raises(ValueError):
+        codec._encode_residues([AdditiveShare(0)], 1 << (maximum*8))
+
+    _, _, _, _, distribution = make_stack()
+    layout = ControllerLayout(4, 2, 1, distribution.p1.layout.scale_ledger)
+    plan = Client._resource_plan(layout, "session", "round", 800)
+    q = 2**256 - 189
+    values = bytes(codec._preloaded_values_size(plan, q))
+    assert plan.triple_count == 30 and plan.truncation_count == 4 and len(values) == 3136
+    assert len(base64.b64encode(values)) == 4184
+    peer = LocalhostProtocol3PeerPort(None, "P1", 8*1024*1024, 1., batch_enabled=True,
+                                      wire_profile=codec._COMPACT_PROFILE)
+    peer.bind(plan.session_id)
+    peer.set_batch_round(plan, modulus=q, run_id="run", epoch_id="epoch")
+    ids = tuple(r.resource_id for r in plan.product_resources)
+    product_payload = peer._batch_payload(plan, "product", ids,
+        products=tuple(ProductMaskPayload(AdditiveShare(0), AdditiveShare(q-1), 0) for _ in ids))
+    assert len(peer._wire_batch(product_payload).values) == 1920
+    from secure_control.protocol.messages import P2TruncationPayload
+    trunc_payload = peer._batch_payload(plan, "truncation", tuple(r.resource_id for r in plan.state_truncation_resources),
+        truncations=tuple(P2TruncationPayload(AdditiveShare(0)) for _ in range(4)))
+    assert len(peer._wire_batch(trunc_payload).values) == 128
+    inp = InputShareMessage(0, plan.session_id, plan.round_id, plan.step,
+                            AdditiveShare(np.array([0, 0], dtype=object)))
+    payload = codec._CompactOnlinePayload(inp, "run", "epoch", public_step_plan_sha256(plan), values)
+    frame = WireEnvelope(SCHEMA_VERSION, "request", "Client", "P1", 999999, "online_stage",
+                          plan.session_id, plan.round_id, plan.step, None, payload)
+    encoded = encode_envelope(frame)
+    assert len(encoded) + 4 <= 8192
+    restored = decode_envelope(encoded).payload
+    assert restored.values == values and restored.plan_sha256 == payload.plan_sha256
+    assert codec._decode_preloaded_values(restored.values, restored.input_message, plan, q).plan == plan
+    for field, bad in (("version", "control-batch-v1"), ("unknown", 1), ("values", "AB=="),
+                       ("values", "AA==\n"), ("values", "A"*(4*((maximum+2)//3)+4))):
+        obj = json.loads(encoded)
+        obj["payload"][field] = bad
+        with pytest.raises(LocalhostCodecError):
+            decode_envelope(json.dumps(obj).encode())
+    with pytest.raises(LocalhostCodecError, match="重复"):
+        decode_envelope(encoded.replace(b'"values":', b'"values":"AA==","values":'))
+    for field, bad in (("step", 799), ("round_id", "old"), ("recipient", "P2")):
+        with pytest.raises(LocalhostCodecError):
+            replace(frame, **{field: bad})
+
+
+def test_compact_restore_and_peer_bind_original_plan_input_and_phase():
+    from test_two_party_protocol import make_stack
+
+    from secure_control.execution import lan_runtime as lan
+    from secure_control.execution import localhost_codec as codec
+
+    client, _, _, _, distribution = make_stack()
+    current = client.prepare_online(distribution, [.25], step=0)
+    plan, q = current.p1_resources.plan, client.fixed_point.modulus
+    raw = codec._encode_preloaded_values(current.p1_resources, q)
+    value = codec._CompactOnlinePayload(current.p1_input, "run", "epoch", public_step_plan_sha256(plan), raw)
+    args = {"layout": distribution.p1.layout, "session": plan.session_id, "round_id": plan.round_id,
+            "step": 0, "modulus": q, "run_id": "run", "epoch_id": "epoch", "party": 0}
+    assert lan._restore_compact_online(value, **args).plan == plan
+    for changed in (replace(value, run_id="other"), replace(value, epoch_id="other"),
+                    replace(value, plan_sha256="0"*64), replace(value, values=raw[:-1]),
+                    replace(value, input_message=replace(value.input_message, recipient=1)),
+                    replace(value, input_message=replace(value.input_message, round_id="old"))):
+        with pytest.raises(ValueError):
+            lan._restore_compact_online(changed, **args)
+    with pytest.raises(ValueError):
+        codec._encode_preloaded_values(replace(current.p1_resources,
+            product_resources=tuple(reversed(current.p1_resources.product_resources))), q)
+    peer = LocalhostProtocol3PeerPort(None, "P1", 8*1024*1024, 1.,
+                                      batch_enabled=True, wire_profile=codec._COMPACT_PROFILE)
+    peer.bind(plan.session_id)
+    peer.set_batch_round(plan, modulus=q, run_id="run", epoch_id="epoch", physical_step=7)
+    ids = tuple(r.resource_id for r in plan.product_resources)
+    products = tuple(ProductMaskPayload(AdditiveShare(0), AdditiveShare(q-1), 1) for _ in ids)
+    old = Protocol3BatchPayload("product", public_step_plan_sha256(plan), "run", "epoch", 7, 0, ids, products)
+    compact = peer._wire_batch(old)
+    frame = WireEnvelope(SCHEMA_VERSION, "request", "P2", "P1", 1, "peer_batch",
+                          plan.session_id, plan.round_id, 0, None, compact)
+    for changed in (replace(frame, sequence=2), replace(frame, round_id="old"), replace(frame, step=1),
+                    replace(frame, payload=old), replace(frame, payload=replace(compact, run_id="old")),
+                    replace(frame, payload=replace(compact, epoch_id="old")),
+                    replace(frame, payload=replace(compact, physical_step=8)),
+                    replace(frame, payload=replace(compact, plan_sha256="0"*64)),
+                    replace(frame, payload=replace(compact, values=compact.values[:-1])),
+                    replace(frame, payload=replace(compact, values=q.to_bytes(4,"big")+compact.values[4:]))):
+        with pytest.raises(ValueError):
+            peer._validate_batch(changed, plan, "product", ids)
+        assert peer._receive_sequence == 1
+    assert peer._validate_batch(decode_envelope(encode_envelope(frame)), plan, "product", ids).products == products
+    assert peer._receive_sequence == 2
+    client.abort_round(current)
+
+
+def test_compact_worker_packet_and_original_capability_bind_encoding_profile():
+    from copy import copy
+
+    from test_two_party_protocol import make_stack
+
+    from secure_control.execution import _material_worker as worker
+    from secure_control.execution.localhost_codec import _COMPACT_PROFILE, _encode_preloaded_values
+
+    client, _, _, _, distribution = make_stack()
+    owner = client._material_owner(distribution)
+    prepared = owner.create(0, rng=random.Random(31))
+    plan = prepared.p1_resources.plan
+    spec = worker._WorkerSpec(owner.layout, client.fixed_point.modulus, 8, 8, None, None,
+        "run", distribution.session_id, "epoch", 0, 16, _COMPACT_PROFILE)
+    worker._check_spec(spec)
+    with pytest.raises(ValueError, match="预留"):
+        worker._check_spec(replace(spec, modulus=1 << 100000))
+    fragments = tuple(_encode_preloaded_values(r, spec.modulus)
+                      for r in (prepared.p1_resources, prepared.p2_resources))
+    packet = worker._package(spec, plan, fragments, 10, 5)
+    assert worker._unpack(spec, packet, 0)[:2] == (plan, fragments)
+    for changed in (replace(spec, encoding_profile="control-batch-v1"), replace(spec, epoch="old")):
+        with pytest.raises(ValueError):
+            worker._unpack(changed, packet, 0)
+    wrong = worker._package(spec, plan, (b'{"old":"json"}', fragments[1]), 10, 5)
+    with pytest.raises(ValueError, match="长度"):
+        worker._unpack(spec, wrong, 0)
+    source = object()
+    owner.open_encoded_source(source, encoding_profile=_COMPACT_PROFILE)
+    with pytest.raises(ValueError):
+        owner.register_encoded(source, plan, fragments)
+    cap = owner.register_encoded(source, plan, fragments, encoding_profile=_COMPACT_PROFILE)
+    assert cap.encoding_profile == _COMPACT_PROFILE
+    for invalid in (copy(cap), replace(cap, encoding_profile="control-batch-v1")):
+        with pytest.raises(ValueError, match="原始"):
+            client._bind_encoded_input(distribution, invalid, [.25], step=0)
+    current = client._bind_encoded_input(distribution, cap, [.25], step=0)
+    with pytest.raises(ValueError):
+        client._bind_encoded_input(distribution, cap, [.25], step=0)
+    client.abort_round(current)
+    owner.discard(prepared)
+
+
+@pytest.mark.parametrize("failure", ("encoding", "second_send", "second_reply"))
+def test_compact_fused_preflight_and_partial_failure_never_commit_or_replay(monkeypatch, failure):
+    import numpy as np
+    from test_two_party_protocol import make_stack
+
+    from secure_control.execution import _localhost_workers as workers
+    from secure_control.execution import lan_runtime as lan
+    from secure_control.execution import localhost_codec as codec
+    from secure_control.execution import localhost_transport as transport
+    from secure_control.execution._material_worker import _MaterialWorkerPool
+    from secure_control.protocol.messages import ControlShareMessage, Protocol3StageReceipt
+
+    client, _, _, _, distribution = make_stack()
+    owner = client._material_owner(distribution)
+    prepared = owner.create(0)
+    plan = prepared.p1_resources.plan
+    source = object()
+    owner.open_encoded_source(source, encoding_profile=codec._COMPACT_PROFILE)
+    cap = owner.register_encoded(source, plan, tuple(codec._encode_preloaded_values(r, client.fixed_point.modulus)
+        for r in (prepared.p1_resources, prepared.p2_resources)), encoding_profile=codec._COMPACT_PROFILE)
+    pool = _MaterialWorkerPool.__new__(_MaterialWorkerPool)
+    pool.owner, pool.take = owner, lambda step: cap
+    pool.observe_current_encoded = lambda size: None
+    runtime = lan.LanContinuousRuntime.__new__(lan.LanContinuousRuntime)
+    runtime.__dict__.update(_v2=True, _failed=False, _finished=False, _step=0,
+        _wire_profile=codec._COMPACT_PROFILE, _segment_start=0, _segment_capacity=400,
+        _preload_steps=0, _material_pool=pool, _sockets=["p1", "p2"], _sequences=[4, 4],
+        _batch=True, _overlap_commit=True, client=client, distribution=distribution,
+        spec=SimpleNamespace(input_dimension=1), config=SimpleNamespace(step_timeout=1.),
+        session_id=distribution.session_id, setup_run_id="run", setup=SimpleNamespace(controller_epoch="epoch"))
+    events, requests = [], {}
+    encode = transport.encode_envelope
+    def encoded(request):
+        events.append("encode")
+        if failure == "encoding" and request.recipient == "P2":
+            raise ValueError("second encoding")
+        return encode(request)
+    def sent(sock, data, **kwargs):
+        assert events[:2] == ["encode", "encode"]
+        requests[sock] = decode_envelope(data)
+        assert requests[sock].operation == "online_stage"
+        events.append(sock)
+        if failure == "second_send" and sock == "p2":
+            raise ValueError("second send")
+    def received(sock, **kwargs):
+        assert events[:4] == ["encode", "encode", "p1", "p2"]
+        request = requests[sock]
+        party = 0 if sock == "p1" else 1
+        receipt = Protocol3StageReceipt(party, plan.session_id, plan.round_id, 0,
+                                       plan.triple_count, plan.truncation_count)
+        share = ControlShareMessage(party, plan.session_id, plan.round_id, 0,
+            plan.scale_ledger.output, AdditiveShare(np.array([0], dtype=object)))
+        return WireEnvelope(SCHEMA_VERSION, "reply", request.recipient, "Client",
+            request.sequence + (1 if party == 1 else 0), "online_stage", plan.session_id,
+            plan.round_id, 0, None, codec.PartyStageResult(receipt, share))
+    monkeypatch.setattr(transport, "encode_envelope", encoded)
+    monkeypatch.setattr(workers, "send_frame", sent)
+    monkeypatch.setattr(workers, "receive_envelope", received)
+    monkeypatch.setattr(runtime, "close", lambda: events.append("closed"))
+    monkeypatch.setattr(client, "reconstruct_control", lambda *args: pytest.fail("failed fused request reconstructed"))
+    with pytest.raises((ValueError, RuntimeError)):
+        runtime.step([.25])
+    assert runtime._failed and not client._issued_rounds and events[-1] == "closed"
+    assert runtime._round_started is (failure != "encoding")
+    if failure == "encoding":
+        assert events == ["encode", "encode", "closed"]
+    with pytest.raises(RuntimeError):
+        runtime.step([.25])
+    with pytest.raises(ValueError):
+        client._bind_encoded_input(distribution, cap, [.25], step=0)
+    owner.discard(prepared)
+
+
+def test_compact_and_original_kernel_exact_shares_across_two_400_boundaries(monkeypatch):
+    """801轮纯协议正确性；没有控制周期、性能计时、供料预热或资格观察。"""
+    import numpy as np
+    from test_two_party_protocol import make_stack
+
+    from secure_control.execution import _localhost_peer as peer_module
+    from secure_control.execution.localhost_codec import (
+        _COMPACT_PROFILE,
+        _decode_preloaded_values,
+        _encode_preloaded_values,
+    )
+
+    client, _, _, _, distribution = make_stack()
+    profiles = ("control-batch-v1", _COMPACT_PROFILE)
+    roles = [[role_type(rehydrate_offline_material(PartyOfflineMaterial.from_message(material),
+                distribution.range_contract)) for role_type, material in ((P1, distribution.p1), (P2, distribution.p2))]
+             for _ in profiles]
+    peers = [[LocalhostProtocol3PeerPort(s, f"P{i+1}", 8*1024*1024, 10.,
+                batch_enabled=True, wire_profile=profile) for i, s in enumerate(socket.socketpair())]
+             for profile in profiles]
+    frames = {profile: [] for profile in profiles}
+    original_send, original_exchange = peer_module.send_envelope, peer_module._exchange_frame
+    def sent(sock, frame, **kwargs):
+        frames["control-batch-v1" if isinstance(frame.payload, Protocol3BatchPayload) else _COMPACT_PROFILE].append(
+            (frame.payload.phase, len(encode_envelope(frame))+4))
+        return original_send(sock, frame, **kwargs)
+    def exchanged(sock, data, **kwargs):
+        frame = decode_envelope(data)
+        frames[_COMPACT_PROFILE].append((frame.payload.phase, len(data)+4))
+        return original_exchange(sock, data, **kwargs)
+    monkeypatch.setattr(peer_module, "send_envelope", sent)
+    monkeypatch.setattr(peer_module, "_exchange_frame", exchanged)
+    for pair in peers:
+        for port in pair:
+            port.bind(distribution.session_id)
+    errors = []
+    try:
+        for step in range(801):
+            current = client.prepare_online(distribution, [.25 if step % 2 else -.125],
+                                             step=step, rng=random.Random(step+110))
+            plan = current.p1_resources.plan
+            original = [PartyOnlineMaterial.from_round(PartyOnlineRound(inp, resources))
+                for inp, resources in ((current.p1_input, current.p1_resources),
+                                       (current.p2_input, current.p2_resources))]
+            compact = [_decode_preloaded_values(_encode_preloaded_values(resources, client.fixed_point.modulus),
+                inp, plan, client.fixed_point.modulus) for inp, resources in (
+                    (current.p1_input, current.p1_resources), (current.p2_input, current.p2_resources))]
+            results = []
+            for index, materials in enumerate((original, compact)):
+                outputs = [[], []]
+                local = [rehydrate_online_material(m, modulus=client.fixed_point.modulus, security_parameter=8)
+                         for m in materials]
+                endpoints = [LocalProtocol3PartyEndpoint(roles[index][i], local[i], outputs[i].append)
+                             for i in (0, 1)]
+                for port in peers[index]:
+                    port.set_batch_round(plan, modulus=client.fixed_point.modulus, run_id="run", epoch_id="epoch")
+                def stage(i, endpoints=endpoints, pair=peers[index]):
+                    try:
+                        stage_protocol3_batch(endpoints[i], pair[i])
+                    except BaseException as error:  # noqa: BLE001 - 保留线程原始失败供断言。
+                        errors.append(error)
+                threads = [Thread(target=stage, args=(i,)) for i in (0, 1)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(12.)
+                assert not any(t.is_alive() for t in threads) and not errors, errors
+                Protocol3Orchestrator().commit(*endpoints)
+                results.append([outputs[i][0].value.value for i in (0, 1)])
+                assert all(r.resources.consumed_count == plan.triple_count+plan.truncation_count for r in local)
+            for i in (0, 1):
+                assert np.array_equal(results[0][i], results[1][i])
+                assert np.array_equal(roles[0][i].state_share.value, roles[1][i].state_share.value)
+            client.abort_round(current)
+        for profile in profiles:
+            assert len(frames[profile]) == 801*7
+            assert {phase: sum(p == phase for p, _ in frames[profile]) for phase in (
+                "product", "product_complete", "truncation", "state_complete")} == {
+                    "product": 1602, "product_complete": 1602, "truncation": 801, "state_complete": 1602}
+    finally:
+        for pair in peers:
+            for port in pair:
+                port.close()
+
+
 def test_preloaded_material_values_are_lossless_and_reject_noncanonical_last_value():
     from test_two_party_protocol import make_stack
 
@@ -1431,6 +1751,7 @@ def test_online_preflights_both_full_frames_once_and_invalidates_on_bad_second_a
         runtime._segment_start, runtime._segment_capacity = 0, 400
         runtime._material_pool = None
         runtime._preload_steps = 0
+        runtime._wire_profile = "control-batch-v1"
         runtime._sockets, runtime._sequences = ["p1", "p2"], [4, 4]
         runtime.client, runtime.distribution = client, distribution
         runtime.spec, runtime.config = SimpleNamespace(input_dimension=1), SimpleNamespace(step_timeout=1.)

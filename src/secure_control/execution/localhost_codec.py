@@ -52,6 +52,8 @@ from secure_control.protocol.messages import (
 )
 
 SCHEMA_VERSION = 3
+_COMPACT_PROFILE = "control-dynamic-compact-v1"
+_COMPACT_MAX_VALUES = 512 * 1024
 _ROLES = {"Supervisor", "Client", "P1", "P2"}
 _KINDS = {"hello", "ready", "request", "reply", "error", "shutdown"}
 _OPERATIONS = {
@@ -59,6 +61,7 @@ _OPERATIONS = {
     "ready",
     "offline",
     "online",
+    "online_stage",
     "preload_init",
     "preload_block",
     "preload_seal",
@@ -192,6 +195,86 @@ class PreloadedHelloPayload:
                 or self.stage_mode not in {"staged", "fused"}
                 or self.version != "control-preloaded-v1"):
             raise LocalhostCodecError("预送 hello 能力、模式或容量无效")
+
+
+@dataclass(frozen=True, slots=True)
+class _CompactHelloPayload:
+    """动态候选显式协商；只承载分段 v2，不改变既有批量默认值。"""
+
+    base: BatchHelloPayload
+    version: str = _COMPACT_PROFILE
+
+    def __post_init__(self):
+        if (self.version != _COMPACT_PROFILE or not isinstance(self.base, BatchHelloPayload)
+                or not isinstance(self.base.base, LanSegmentedHelloPayload)
+                or self.base.base.mode != "lan-segmented-v2"):
+            raise LocalhostCodecError("动态紧凑 hello 的模式或版本无效")
+
+
+@dataclass(frozen=True, slots=True)
+class _CompactOnlinePayload:
+    """原输入 DTO 与 worker 数值块；计划由接收方的认证布局恢复。"""
+
+    input_message: InputShareMessage
+    run_id: str
+    epoch_id: str
+    plan_sha256: str
+    values: bytes = field(repr=False)
+
+    def __post_init__(self):
+        if not isinstance(self.input_message, InputShareMessage):
+            raise LocalhostCodecError("紧凑输入 DTO 无效")
+        _text(self.run_id, "run_id")
+        _text(self.epoch_id, "epoch_id")
+        _required_sha256(self.plan_sha256, "plan_sha256")
+        _check_compact_bytes(self.values)
+
+
+@dataclass(frozen=True, slots=True)
+class _CompactBatchPayload:
+    """同阶段 peer 数值块；资源标识只从当前 canonical plan 派生。"""
+
+    phase: str
+    plan_sha256: str
+    run_id: str
+    epoch_id: str
+    physical_step: int | None
+    batch_index: int
+    values: bytes = field(repr=False)
+
+    def __post_init__(self):
+        if self.phase not in {"product", "product_complete", "truncation", "state_complete"}:
+            raise LocalhostCodecError("紧凑 peer 阶段无效")
+        if type(self.batch_index) is not int or self.batch_index != {
+            "product": 0, "product_complete": 1, "truncation": 2, "state_complete": 3}[self.phase]:
+            raise LocalhostCodecError("紧凑 peer 批次索引无效")
+        _required_sha256(self.plan_sha256, "plan_sha256")
+        _text(self.run_id, "run_id")
+        _text(self.epoch_id, "epoch_id")
+        if self.physical_step is not None:
+            _require_nonnegative_integer(self.physical_step, "physical_step")
+        _check_compact_bytes(self.values, empty=self.phase.endswith("complete"))
+
+
+def _check_compact_bytes(data, *, empty=False):
+    if type(data) is not bytes or len(data) > _COMPACT_MAX_VALUES or (
+        len(data) != 0 if empty else len(data) == 0
+    ):
+        raise LocalhostCodecError("紧凑数值块长度无效")
+
+
+def _decode_compact_base64(value):
+    """先检查公共字节预算，再解码并拒绝非规范填充。"""
+    text = _text(value, "values", maximum=4 * ((_COMPACT_MAX_VALUES + 2) // 3)) if value else value
+    if type(text) is not str:
+        raise LocalhostCodecError("紧凑 base64 必须是字符串")
+    try:
+        data = base64.b64decode(text, validate=True)
+    except (ValueError, binascii.Error) as error:
+        raise LocalhostCodecError("紧凑 base64 无效") from error
+    if len(data) > _COMPACT_MAX_VALUES or base64.b64encode(data).decode("ascii") != text:
+        raise LocalhostCodecError("紧凑 base64 长度或规范性无效")
+    return data
 
 
 @dataclass(frozen=True, slots=True)
@@ -448,6 +531,9 @@ WirePayload = (
     | PreloadReceipt
     | PreloadedReadyPayload
     | PreloadedInputPayload
+    | _CompactHelloPayload
+    | _CompactOnlinePayload
+    | _CompactBatchPayload
     | None
 )
 
@@ -638,7 +724,6 @@ def _encode_preloaded_values(resources: PartyResources, modulus: int) -> bytes:
             or tuple(item.metadata for item in resources.state_truncation_resources)
             != plan.state_truncation_resources):
         raise ValueError("预送资源角色或顺序不匹配")
-    width = (modulus.bit_length() + 7) // 8
     values = []
     for item in resources.product_resources:
         if type(item.owner) is not int or item.owner != resources.recipient:
@@ -648,16 +733,45 @@ def _encode_preloaded_values(resources: PartyResources, modulus: int) -> bytes:
         if type(item.owner) is not int or item.owner != resources.recipient:
             raise ValueError("预送资源角色不匹配")
         values.extend((item.truncation.r, item.truncation.r_prime))
+    result = _encode_residues(values, modulus)
+    if len(result) != size:
+        raise ValueError("预送数值长度错误")
+    return result
+
+
+def _encode_residues(values, modulus: int) -> bytes:
+    """紧凑动态与原预送共用定宽无符号 residue 编码。"""
+    width = _residue_width(modulus)
+    if len(values) * width > _COMPACT_MAX_VALUES:
+        raise ValueError("residue 数值块超过公共预算")
     encoded = []
     for share in values:
         value = share.value
         if type(value) is not int or not 0 <= value < modulus:
             raise ValueError("预送数值必须是 canonical scalar residue")
         encoded.append(value.to_bytes(width, "big"))
-    result = b"".join(encoded)
-    if len(result) != size:
-        raise ValueError("预送数值长度错误")
-    return result
+    return b"".join(encoded)
+
+
+def _residue_width(modulus):
+    if type(modulus) is not int or modulus < 3 or modulus.bit_length() > 8 * _COMPACT_MAX_VALUES:
+        raise ValueError("residue 模数超出公共预算")
+    return (modulus.bit_length() + 7) // 8
+
+
+def _decode_residues(data, count: int, modulus: int):
+    """按公开数量先验长度校验后创建原 AdditiveShare。"""
+    width = _residue_width(modulus)
+    if (type(count) is not int or count < 0 or count * width > _COMPACT_MAX_VALUES
+            or type(data) is not bytes or len(data) != count * width):
+        raise ValueError("residue 数值长度错误")
+    values = []
+    for offset in range(0, len(data), width):
+        value = int.from_bytes(data[offset:offset + width], "big")
+        if value >= modulus:
+            raise ValueError("预送数值必须是 canonical residue")
+        values.append(AdditiveShare(value))
+    return tuple(values)
 
 
 def _decode_preloaded_values(data: bytes, inp: InputShareMessage,
@@ -667,13 +781,7 @@ def _decode_preloaded_values(data: bytes, inp: InputShareMessage,
         raise ValueError("预送数值长度错误")
     if not isinstance(inp, InputShareMessage) or type(inp.recipient) is not int or inp.recipient not in (0, 1):
         raise ValueError("预送输入角色无效")
-    width = (modulus.bit_length() + 7) // 8
-    values = []
-    for offset in range(0, len(data), width):
-        value = int.from_bytes(data[offset:offset + width], "big")
-        if value >= modulus:
-            raise ValueError("预送数值必须是 canonical residue")
-        values.append(AdditiveShare(value))
+    values = _decode_residues(data, 3 * plan.triple_count + 2 * plan.truncation_count, modulus)
     iterator = iter(values)
     return PartyOnlineMaterial(
         inp, plan,
@@ -685,6 +793,15 @@ def _decode_preloaded_values(data: bytes, inp: InputShareMessage,
 
 
 def _encode_value(value: object) -> object:
+    if isinstance(value, _CompactHelloPayload):
+        return {"type": "compact_hello", "base": _encode_value(value.base), "version": value.version}
+    if isinstance(value, (_CompactOnlinePayload, _CompactBatchPayload)):
+        fields = {name: getattr(value, name) for name in value.__dataclass_fields__}
+        fields["values"] = base64.b64encode(value.values).decode("ascii")
+        if isinstance(value, _CompactOnlinePayload):
+            fields["input_message"] = _encode_value(value.input_message)
+        return {"type": "compact_online" if isinstance(value, _CompactOnlinePayload)
+                else "compact_batch", "version": _COMPACT_PROFILE, **fields}
     if isinstance(value, PreloadedHelloPayload):
         return {"type": "preloaded_hello", "base": _encode_value(value.base),
                 "count": value.count, "stage_mode": value.stage_mode, "version": value.version}
@@ -1042,6 +1159,19 @@ def _decode_value(value: object) -> object:
     kind = mapping.get("type")
     if not isinstance(kind, str):
         raise LocalhostCodecError("wire value 缺少字符串 type。")
+    if kind == "compact_hello":
+        _exact_fields(mapping, {"type", "base", "version"}, kind)
+        return _CompactHelloPayload(_typed(mapping["base"], BatchHelloPayload), mapping["version"])
+    if kind in {"compact_online", "compact_batch"}:
+        cls = _CompactOnlinePayload if kind == "compact_online" else _CompactBatchPayload
+        _exact_fields(mapping, {"type", "version", *cls.__dataclass_fields__}, kind)
+        if mapping["version"] != _COMPACT_PROFILE:
+            raise LocalhostCodecError("紧凑数值块版本不匹配")
+        fields = {name: mapping[name] for name in cls.__dataclass_fields__}
+        fields["values"] = _decode_compact_base64(mapping["values"])
+        if cls is _CompactOnlinePayload:
+            fields["input_message"] = _typed(mapping["input_message"], InputShareMessage)
+        return cls(**fields)
     if kind == "preloaded_hello":
         _exact_fields(mapping, {"type", "base", "count", "stage_mode", "version"}, kind)
         return PreloadedHelloPayload(_typed(mapping["base"], BatchHelloPayload),
@@ -1510,7 +1640,7 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
         ("reply", "shutdown"): {("Client", "Supervisor")} | to_client,
         ("error", "shutdown"): {("Client", "Supervisor")} | to_client,
     }
-    for operation in ("preload_init", "preload_block", "preload_seal", "activate", "activate_stage"):
+    for operation in ("preload_init", "preload_block", "preload_seal", "activate", "activate_stage", "online_stage"):
         allowed[("request", operation)] = to_party
         allowed[("reply", operation)] = to_client
         allowed[("error", operation)] = to_client
@@ -1529,7 +1659,7 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
         expected = (HelloPayload, BatchHelloPayload)
     elif key == ("hello", "lan_hello"):
         expected = (LanHelloPayload, LanSegmentedHelloPayload, BatchHelloPayload,
-                    PreloadedHelloPayload)
+                    PreloadedHelloPayload, _CompactHelloPayload)
     elif key == ("ready", "ready"):
         expected = (ReadyPayload,)
     elif message.kind == "error":
@@ -1543,6 +1673,8 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
     elif message.operation in {"activate", "activate_stage"}:
         expected = ((PreloadedInputPayload,) if message.kind == "request" else
                     (PartyStageResult,) if message.operation == "activate_stage" else (type(None),))
+    elif message.operation == "online_stage":
+        expected = (_CompactOnlinePayload,) if message.kind == "request" else (PartyStageResult,)
     elif key == ("request", "step"):
         expected = (np.ndarray,)
     elif key == ("reply", "step"):
@@ -1556,7 +1688,7 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
     elif key == ("request", "peer_truncation"):
         expected = (P2TruncationPayload,)
     elif key == ("request", "peer_batch"):
-        expected = (Protocol3BatchPayload,)
+        expected = (Protocol3BatchPayload, _CompactBatchPayload)
     elif key == ("request", "offline"):
         expected = (PartyOfflineMaterial,)
     elif key == ("request", "lan_setup"):
@@ -1586,6 +1718,12 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
         expected = None
     if expected is None or not isinstance(payload, expected):
         raise LocalhostCodecError("wire kind/operation 与 payload 类型组合非法。")
+    if isinstance(payload, _CompactOnlinePayload):
+        inp = payload.input_message
+        if (message.session_id, message.round_id, message.step, message.resource_id) != (
+            inp.session_id, inp.round_id, inp.step, None,
+        ) or type(inp.recipient) is not int or inp.recipient != (0 if message.recipient == "P1" else 1):
+            raise LocalhostCodecError("紧凑信封与输入身份或方向不匹配")
     if isinstance(payload, _EncodedOnlinePayload):
         inp, plan = payload.input_message, payload.plan
         if (type(payload.fragment) is not bytes or not payload.fragment.startswith(b',"plan":')
@@ -1602,7 +1740,7 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
         )
     ):
         raise LocalhostCodecError("批量 hello 与原握手模式不匹配")
-    if (message.operation == "peer_batch" and isinstance(payload, Protocol3BatchPayload)
+    if (message.operation == "peer_batch" and isinstance(payload, (Protocol3BatchPayload, _CompactBatchPayload))
             and (message.round_id is None or message.step is None
                  or message.resource_id is not None
                  or payload.phase == "truncation" and direction != ("P2", "P1")
@@ -1627,7 +1765,7 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
     ):
         raise LocalhostCodecError("Client 单步结果与信封 step 不匹配。")
     if (
-        message.operation in {"endpoint", "activate", "activate_stage"}
+        message.operation in {"endpoint", "activate", "activate_stage", "online_stage"}
         and isinstance(payload, PartyStageResult)
         and (
             direction[0] not in {"P1", "P2"}
@@ -1636,7 +1774,7 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
     ):
         raise LocalhostCodecError("暂存结果的角色不匹配。")
     if (
-        message.operation in {"endpoint", "activate", "activate_stage"}
+        message.operation in {"endpoint", "activate", "activate_stage", "online_stage"}
         and isinstance(payload, PartyStageResult)
         and (
             (payload.receipt.session_id, payload.receipt.round_id, payload.receipt.step)

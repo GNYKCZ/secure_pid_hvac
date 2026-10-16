@@ -289,6 +289,49 @@ def test_budget_failure_repair_recheck_and_final_call_cap(tmp_path):
     assert len(json.loads(path.read_text())["entries"]) == 1
 
 
+def test_compact_continuation_appends_same_closed_ledger_and_never_retries(tmp_path):
+    """新批准保留四项旧失败；失败启动、改源、二次候选与第三次调用均拒绝。"""
+    old = [_entry("N0"), _entry("N1"), _entry("N2", passed=False),
+           _entry("N2", head="b", sources={"src": "b"}, phase="recheck", passed=False)]
+    continuation = {"wire_profile": network._COMPACT_PROFILE,
+        "authorization_url": "https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-2",
+        "closed_history_sha256": network.digest(old)}
+    path = tmp_path/"same-ledger.json"
+    path.write_text(json.dumps({"schema": "network-call-budget-v1", "entries": old}), encoding="utf-8")
+    for entries in ([], old[:-1], [dict(e, sample_pass=True) for e in old]):
+        with pytest.raises(ValueError):
+            network._next_compact_call(entries, "N2", "candidate", "c", {"src": "c"}, continuation)
+    with network.RunBudget(path) as budget:
+        assert budget.reserve("N2", "candidate", "c", {"src": "c"}, tmp_path/"candidate.json",
+                              continuation=continuation) == 1000
+    saved = json.loads(path.read_text())["entries"]
+    assert saved[:4] == old and len(saved) == 5
+    with network.RunBudget(path) as budget, pytest.raises(ValueError):
+        budget.reserve("N2", "candidate", "c", {"src": "c"}, tmp_path/"retry.json", continuation=continuation)
+    for passed in (False, True):
+        entries = copy.deepcopy(saved)
+        entries[-1].update(finished=True, sample_pass=passed)
+        for profile, phase, head, sources in (("N3", "candidate", "c", {"src": "c"}),
+                ("N2", "candidate", "c", {"src": "c"}), ("N2", "qualification", "d", {"src": "d"})):
+            with pytest.raises(ValueError):
+                network._next_compact_call(entries, profile, phase, head, sources, continuation)
+        if not passed:
+            with pytest.raises(ValueError):
+                network._next_compact_call(entries, "N2", "qualification", "c", {"src": "c"}, continuation)
+        else:
+            assert network._next_compact_call(entries, "N2", "qualification", "c", {"src": "c"}, continuation) == 10000
+            entries.append(dict(entries[-1], phase="qualification", maximum_attempts=10000))
+            with pytest.raises(ValueError):
+                network._next_compact_call(entries, "N2", "qualification", "c", {"src": "c"}, continuation)
+    assert json.loads(path.read_text())["entries"][:4] == old
+    with network.RunBudget(path) as budget:
+        budget.finish({"cycles": [], "network_sample_pass": False, "failure_category": "StartupError"}, "raw")
+    stopped = json.loads(path.read_text())["entries"]
+    assert stopped[-1]["actual_attempts"] == 0 and stopped[-1]["finished"]
+    with pytest.raises(ValueError):
+        network._next_compact_call(stopped, "N2", "candidate", "c", {"src": "c"}, continuation)
+
+
 def test_peer_stress_failure_does_not_redefine_target_or_allow_seventh_call():
     entries = [_entry(p, passed=p != "N3") for p in network.PROFILES]
     assert network.next_call(entries, "N2", "qualification", "a", {"src": "a"}) == 10000
@@ -322,6 +365,20 @@ def test_network_gate_requires_shared_full_evidence_tls_and_model(monkeypatch):
         assert not network.assemble(bad, profile="N2", phase="qualification", manifest={}, relay=relay)["network_sample_pass"]
     assert not network.assemble(copy.deepcopy(base), profile="N2", phase="qualification", manifest={},
                                relay=relay | {"model_valid": False})["network_dynamic_qualification_pass"]
+    compact = copy.deepcopy(base)
+    compact["wire_profile"] = network._COMPACT_PROFILE
+    compact["material_summary"] = {"encoding_profile": network._COMPACT_PROFILE,
+        "worker": {"encoding_profile": network._COMPACT_PROFILE}}
+    for outcome in compact["party_outcomes"]:
+        outcome["wire_profile"] = network._COMPACT_PROFILE
+    manifest = {"wire_profile": network._COMPACT_PROFILE}
+    assert network.assemble(copy.deepcopy(compact), profile="N2", phase="qualification", manifest=manifest,
+                            relay=relay)["network_dynamic_qualification_pass"]
+    for remove in (lambda r: r.pop("wire_profile"), lambda r: r["material_summary"]["worker"].clear(),
+                   lambda r: r["party_outcomes"][1].pop("wire_profile")):
+        bad = copy.deepcopy(compact)
+        remove(bad)
+        assert not network.assemble(bad, profile="N2", phase="qualification", manifest=manifest, relay=relay)["network_sample_pass"]
     monkeypatch.setattr(benchmark, "_compact_sample_pass", lambda *_args, **_kwargs: False)
     assert not network.assemble(copy.deepcopy(base), profile="N2", phase="qualification", manifest={}, relay=relay)["network_dynamic_qualification_pass"]
 
@@ -332,6 +389,10 @@ def test_new_shared_entry_keeps_old_bare_tcp_guard_and_rejects_mixed_configs(tmp
     monkeypatch.setattr(benchmark, "_run_material_comparison", lambda *a, **k: captured.append((a, k)))
     benchmark.run_network_observation(configs=configs, steps=1000)
     assert captured[0][0][0]["network_configs"] == configs
+    benchmark.run_network_observation(configs=configs, steps=1000, wire_profile=network._COMPACT_PROFILE)
+    assert captured[-1][0][0]["network_wire_profile"] == network._COMPACT_PROFILE
+    with pytest.raises(ValueError):
+        benchmark.run_network_observation(configs=configs, steps=1000, wire_profile="unknown")
     for bad in (configs[:2], (replace(configs[0], transport="insecure_tcp"), *configs[1:]),
                 (configs[0], replace(configs[1], topology=replace(configs[1].topology, digest="different")), configs[2])):
         with pytest.raises(ValueError):
@@ -362,6 +423,16 @@ def test_network_cli_is_exclusive_and_does_not_accept_arbitrary_steps(tmp_path, 
                   ("--recording", "full"), ("--segment-steps", "8"), ("--mode", "legacy")):
         monkeypatch.setattr(sys, "argv", argv+list(extra))
         assert lan_runner._run() == 5 and len(calls) == 1
+    compact = ["N2" if a == "N0" else "candidate" if a == "discovery" else a for a in argv]
+    compact += ["--network-wire-profile", network._COMPACT_PROFILE, "--network-authorization",
+                "https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-2"]
+    monkeypatch.setattr(sys, "argv", compact)
+    assert lan_runner._run() == 0 and calls[-1]["wire_profile"] == network._COMPACT_PROFILE
+    for key, bad in (("--network-authorization", "wrong"), ("--network-profile", "N1"), ("--network-phase", "recheck")):
+        invalid = list(compact)
+        invalid[invalid.index(key)+1] = bad
+        monkeypatch.setattr(sys, "argv", invalid)
+        assert lan_runner._run() == 5 and len(calls) == 2
 
 
 def test_startup_failure_is_exported_and_consumes_unique_discovery(tmp_path, monkeypatch):
@@ -455,6 +526,82 @@ def test_three_tls_links_cross_opaque_relay_and_wrong_role_still_fails(tmp_path)
             return "TLSv1.3"
     with pytest.raises(lan_transport.LanIdentityError):
         lan_transport._verify_identity(WrongPeer(), "client.secure-control.test")
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("wire_profile,expected_frames", ((None, 19), (network._COMPACT_PROFILE, 15)))
+def test_tls_protocol_fixture_preserves_fused_frames_worker_cleanup_segments_and_stop(
+        tmp_path, wire_profile, expected_frames):
+    """仅三轮协议功能夹具，无 plant、20ms周期或性能资格入口。"""
+    import multiprocessing as mp
+
+    from secure_control.execution.lan_runtime import LanSegmentedRuntime, RunControl
+    from secure_control.experiments.lan_continuous_profile import load_segmented_experiment
+    from secure_control.scenarios.cart_pole.interactive import InteractiveSession
+
+    subprocess.run([sys.executable, str(ROOT/"tests/fixtures/prepare_local_lan_certs.py"),
+                    "--output", str(tmp_path)], check=True, capture_output=True)
+    ports = free_ports()
+    configs = network.role_configs(tmp_path, ports, "N0")
+    context = mp.get_context("spawn")
+    queue = context.Queue()
+    parties = [context.Process(target=benchmark._party_job,
+        args=(config, ports, 0., True, queue),
+        kwargs={"network_observation": True, "wire_profile": wire_profile,
+                "stage_wait_diagnostic": True}) for config in configs[1:]]
+    runtime = None
+    restore = lambda: None
+    try:
+        for process in parties:
+            process.start()
+        prepared = load_segmented_experiment(configs[0].experiment_config, 400, InteractiveSession())
+        control = RunControl()
+        counts, _, restore = benchmark._meter("Client", ports, 0.)
+        runtime = LanSegmentedRuntime(configs[0], prepared.spec, prepared.context, prepared.contract,
+            prepared.security_parameter, prepared.evidence, control=control, segment_capacity=2,
+            **({"wire_profile": wire_profile} if wire_profile else {}))
+        runtime.enable_material_preparation(slots=16, _candidate="worker")
+        before = sum(row["frames"] for row in counts.values())
+        for step in range(3):
+            result = runtime.step([0., 0.])
+            assert result.global_step == step and result.products == 30 and result.truncations == 4
+            runtime.confirm_applied(result)  # 测试只验证确认门禁；不创建物理完成证据。
+            if step == 0:
+                client_frames = sum(row["frames"] for row in counts.values()) - before
+            if runtime.segment_full:
+                runtime.end_segment()
+                runtime.next_segment()
+        control.request_stop()
+        runtime.end_segment()
+        assert runtime.phase == "STOPPED" and runtime.confirmed_step_count == 3
+        runtime.close()
+        summary = runtime.material_summary
+        assert all(summary[name] for name in ("worker_exited", "receiver_exited", "credit_thread_exited"))
+        assert summary["claimed"] == 3 and not summary["cleanup_failed"]
+        outcomes = [queue.get(timeout=15.) for _ in parties]
+        for process in parties:
+            process.join(10.)
+            assert not process.is_alive() and process.exitcode == 0
+        assert all(outcome["status"] == "closed" for outcome in outcomes), outcomes
+        party_frames = sum(sum(row["frames"] for row in outcome["steps"][0]["sent"].values())
+                           for outcome in outcomes)
+        assert client_frames + party_frames == expected_frames
+        assert client_frames == (4 if wire_profile else 6)
+        if wire_profile:
+            assert all(outcome["wire_profile"] == wire_profile for outcome in outcomes)
+        assert len(outcomes) == 2 and all(len(o["steps"]) == 3 for o in outcomes)
+        assert all(o["stage_wait"]["first_failure"] is None and o["stage_wait"]["hooks_restored"]
+                   for o in outcomes)
+    finally:
+        if runtime is not None:
+            runtime.close()
+        restore()
+        for process in parties:
+            if process.is_alive():
+                process.terminate()
+            if process.pid is not None:
+                process.join(10.)
+        queue.close()
 
 
 @pytest.mark.integration

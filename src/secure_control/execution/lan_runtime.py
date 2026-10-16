@@ -63,6 +63,7 @@ from .cycle_timing import check_deadline, network_deadline
 from .lan_config import LanConfig, Role
 from .lan_transport import accept_role, connect_role, listener
 from .localhost_codec import (
+    _COMPACT_PROFILE,
     SCHEMA_VERSION,
     BatchHelloPayload,
     LanContinuousSetupPayload,
@@ -81,6 +82,8 @@ from .localhost_codec import (
     SegmentEndPayload,
     SegmentEndReceipt,
     WireEnvelope,
+    _CompactHelloPayload,
+    _CompactOnlinePayload,
     _decode_preloaded_values,
     _EncodedOnlinePayload,
     encode_wire_value,
@@ -463,6 +466,7 @@ class LanContinuousRuntime:
         batch: bool = True,
         preload_steps: int = 0, preload_execution: str = "fused",
         deadline_ns: int | None = None,
+        wire_profile: str = "control-batch-v1",
     ) -> None:
         check_deadline(deadline_ns, "DYNAMIC_SETUP")
         if config.role != "Client" or config.experiment_config is None:
@@ -470,6 +474,12 @@ class LanContinuousRuntime:
         v2 = _segment_hello is not None and _segment_hello.mode in {
             "lan-segmented-v2", "lan-full-v3",
         }
+        if wire_profile not in {"control-batch-v1", _COMPACT_PROFILE} or (
+            wire_profile == _COMPACT_PROFILE and (not batch or preload_steps
+                or _segment_hello is None or _segment_hello.mode != "lan-segmented-v2")
+        ):
+            raise ValueError("紧凑动态候选仅允许显式批量 v2 且不预送")
+        self._wire_profile = wire_profile
         if v2:
             if (range_contract.reachability_block_steps is None
                     or range_contract.horizon_steps is not None
@@ -523,13 +533,15 @@ class LanContinuousRuntime:
                       LanHelloPayload(config.topology.digest, secrets.token_hex(32),
                                       "lan-continuous-v1"))
         hello = BatchHelloPayload(base_hello) if batch else base_hello
+        if wire_profile == _COMPACT_PROFILE:
+            hello = _CompactHelloPayload(hello)
         if preload_steps:
             hello = PreloadedHelloPayload(hello, preload_steps, preload_execution)
         self._preload_steps, self._preload_execution = preload_steps, preload_execution
         self._preloaded = None
         self._preload_digest = None
         self._preload_statistics = {}
-        self.setup_run_id = base_hello.run_id if preload_steps else None
+        self.setup_run_id = base_hello.run_id if preload_steps or wire_profile == _COMPACT_PROFILE else None
         self._last_result = None
         self._round_started = False
         self._material_pool = None
@@ -696,6 +708,8 @@ class LanContinuousRuntime:
             else:
                 prepared = self._material_pool.take(self._step)
                 if isinstance(self._material_pool, _MaterialWorkerPool):
+                    if prepared.encoding_profile != self._wire_profile:
+                        raise ValueError("材料工人编码与协商 profile 不匹配")
                     current = self.client._bind_encoded_input(self.distribution, prepared, value,
                                                              step=self._step)
                 else:
@@ -714,7 +728,10 @@ class LanContinuousRuntime:
                 deadline = deadline_after(self.config.step_timeout)
             online_started = time.perf_counter_ns()
             endpoints: list[_ClientPartyEndpoint] = []
-            fused = self._preload_steps and self._preload_execution == "fused"
+            compact = self._wire_profile == _COMPACT_PROFILE
+            if compact and not encoded_current:
+                raise ValueError("紧凑动态候选必须使用原专属材料工人")
+            fused = compact or self._preload_steps and self._preload_execution == "fused"
             if self._preload_steps:
                 digest = public_step_plan_sha256(plan)
                 materials = tuple(PreloadedInputPayload(self._preload_digest, inp,
@@ -723,10 +740,18 @@ class LanContinuousRuntime:
                     "activate_stage" if fused else "activate", self.session_id,
                     plan.round_id, self._step, self._sequences, _FRAME_LIMIT)
             elif encoded_current:
-                materials = tuple(_EncodedOnlinePayload(inp, plan, fragment) for inp, fragment in
-                    zip((current.p1_input, current.p2_input), current.prepared.fragments, strict=True))
-                prepared_requests = _prepare_online_requests(
-                    materials, self.session_id, plan.round_id, self._step, self._sequences)
+                if compact:
+                    digest = public_step_plan_sha256(plan)
+                    materials = tuple(_CompactOnlinePayload(inp, self.setup_run_id,
+                        self.setup.controller_epoch, digest, fragment) for inp, fragment in
+                        zip((current.p1_input, current.p2_input), current.prepared.fragments, strict=True))
+                    prepared_requests = _prepare_requests(materials, "online_stage", self.session_id,
+                        plan.round_id, self._step, self._sequences, _FRAME_LIMIT)
+                else:
+                    materials = tuple(_EncodedOnlinePayload(inp, plan, fragment) for inp, fragment in
+                        zip((current.p1_input, current.p2_input), current.prepared.fragments, strict=True))
+                    prepared_requests = _prepare_online_requests(
+                        materials, self.session_id, plan.round_id, self._step, self._sequences)
                 self._material_pool.observe_current_encoded(sum(len(v[1]) for v in prepared_requests)
                     + sum(len(v) for v in current.prepared.fragments))
             else:
@@ -976,10 +1001,15 @@ class LanSegmentedRuntime:
                  full_run_id: str | None = None,
                  previous_epoch_session: str | None = None,
                  preload_steps: int = 0, preload_execution: str = "fused",
-                 deadline_ns: int | None = None) -> None:
+                 deadline_ns: int | None = None, wire_profile: str = "control-batch-v1") -> None:
         check_deadline(deadline_ns, "DYNAMIC_SETUP")
         self._v2 = spec.state_dimension != 0
         self._full_v3 = full_run_id is not None
+        if wire_profile not in {"control-batch-v1", _COMPACT_PROFILE} or (
+            wire_profile == _COMPACT_PROFILE and (not self._v2 or self._full_v3 or preload_steps)
+        ):
+            raise ValueError("紧凑动态候选仅允许 v2 且不预送")
+        self._wire_profile = wire_profile
         if (type(preload_steps) is not int or not 0 <= preload_steps <= 1000
                 or preload_execution not in {"staged", "fused"}
                 or (preload_steps and (not self._v2 or self._full_v3))):
@@ -1039,6 +1069,7 @@ class LanSegmentedRuntime:
             _segment_capacity=self.segment_capacity if self._v2 else None,
             _controller_epoch=self.controller_epoch,
             preload_steps=self.preload_steps, preload_execution=self.preload_execution,
+            **({"wire_profile": self._wire_profile} if self._wire_profile == _COMPACT_PROFILE else {}),
             **({"deadline_ns": deadline_ns} if deadline_ns is not None else {}),
         )
         self.connection_seconds = time.monotonic() - started
@@ -1096,10 +1127,13 @@ class LanSegmentedRuntime:
             raise RuntimeError("材料池不存在或已经安装。")
         if _candidate not in (None, "thread", "worker") or _candidate and self._full_v3:
             raise ValueError("实验供料只支持动态v2")
+        if self._wire_profile == _COMPACT_PROFILE and _candidate != "worker":
+            raise ValueError("紧凑动态候选必须使用专属材料工人")
         if _candidate == "worker":
             try:
                 segment._material_pool = _MaterialWorkerPool(segment.client, segment.distribution,
-                    run_id=self.run_id, epoch=self.controller_epoch, start=segment._step, slots=slots)
+                    run_id=self.run_id, epoch=self.controller_epoch, start=segment._step, slots=slots,
+                    **({"encoding_profile": self._wire_profile} if self._wire_profile == _COMPACT_PROFILE else {}))
             except Exception as error:
                 segment._material_statistics = getattr(error, "_public_material_summary", {})
                 raise
@@ -1303,10 +1337,15 @@ class LanSegmentedRuntime:
             self._segment.close()
 
 
-def run_party_single_step(config: LanConfig, *, batch: bool = True) -> dict[str, object]:
+def run_party_single_step(config: LanConfig, *, batch: bool = True,
+                         wire_profile: str = "control-batch-v1") -> dict[str, object]:
     """P1/P2 默认只接受批量能力；旧 wire 须由双方显式选择诊断模式。"""
     if config.role not in {"P1", "P2"}:
         raise ValueError("角色命令必须是 P1 或 P2。")
+    if wire_profile not in {"control-batch-v1", _COMPACT_PROFILE} or (
+        wire_profile == _COMPACT_PROFILE and not batch
+    ):
+        raise ValueError("紧凑动态 profile 必须显式协商原批量内核")
     role: Literal["P1", "P2"] = config.role
     party = 0 if role == "P1" else 1
     address = config.topology.p1_client if party == 0 else config.topology.p2_client
@@ -1319,6 +1358,7 @@ def run_party_single_step(config: LanConfig, *, batch: bool = True) -> dict[str,
         while True:
             summary, tail = _run_party_session(
                 config, client_listener, peer_listener, tail, expected_batch=batch,
+                expected_wire_profile=wire_profile,
             )
             if tail is None:
                 return summary
@@ -1361,9 +1401,23 @@ def _validate_segment_chain(hello: LanSegmentedHelloPayload, session: str,
         raise ValueError("段链存在外来 run、跳段或旧 session。")
 
 
+def _restore_compact_online(value, *, layout, session, round_id, step, modulus, run_id, epoch_id, party):
+    """只从认证 setup 与当前信封恢复公开计划，再交给原资源 recovery。"""
+    plan = Client._resource_plan(layout, session, round_id, step)
+    if not isinstance(value, _CompactOnlinePayload) or (
+        value.run_id, value.epoch_id, value.plan_sha256
+    ) != (run_id, epoch_id, public_step_plan_sha256(plan)):
+        raise ValueError("紧凑材料的 run、epoch 或公开计划不匹配")
+    inp = value.input_message
+    if (inp.session_id, inp.round_id, inp.step, inp.recipient) != (session, round_id, step, party):
+        raise ValueError("紧凑材料当前输入身份不匹配")
+    return _decode_preloaded_values(value.values, inp, plan, modulus)
+
+
 def _run_party_session(config: LanConfig, client_listener: socket.socket,
                        peer_listener: socket.socket | None,
-                       tail: _PartyRunTail | _ScalarRunTail | None, *, expected_batch: bool
+                       tail: _PartyRunTail | _ScalarRunTail | None, *, expected_batch: bool,
+                       expected_wire_profile: str = "control-batch-v1",
                        ) -> tuple[dict[str, object], _PartyRunTail | _ScalarRunTail | None]:
     """旧模式与新模式共享唯一的握手、离线装配和 Protocol 3 单段计算。"""
     role = config.role
@@ -1371,6 +1425,7 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
     client_socket = peer_socket = peer_port = None
     preload_store = None
     endpoint = None
+    compact_hello = None
     try:
         startup_deadline = deadline_after(config.startup_timeout)
         _LAN_LOG.info("%s 已启动，正在等待 Client（最多 %.0f 秒）。", role,
@@ -1383,8 +1438,13 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
             config,
             startup_deadline,
         )
+        compact_hello = wire_hello if isinstance(wire_hello, _CompactHelloPayload) else None
+        if (expected_wire_profile not in {"control-batch-v1", _COMPACT_PROFILE}
+                or (compact_hello is not None) != (expected_wire_profile == _COMPACT_PROFILE)):
+            raise ValueError("LAN Client 与 Party 动态编码 profile 不一致")
         preload_hello = wire_hello if isinstance(wire_hello, PreloadedHelloPayload) else None
-        inner_hello = preload_hello.base if preload_hello is not None else wire_hello
+        inner_hello = (compact_hello.base if compact_hello is not None else
+                       preload_hello.base if preload_hello is not None else wire_hello)
         batch = isinstance(inner_hello, BatchHelloPayload)
         if batch != expected_batch:
             raise ValueError("LAN Client 与 Party 批量能力不一致；旧协议须双方显式诊断启用")
@@ -1544,7 +1604,8 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                          deadline=startup_deadline)
             sequence += 1
         peer_port = LocalhostProtocol3PeerPort(
-            peer_socket, role, _FRAME_LIMIT, config.step_timeout, batch_enabled=batch
+            peer_socket, role, _FRAME_LIMIT, config.step_timeout, batch_enabled=batch,
+            wire_profile=expected_wire_profile,
         )
         peer_port.bind(session)
         steps = (setup.segment_capacity if v2 else
@@ -1622,8 +1683,9 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                         "budget": preload_store.budget, "claimed": preload_store.next_slot,
                         "committed": preload_store.committed, "exported_count": preload_store.loaded}
                 return summary, tail
-            fused = preload_hello is not None and preload_hello.stage_mode == "fused"
-            operation = "activate_stage" if fused else "activate" if preload_store is not None else "online"
+            fused = compact_hello is not None or preload_hello is not None and preload_hello.stage_mode == "fused"
+            operation = ("online_stage" if compact_hello is not None else
+                         "activate_stage" if fused else "activate" if preload_store is not None else "online")
             _check_request(online_request, role, sequence, operation, session)
             expected_step = global_committed if v2 else committed
             if committed >= steps:
@@ -1633,6 +1695,10 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                 raise ValueError("LAN online step 必须连续递增。")
             online_material = (preload_store.claim(online_request.payload)
                                if preload_store is not None else online_request.payload)
+            if compact_hello is not None:
+                online_material = _restore_compact_online(online_material, layout=material.layout,
+                    session=session, round_id=online_request.round_id, step=expected_step,
+                    modulus=fixed.modulus, run_id=hello.run_id, epoch_id=setup.controller_epoch, party=party)
             if not isinstance(online_material, PartyOnlineMaterial):
                 raise TypeError("在线单方材料类型错误。")
             online = recovery.restore(online_material)
@@ -1725,8 +1791,8 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
     finally:
         if preload_store is not None:
             preload_store.close()
-            if endpoint is not None:
-                endpoint.abort()
+        if (preload_store is not None or compact_hello is not None) and endpoint is not None:
+            endpoint.abort()
         if client_socket is not None:
             client_socket.close()
         if peer_port is not None:
@@ -1740,7 +1806,7 @@ def _hello(
     sender: Role,
     recipient: Role,
     session: str,
-    hello: LanHelloPayload | LanSegmentedHelloPayload | BatchHelloPayload | PreloadedHelloPayload,
+    hello: LanHelloPayload | LanSegmentedHelloPayload | BatchHelloPayload | PreloadedHelloPayload | _CompactHelloPayload,
     timeout: float,
     *, deadline: float | None = None,
 ) -> None:
@@ -1787,12 +1853,12 @@ def _accept_hello(
     config: LanConfig,
     deadline: float,
     *,
-    expected: tuple[str, LanHelloPayload | LanSegmentedHelloPayload | BatchHelloPayload | PreloadedHelloPayload]
+    expected: tuple[str, LanHelloPayload | LanSegmentedHelloPayload | BatchHelloPayload | PreloadedHelloPayload | _CompactHelloPayload]
     | None = None,
 ) -> tuple[str, LanHelloPayload | LanSegmentedHelloPayload | BatchHelloPayload]:
     request = receive_envelope(sock, deadline=deadline, limit=_FRAME_LIMIT)
     payload = request.payload
-    base = payload.base if isinstance(payload, PreloadedHelloPayload) else payload
+    base = payload.base if isinstance(payload, (PreloadedHelloPayload, _CompactHelloPayload)) else payload
     base = base.base if isinstance(base, BatchHelloPayload) else base
     if (
         request.kind != "hello"
@@ -1805,7 +1871,7 @@ def _accept_hello(
         or request.step is not None
         or request.resource_id is not None
         or not isinstance(payload, (LanHelloPayload, LanSegmentedHelloPayload,
-                                    BatchHelloPayload, PreloadedHelloPayload))
+                                    BatchHelloPayload, PreloadedHelloPayload, _CompactHelloPayload))
         or base.profile_sha256 != config.topology.digest
         or (expected is not None and (request.session_id, payload) != expected)
     ):

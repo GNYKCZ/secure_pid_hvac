@@ -1158,7 +1158,8 @@ class _TraceSocket:
         except BaseException as error:
             ended = observer.wall()
             origin = "socket_send" if operation == "send" else "socket_recv" if operation == "recv" else "unknown"
-            recoverable = (operation == "recv" and getattr(observer.state, "qpc_receive_probe", None) is self
+            recoverable = ((operation == "recv" and getattr(observer.state, "qpc_receive_probe", None) is self
+                            or operation in {"send", "recv"} and getattr(observer.state, "duplex_probe", None) is self)
                            and isinstance(error, (BlockingIOError, ssl.SSLWantReadError, ssl.SSLWantWriteError)))
             self.native_error = None if recoverable else origin
             record = observer.values(self, operation, started, ended, requested=requested,
@@ -1544,10 +1545,47 @@ class _StageWaitDiagnostic(_TimeoutDiagnostic):
                      "stage_batch", self._public(request.session_id), self._public(request.round_id),
                      self._public(request.step), self._public(request.sequence), *self.run_identity, self._public(request.step)))
                 def replied(sock, request, *args, **kwargs):
-                    selected = (request.operation == "endpoint"
+                    selected = (request.operation == "online_stage" or request.operation == "endpoint"
                                 and getattr(request.payload, "operation", None) == "stage_batch")
                     return (stage_reply if selected else reply)(sock, request, *args, **kwargs)
                 install(lan_runtime, "_party_reply", replied)
+                exchange = _localhost_peer._exchange_frame
+                def duplex(sock, payload, *, deadline, limit):
+                    # 同阶段双向帧的瞬态 WANT 只在这个原调用内可恢复，不污染终止首错。
+                    try:
+                        probe = self.probe(sock)
+                    except Exception as error:  # noqa: BLE001 - 观察失败不改变原传输。
+                        self._observe_error(error)
+                        return exchange(sock, payload, deadline=deadline, limit=limit)
+                    previous = (probe.deadline, probe.context, probe.direction, probe.part,
+                                probe.confirmed, probe.frame_requested, probe.current_entry)
+                    previous_probe = getattr(self.state, "duplex_probe", None)
+                    self.state.duplex_probe = probe
+                    probe.deadline, probe.context = deadline, getattr(self.state, "context", None)
+                    probe.direction, probe.part = "duplex", "duplex_frame"
+                    probe.confirmed, probe.frame_requested, probe.current_entry = 0, len(payload)+4, None
+                    probe.native_error = None
+                    started = self.wall()
+                    try:
+                        return exchange(probe, payload, deadline=deadline, limit=limit)
+                    except BaseException as error:
+                        from secure_control.execution.cycle_timing import remaining_seconds
+                        origin = ("absolute_precheck" if isinstance(error, TimeoutError)
+                                  and remaining_seconds(deadline) <= 0 else probe.native_error or "unknown")
+                        if origin == "absolute_precheck" and probe.native_error is None:
+                            probe.current_entry = None  # 没有观察到该期限检查入口，不能借用已返回的 native 入口。
+                        record = self.values(probe, "frame_exchange", started, self.wall(),
+                            error=error, origin=origin)
+                        self.failed(record)
+                        if self.outer_failure is None:
+                            self.outer_failure = record
+                        self.put("critical", record)
+                        raise
+                    finally:
+                        self.state.duplex_probe = previous_probe
+                        (probe.deadline, probe.context, probe.direction, probe.part,
+                         probe.confirmed, probe.frame_requested, probe.current_entry) = previous
+                install(_localhost_peer, "_exchange_frame", duplex)
                 for name in ("exchange_products", "product_complete", "send_truncations", "receive_truncations", "state_complete"):
                     owner = _localhost_peer.LocalhostProtocol3PeerPort
                     install(owner, name, self._wrapped(getattr(owner, name), name,
@@ -1739,10 +1777,7 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
             diagnostic.end(token, status=status, direction=direction,
                            public_bytes=len(value) if isinstance(value, bytes) else None)
 
-    def measured(sock, payload, deadline):
-        started = time.perf_counter_ns()
-        if delay_ms:
-            time.sleep(delay_ms / 1000)
+    def count_frame(sock, length):
         local = sock.getsockname()[1]
         remote = sock.getpeername()[1]
         if role == "Client":
@@ -1754,7 +1789,14 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
         direction = f"{role}->{recipient}"
         entry = counts.setdefault(direction, {"frames": 0, "application_bytes": 0})
         entry["frames"] += 1
-        entry["application_bytes"] += len(payload)
+        entry["application_bytes"] += length
+        return direction
+
+    def measured(sock, payload, deadline):
+        started = time.perf_counter_ns()
+        if delay_ms:
+            time.sleep(delay_ms / 1000)
+        direction = count_frame(sock, len(payload))
         # S0区间包住原_send_exact；原meter另含公开计数/注入等待，不声称纯OS耗时。
         token = diagnostic.begin("send_ms") if diagnostic and diagnostic.supply else None
         status = "complete"
@@ -1786,12 +1828,23 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
     from secure_control.execution import _localhost_peer, lan_runtime
     from secure_control.protocol import coordinator
 
+    original_exchange = _localhost_peer._exchange_frame
+    def exchanged(sock, payload, *, deadline, limit):
+        # 与旧 _send_exact 相同：包含4字节帧头，失败调用也保留已尝试发送计数。
+        count_frame(sock, len(payload) + 4)
+        return original_exchange(sock, payload, deadline=deadline, limit=limit)
+    observations.enter_context(patch.object(_localhost_peer, "_exchange_frame", exchanged))
+    observations.enter_context(patch.object(_localhost_peer, "encode_envelope",
+        timed("encode_ms", _localhost_peer.encode_envelope)))
+    observations.enter_context(patch.object(_localhost_peer, "decode_envelope",
+        timed("decode_ms", _localhost_peer.decode_envelope)))
+
     if gc_boundaries is not None and role != "Client":
         # 每层保留独立前驱；后续诊断包装不能重绑定本层闭包而形成自递归。
         boundary_receive = lan_runtime.receive_envelope
         def boundary_request(*args, **kwargs):
             request = boundary_receive(*args, **kwargs)
-            if request.sender == "Client" and request.operation == "online" and "begin" not in gc_boundaries:
+            if request.sender == "Client" and request.operation in {"online", "online_stage"} and "begin" not in gc_boundaries:
                 gc_boundaries["begin"] = {"stats": gc.get_stats(), "enabled": gc.isenabled(),
                                            "threshold": list(gc.get_threshold())}
             if (request.sender == "Client" and request.operation == "segment_end"
@@ -1944,7 +1997,7 @@ def _party_job(
     diagnostic_enabled=False, full_observation=False, tcp_nodelay=None, supply_diagnostic=False,
     timeout_trace=False, material_comparison=False, worker_wait_diagnostic=False, server_gc_candidate=False,
     stage_wait_diagnostic=False, compact_history_candidate=False, compact_history_steps=4000,
-    compact_history_qualification=False, network_observation=False,
+    compact_history_qualification=False, network_observation=False, wire_profile=None,
 ) -> None:
     role_steps = []
     history = None
@@ -1982,7 +2035,8 @@ def _party_job(
             observations.enter_context(server_gc.installed())
         if stage_wait:
             observations.enter_context(stage_wait.installed())
-        result = run_party_single_step(config, batch=batch)
+        result = run_party_single_step(config, batch=batch,
+            **({"wire_profile": wire_profile} if wire_profile is not None else {}))
         outcome.update({"status": result.get("status", "closed"),
                    "directions": counts, "activity_ms": activity, "steps": role_steps,
                    "memory": _process_memory(), "material_summary": result.get("material_summary")})
@@ -2003,6 +2057,8 @@ def _party_job(
         outcome["tcp_socket_options"] = socket_options
         if network_observation:
             outcome["network_tls"] = network_tls
+        if wire_profile is not None:
+            outcome["wire_profile"] = wire_profile
         if diagnostic:
             outcome["diagnostic"] = diagnostic.report()
         if stage_wait:
@@ -3272,9 +3328,12 @@ def _observe_network_tls(role, facts):
         facts["restored"] = lan_transport._verify_identity is original
 
 
-def run_network_observation(*, configs, steps):
+def run_network_observation(*, configs, steps, wire_profile=None):
     """独立TLS实验共享入口；先严格校验再复用原循环，旧裸TCP门禁不变。"""
-    if (type(configs) is not tuple or len(configs) != 3 or type(steps) is not int or steps not in (1000, 10000)
+    from secure_control.execution.localhost_codec import _COMPACT_PROFILE
+
+    if (wire_profile not in (None, _COMPACT_PROFILE)
+            or type(configs) is not tuple or len(configs) != 3 or type(steps) is not int or steps not in (1000, 10000)
             or tuple(getattr(c, "role", None) for c in configs) != ("Client", "P1", "P2")
             or not all(isinstance(c, LanConfig) and c.transport == "mutual_tls" for c in configs)
             or any(c.topology != configs[0].topology or c.startup_timeout != 30. or c.step_timeout != 30.
@@ -3295,7 +3354,8 @@ def run_network_observation(*, configs, steps):
     return _run_material_comparison({"steps": steps, "delay_ms": 0., "segment_steps": 400, "optimized": True,
         "material_slots": 16, "role_config": None, "preload_steps": 0, "preload_execution": "fused", "diagnostic": False,
         "recording_mode": "light", "tcp_nodelay": None, "commit_policy": "default", "timeout_trace": False,
-        "network_configs": configs}, "worker", target_steps=steps)
+        "network_configs": configs, **({"network_wire_profile": wire_profile} if wire_profile is not None else {})},
+        "worker", target_steps=steps)
 
 
 def _run_continuous_observation(*, steps: int, delay_ms: float,
@@ -3310,14 +3370,20 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
                                server_gc_candidate=False, stage_wait_diagnostic=False, _stage_observers=None,
                                compact_history_candidate=False, _compact_history=None,
                                qpc_stage_receive_candidate=False, qpc_dynamic_qualification=False,
-                               network_configs=None) -> dict[str, object]:
+                               network_configs=None, network_wire_profile=None) -> dict[str, object]:
     """实际持续动态循环及原同步 writer；退出后报告观察，不发布图或更改调度。"""
     from secure_control.execution.lan_runtime import RunControl
+    from secure_control.execution.localhost_codec import _COMPACT_PROFILE
     from secure_control.scenarios.cart_pole.interactive import InteractiveSession
 
     from .cart_pole_segmented_evidence import _BatchWriter, _correct_cycle_tail, _Spool
     from .lan_continuous_profile import load_segmented_experiment
     from .lan_runner import _run_prepared_segmented
+
+    if network_wire_profile is not None and (network_wire_profile != _COMPACT_PROFILE
+            or network_configs is None or material_candidate != "worker" or not optimized
+            or preload_steps or material_slots != 16 or recording_mode != "light"):
+        raise ValueError("紧凑动态 profile 只允许显式原网络工人实验入口")
 
     maximum = 10000 if optimized else 400
     if tcp_nodelay is not None and type(tcp_nodelay) is not bool:
@@ -3384,7 +3450,7 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
         stage_wait_diagnostic, compact_history_candidate or qpc_stage_receive_candidate or qpc_dynamic_qualification or network_configs is not None,
         steps if qpc_stage_receive_candidate or qpc_dynamic_qualification or network_configs is not None else 4000,
         qpc_dynamic_qualification or network_configs is not None and steps == 10000,
-        *((True,) if network_configs is not None else ()),
+        *((True, network_wire_profile) if network_configs is not None else ()),
     )) for index, role in enumerate(("P1", "P2"))] if role_config is None else []
     records, events, outcomes, writer_batches = [], [], [], []
     history = _compact_history
@@ -3603,6 +3669,7 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
                     cycle_snapshot=writer.snapshot if writer else None,
                     before_sample=writer.check if writer else None,
                     **({"_material_candidate": material_candidate} if material_candidate else {}),
+                    **({"_wire_profile": network_wire_profile} if network_wire_profile is not None else {}),
                 )
                 if _gc_trial:
                     _gc_trial.report["original_startup_gc"] = result.get("startup_gc")
@@ -3713,6 +3780,7 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
     return {
         "schema": "cycle-qualification-v1" if optimized else "continuous-observation-v1",
         **({"network_tls": network_tls} if network_configs is not None else {}),
+        **({"wire_profile": network_wire_profile} if network_wire_profile is not None else {}),
         "recording_mode": recording_mode,
         "evidence_state": "not_recorded" if light else "full_observation_spool",
         "diagnostic": diagnostic, "diagnostic_report": diagnostic_report,
