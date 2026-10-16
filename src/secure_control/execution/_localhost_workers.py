@@ -85,6 +85,10 @@ class _ClientPartyEndpoint:
         self._pending_batch: WireEnvelope | None = None
         self._activation = activation
         self._on_send = on_send
+        self._commit_state = "not_started"
+        self._pending_commit = None
+        self.commit_timings = {}
+        self.commit_observation = {"request_state": "not_attempted", "valid_ack_received": False}
 
     @property
     def party(self) -> int:
@@ -139,7 +143,56 @@ class _ClientPartyEndpoint:
         finally:
             self.commit_duration_ns = perf_counter_ns() - started
 
+    def start_commit(self) -> None:
+        self._check_available()
+        if self.share is None:
+            raise RuntimeError("尚未完成 stage，不能提交。")
+        request = WireEnvelope(
+            SCHEMA_VERSION, "request", "Client", self._role, self.sequence, "endpoint",
+            self.session_id, self.plan.round_id, self.plan.step, None,
+            Protocol3EndpointCommand("commit"),
+        )
+        self._commit_started = perf_counter_ns()
+        self._commit_deadline = (self._deadline if self._deadline is not None
+                                 else deadline_after(self._timeout))
+        self._pending_commit = request
+        self._commit_state = "in_flight"
+        self.sequence += 1
+        self.commit_observation["request_state"] = "uncertain"
+        try:
+            send_envelope(self._sock, request, deadline=self._commit_deadline, limit=self._limit)
+            self.commit_observation["request_state"] = "sent"
+        except Exception:
+            self._commit_state = "failed"
+            raise
+        finally:
+            self.commit_timings["send"] = perf_counter_ns() - self._commit_started
+
+    def finish_commit(self) -> None:
+        if self._commit_state != "in_flight" or self._pending_commit is None:
+            raise RuntimeError("没有可收取的 commit 回执。")
+        started = perf_counter_ns()
+        try:
+            response = receive_envelope(self._sock, deadline=self._commit_deadline, limit=self._limit)
+            _validate_party_reply(response, self._pending_commit)
+            if response.payload is not None:
+                raise ValueError("非暂存操作不得返回输出份额或其他 payload。")
+            self.commit_observation["valid_ack_received"] = True
+            self._commit_state = "acknowledged"
+            self._pending_commit = None
+        except Exception:
+            self._commit_state = "failed"
+            raise
+        finally:
+            self.commit_timings["ack_wait"] = perf_counter_ns() - started
+            self.commit_timings["latency"] = perf_counter_ns() - self._commit_started
+
+    def _check_available(self) -> None:
+        if self._commit_state != "not_started" or self._pending_batch is not None:
+            raise RuntimeError("endpoint 已提交/失败或仍有在途请求。")
+
     def start_stage_batch(self) -> None:
+        self._check_available()
         if self._pending_batch is not None:
             raise RuntimeError("批量 stage 已发送")
         request = WireEnvelope(
@@ -173,6 +226,7 @@ class _ClientPartyEndpoint:
         return response.payload.receipt
 
     def _command(self, operation: str, metadata: ResourceMetadata | None = None) -> object:
+        self._check_available()
         if self._pending_batch is not None:
             raise RuntimeError("批量 stage 回执未收齐")
         command = Protocol3EndpointCommand(operation, metadata=metadata)
@@ -191,12 +245,24 @@ class _ClientPartyEndpoint:
         )
         self.sequence += 1
         deadline = self._deadline if self._deadline is not None else deadline_after(self._timeout)
-        send_envelope(self._sock, request, deadline=deadline, limit=self._limit)
-        response = receive_envelope(self._sock, deadline=deadline, limit=self._limit)
-        _validate_party_reply(response, request)
-        if operation != "stage_output" and response.payload is not None:
-            raise ValueError("非暂存操作不得返回输出份额或其他 payload。")
-        return response.payload
+        if operation == "commit":
+            self._commit_state = "in_flight"
+            self.commit_observation["request_state"] = "uncertain"
+        try:
+            send_envelope(self._sock, request, deadline=deadline, limit=self._limit)
+            if operation == "commit":
+                self.commit_observation["request_state"] = "sent"
+            response = receive_envelope(self._sock, deadline=deadline, limit=self._limit)
+            _validate_party_reply(response, request)
+            if operation != "stage_output" and response.payload is not None:
+                raise ValueError("非暂存操作不得返回输出份额或其他 payload。")
+            if operation == "commit":
+                self._commit_state = "acknowledged"
+                self.commit_observation["valid_ack_received"] = True
+            return response.payload
+        except Exception:
+            self._commit_state = "failed"
+            raise
 
 
 def _validate_party_reply(response: WireEnvelope, request: WireEnvelope) -> None:
@@ -782,9 +848,11 @@ def _complete_client_round(
     second: _ClientPartyEndpoint,
     plan: StepResourcePlan,
     on_phase: Callable[[str], None] | None = None,
-    *, batch: bool = False,
+    *, batch: bool = False, overlap_commit: bool = False,
 ) -> ClientStepResult:
     """仅在两方暂存、重构与双提交均完成后签发父进程可见结果。"""
+    if type(overlap_commit) is not bool or overlap_commit and not batch:
+        raise ValueError("重叠 commit 只允许 batch。")
     orchestrator = Protocol3Orchestrator()
     receipts = (orchestrator.stage_batch(first, second, plan) if batch else
                 orchestrator.stage(first, second, plan))
@@ -800,7 +868,10 @@ def _complete_client_round(
     if on_phase is not None:
         on_phase("reconstruct")
     # P2 提交或回执不确定时不能返回结果；调用方必须废弃整组角色。
-    orchestrator.commit(first, second)
+    if overlap_commit:
+        orchestrator.commit_batch(first, second, plan)
+    else:
+        orchestrator.commit(first, second)
     if on_phase is not None:
         on_phase("commit")
     return ClientStepResult(

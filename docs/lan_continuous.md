@@ -1,5 +1,65 @@
 # 独立三角色连续 LAN 实验（Issues #86、#84、#75、#92）
 
+## S6 独立 worker 首轮通信定位（#120）
+
+`benchmark --case cycle --mode batch --steps 20 --segment-steps 400
+--material-slots 16 --preload-steps 0 --recording light --delay-ms 0
+--worker-timeout-diagnostic --output <本次新结果路径>` 是独立诊断入口，隐式选择原worker。
+不同时传S5 material-candidate、旧timeout-trace、diagnostic或GC-trial选项；旧门禁不放宽。
+必须正常GC/原阈值、默认通信/ACK及原20ms。D6只批准唯一一次最多20周期，首错停，
+启动/准备失败也消费该次调用，不重跑、不补步；软件检查和固定提交后的声明先于运行。
+
+复用原304槽/每角色72KiB的socket/frame/GC探针，首错锁存在清理前，公开上下文只含
+角色、操作、轮身份及序列。保存native调用起止/返回字节/部分进度/超时设置及读回/类别；
+remaining与QPC/monotonic时钟对在调用结束后采样，不标成入口余量，不跨机器直接相减。
+区分absolute_precheck、native异常、EOF及后续对端关闭，不把帧尝试计数当完整交付。
+不记录秘密或异常消息，不写逐步诊断；原权威CycleTiming包括首步和失败/null端点及确认前缀。
+P1/P2的GC边界与接收诊断包装各自固定前驱，同一次请求只委托原接收一次；
+正常返回和原接收错误保持，退出还原全部观察钩子。软件修复不恢复已消费的运行额度。
+
+S6由独立ExitStack持有恢复回调/角色队列，不依赖StartupGCTrial；初始化/运行/关闭失败
+仍保留原错误并逆序恢复，附加清理失败拒绝成功。总诊断（含材料/GC/trace摘要）上限262144B，
+输出声明实际字节、丢弃及恢复事实。`comparison_only=true`，qualification/stage/candidate门禁
+始终false；20步全成功只算未复现，探针有扰动，不能替代1000/10000/完整路线或三机设备资格。
+总预算不足时只保留首错/外层错与恢复事实、明确历史省略；必要时省略材料摘要但不丢周期，
+预算失败拒绝资格，不把被省略的退出/内存事实补造为成功。
+
+## S5 显式本机材料供料对照（#120）
+
+`benchmark --case cycle --mode batch --steps 1000 --segment-steps 400
+--material-slots 16 --preload-steps 0 --recording light --delay-ms 0
+--material-candidate thread|worker --output <本次结果路径>` 只选择实验候选；
+不改变正式 CLI/GUI/配置默认。S5批准范围为同一提交先thread一次、再worker一次，
+各最多1000尝试，首次失败停止；初始化失败也保留，不补步、不重跑或筛选参数。
+
+worker在Client本机用一个spawn工人生成原Beaver/Trunc及静态JSON片段，
+两个单向私有Pipe只传有界字节/累计前缀额度。父接收器核对身份、计划摘要、
+尺寸/完整性/步号/额度后登记父进程一次性能力；当前测量由原Client量化/检查/分享，
+父进程拼装的两份完整信封均预检后才发送。工人不持测量、控制参数、秘密state、
+控制socket或输出签发表，不pickle业务对象，不恢复父进程秘密DTO树。
+双方仍用原动态后端、旧state出力、逐行Trunc、原重构、双提交及设备确认。
+
+库存与生成/IPC在途合计最多16份，每份预留512KiB，总编码预留8MiB；
+当前已领取轮、IPC临时副本单独报告。这不是RSS上限。Client/worker各受256MiB
+离散内存保护；采样不证明瞬时上限或长期无泄漏。控制线程不等待Pipe/补货，
+短缺、工人/通道故障、部分帧、超期及未知提交封闭当前run，不重启/重试/fallback。
+停止废弃库存、五秒内join工人与接收/额度线程；强制终止或缺最终汇总记清理失败，
+不能通过候选门禁。材料不写磁盘，不跨运行缓存。
+关闭观察或清理异常不覆盖已发生的协议首错；`material_comparison`中的
+`memory_sample_error_type`/`cleanup_error_type`只附加公开异常类别（无消息），
+同时保留保护/清理失败标志。关闭层延后到原runner结果返回后统一判定，不以异常栈是否为空
+判断有无首错，不丢已形成的周期与确认前缀。无先前错误时保护或清理失败仍使对照失败，
+不能通过候选门禁。
+
+正常GC/原阈值，保留原启动收集，不freeze/disable，也不安装S3/S4 socket或GC事件探针。
+仅控制开始/结束读取GC统计；worker按开始命令接收和停止读取，P1/P2以第一online请求
+及stop请求（故障时退出）为边界，不把这些非同步时钟边界作单向网络时间。
+只在结束输出轻量公开汇总，保留所有权威CycleTiming的尝试、失败与null端点。
+`comparison_only=true`，`qualification_pass/stage_pass=false`；
+`candidate_gate_pass`只在worker完整1000步零超期/故障、状态/跨段/资源连续且清理成功时通过。
+1000未发生整代GC可能仅推迟扫描；不是10,000、完整路线、三机Wi-Fi或硬件验收，
+也不自动推广默认、追加试验、合并或关闭Issue。
+
 ## 批量通信（#116）
 
 三个角色默认通过 `control-batch-v1` 能力握手，同一运行必须使用同一版本程序；
@@ -118,6 +178,44 @@ qualification_pass 仅在完整 10k、零 miss、所有完整周期在 deadline 
 一旦迟到即终止并保留失败证据。真实 Wi-Fi/硬件、不同网络尾延迟仍须实机验证。
 
 ## 持续分段后端（#100）
+
+### 动态持续控制的记录模式与通信（#120）
+
+动态 observer 的专用 GUI 与 `--headless-continuous` 默认使用轻量记录；
+显式 `--recording full` 才启用完整留证。静态、有限步和完整起摆路线维持原服务，
+不接受这个模式选择参数。记录模式不修改协议、材料、安全检查、设备确认或20 ms截止时间。
+
+light 只在内存保留首周期、最近256个公开周期和失败摘要，停止后才整理窗口统计；
+窗口分位数不代表全程。正常停止返回 `status=stopped`、`recording_mode=light`、
+`evidence_state=not_recorded`，run_dir/prefix_dir为空，durable_step_count为0。
+没有轨迹/哈希链/读回/写盘/图或正式回放。GUI按钮为“停止”，保留最后确认画面与计数，
+显示“未保存完整实验轨迹”；failed/uncertain/cancelled仍显示真实失败类别。
+full 继续原严格记录、可靠前缀、读回、停止保存与正式回放契约；磁盘失败不降级成light。
+静态入口的默认记录服务不变。
+
+所有真实TCP拨号和接受连接在建连期设置TCP_NODELAY，TLS包装保留该设置；设置失败关闭
+连接。它减少可能的小消息等待，不减少应用帧，也不保证操作系统/无线网络尾延迟。
+只有batch、非零秘密状态、lan-segmented-v2的独立动态持续路径先发送P1/P2原commit请求，
+再依次核验两方ACK；full-v3、有限/静态和旧后端保持串行提交。两份有效ACK是出力门槛，
+未知提交不重试、不回滚、不继续下一轮。last_commit_observation的false只表示未收到有效ACK，
+不能推断远端未提交。协议双确认、物理确认与可靠前缀仍是不同事实。
+
+overlap的公开阶段键为p1/p2_commit_send、commit_ack_wait、commit_latency；两方latency
+存在重叠，不可相加当总耗时或称网络RTT。原serial的p1/p2_commit含义保持。
+
+benchmark cycle为兼容历史负载仍默认full，需显式 `--recording light` 测量轻量控制。
+light的writer/drain/fsync/checkpoint指标为null（未执行），来源检查仍实际执行并计时。
+基准保存至多10000个周期用于停止后单次输出，区别于生产256窗口；最终周期以runner终止
+事实校正，不能用回调中临时的confirmed覆盖回调后超期。
+仅内部三进程cycle接受 `--tcp-nodelay off` 或 `--commit-policy serial` 的受控对照；
+外部role-config及其他case拒绝非默认策略。报告各角色建连期实测socket选项、实际提交策略、
+comparison_only和来源摘要。非默认对照不能取得production qualification_pass。
+
+本轮同SHA各一次A（light/off/serial）、B（light/default/serial）、C（light/default/default）
+1000步、segment400/preload1000/fused/delay0，新run/new材料、首次失败停止。C零超期才运行
+默认16槽无预送1000；再通过且长期条件合法才10000。首个C/默认供料失败最多一次原有限
+诊断，steps=min(首次失败尝试数+5,1000)。不重复挑绿，不用预送库存冒充持续供应资格；
+本机仿真通过也不代表完整起摆或真实三机Wi-Fi/硬件资格。
 
 三个终端仍分别启动原 P1、P2、Client 文件；持续模式由 Client 显式选择：
 
@@ -433,7 +531,275 @@ callback不写盘、不序列化、不查看对象；退出还原hook，不修�
 综合未执行时间，不能直接解释为GIL、网络或磁盘。报告给出时钟实现/分辨率、
 启动时钟读取探针和实际峰值RSS，测量开销仍计入原绝对20ms期限。
 诊断允许单步请求，标记 `diagnostic=true`，不作为正式qualification资格。
-当前获批观察仅为fused/stock1000/段400的零注入406步和1ms每帧1步，各一次；
+
+限定启动GC试验使用 `--gc-trial-policy baseline|startup-freeze`，默认不启用。
+只允许独占、运行一次即退出的Client主进程，以及cycle/batch/light/diagnostic、
+1000步、段400、16槽、无预送、零注入延迟和默认通信策略；非法组合先拒绝。
+自动GC必须开启，永久代、调试标志和外部callbacks必须为空。必要依赖导入后，
+在端口、角色配置、进程/队列、会话、场景和材料创建前，两组各做一次冷启动完整GC；
+startup-freeze再冻结当时全部受跟踪对象。运行中新对象仍正常GC，原运行时startup_gc保留。
+冻结不保证对象不可变，也不能直接用于GUI或正式入口。
+
+公开 `gc_trial` 分开记录冷GC、freeze计数/耗时、原startup_gc、GC统计采样时刻、
+退出恢复和当前/峰值OS内存。控制开始/结束及g0/每100步输入前检查当前RSS 256MiB保护线；
+不可用或超限按原异常停止，采样开销计入原期限，不能排除采样之间的瞬时超限。
+材料8MiB编码预留不是RSS上界。详细区间保持g0..1、165..168、176..180；
+Client GC配对覆盖整个试验（含初始化/关闭，以control_active区分），P1/P2窗口不扩展。
+GC stop保存collected/uncollectable计数，缺失配对与overflow明确报告；仍共用每角色512槽、
+72KiB事件预算，全部诊断及策略摘要共256KiB。退出集中写JSON，不按周期写文件。
+
+退出先执行原池close/5秒join/discard并移除自有诊断钩子，再解冻自有永久代、
+恢复GC设置；只有供料线程已退出才做停机收集。清理失败单列且不能覆盖原控制失败，
+不能继续建池或重试。S2获批预算为同一固定head先baseline后startup-freeze各一次、
+每组最多1000尝试且首次失败即停，总计最多2000；安全/数学/所有权缺陷取消第二组。
+两组均为comparison_only/diagnostic，qualification_pass和stage_pass均false；
+即使1000步无miss，也不替代默认持续供料门禁、10000步、GUI或三机验收。
+
+S3为另行批准的单次定位：`--timeout-trace`与startup-freeze及200周期、
+cycle/batch/light/diagnostic、段400/槽16/无预送/零注入/默认通信的本机三角色组合。
+S4另行批准baseline的同一严格200周期组合，复用相同探针及预算，只有启动GC条件不同：
+一次cold collect和原startup_gc保留，不freeze/unfreeze、disable或改阈值。
+baseline仍是有额外冷启动清理和观测的诊断条件，不等于正式默认资格；
+S3预算已用尽，S4仅一组一次、最多200尝试，初始化失败也耗用机会，不追加冻结对照。
+False不安装socket探针；S2不带该标志仍严格要求1000周期。新探针在冷GC及可选freeze后创建，
+仅在原send_exact/receive_exact调用参数处透传同buffer、参数、返回及异常；
+不改socket算法、blocking、原cursor或deadline，不加重试/业务重发。每角色最多4探针、
+8条公开上下文，只有角色/操作/session/round/step/sequence等白名单标量，
+没有payload、信封/异常对象、消息文本或repr。接收上下文可能只是末次请求的预期回包，
+或上次实际收到的信封；明确标注来源，不冒充当前回包已验证。
+
+事件列schema只导出一次；记录原settimeout秒值、实际gettimeout值、原deadline秒/ns与域，
+以及Python调用边界QPC起止、调用后QPC→monotonic_ns→QPC采样对、已返回的字节数。
+remaining_ns只在相应QPC或monotonic域计算；legacy浮点秒转ns有舍入，不能跨epoch减。
+first_failure锚点在清理前，区分absolute_precheck、socket_send、socket_recv或unknown；
+外层和直接cause仅公开类别与整数errno/winerror，异常native调用的部分进度明确unknown。
+时点包含探针开销，不能看到C内部重试/内核路径，线程CPU量化不证明GIL归因。
+
+S3/S4固定环为128 socket/64 frame阶段/64 GC/32 producer/16首错与关闭，共304槽，
+活跃配对最多16，仍受每角色512槽/72KiB、总256KiB（含GCtrial摘要）保护。
+各环正常淘汰evicted_count与导出encoded_omitted分别记录，公开实际最早保留时点。
+首个Client终止错误立即锁存；随后正常停止流量不挤掉现场，只保留在途GC/补货结束和有界close。
+正式QPC续收中的would-block及TLS WantRead/WantWrite仍记录原生事实，但不锁存/停记；
+只在当前线程、当前QPC接收通道内区分，旧float接收和发送中的终止错误保持原首错语义。
+旧固定窗口不叠加；保持原RSS256MiB、g0/g100与启动/结束/恢复检查及GC/钩子恢复。
+仅在固定提交推送、发布预声明后运行一次最多200周期，首失败停，退出一次集中输出。
+失败/缺测/省略/未复现均不重跑，不复用剩余上限、不加对照或参数扫描。
+S4未复现或关键区间缺证时定位未完成，停止新增运行与自动往返交接，不制造后续试验。
+diagnostic/comparison_only=true，qualification/stage=false；200成功不代表正式冻结可采用，
+也不替代1000/10000、跨段、完整路线/GUI、网络、三机或硬件资格。
+
+### 显式 worker 长期候选（S9）
+
+`--worker-long-run` 默认关闭，只续接现有 worker，不改变正式线程供料或 GUI。
+原 `--material-candidate` 仍固定 1000 周期，`--worker-timeout-diagnostic`
+仍固定 20 周期。S9 仅接受 cycle/batch/light、严格整数 10000 周期、段 400、
+16 槽、无预送、零延迟、内部本机角色、默认 TCP/双提交和正常 GC 700/10/10。
+冻结、禁用、调试 GC、外部 callback、诊断/trace/GC-trial、外部 role-config、
+候选选择或通信策略覆盖均互斥；非法组合在端口、材料、进程创建前拒绝。
+
+```powershell
+uv run secure-control benchmark --case cycle --mode batch --steps 10000 --delay-ms 0 --segment-steps 400 --material-slots 16 --preload-steps 0 --recording light --worker-long-run --output .tmp/issue120-s9-worker-long-run.json
+```
+
+[D9 批准](https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6144849748)
+覆盖限定入口/门禁/测试/文档实施及新 SHA 必要软件检查、独立核查；只有该软件
+部分无确认缺陷并获准进入验证，才可发布预声明后使用唯一一次最多 10000 尝试
+的预算。初始化失败也耗用机会，首个失败即停，不重跑、补步或加对照/探针。
+输出必须是新文件，不覆盖 S5–S8 原件；失败后的新修复/测量另需具体决定。
+累计自动返工仍 3/3，不自动第四轮，不合并或开始下一阶段。
+
+有效配置仍为 `cart_pole_observer_lan.example.yaml`。原小数 32 bit、lambda80、
+参数/运行 payload 40/46 bit、256 bit 素数和 n4/m2/p1 不变。持续装配使用
+`sustained_observer_numeric_contract` 的 `bounded_input_reachability`，
+`horizon_steps=None`，原精确编码块幂证明覆盖有界输入下任意轮次并含截断误差。
+原 Client 仍在控制前验证范围、累加器和截断界，每轮检查输入，场景守卫保留；
+不延长有限证书、不重建初态或跨段清秘密状态。只公开证明模式/算法/位宽摘要，
+不导出矩阵、编码初态或秘密状态。数学范围证明不是物理或硬实时无限期保证。
+
+10000 个完整周期从原计划起点计至软件设备确认、记账与观测出口，均须严格
+小于原 20ms 期限。g399、799…9599 共 24 次继续控制的段维护计入对应周期，
+不刷新时钟或期限。g9999 设备确认和记账仍受最后周期保护；之后正常停止的
+末段 END/双方停止确认、终止 source 复核、关闭和结果导出属于周期外停止流。
+不能称停止握手也在 20ms 内，不能用退出耗时倒推周期完成。停止必须成功：
+缺双方关闭确认、来源复核或清理失败均拒绝长期门禁，即使控制周期全部按时。
+
+`worker_long_run` 元数据含版本 1、目标/最大尝试 10000、条件及持续数值契约
+摘要；初始化失败也保留模式和原失败周期/类别。`worker_long_run_gate_pass`
+要求全分母、连续步/段/身份和唯一 round、原计划/期限/确认前缀、双方各步对应
+round及末步双 ACK、10000 次材料领取、库存+在途≤16、编码≤8MiB、原内存保护
+及全部供料进程/线程有界退出。材料消费为300000次乘法/40000次截断，多余库存
+停止废弃。所有首步、慢步、跨段和失败/null端点保留，不能只看平均值或p99。
+
+原 Client/worker 256MiB 离散当前 RSS 保护线不提高；worker 内存 deque(maxlen=32)
+和 16KiB 结束摘要保持。benchmark 最多保存10000尝试、生产近期窗口仍256，
+它们不是无限期内存证明。light 不在控制期间新增写盘或存储材料；退出后沿
+既有方式一次导出公开结果，不承诺一次物理写入。离散采样和各角色 GC 边界
+也不能定位逐 socket 错误、证明瞬时总内存或排除未来尖峰。
+
+长期候选通过时 `candidate_gate_pass=false`，`comparison_only=true`，
+`qualification_pass=false`、`stage_pass=false`。结果只适用于声明 SHA/配置/
+环境的本机 worker 动态长期样本；不是正式默认推广、完整路线、认证三机
+Wi-Fi 或硬件施力资格。未开启重 socket/GC 事件探针，历史 S5 根因仍可能未知。
+完成后发布完整原件/hash与实际结果交回 Design，停止，不自动追加运行。
+
+### 显式 worker 在线确认链定位（S10）
+
+`--worker-wait-diagnostic` 默认关闭，独立接受 cycle/batch/light、4000周期、段400、
+16槽、无预送、零注入、内部角色、原TCP/双提交与正常GC700/10/10。
+与所有其他候选/诊断/trace/GC选择及外部配置/通信覆盖互斥，严格类型检查在
+端口/材料创建前完成。S5/S8的1000、S6的20、S9的10000入口限制保持。
+
+```powershell
+uv run secure-control benchmark --case cycle --mode batch --steps 4000 --delay-ms 0 --segment-steps 400 --material-slots 16 --preload-steps 0 --recording light --worker-wait-diagnostic --output .tmp/issue120-s10-worker-wait-diagnostic.json
+```
+
+[D10批准](https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6146925091)
+仅授权四文件诊断续接，必要软件验证和独立核查通过后，先预声明新完整SHA、
+有效来源/配置/数值/初态/依赖锁/环境时钟/正常GC及完整命令，再仅运行一次，
+最多4000尝试，首次失败停。准备/启动失败也消费；不预热、补步、重跑或加对照。
+输出必须是新文件，不覆盖旧原件。3/3不重置，不自动第四轮修复。
+
+复用原worker及持续证明（reachability/horizon=None/block19），不改输入、秘密
+状态、材料新鲜性、截断/模数/位宽、安全校验和online→stage→重构→双提交顺序。
+20M ns绝对期限、迟采样占预算、继续段维护计入周期，正常停止握手/退出/导出
+仍在周期外另计且必须成功；失败关闭不能冒充正常停止或周期完成。
+
+新增探针profile为`worker-online-wait-v1`，角色报告`format_version=2`。
+原trace `values`/`schemas.trace`字段仍在调用后采样，尤其`remaining_ns`仍不是
+入口预算。新增`schemas.entry`定义调用前固定快照：操作、peer、方向、header/body、
+时钟域、deadline、`remaining_at_entry_ns`、请求/实际timeout_s、`native_called`、
+请求字节/之前确认字节、线程及可确认公共上下文。QPC/monotonic/QPC配对在调用前
+读取；legacy剩余时间按monotonic计算，不能把跨时钟域值直接相减。
+canonical timeout precheck前也采样；其后才可能耗尽预算，因此入口正余量不保证
+原precheck或调用返回时仍有余量。预检异常`native_called=false`，实际send/recv为true；
+失败实际进度未知，不由请求字节数推造。每socket只保留当前入口，角色首错入口
+`first_failure_entry`锁存；普通native事件的entry进入原滚动socket环，不无限累计。
+
+Client分别记录`online_wait_P1/P2`；服务器记录完整body返回时身份未知的标记、
+decode区间及online解码返回标记、`material_restore`及`online_ack`区间。
+服务器收帧/解码前不使用上轮身份；解码成功后才登记当前公开身份。两层phase过滤
+都支持这些事件。正常GC callback仅记录起止、线程CPU/墙钟和公开计数，不主动
+collect/freeze/调阈值；生产事件沿用原观察入口。没有采集worker内部GC或内核状态。
+
+每角色共享304槽/最多4socket、72KiB角色报告、256KiB额外诊断合并预算保持。
+入口快照、schema和首错也计入编码预算；滚动淘汰、编码省略、未配对GC及未知
+上下文如实保存。完整CycleTiming/逐步原件另计，不能说整份JSON≤256KiB。
+原Client/worker离散256MiB、库存+在途16、预编码8MiB保护保持。探针会有开销；
+不能将有探针S10与无探针S9当严格性能收益对照。原函数调用次数/参数/返回/异常
+透传，退出恢复hook/callback，首错不被关闭覆盖。探针/预算/清理错误拒绝成功。
+
+顶层`worker_wait_diagnostic`含版本1、最大4000、实际尝试/失败、预算使用及持续
+数值摘要；初始化失败也保留。`diagnostic=true`、`comparison_only=true`，candidate/
+worker_long_run/stage/qualification均false。即使4000全成功也只报“未复现”，
+不授予10000、正式默认、完整路线、TLS三机Wi-Fi或真实设备资格。
+退出后保存全部尝试及失败null端点，公开可恢复完整原件/hash和时序证据，交回
+Design分析后停止。GC重合仅是线索、低CPU大等待不证明网络/GIL原因，ACK发送
+返回不等于Client已收到，软件设备确认不等于硬件施力。
+
+### 正常 GC 下的有限服务器候选（S11）
+
+`--server-gc-candidate` 默认关闭，严格独立接受 cycle/batch/light、4000周期、
+段400、16槽、无预送、零注入、内部角色、原TCP和双提交。使用既有worker；
+与S5/S6/S9/S10、GC试验、重诊断、timeout_trace和配置/通信覆盖双向互斥。
+选择必须为严格bool；GC须enabled、700/10/10、无冻结/debug/外部callback，
+错误选择在创建端口和材料之前拒绝。原入口的20/1000/4000诊断/10000限制保持。
+
+```powershell
+uv run secure-control benchmark --case cycle --mode batch --steps 4000 --delay-ms 0 --segment-steps 400 --material-slots 16 --preload-steps 0 --recording light --server-gc-candidate --output .tmp/issue120-s11-server-gc-candidate.json
+```
+
+[D11批准](https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6148905058)
+授权六文件限定优化与软件/独立核查通过后一次最多4000尝试的验证。先发布并
+全文读回新完整SHA、来源/配置/依赖/初态/持续数值证明/环境时钟和唯一命令；
+输出/日志必须尚不存在。启动失败也消费预算，首次失败立即停，不预热、补步、
+重跑或加对照；3/3不重置，新有效Finding不触发自动第四轮。完成后公开全部
+尝试和可恢复原件/hash，实际交回Design只读分析后停止。
+
+canonical codec只减少固定字段校验的临时对象，公开字段名为不可变常量，
+不缓存秘密值/DTO。schema3和原编码字节、重复键/UTF-8/有限值、深度/数量、
+完整字段集合（含同数异名）、严格类型/shape/decimal/资源身份检查保持。
+候选P1/P2在有效offline材料恢复、角色/recovery装配后、原offline ACK前各
+仅主动`gc.collect(2)`一次。清理失败不发伪ACK；lan_ready、online、commit及
+跨段不重复主动清理。Client原准备及t0边界保持，正式入口GC策略不改。
+
+新增轻量profile `server-gen2-light-v1`只保存正常gen2的公开QPC起止、线程、
+generation/collected/uncollectable；没有当前round/step身份，明确unknown。
+每方64完成区间+1pending、32KiB/角色，合并96KiB含元数据，全周期/raw另计。
+淘汰/未配对/编码省略/已观察最大值另报；启动主动清理单列，不算运行期覆盖。
+运行中不遍历对象、读locals或秘密值、编码JSON/写盘，不安装S10逐socket/frame/
+阶段探针。退出恢复callback及hook；观察/编码/内存错误拒绝候选且不覆盖原首错。
+原材料库存+在途16、预编码8MiB、Client/worker及新增子角色离散RSS256MiB、
+原有界退出保护保持；离散RSS不是瞬时峰值或长期内存证明。
+
+`server_gc_candidate`元数据version1公开target/max4000、实际尝试/失败、预算
+消费、两方启动清理、运行期gen2覆盖和观察预算。`diagnostic=false`、
+`diagnostic_report=null`、`timeout_trace=null`表示没有旧重探针，新增轻量GC
+观察仍存在。新`server_gc_candidate_gate_pass`须4000全部有效按时确认、零miss、
+唯一身份与连续确认前缀、120000乘法/16000截断、原持续reachability/horizon=None/
+block19证明、9次继续维护g399…3599在原20M ns周期内，以及最后周期和原正常
+停止/双方ACK/worker退出成功。迟采样占原预算，不刷新deadline。
+
+`runtime_gen2_covered`独立报告：两方完整保留控制窗口内gen2且没有淘汰/未配对/
+省略才支持覆盖此类暂停。未发生或记录不完整时，即使有限门禁通过也不能说
+长期GC风险已经验证；启动清理可能只推迟首轮暂停。两项优化共同候选、无同SHA
+A/B，不分配单项收益。始终`comparison_only=true`，旧candidate/worker_long_run/
+stage/qualification保持false。原10000、完整路线、认证三机网络和硬件验收仍需
+独立完成，软件设备确认不等于真实施力，不据此推广正式默认或合并PR。
+
+### 计算阶段与首个通信错误定位（S12）
+
+`--stage-wait-diagnostic`默认关闭，只允许独立cycle/batch/worker/light、4000周期、
+段400、16槽、无预送、零注入、原配置/初态/持续proof、默认TCP/双提交、正常
+GC700/10/10/freeze0/debug0及无外部callback。严格bool及互斥检查在端口/材料创建
+前执行；与S5–S11及通用diagnostic/timeout_trace/GC试验/外部配置和通信覆盖双向
+互斥。原预算不放宽，不能与`--server-gc-candidate`同时选择。
+
+```powershell
+uv run secure-control benchmark --case cycle --mode batch --steps 4000 --delay-ms 0 --segment-steps 400 --material-slots 16 --preload-steps 0 --recording light --stage-wait-diagnostic --output .tmp/issue120-s12-stage-wait-diagnostic.json
+```
+
+[D12批准](https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6162360598)
+只授权四文件定位及软件/独立核查通过后一次最多4000周期。先发布并全文读回新
+完整SHA、来源/配置/依赖锁/初态/持续proof/输入策略/环境钟域/GC和观察预算及
+完整命令，新raw/log不得已存在；启动失败也耗预算，首失败停，不预热、20步、
+补步、重跑或第二组/无探针对照。D11已用完，3/3不重置，新有效Finding不自动
+第四轮。完成后公开全部尝试和可恢复原件/hash，交Design只读分析后停止。
+
+复用S11两服务器offline ACK前各一次collect2及正常gen2观察；Client原启动清理
+不改。Client新增gen2报告另标`client-gen2-light-v1`，可能包含t0前原启动区间，
+不能把它算运行覆盖；服务器保持原`server-gen2-light-v1`语义。GC仍64完成+1pending。
+只补Client原start/finish_stage_batch、服务器原stage/批量peer交换/计算回执区间，
+方法入口与原返回/异常分列，原返回表示原验证已完成，收齐body并不等于验证。
+透明复用原socket包装与canonical framing，原buffer/deadline/参数/返回/异常一次
+透传，不多读、不重试、不改变blocking/cursor。回执send返回不是Client收到。
+
+每角色128个stage滚动事件、4连接在途槽、1独立首个I/O错误；非stage I/O不存
+滚动历史，只保留当前framing的最新入口与独立首错。调用已返回/报错的事件不
+标为native仍在途；部分帧的已确认字节与失败native未知进度分别保存。原precheck
+失败native_called=false；真正send/recv入口为true，不由事后余量倒填入口预算。
+每次只作必要QPC/legacy单次读值，无S10 CPU/每次双钟配对/全阶段重探针。
+
+公开字段限定时间整数ns、枚举、线程、限长身份、peer/方向/header/body、字节进度、
+deadline域、入口余量/timeout及错误/cause类别/errno/winerror；不读对象图、locals、
+秘密值、任意异常文本或traceback，不在控制中JSON/写盘。服务器解码前身份未知，
+stage只用当前已验证plan/request的期望身份，期望不等于收到的帧已验证。legacy保护
+按原monotonic计算、QPC单列，不当周期deadline，也不直接跨主机相减。
+
+`stage_wait_diagnostic`格式1/profile `stage-wait-light-v1`包含三角色schema、去重
+公开身份表、阶段记录、独立首错/外层错、close锚点、原gen2及丢失/恢复状态。
+stage+GC+元数据每角色64KiB，合并192KiB（含诊断描述字段），全部CycleTiming/raw另计。普通环淘汰
+及编码省略单列；超预算会压缩普通历史而保留首错，并标证据不完整。观察/编码/
+恢复/GC状态/内存/退出错误不覆盖原控制首错。只判evidence_complete、控制故障及
+首个I/O错误是否观察到；无故障也只是有限未复现，不称修复或定位成功。
+
+`diagnostic=true`、`comparison_only=true`，原S11有限gate及candidate/worker_long_run/
+stage/qualification均false，timeout_trace=null表示没有旧全量trace。原20Mns绝对
+周期、迟采样/继续维护占预算、正常停止另计、16库存+在途/8MiB/256MiB/有界退出、
+一次性材料/秘密状态/原精度/模数/输入守卫/reachability horizonNone block19/双提交
+和过期输出拒绝保持。新观察会影响分配和故障轮，不是无探针A/B；并行/嵌套区间
+不能相加为独占成本，不排他归因OS/GIL/内核，不推广默认或替代原长期/三机/硬件验收。
+
+早期有限诊断预算为fused/stock1000/段400的零注入406步和1ms每帧1步，各一次，现已使用，不能复用；
 失败即停，退出集中输出。未复现也不得循环追样本或用诊断PASS代替1000/10k验收。
 
 - `configs/lab-p1.example.yaml`、`lab-p2.example.yaml`、`lab-client-continuous.example.yaml`：三个独立角色入口。
@@ -442,3 +808,170 @@ callback不写盘、不序列化、不查看对象；退出还原hook，不修�
 - `configs/paper_pid_fig3_sweep.yaml`：四点图独占的冻结定义，仍读取历史名 `hvac_2r2c_sweep_prime.yaml`，因为已发布 Fig3 清单绑定文件名和原始 SHA。
 
 旧 LAN/TLS 示例配置和 VS Code 调试清单已移除。历史 HVAC 配置仅留在 `tests/fixtures/legacy_hvac/` 供内部回归；它们不是日常实验入口。正式 `results/paper_pid_fig3/` 证据和四点 reader 保留。三角色与 Fig3 复用同一个 paper PID 场景计算，不复制安全协议。
+## S13：有限实验历史的紧凑表示
+
+`--compact-history-candidate` 默认关闭，仅用于显式批准的本机
+cycle/batch/worker、4000 steps、400 segment、16 slots、preload0、light、delay0。
+它与 S11/S12 及其余试验/诊断/外部角色或通信覆盖互斥，严格 bool 和形状检查在端口、角色、材料之前完成。
+正式 light 的 256 近期窗口和段内 400 记录不变；本候选改变的是实验层全量历史表示。
+
+Client/P1/P2 在各自控制开始前分配固定 `bytearray` 行表。Client 的 steps/cycles
+各 4001 槽（含失败/尾部预留），phase events 为 16×4000+64 槽；P1/P2 各 4001 step 槽。
+公开字段白名单及布局在启动前确定，不扩容、不循环覆盖、不保存输入 DTO 或完整嵌套树。
+控制回调直接读取原公开标量，原 meter 的计数/分项仍使用原一次调用；不先 asdict/JSON/pickle
+整棵输入对象。原 runner 自身的必要有界状态与校验没有因此移除。
+
+每字段独立区分未出现、None、实际值；整数 ns/count 检查后按无符号 64bit 保存，不经 float；
+毫秒保存为原 binary64，不舍入、不转 float32；UTF-8 显式检查字节长度，不静默截断。
+全部字段写完才发布有效行计数，未知字段、重复字段、非法父映射、容量/类型/范围/长度错误停止捕获。
+半写入行不发布，已完整捕获前缀保留；展开损坏只返回完整行前缀，并明确不完整。
+错误只记公开类别，不保留异常对象、任意错误文本、份额、材料、矩阵、对象图或分配栈。
+
+当前启动布局：Client buffer 12,257,607B，加固定元数据保守上界 524,288B，预留上界
+12,781,895B；P1/P2 各 buffer 1,348,337B，加同样元数据上界，各 1,872,625B。
+三角色合计预留上界 16,527,145B，分别小于每角色 16MiB、合并 48MiB。
+元数据上界是固定字段表/计数/登记/报告的保守预算，不是测得 RSS 或额外物理 arena。
+预分配与展开分别采样原 OS RSS，原离散 256MiB、材料库存+在途16和预编码8MiB保护不放宽。
+捕获时间仍在原20ms预算内；控制停止、S12 hooks/callback卸载后才展开/汇总/写盘，展开耗时单列。
+JSON编码及独占文件写入的退出后耗时另存命令末行 `history_export_ns`（运行log），不倒填为周期成本。
+原 `_correct_cycle_tail` 在退出展开后处理同身份权威尾部；不另造控制成功数或把 miss_after_apply 改为成功。
+
+仅在原材料工厂成功装配后读取 control/receiver/credit 的 PID、native ID、ident 和观察生命周期，
+保存标量，不保存线程对象。原 close 后读取已有 receiver/credit 的存活状态；控制线程的 observation_end
+表示观察结束，不谎称控制线程此时已经退出。登记早于 GC start 且 GC end 早于观察结束、PID/native
+匹配时才标明线程角色，否则保留未知；这不证明触发分配的函数或独占 CPU，也不反改 S12 的旧线程14320。
+材料生成、接收、公开计划/片段校验、摘要和 IPC 格式保持原实现，无新进程、依赖或模块。
+
+内部复用 S12 stage-wait-light-v1、每方128 stage环/4在途/独立首错、GC64+1及三方192KiB观察预算；
+非stage成功 I/O 没有新增全量历史。Client原startup、P1/P2 offline装配后ACK前各一次collect2保持；
+运行GC enabled700/10/10/freeze0/debug0，不冻结/禁用/改阈值/主动运行期收集。
+新 `compact_history_candidate` version1 明示尝试/失败/消费预算、布局/捕获与展开、首错/线程及GC覆盖，
+`diagnostic/comparison_only=true`；所有原 S11/candidate/worker_long_run/stage/qualification flags 为 false。
+`finite_sample_pass` 单独检查4000按时完整、原身份/数值/材料/资源、9次继续维护、正常STOP双ACK、
+worker/receiver/credit退出与完整恢复。无运行 gen2 只能说未覆盖，不能说GC成本降为0。
+
+GC分类版本2使用Client原on_cycle正常confirmed出口的私有QPC锚点与终末STOPPING入口；
+继续段ENDING_SEGMENT仍属原控制周期。完整GC区间须全落在已证实的控制/观察范围且原观察证据完整，
+才贡献`runtime_gen2_coverage=true`。正常停止、启动外部、跨边界或末观察到STOPPING间隙分别标为
+`normal_stop`、`outside`、`overlap_or_unknown`，全部原区间及线程匹配保留。缺失/乱序锚点不能
+退回最后计划deadline；失败I/O和清理不延长已确认观察范围。原callback成本及miss_after_apply保护不变。
+
+仅软件和新head独立核查通过、目录释放、完整预声明发布且全文读回后允许：
+
+```powershell
+uv run secure-control benchmark --case cycle --mode batch --steps 4000 --delay-ms 0 --segment-steps 400 --material-slots 16 --preload-steps 0 --recording light --compact-history-candidate --output .tmp/issue120-s13-compact-history-candidate.json
+```
+
+一次最多4000，启动失败也消费，首失败停，不补步/重跑/预热/额外20步/第二组/对照。
+旧预算不复用；全部成功/慢步/失败/null、阶段事件和双方逐步记录退出后完整导出，可恢复原件和hash。
+观察或展开失败不覆盖原控制首错、不获得完整/PASS，不靠再次运行恢复证据。
+正常GC、算法/协议/精度、20ms及正式默认不变；新旧SHA/随机负载不同，不是同SHA A/B。
+即使有限样本通过，也不授原10000、完整路线、认证三机或真实硬件资格，不自动进入下一试验或合并。
+
+## S15：实验 Client stage 回复观察（历史D15预算已消费）
+
+`--qpc-stage-receive-candidate` 默认关闭，只有显式获批的 cycle/batch/fused/worker/light、
+delay0/preload0、slots16/segment400、本机 insecure_tcp、1..1000 steps 可用；与其余诊断候选互斥。
+S15原始SHA没有改变正式transport；当前S17已将算法移到canonical owner，见下一节。
+此选项仅在Client的`finish_stage_batch`、当前P1/P2原通道与同一`_CycleDeadline`上增加公开观察，
+委托与正式路径相同的收齐实现；非该阶段走canonical默认。未知身份、通道、TLS或legacy deadline不纳入此实验观察。
+
+仍由原 receive_frame 读取/验证4B长度头、长度上限、body及原信封身份。保存原timeout并暂用
+非阻塞recv；select每次使用原remaining_seconds，不刷新20ms。空就绪/would-block只续收当前
+frame剩余字节，正字节推进并清零无进展计数，绝不重发stage/commit或复用失败材料。
+每次等待前后、读取前后、收齐及恢复模式后重查原截止；迟到不返回结果供采用。
+同一收齐调用连续8次无进展即 `LocalhostTransportError` / `no_progress_guard`，不谎称原截止已到。
+原生TimeoutError/OSError按原传输错误类别停止，不无条件重试；EOF仍断连。finally恢复原timeout，
+恢复异常单列；先前首错在恢复前锁定，不被恢复错误覆盖，也不由实验层关闭runtime拥有的通道。
+模式/就绪/读取/观察/恢复成本全计原receive_ms和原周期，原设备/双提交/观察出口保护保持。
+
+内部复用S13有界历史，容量按本次请求步数预分配，保留全部steps/events/cycles/party rows/null；
+S13显式候选及默认4000门禁不改变。S15独立 `qpc_stage_receive_candidate` 元数据，最大1000，
+`finite_sample_pass` 只对全部请求周期、数值/身份/资源/退出、完整历史/线程与新观察profile通过；
+g399/g799等实际继续维护到达才记覆盖，未到不补测，旧资格flags始终false。
+
+观察为 `qpc-stage-receive-v1`：Client原128 stage环/原首IO/GC不变，同一64KiB内增加总共16项
+select/无进展/异常滚动事实及各一项首异常现象和首终止异常；P1/P2仍原stage-wait-light-v1。
+非阻塞recv实际requested/observed timeout为0，select请求等待单列，绝不标成原S12 native-timeout语义。
+全部时间整数QPC ns，仅公开身份/数量/时长/错误类别，不保存payload/份额/对象栈。
+淘汰/编码省略/预算失败如实报告；不省略首错/原GC或新首异常来假装满足预算，不提高原
+Client64KiB/合并192KiB。预算或恢复/观察故障拒绝有限PASS，控制首错与完整可靠前缀保持。
+RV-003的确定控制/正常STOP边界与unknown归类沿用；失败轮未知不能变成“没有GC”。
+
+仅软件检查、新head独立审查并释放、唯一预声明全文读回后，按另批D15一次执行：
+
+```powershell
+uv run secure-control benchmark --case cycle --mode batch --steps 1000 --delay-ms 0 --segment-steps 400 --material-slots 16 --preload-steps 0 --recording light --qpc-stage-receive-candidate --output .tmp/issue120-s15-qpc-stage-receive-candidate.json
+```
+
+首次失败停，启动失败也消费，不补步/热身/20步/重跑/第二组/额外D14或baseline。
+原D13/D14预算不恢复；一次满1000也仅有限样本，不证明S13内部根因或长期10000/完整路线/
+真实认证三机/硬件达标，不据此推广或合并。D13/D14/D15及第6次原生定位预算均已消费，不可重跑。
+
+## S17：正式QPC接收加固与唯一10000本机动态资格
+
+第7次直接人工批准改变的是工程前置：不再等待S13历史故障复现。
+S13内部原因仍未知，第6次真实根因闭环仍未完成；本节故障模型回归不称历史故障重放或内核修复证明。
+
+正式`localhost_transport._receive_exact`遇到`_CycleDeadline`时，使用同一owner的
+`_receive_qpc_exact`，S15和新资格观察也委托该实现，不保留第二套实验接收算法。
+公共签名、长度头/body、信封身份、发送、控制/材料/双提交不改；旧float monotonic启动/保护路径保持原实现。
+这是正式QPC接收行为的改变，不等于完整路线或认证部署已经验收。
+
+保存原timeout、暂用非阻塞接收，在同一个绝对截止内推进当前字节游标；等待前后、读取前后、
+收齐/转换和模式恢复后都查原截止。空就绪/would-block只续当前接收，不重发、不重建20ms；
+正字节清零连续无进展，8次保护明确报错。真正TimeoutError/OSError/EOF/SSL错误仍立即失败，
+恢复错误不覆盖先前首错，也不由传输helper关闭runtime拥有的通道。
+TLS先尝试读取内部可推进数据，再按WantRead/WantWrite等待相应方向；pending为0也不能仅凭底层可读决定是否尝试。
+保持已有TLS认证与关闭语义，不降级裸TCP。控制调用串行拥有通道，材料辅助线程只读其IPC；
+不为任意外部并发/别名新增锁或线程。
+
+`--qpc-dynamic-qualification`仅启用完整记录/验收门禁，接收仍是同一正式实现。
+限定cycle/batch/fused/worker/light、10000步、400段/16库存/preload0/delay0、原本机insecure_tcp、
+正常GC700/10/10/freeze0/debug0，与其它诊断候选互斥。没有Frida、原生桥接或辅助跟踪进程。
+启动前核真实原schema布局：Client31159895B、各party3894625B、总38949145B；
+仅此profile的Client上限32MiB，party16MiB/总48MiB、RSS256MiB、材料8MiB/16份保持。
+原S13/S15仍原容量上限。只在内存捕获，退出卸载后完整展开/一次写盘，不筛慢步/失败/null。
+
+新`canonical-qpc-receive-v1`公开观察覆盖Client所有QPC周期回复，仍为16项滚动/首异常及原stage/首IO/GC，
+角色64KiB/合并192KiB不提高。完整10000路径应有120192次exact接收（12/步、24次维护各8）；
+计数、恢复、首异常、预算/省略和全部历史/线程/数值/身份/材料/退出均须过门禁。
+`local_dynamic_qualification_pass`只代表声明环境下本机动态资格；所有既有整体资格flags保持false，
+三机TLS网络、完整路线/切换和真实设备资格另列。Client运行gen2及早empty实际覆盖独立报告，未出现不补造。
+
+仅新SHA直接/完整检查及独立Review通过、目录释放、唯一预声明全文远端读回后才运行：
+
+```powershell
+uv run secure-control benchmark --case cycle --mode batch --steps 10000 --delay-ms 0 --segment-steps 400 --material-slots 16 --preload-steps 0 --recording light --qpc-dynamic-qualification --output .tmp/issue120-s17-qpc-dynamic-qualification.json
+```
+
+这使用原未消费的一次10000额度，不新增定位/短测/性能次数；首失败停，启动失败也消费。
+24次继续维护g399..g9599只有实际到达才确认，g9999终末STOP；不热身/短测/对照/额外D14/补跑。
+任一失败仍未完成，不自动第8次源码返工、推广全线默认、合并/关闭或开始下一Issue。
+
+后续第8次直接人工单次批准仅处理RV-004旧timeout/S10观察器兼容回归：
+可恢复原生事件不占终止首错或其入口，后续普通I/O/GC继续；真正错误保留原入口、
+部分字节与cause。此批准不增加试验次数；仍须新head软件检查和独立复审通过后，
+才使用上面原未消费的一次10000预算。不自动第9次源码返工或新增定位/短测/重跑。
+
+## S19：公开计划摘要减负与新授权单次资格
+
+第9次直接人工单次批准仅减少`public_step_plan_sha256`的中间对象构造：标准JSON按需
+投影公开dataclass字段，替代预先`asdict`递归深复制整棵计划；有限缓存仅含三种类型的字段名，
+不缓存plan/round/摘要/能力，不删除任何资源或字段。原domain零字节、UTF-8、排序/分隔符、
+Unicode与NaN拒绝及SHA256保持，worker/Client/peer仍独立调用同一个canonical实现。
+非法循环仍按旧asdict的RecursionError拒绝，不改为JSON循环检查的另一异常类别。
+消息/wire、来源与一次性能力、owner/锁/生命周期、数值/控制/期限/GC/内存预算均不改。
+
+旧S17资格9807尝试/9806确认/1超期及全部原件保持，原预算已消费；本次另有一次最多10000
+的新预算，不能拼接剩余193步。沿同一有效场景/worker/正常GC/20ms/400段/库存16/light，
+软件检查及新head独立审查通过、目录释放和新SHA/源码/配置/环境唯一预声明全文读回后才可用：
+
+```powershell
+uv run secure-control benchmark --case cycle --mode batch --steps 10000 --delay-ms 0 --segment-steps 400 --material-slots 16 --preload-steps 0 --recording light --qpc-dynamic-qualification --output .tmp/issue120-s19-qpc-dynamic-qualification.json
+```
+
+新结果与独占log事前必须不存在；首次失败即停，启动失败也消费，不热身/短测/定位/对照/补跑。
+完整周期/24维护/正常STOP/材料/状态/资源/历史与退出门禁不改；少分配可能只推迟gen2，
+未覆盖Client运行期GC不等于消除停顿，退出GC不能充作控制内覆盖。原历史S13内部仍未知，
+有限本机动态结果不授完整路线/真实TLS三机/Wi-Fi/硬件资格，不自动第10次源码续接或合并关闭。

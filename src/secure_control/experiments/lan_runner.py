@@ -144,7 +144,8 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                             phase=None, realtime=None, material_slots=16,
                             on_cycle=None, cycle_snapshot=None,
                             before_sample=None, preload_steps=0,
-                            preload_execution="fused", on_segment_ready=None) -> dict[str, object]:
+                            preload_execution="fused", on_segment_ready=None,
+                            _material_candidate=None) -> dict[str, object]:
     """唯一持续循环接收已装配场景；保存/GUI 与 headless 不重复 parse 或创建 plant。"""
     control.bind_stop(session.reject_new)
     if preload_steps and material_slots != 16:
@@ -206,7 +207,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
         if session.cancelled.is_set():
             raise RuntimeError("Client 运行已取消。")
         progress("RECORDING_SEGMENT")
-        packet = CompletedSegment(segment, tuple(records))
+        packet = CompletedSegment(segment, tuple(records)) if on_segment is not None else None
         if on_segment is not None:
             measured("seal", lambda: on_segment(packet))
         primary = None
@@ -234,6 +235,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                                       "last_cycle": last_cycle},
                     "material_summary": getattr(runtime, "material_summary", runtime.cycle_queue_levels),
                     "startup_gc": startup_gc,
+                    "last_commit_observation": getattr(runtime, "last_commit_observation", None),
                 }
             progress("CONNECTING_NEXT")
             measured("source", experiment.recheck_sources)
@@ -282,12 +284,15 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                                            or control.stop_requested)
         if dynamic_realtime:
             if material_slots and not preload_steps:
-                runtime.enable_material_preparation(slots=material_slots)
+                runtime.enable_material_preparation(slots=material_slots,
+                    **({"_candidate": _material_candidate} if _material_candidate else {}))
             # 所有固定验证、建连、writer 初始化与首池填充完成后才确定唯一 t0。
             # 收集初始化暂存垃圾；运行中的自动 GC/阈值保持原样，不转移周期内的工作。
             started = perf_counter_ns()
             collected = gc.collect(2)
             startup_gc = {"duration_ns": perf_counter_ns() - started, "collected": collected}
+            if _material_candidate:
+                runtime._begin_material_control()
             if session.cancelled.is_set():
                 raise RuntimeError("Client 运行已取消。")
             # 启动期间的正常停止仍关闭零步段，不再建立不需要的控制时钟。
@@ -348,8 +353,9 @@ def _run_prepared_segmented(config, experiment, *, control, session,
             if attempt is not None:
                 attempt["device"] = perf_counter_ns()
                 attempt["durations"]["device"] = attempt["device"] - started
-            record = ConfirmedStep(identity, snapshot)
-            records.append(record)
+            record = ConfirmedStep(identity, snapshot) if on_step is not None or on_segment is not None else None
+            if on_segment is not None:
+                records.append(record)
             progress("RECORDING_STEP")
             started = perf_counter_ns()
             if on_step is not None:
@@ -408,6 +414,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                               "last_cycle": last_cycle},
             "material_summary": getattr(runtime, "material_summary", runtime.cycle_queue_levels) if runtime is not None else {},
             "startup_gc": startup_gc,
+            "last_commit_observation": getattr(runtime, "last_commit_observation", None),
             "recording_error": getattr(error, "_public_recording_error", None),
         }
     finally:
@@ -558,25 +565,93 @@ def _run() -> int:
     redraw.add_argument("--run-dir", required=True, type=Path)
     redraw.add_argument("--output", required=True, type=Path)
     benchmark = commands.add_parser("benchmark")
-    benchmark.add_argument("--case", required=True, choices=("dynamic", "scalar", "continuous", "cycle"))
-    benchmark.add_argument("--mode", required=True, choices=("legacy", "batch"))
+    benchmark.add_argument("--case", required=True, choices=("dynamic", "scalar", "continuous", "cycle", "full-observation"))
+    benchmark.add_argument("--mode", default="batch", choices=("legacy", "batch"))
     benchmark.add_argument("--steps", required=True, type=int)
     benchmark.add_argument("--delay-ms", type=float, default=0.)
     benchmark.add_argument("--segment-steps", type=int, default=8)
     benchmark.add_argument("--material-slots", type=int, choices=(0, 4, 16), default=16)
     benchmark.add_argument("--preload-steps", type=int, default=0)
     benchmark.add_argument("--preload-execution", choices=("staged", "fused"), default="fused")
+    benchmark.add_argument("--recording", choices=("light", "full"),
+                           help="仅cycle：轻量控制/完整留证对照；默认full保持原观察负载")
+    benchmark.add_argument("--tcp-nodelay", choices=("default", "off"), default="default")
+    benchmark.add_argument("--commit-policy", choices=("default", "serial"), default="default")
     benchmark.add_argument("--diagnostic", action="store_true",
                            help="本机cycle有限CPU/GC观测，不作为正式资格")
+    benchmark.add_argument("--gc-trial-policy", choices=("baseline", "startup-freeze"),
+                           help="独占Client一次性限定GC对照；默认不启用")
+    benchmark.add_argument("--timeout-trace", action="store_true",
+                           help="显式baseline或startup-freeze一次最多200周期的有限socket超时定位")
+    benchmark.add_argument("--material-candidate", choices=("thread", "worker"),
+                           help="S5显式供料对照，固定1000/400/16/light；默认不启用")
+    benchmark.add_argument("--worker-timeout-diagnostic", action="store_true",
+                           help="S6独立worker正常GC定位，固定20/400/16/light，首次失败停，非性能资格")
+    benchmark.add_argument("--worker-long-run", action="store_true",
+                           help="S9显式worker长期候选，固定10000/400/16/light，首次失败停，非整体资格")
+    benchmark.add_argument("--worker-wait-diagnostic", action="store_true",
+                           help="S10独立worker确认链定位，固定4000/400/16/light，首次失败停，非资格")
+    benchmark.add_argument("--server-gc-candidate", action="store_true",
+                           help="S11独立服务端启动GC候选，固定4000/400/16/light，非长期资格")
+    benchmark.add_argument("--stage-wait-diagnostic", action="store_true",
+                           help="S12独立stage/首个通信错误定位，固定4000/400/16/light，非资格")
+    benchmark.add_argument("--compact-history-candidate", action="store_true",
+                           help="S13紧凑实验历史候选，固定4000/400/16/light，保留S12观察，非长期资格")
+    benchmark.add_argument("--qpc-stage-receive-candidate", action="store_true",
+                           help="S15仅实验Client stage回复按原QPC截止续收；默认关闭")
+    benchmark.add_argument("--qpc-dynamic-qualification", action="store_true",
+                           help="固定10000/400/16/light的本机动态资格，使用正式canonical QPC接收")
+    benchmark.add_argument("--fixed-proof-cache", action="store_true",
+                           help="full-observation固定精确矩阵计算的显式候选对照")
     benchmark.add_argument("--role-config", type=Path)
     benchmark.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     _enable_terminal_progress()
     if args.role == "benchmark":
-        from .communication_benchmark import run_continuous_observation, run_local_benchmark
+        from .communication_benchmark import (
+            run_continuous_observation,
+            run_full_observation,
+            run_local_benchmark,
+        )
 
         try:
-            if args.case in {"continuous", "cycle"}:
+            if args.qpc_dynamic_qualification and (args.case != "cycle" or args.mode != "batch" or args.fixed_proof_cache):
+                raise ValueError("qpc-dynamic-qualification只支持独立cycle/batch资格。")
+            if args.qpc_stage_receive_candidate and (args.case != "cycle" or args.mode != "batch" or args.fixed_proof_cache):
+                raise ValueError("qpc-stage-receive-candidate只支持独立cycle/batch候选。")
+            if args.compact_history_candidate and (args.case != "cycle" or args.mode != "batch" or args.fixed_proof_cache):
+                raise ValueError("compact-history-candidate只支持独立cycle/batch候选。")
+            if args.stage_wait_diagnostic and (args.case != "cycle" or args.mode != "batch" or args.fixed_proof_cache):
+                raise ValueError("stage-wait-diagnostic只支持独立cycle/batch定位。")
+            if args.server_gc_candidate and (args.case != "cycle" or args.mode != "batch" or args.fixed_proof_cache):
+                raise ValueError("server-gc-candidate只支持独立cycle/batch候选。")
+            if args.worker_wait_diagnostic and (args.case != "cycle" or args.mode != "batch"
+                                                or args.fixed_proof_cache):
+                raise ValueError("worker-wait-diagnostic只支持独立cycle/batch诊断。")
+            if args.worker_long_run and (args.case != "cycle" or args.mode != "batch"
+                                         or args.fixed_proof_cache):
+                raise ValueError("worker-long-run只支持独立cycle/batch候选。")
+            if args.worker_timeout_diagnostic and (args.case != "cycle" or args.mode != "batch"):
+                raise ValueError("worker-timeout-diagnostic只支持cycle/batch。")
+            if args.material_candidate is not None and (args.case != "cycle" or args.mode != "batch"):
+                raise ValueError("材料候选只支持cycle/batch")
+            if args.timeout_trace and (args.case != "cycle" or args.mode != "batch"):
+                raise ValueError("timeout-trace只支持cycle/batch。")
+            if args.gc_trial_policy is not None and (args.case != "cycle" or args.mode != "batch"):
+                raise ValueError("GC限定试验只支持cycle/batch。")
+            if args.recording is not None and args.case != "cycle":
+                raise ValueError("--recording 只适用于cycle动态持续观察")
+            if (args.tcp_nodelay != "default" or args.commit_policy != "default") and args.case != "cycle":
+                raise ValueError("通信策略对照只适用于cycle。")
+            if args.fixed_proof_cache and args.case != "full-observation":
+                raise ValueError("固定证明对照只适用于full-observation")
+            if args.case == "full-observation":
+                if args.mode != "batch" or args.preload_steps or args.diagnostic:
+                    raise ValueError("full-observation只观察原batch完整路线，不支持预送或cycle诊断")
+                report = run_full_observation(steps=args.steps, delay_ms=args.delay_ms,
+                                             segment_steps=args.segment_steps,
+                                             role_config=args.role_config, fixed_proof_cache=args.fixed_proof_cache)
+            elif args.case in {"continuous", "cycle"}:
                 if args.mode != "batch":
                     raise ValueError("实际持续观察只使用默认批量协议")
                 report = run_continuous_observation(
@@ -585,6 +660,20 @@ def _run() -> int:
                     preload_steps=args.preload_steps, preload_execution=args.preload_execution,
                     role_config=args.role_config,
                     diagnostic=args.diagnostic,
+                    recording_mode=args.recording if args.recording is not None else "full",
+                    tcp_nodelay=False if args.tcp_nodelay == "off" else None,
+                    commit_policy=args.commit_policy,
+                    gc_trial_policy=args.gc_trial_policy,
+                    timeout_trace=args.timeout_trace,
+                    material_candidate=args.material_candidate,
+                    worker_timeout_diagnostic=args.worker_timeout_diagnostic,
+                    worker_long_run=args.worker_long_run,
+                    worker_wait_diagnostic=args.worker_wait_diagnostic,
+                    server_gc_candidate=args.server_gc_candidate,
+                    stage_wait_diagnostic=args.stage_wait_diagnostic,
+                    compact_history_candidate=args.compact_history_candidate,
+                    qpc_stage_receive_candidate=args.qpc_stage_receive_candidate,
+                    qpc_dynamic_qualification=args.qpc_dynamic_qualification,
                 )
             else:
                 if args.preload_steps or args.diagnostic:
@@ -592,15 +681,21 @@ def _run() -> int:
                 report = run_local_benchmark(
                     args.case, args.mode, steps=args.steps, delay_ms=args.delay_ms,
                 )
+            export_started = perf_counter_ns() if (args.compact_history_candidate or args.qpc_stage_receive_candidate
+                                                   or args.qpc_dynamic_qualification) else None
             with args.output.open("x", encoding="utf-8") as stream:
                 json.dump(report, stream, ensure_ascii=False, indent=2, allow_nan=False)
+            export_ns = perf_counter_ns()-export_started if export_started is not None else None
         except (OSError, ValueError, RuntimeError) as error:
             return _failure("Client", 5, "communication_benchmark", error)
         observed_ok = report.get("status", "complete") in {"complete", "stopped"}
         display_timing = report["cycle_timing"] if args.case == "cycle" else report["timing"]
         print(json.dumps({"status": "complete" if observed_ok else "failed", "report": str(args.output),
                           "case": args.case, "mode": args.mode,
-                          "p50_ms": display_timing["p50_ms"]},
+                          "p50_ms": display_timing["p50_ms"],
+                          **({"history_export_ns": export_ns,
+                              "history_export_scope": "after control/observer exit; JSON encoding and exclusive file write"}
+                             if args.compact_history_candidate or args.qpc_stage_receive_candidate or args.qpc_dynamic_qualification else {})},
                          ensure_ascii=False, sort_keys=True))
         return 0 if observed_ok else 5
     if args.role == "redraw":

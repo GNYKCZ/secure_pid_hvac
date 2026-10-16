@@ -30,7 +30,8 @@ class CartPoleWindow:
     """网络与正式写入在工作线程；画面从已提交状态或正式 reader 来。"""
 
     def __init__(self, root: tk.Tk, config_path: Path, *, segment_steps=400,
-                 mode="segmented", preload_steps=0, preload_execution="fused") -> None:
+                 mode="segmented", preload_steps=0, preload_execution="fused",
+                 recording_mode=None) -> None:
         if mode not in ("segmented", "finite"):
             raise ValueError("窗口模式无效。")
         self.mode, self.segment_steps = mode, segment_steps
@@ -58,6 +59,11 @@ class CartPoleWindow:
             if mode == "segmented" else
             load_interactive_cart_pole_experiment(self.config.experiment_config, self.session)
         )
+        dynamic = mode == "segmented" and self.prepared.spec.state_dimension != 0
+        if recording_mode is not None and (type(recording_mode) is not str
+                                          or recording_mode not in ("light", "full") or not dynamic):
+            raise ValueError("recording_mode 仅支持动态持续窗口的 light/full。")
+        self.recording_mode = recording_mode if recording_mode is not None else "light" if dynamic else "full"
         self._result: tuple[object, dict[str, object], Path] | None = None
         self._verified = None
         self._final_count = None
@@ -89,7 +95,7 @@ class CartPoleWindow:
         tk.Button(controls, text="+1 N / 20 ms →", command=lambda: self._request(1.0)).pack(
             side="left", padx=12
         )
-        self.stop = tk.Button(controls, text="停止并保存", command=self._request_stop,
+        self.stop = tk.Button(controls, text="停止" if self.recording_mode == "light" else "停止并保存", command=self._request_stop,
                               state="normal" if mode == "segmented" else "disabled")
         self.stop.pack(side="left", padx=12)
         self.replay = tk.Scale(root, from_=0, to=0,
@@ -108,7 +114,8 @@ class CartPoleWindow:
         self.charts = tk.Button(root, text="查看正式控制图与运动图", state="disabled",
                                 command=self._open_charts)
         self.charts.pack(pady=4)
-        self.location = tk.StringVar(value="结果目录：尚未发布")
+        self.location = tk.StringVar(value="轻量运行：不保存完整实验轨迹" if self.recording_mode == "light"
+                                    else "结果目录：尚未发布")
         tk.Label(root, textvariable=self.location, wraplength=820).pack(pady=4)
         root.bind("<Left>", lambda _event: self._request(-1.0))
         root.bind("<Right>", lambda _event: self._request(1.0))
@@ -122,7 +129,7 @@ class CartPoleWindow:
                 self._latest_frame = value
             elif kind == "phase":
                 self._latest_phase = value
-            elif kind in ("complete", "failed"):
+            elif kind in ("complete", "failed", "light_stopped"):
                 self._terminal = (kind, value)
             elif kind == "seek":
                 self._seek_result = value
@@ -265,7 +272,11 @@ class CartPoleWindow:
                     phase=lambda value: self._notify("phase", value),
                     on_step=self._confirmed_frame,
                     preload_steps=self.preload_steps, preload_execution=self.preload_execution,
+                    recording_mode=self.recording_mode if self.prepared.spec.state_dimension else None,
                 )
+                if result.get("recording_mode") == "light":
+                    self._notify("light_stopped", result)
+                    return
                 if result["status"] != "complete":
                     self._notify("failed", result["status"])
                     return
@@ -350,7 +361,14 @@ class CartPoleWindow:
         if terminal is not None:
             kind, value = terminal
             self.stop.configure(state="disabled")
-            if kind == "complete" and not self._closing:
+            if kind == "light_stopped" and not self._closing:
+                self._final_count = value["confirmed_step_count"]
+                reason = ("预送库存耗尽" if value.get("stop_reason") == "preload_exhausted"
+                          else "用户停止" if value["status"] == "stopped"
+                          else f"{value['status']} / {value.get('category', '失败')}")
+                self.phase.set(f"{reason}；已确认{self._final_count}步")
+                self.location.set("未保存完整实验轨迹；不能正式回放")
+            elif kind == "complete" and not self._closing:
                 if self.mode == "segmented":
                     self._verified = value
                     self._final_count = value.metadata["N"]
@@ -399,12 +417,13 @@ class CartPoleWindow:
 
 
 def run_window(config_path: Path, *, segment_steps=400, mode="segmented",
-               preload_steps=0, preload_execution="fused") -> None:
+               preload_steps=0, preload_execution="fused", recording_mode=None) -> None:
     """配置和 Tk 创建均在拨号前完成；没有窗口时直接失败。"""
     root = tk.Tk()
     try:
         window = CartPoleWindow(root, config_path, segment_steps=segment_steps, mode=mode,
-                               preload_steps=preload_steps, preload_execution=preload_execution)
+                               preload_steps=preload_steps, preload_execution=preload_execution,
+                               recording_mode=recording_mode)
     except Exception:
         root.destroy()
         raise
@@ -413,24 +432,26 @@ def run_window(config_path: Path, *, segment_steps=400, mode="segmented",
 
 
 class FullRouteWindow:
-    """#103 两条完整路线的物理确认帧和 v3 验证结果回放。"""
+    """两条完整路线的物理确认帧及同一严格验证入口的结果回放。"""
 
     def __init__(self, root: tk.Tk, *, route: str, client_path: Path,
                  observer_path: Path, swing_path: Path, prime_path: Path,
-                 output: Path, segment_steps: int) -> None:
+                 output: Path, segment_steps: int, realtime: bool = True) -> None:
         if route not in {"plaintext", "secure"}:
             raise ValueError("完整路线模式无效")
         self.root, self.route = root, route
         self.client_path, self.observer_path = client_path, observer_path
         self.swing_path, self.prime_path = swing_path, prime_path
         self.output, self.segment_steps = output, segment_steps
+        self.realtime = realtime
         self.stop_event = threading.Event()
         self._lock = threading.Lock()
         self._frame = self._terminal = None
         self.verified = None
         root.title(f"Cart-pole full route · {route}")
         root.geometry("860x610")
-        self.status = tk.StringVar(value="准备从下垂起点运行")
+        self.status = tk.StringVar(value=("准备从下垂起点运行 · 超期即停止" if route == "secure" and realtime
+                                         else "准备从下垂起点运行 · 非实时仿真"))
         self.detail = tk.StringVar(value="物理 step=0 · 起摆")
         tk.Label(root, textvariable=self.status, font=("Arial", 14, "bold")).pack(pady=10)
         self.canvas = tk.Canvas(root, width=820, height=340, bg="white")
@@ -503,7 +524,13 @@ class FullRouteWindow:
                     load_lan_config(self.client_path, "Client"), modulus=modulus,
                     modulus_evidence=evidence, segment_capacity=self.segment_steps,
                     on_step=self._confirmed, stop_event=self.stop_event,
+                    realtime=self.realtime,
                 )
+                sealed = any(c["physical_end"] > 0 for e in result.epoch_events for c in e["closed_segments"])
+                if not sealed:
+                    with self._lock:
+                        self._terminal = ("unsealed", (result.physically_confirmed_count, result.cycle_failure))
+                    return
                 path = write_cart_pole_full_run(result, self.output)
             verified = open_verified_cart_pole_full_run(path)
             with self._lock:
@@ -538,9 +565,18 @@ class FullRouteWindow:
                 self.location.set(f"已验证结果目录：{value.path}")
                 self.replay.set(value.manifest["N"])
                 self.status.set(
-                    f"{self.route} · v3 已验证 · N={value.manifest['N']} · "
+                    f"{self.route} · 轨迹已验证 · N={value.manifest['N']} · "
                     f"{value.report['termination']} · goal={value.report['goal_met']}"
                 )
+                if value.manifest.get("cycle_failure") is not None:
+                    self.status.set(f"周期失败停止 · 已确认{value.manifest['timing_summary']['physically_confirmed_count']}个区间 · 可验证回放{value.manifest['N']}个")
+                elif value.manifest["format_version"] == 3:
+                    self.status.set(self.status.get() + " · 无20ms周期证据")
+            elif kind == "unsealed":
+                count, failure = value
+                self.status.set(f"运行已停止 · 已确认{count}个区间 · 暂无可验证回放结果")
+                if failure is not None:
+                    self.detail.set("本次周期失败，未继续发送下一步控制")
             else:
                 self.status.set(f"运行/发布失败：{value}")
         if self.root.winfo_exists():
@@ -567,13 +603,13 @@ class FullRouteWindow:
 
 def run_full_window(config_path: Path, *, route: str, observer_path: Path,
                     swing_path: Path, prime_path: Path, output: Path,
-                    segment_steps: int = 400) -> None:
+                    segment_steps: int = 400, realtime: bool = True) -> None:
     root = tk.Tk()
     try:
         window = FullRouteWindow(
             root, route=route, client_path=config_path, observer_path=observer_path,
             swing_path=swing_path, prime_path=prime_path, output=output,
-            segment_steps=segment_steps,
+            segment_steps=segment_steps, realtime=realtime,
         )
     except Exception:
         root.destroy()

@@ -77,6 +77,48 @@ from secure_control.simulation.telemetry import (
 _DEFAULT_TRANSPORT = LocalhostTransportConfig()
 
 
+def test_loopback_tcp_options_restore_after_benchmark_and_close_failed_owner(monkeypatch):
+    from contextlib import nullcontext
+
+    from secure_control.execution import localhost_transport as transport
+    from secure_control.experiments.communication_benchmark import _observe_tcp
+
+    rows = []
+    for enabled in (False, True):
+        listener = transport.create_listener("127.0.0.1", 0)
+        dial = accepted = None
+        try:
+            with _observe_tcp(rows, False) if not enabled else nullcontext():
+                deadline = deadline_after(1.)
+                dial = transport.connect_loopback(listener.getsockname(), deadline=deadline)
+                accepted = transport.accept_loopback(listener, deadline=deadline)
+            assert all(s.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) == int(enabled)
+                       for s in (dial, accepted))
+        finally:
+            if dial is not None:
+                dial.close()
+            if accepted is not None:
+                accepted.close()
+            listener.close()
+    assert len(rows) == 2 and all(row["tcp_nodelay"] == 0 for row in rows)
+    tracked = []
+    def fail(sock, **kwargs):
+        tracked.append(sock)
+        raise OSError("option failed")
+    monkeypatch.setattr(transport, "_configure_tcp", fail)
+    listener = transport.create_listener("127.0.0.1", 0)
+    dial = socket.create_connection(listener.getsockname())
+    try:
+        with pytest.raises(transport.LocalhostTransportError):
+            transport.accept_loopback(listener, deadline=deadline_after(1.))
+        with pytest.raises(transport.LocalhostTransportError):
+            transport.connect_loopback(listener.getsockname(), deadline=deadline_after(1.))
+        assert len(tracked) == 2 and all(s.fileno() == -1 for s in tracked)
+    finally:
+        dial.close()
+        listener.close()
+
+
 def _general_spec() -> ControllerSpec:
     return ControllerSpec(
         A=np.array([[0.5]]),
@@ -118,6 +160,130 @@ def test_bigint_scalar_and_object_array_round_trip_without_fixed_width_conversio
     assert isinstance(decoded, AdditiveShare)
     np.testing.assert_array_equal(decoded.value, vector)
     assert np.asarray(decoded.value).dtype == object
+
+
+def test_integer_share_wire_bytes_match_original_scalar_and_array_encoding() -> None:
+    """旧数组转换方式独立确定 wire 期望，覆盖标量快路径和保留的数组路径。"""
+    for value in (0, -(1 << 200), np.int64(-(1 << 63)), np.uint64((1 << 64) - 1),
+                  np.array(1 << 200, dtype=object), np.empty((0, 2), dtype=object),
+                  np.array([[1, -(1 << 190)]], dtype=object), [1, 2]):
+        array = np.asarray(value, dtype=object)
+        if array.ndim == 0:
+            integer = {"type": "bigint", "decimal": str(int(array.item()))}
+        else:
+            integer = {"type": "bigint_array", "shape": list(array.shape),
+                       "values": [str(int(item)) for item in array.flat]}
+        expected = json.dumps({"type": "share", "value": integer}, ensure_ascii=False,
+                              sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+        assert encode_wire_value(AdditiveShare(value)) == expected
+    for invalid in (True, np.bool_(True), np.array(False), [True], 1.5):
+        with pytest.raises(TypeError):
+            encode_wire_value(AdditiveShare(invalid))
+
+
+def _s11_online_wire(role):
+    """原数学/材料生成器产出合法online，不拼装一个绕过校验的DTO。"""
+    import random
+
+    from test_two_party_protocol import make_stack
+
+    from secure_control.protocol.messages import PartyOnlineMaterial, PartyOnlineRound
+
+    owner, _, _, _, distribution = make_stack()
+    online = owner.prepare_online(distribution, [0.25], step=0, rng=random.Random(11))
+    material = PartyOnlineMaterial.from_round(PartyOnlineRound(
+        online.p1_input if role == "P1" else online.p2_input,
+        online.p1_resources if role == "P1" else online.p2_resources))
+    return encode_envelope(WireEnvelope(SCHEMA_VERSION, "request", "Client", role, 3, "online",
+        online.session_id, online.round_id, 0, None, material))
+
+
+def test_s11_codec_reordered_online_preserves_both_roles_wire_bytes():
+    def reverse(value):
+        if isinstance(value, dict):
+            return {key: reverse(value[key]) for key in reversed(value)}
+        if isinstance(value, list):
+            return [reverse(item) for item in value]
+        return value
+    for role in ("P1", "P2"):
+        wire = _s11_online_wire(role)
+        shuffled = json.dumps(reverse(json.loads(wire)), separators=(",", ":")).encode()
+        assert shuffled != wire
+        assert encode_envelope(decode_envelope(shuffled)) == wire
+
+
+def test_s11_codec_rejects_missing_extra_and_same_count_wrong_hot_fields():
+    from copy import deepcopy
+
+    from secure_control.execution import localhost_codec as codec
+
+    roots = [json.loads(_s11_online_wire("P1")), json.loads(encode_wire_value(AdditiveShare(7)))]
+    found = {}
+    def visit(value):
+        if isinstance(value, dict):
+            if value.get("type") in codec._ONLINE_FIELDS:
+                found.setdefault(value["type"], value)
+            for item in value.values():
+                visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+    for root in roots:
+        visit(root)
+    assert set(found) == set(codec._ONLINE_FIELDS)
+    for obj in found.values():
+        key = next(key for key in obj if key != "type")
+        for edit in ("missing", "extra", "same_count"):
+            bad = deepcopy(obj)
+            if edit != "extra":
+                value = bad.pop(key)
+            if edit != "missing":
+                bad["unexpected_public_field"] = None if edit == "extra" else value
+            with pytest.raises(LocalhostCodecError, match="字段集合"):
+                decode_wire_value(json.dumps(bad).encode())
+    with pytest.raises(TypeError):
+        codec._ONLINE_FIELDS["share"] = frozenset()
+    assert all(isinstance(fields, frozenset) for fields in codec._ONLINE_FIELDS.values())
+
+
+def test_s11_codec_generic_rejections_match_original_field_algorithms(monkeypatch):
+    """旧集合算法作独立比较，合法/非法语言和异常不因减少分配而改变。"""
+    from secure_control.execution import localhost_codec as codec
+
+    original_mapping, original_fields = codec._mapping, codec._exact_fields
+    def mapping(value, name):
+        if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+            raise LocalhostCodecError(f"{name} 必须是 JSON object。")
+        return value
+    def fields(value, expected, name):
+        if set(value) != expected:
+            raise LocalhostCodecError(f"{name} 字段集合不匹配。")
+    def outcome(wire):
+        try:
+            return ("wire", encode_wire_value(decode_wire_value(wire)))
+        except (LocalhostCodecError, ValueError, TypeError) as error:
+            return (type(error).__name__, str(error))
+    deep = {"type": "share", "value": None}
+    for _ in range(34):
+        deep = {"public": deep}
+    wires = [encode_wire_value(AdditiveShare(-(1 << 200))),
+        encode_wire_value(AdditiveShare(np.array([[0, 1 << 180]], dtype=object))),
+        b'{"type":"share","value":{"type":"bigint","decimal":true}}',
+        b'{"type":"share","value":{"type":"bigint","decimal":"-0"}}',
+        b'{"type":"bigint_array","shape":[true],"values":["1"]}',
+        b'{"type":"bigint_array","shape":[2],"values":["1"]}',
+        b'{"type":"bigint_array","shape":[1000001],"values":[]}',
+        b'{"type":"float_array","shape":[1],"values":[1e309]}',
+        b'{"type":"bigint","type":"bigint","decimal":"1"}', b'\xff',
+        b'{"type":"bigint","decimal":NaN}', json.dumps(deep).encode(),
+        json.dumps({str(i): i for i in range(65)}).encode()]
+    expected = [outcome(wire) for wire in wires]
+    assert all(row[0] != "wire" for row in expected[2:])
+    monkeypatch.setattr(codec, "_mapping", mapping)
+    monkeypatch.setattr(codec, "_exact_fields", fields)
+    assert [outcome(wire) for wire in wires] == expected
+    monkeypatch.setattr(codec, "_mapping", original_mapping)
+    monkeypatch.setattr(codec, "_exact_fields", original_fields)
 
 
 def test_public_int64_input_array_round_trip_preserves_low_bits() -> None:
@@ -528,6 +694,166 @@ def test_framing_handles_fragmented_and_coalesced_tcp_bytes() -> None:
     finally:
         receiver.close()
         sender.close()
+
+
+def _qpc_receive_model(monkeypatch, chunks, *, waits=(), tls=False, restore_error=None,
+                       read_delay=0, restore_delay=0):
+    """故障模型：只用虚拟时钟/就绪/字节，不打开socket或执行控制。"""
+    from types import SimpleNamespace
+
+    from secure_control.execution import cycle_timing
+    from secure_control.execution import localhost_transport as transport
+
+    now, selected, pending = [0], [], list(chunks)
+    schedule = list(waits)
+    class Channel:
+        timeout = .5
+        def __init__(self):
+            self.read_lengths, self.modes = [], []
+            if tls:
+                self.pending = lambda: 0
+        def gettimeout(self):
+            return self.timeout
+        def settimeout(self, value):
+            self.modes.append(value)
+            if value == .5:
+                now[0] += restore_delay
+                if restore_error:
+                    raise restore_error
+            self.timeout = value
+        def recv(self, length):
+            self.read_lengths.append(length)
+            if self.timeout != 0:
+                raise TimeoutError("model: relative wait ended before QPC deadline")
+            now[0] += read_delay
+            value = pending.pop(0)
+            if isinstance(value, BaseException):
+                raise value
+            assert len(value) <= length
+            return value
+        def send(self, *args):
+            pytest.fail("接收不能重发事务")
+    channel = Channel()
+    def ready(read, write, errors, timeout):
+        assert (read == [channel]) != (write == [channel]) and not errors
+        assert timeout > 0 and channel.timeout == 0
+        selected.append(("read" if read else "write", timeout))
+        delay, result = schedule.pop(0) if schedule else (1000000, "ready")
+        now[0] += delay
+        if isinstance(result, BaseException):
+            raise result
+        return (read, write, []) if result == "ready" else ([], [], [])
+    monkeypatch.setattr(cycle_timing.time, "perf_counter_ns", lambda: now[0])
+    # select导入也是待加固职责的一部分，旧实现未导入时先不设置它。
+    if hasattr(transport, "select"):
+        monkeypatch.setattr(transport.select, "select", ready)
+    return SimpleNamespace(now=now, selected=selected, channel=channel, ready=ready,
+        deadline=cycle_timing._CycleDeadline(11000000), transport=transport)
+
+
+def test_canonical_qpc_model_early_empty_keeps_same_deadline_and_frame(monkeypatch):
+    f = _qpc_receive_model(monkeypatch, [b"ab", b"cd"], waits=[(3000000, "empty"), (2000000, "ready"), (2000000, "ready")])
+    assert f.transport._receive_exact(f.channel, 4, f.deadline) == b"abcd"
+    assert f.channel.read_lengths == [4, 2] and f.channel.timeout == .5
+    assert [round(t*1e9) for _, t in f.selected] == [11000000, 8000000, 6000000]
+    assert f.now[0] == 7000000
+
+
+@pytest.mark.parametrize("boundary", ("before", "wait_equal", "wait_late", "read_equal", "restore_equal"))
+def test_canonical_qpc_model_rejects_expiry_at_every_exit(monkeypatch, boundary):
+    f = _qpc_receive_model(monkeypatch, [b"data"],
+        waits=[(11000000 if boundary == "wait_equal" else 12000000, "ready")] if boundary.startswith("wait") else (),
+        read_delay=10000000 if boundary == "read_equal" else 0,
+        restore_delay=10000000 if boundary == "restore_equal" else 0)
+    if boundary == "before":
+        f.now[0] = 11000000
+    with pytest.raises(LocalhostTransportTimeout):
+        f.transport._receive_exact(f.channel, 4, f.deadline)
+    assert f.channel.timeout == .5
+    assert len(f.channel.read_lengths) == (1 if boundary in ("read_equal", "restore_equal") else 0)
+
+
+@pytest.mark.parametrize("case", ("empty8", "would_block8", "reset", "eof", "native_timeout", "native_error",
+                                  "select_error", "restore_only", "primary_and_restore"))
+def test_canonical_qpc_model_progress_error_and_mode_ownership(monkeypatch, case):
+    from secure_control.execution.localhost_transport import LocalhostTransportError
+
+    original = TimeoutError("primary") if case in ("native_timeout", "primary_and_restore") else OSError(9, "primary")
+    restore = OSError(8, "restore") if case in ("restore_only", "primary_and_restore") else None
+    chunks, waits, expected = [b"data"], (), LocalhostTransportDisconnected
+    if case == "empty8":
+        chunks, waits, expected = [], [(1000000, "empty")]*8, LocalhostTransportError
+    elif case == "would_block8":
+        chunks, expected = [BlockingIOError()]*8, LocalhostTransportError
+    elif case == "reset":
+        chunks = [BlockingIOError()]*3 + [b"ab"] + [BlockingIOError()]*3 + [b"cd"]
+    elif case == "eof":
+        chunks = [b"ab", b""]
+    elif case in ("native_timeout", "primary_and_restore"):
+        chunks, expected = [original], LocalhostTransportTimeout
+    elif case == "native_error":
+        chunks = [original]
+    elif case == "select_error":
+        chunks, waits = [], [(1000000, original)]
+    elif case == "restore_only":
+        expected = OSError
+    f = _qpc_receive_model(monkeypatch, chunks, waits=waits, restore_error=restore)
+    if case == "reset":
+        assert f.transport._receive_exact(f.channel, 4, f.deadline) == b"abcd"
+        assert f.channel.read_lengths == [4]*4+[2]*4
+    else:
+        with pytest.raises(expected) as caught:
+            f.transport._receive_exact(f.channel, 4, f.deadline)
+        if case in ("native_timeout", "native_error", "select_error", "primary_and_restore"):
+            assert caught.value.__cause__ is original
+        if case in ("empty8", "would_block8"):
+            assert type(caught.value) is LocalhostTransportError and len(f.selected) == 8 and f.now[0] < 11000000
+        if case == "restore_only":
+            assert caught.value is restore
+    assert f.channel.timeout == (0 if restore else .5)
+
+
+@pytest.mark.parametrize("case", ("internal_data", "want_read", "want_write", "closed", "certificate", "ssl_error"))
+def test_canonical_qpc_tls_model_drains_before_select_and_waits_requested_direction(monkeypatch, case):
+    import ssl
+
+    error = (ssl.SSLCertVerificationError(1, "authentication failed") if case == "certificate"
+             else ssl.SSLError(1, "TLS failure"))
+    chunks = {"internal_data": [b"ab", b"cd"], "want_read": [ssl.SSLWantReadError(), b"data"],
+              "want_write": [ssl.SSLWantWriteError(), b"data"], "closed": [b""],
+              "certificate": [error], "ssl_error": [error]}[case]
+    f = _qpc_receive_model(monkeypatch, chunks, tls=True)
+    if case in ("closed", "certificate", "ssl_error"):
+        with pytest.raises(LocalhostTransportDisconnected) as caught:
+            f.transport._receive_exact(f.channel, 4, f.deadline)
+        if case != "closed":
+            assert caught.value.__cause__ is error
+        assert not f.selected
+    else:
+        expected = b"abcd" if case == "internal_data" else b"data"
+        assert f.transport._receive_exact(f.channel, 4, f.deadline) == expected
+        assert [direction for direction, _ in f.selected] == ([] if case == "internal_data" else ["write" if case == "want_write" else "read"])
+    assert f.channel.timeout == .5 and f.channel.pending() == 0
+
+
+def test_canonical_qpc_legacy_float_keeps_original_relative_failure(monkeypatch):
+    f = _qpc_receive_model(monkeypatch, [b"data"])
+    monkeypatch.setattr(f.transport, "remaining_seconds", lambda deadline: .01)
+    with pytest.raises(LocalhostTransportTimeout):
+        f.transport._receive_exact(f.channel, 4, 1.0)
+    assert f.channel.modes == [.01] and f.channel.read_lengths == [4] and not f.selected
+
+
+def test_canonical_qpc_observation_and_restore_errors_keep_primary_cause(monkeypatch):
+    original, restore = TimeoutError("original"), OSError(9, "restore")
+    f = _qpc_receive_model(monkeypatch, [original], restore_error=restore)
+    def broken_observer(operation, *args, **kwargs):
+        if operation in ("failure", "restore_error"):
+            raise KeyboardInterrupt("observer")
+    with pytest.raises(LocalhostTransportTimeout) as caught:
+        f.transport._receive_qpc_exact(f.channel, 4, f.deadline, _observe=broken_observer)
+    assert caught.value.__cause__ is original and f.channel.timeout == 0
+    assert len(caught.value.__notes__) == 2
 
 
 @pytest.mark.integration

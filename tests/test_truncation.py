@@ -1,6 +1,8 @@
 """论文 Protocol 2 截断的参数、消息流、误差和随机量生命周期测试。"""
 
 import random
+from copy import copy, deepcopy
+from weakref import ref
 
 import pytest
 
@@ -156,7 +158,18 @@ def test_auxiliary_randomness_cannot_be_reused() -> None:
     rng = random.Random(8)
     shares = instance.share_message(23, rng=rng)
     auxiliary = instance.create_auxiliary(rng=rng)
-    first_masked = instance.mask_input(shares[0], auxiliary[0])
+    lifecycle = auxiliary[0]._lifecycle
+    assert lifecycle is auxiliary[1]._lifecycle and not hasattr(lifecycle, "__dict__")
+    lifecycle_ref = ref(lifecycle)
+    state_copy = copy(lifecycle)
+    assert state_copy.owner is instance and state_copy.masked_parties is lifecycle.masked_parties
+    assert state_copy.finished_parties is lifecycle.finished_parties
+    assert not state_copy.p2_sent and not state_copy.p1_reconstructed and not state_copy.consumed
+    alias = copy(auxiliary[0])
+    assert alias._lifecycle is lifecycle
+    with pytest.raises(ValueError, match="不属于"):
+        instance.mask_input(shares[0], deepcopy(auxiliary[0]))
+    first_masked = instance.mask_input(shares[0], alias)
 
     with pytest.raises(ValueError, match="遮蔽"):
         instance.mask_input(shares[0], auxiliary[0])
@@ -168,6 +181,8 @@ def test_auxiliary_randomness_cannot_be_reused() -> None:
         instance.finish_p1(shares[0], auxiliary[0], p1_value)
     instance.finish_p2(shares[1], auxiliary[1])
     assert auxiliary[0].is_consumed
+    assert lifecycle_ref() is lifecycle and lifecycle.finished_parties == {0, 1}
+    assert instance.consumed_masks == 1
 
 
 def test_parameters_inverse_and_input_range_fail_before_protocol_execution() -> None:

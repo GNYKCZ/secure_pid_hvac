@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import secrets
 import socket
+import time
 from dataclasses import dataclass
 
 from secure_control.crypto.fixed_point import FixedPointContext
@@ -17,6 +18,7 @@ from secure_control.protocol.arithmetic import (
     prepare_scalar_round,
 )
 
+from .cycle_timing import check_deadline, network_deadline
 from .lan_config import LanConfig
 from .lan_transport import connect_role
 from .localhost_codec import (
@@ -221,7 +223,7 @@ class LanScalarRuntime:
         self, config: LanConfig, program: ScalarProgram, certificate: ScalarCertificate,
         *, modulus: int, modulus_evidence: PrimeModulusEvidence | None,
         run_id: str, epoch_id: str, start_physical_step: int,
-        batch: bool = True,
+        batch: bool = True, deadline_ns: int | None = None,
     ) -> None:
         if config.role != "Client" or config.experiment_config is None:
             raise ValueError("v3 标量运行须使用 Client 配置")
@@ -229,7 +231,9 @@ class LanScalarRuntime:
                 or start_physical_step < 0
                 or certificate.program_sha256 != program.topology_sha256()):
             raise ValueError("v3 run/epoch/程序证书身份无效")
+        check_deadline(deadline_ns, "SCALAR_SETUP")
         verify_prime_modulus(modulus, modulus_evidence)
+        check_deadline(deadline_ns, "SCALAR_SETUP")
         self.config = config
         self.program = program
         self.certificate = certificate
@@ -241,6 +245,10 @@ class LanScalarRuntime:
         self.start_physical_step = start_physical_step
         self.batch = batch
         self.local_step = 0
+        self.last_round_id = None
+        self.last_step_protocol_state = "not_started"
+        self.cycle_phase_ns: dict[str, int] = {}
+        self.last_end_receipts: tuple[ScalarEndReceipt, ...] = ()
         self._sockets: list[socket.socket] = []
         self._spent: set[str] = set()
         self._failed = False
@@ -253,17 +261,21 @@ class LanScalarRuntime:
 
             for role, address in (( "P1", config.topology.p1_client),
                                   ("P2", config.topology.p2_client)):
-                sock = connect_role(address, config, role, deadline_after(config.startup_timeout))
+                sock = connect_role(address, config, role,
+                                    network_deadline(config.startup_timeout, deadline_ns))
                 self._sockets.append(sock)
-                _hello(sock, "Client", role, self.session_id, hello, config.startup_timeout)
+                _hello(sock, "Client", role, self.session_id, hello, config.startup_timeout,
+                       **({"deadline": network_deadline(config.startup_timeout, deadline_ns)}
+                          if deadline_ns is not None else {}))
             for party, sock in enumerate(self._sockets):
                 role = "P1" if party == 0 else "P2"
-                _request(sock, role, 1, "lan_ready", self.session_id, config.startup_timeout)
+                _request(sock, role, 1, "lan_ready", self.session_id, config.startup_timeout,
+                         deadline=network_deadline(config.startup_timeout, deadline_ns))
             public = ScalarSetupV3(
                 program, modulus, certificate.fractional_bits,
                 modulus.bit_length() - certificate.kappa - 2, modulus_evidence,
             )
-            deadline = deadline_after(config.startup_timeout)
+            deadline = network_deadline(config.startup_timeout, deadline_ns)
             for party, sock in enumerate(self._sockets):
                 role = "P1" if party == 0 else "P2"
                 _send(sock, self._frame("Client", role, "setup", public, round_id=None), deadline)
@@ -271,6 +283,7 @@ class LanScalarRuntime:
                 role = "P1" if party == 0 else "P2"
                 _receive(sock, self._frame(role, "Client", "ready", None,
                                            round_id="setup"), deadline)
+            check_deadline(deadline_ns, "SCALAR_SETUP")
         except Exception:
             self._failed = True
             self.close()
@@ -286,12 +299,23 @@ class LanScalarRuntime:
             round_id, resource_id, operation, payload,
         )
 
-    def step(self, values: dict[str, float], physical_step: int) -> ScalarStepReceipt:
+    @property
+    def protocol_committed_count(self) -> int:
+        """仅已验证双方 committed 回执的 epoch-local 前缀；不是物理确认。"""
+        return self.local_step
+
+    def step(self, values: dict[str, float], physical_step: int, *,
+             deadline_ns: int | None = None) -> ScalarStepReceipt:
         """双方 stage、重构、双提交后返回；物理推进仍由 Client 场景层负责。"""
         if self._failed or self._ended or physical_step != self.start_physical_step + self.local_step:
             raise RuntimeError("v3 session 失败、结束或物理步失序")
         round_id = f"{self.epoch_id}:{self.local_step}:{secrets.token_hex(16)}"
+        self.last_round_id = round_id
+        self.last_step_protocol_state = "not_started"
+        self.cycle_phase_ns = {}
         try:
+            check_deadline(deadline_ns, "SCALAR_MATERIAL")
+            started = time.perf_counter_ns()
             materials = prepare_scalar_round(
                 self.program, values, self.certificate, modulus=self.modulus,
                 modulus_evidence=self.modulus_evidence, round_id=round_id,
@@ -302,7 +326,11 @@ class LanScalarRuntime:
                 raise ValueError("v3 一次性材料身份重用")
             # 一旦发出任何单方材料，即便断连也烧毁全部本轮身份。
             self._spent.update(ids)
-            deadline = deadline_after(self.config.step_timeout)
+            self.cycle_phase_ns["material_prepare"] = time.perf_counter_ns() - started
+            check_deadline(deadline_ns, "SCALAR_MATERIAL")
+            deadline = network_deadline(self.config.step_timeout, deadline_ns)
+            started = time.perf_counter_ns()
+            self.last_step_protocol_state = "uncertain"
             for party, sock in enumerate(self._sockets):
                 role = "P1" if party == 0 else "P2"
                 _send(sock, self._frame("Client", role, "material", materials[party],
@@ -311,6 +339,9 @@ class LanScalarRuntime:
                 role = "P1" if party == 0 else "P2"
                 _receive(sock, self._frame(role, "Client", "ready", None,
                                            round_id=round_id), deadline)
+            self.cycle_phase_ns["distribution"] = time.perf_counter_ns() - started
+            check_deadline(deadline_ns, "SCALAR_DISTRIBUTION")
+            started = time.perf_counter_ns()
             for party, sock in enumerate(self._sockets):
                 role = "P1" if party == 0 else "P2"
                 _send(sock, self._frame("Client", role, "compute", None,
@@ -327,6 +358,9 @@ class LanScalarRuntime:
                         or not 0 <= result.output_share < self.modulus):
                     raise ValueError("v3 单方输出收据、资源计数或 share 无效")
                 results.append(result)
+            self.cycle_phase_ns["stage"] = time.perf_counter_ns() - started
+            check_deadline(deadline_ns, "SCALAR_STAGE")
+            started = time.perf_counter_ns()
             context = FixedPointContext(
                 self.modulus, self.certificate.kappa, self.certificate.fractional_bits,
             )
@@ -336,6 +370,9 @@ class LanScalarRuntime:
             if abs(output) > float(self.certificate.bound(self.program.output).ideal_abs
                                    + self.certificate.bound(self.program.output).error_abs):
                 raise ValueError("v3 解码力越出证书")
+            self.cycle_phase_ns["reconstruct"] = time.perf_counter_ns() - started
+            check_deadline(deadline_ns, "SCALAR_RECONSTRUCT")
+            started = time.perf_counter_ns()
             for party, sock in enumerate(self._sockets):
                 role = "P1" if party == 0 else "P2"
                 _send(sock, self._frame("Client", role, "commit", None,
@@ -352,16 +389,21 @@ class LanScalarRuntime:
                 physical_step, self.local_step, round_id, ids, output, len(ids), len(ids),
             )
             self.local_step += 1
+            self.last_step_protocol_state = "double_committed"
+            self.cycle_phase_ns["commit"] = time.perf_counter_ns() - started
+            # 先保留双方已提交事实，再拒绝迟到输出；失败不会把真实协议进度归零。
+            check_deadline(deadline_ns, "SCALAR_COMMIT")
             return receipt
         except Exception:
             self._failed = True
             self.close()
             raise
 
-    def end(self, action: str = "stop") -> tuple[ScalarEndReceipt, ScalarEndReceipt]:
+    def end(self, action: str = "stop", *, deadline_ns: int | None = None
+            ) -> tuple[ScalarEndReceipt, ScalarEndReceipt]:
         if self._failed or self._ended or action not in {"stop", "switch"}:
             raise RuntimeError("v3 epoch 不处于可结束状态")
-        deadline = deadline_after(self.config.shutdown_timeout)
+        deadline = network_deadline(self.config.shutdown_timeout, deadline_ns)
         try:
             receipts = []
             for party, sock in enumerate(self._sockets):
@@ -380,7 +422,9 @@ class LanScalarRuntime:
                     self.start_physical_step + self.local_step, count,
                 ))
             self._ended = True
-            return tuple(receipts)
+            self.last_end_receipts = tuple(receipts)
+            check_deadline(deadline_ns, "SCALAR_END")
+            return self.last_end_receipts
         except Exception:
             self._failed = True
             raise

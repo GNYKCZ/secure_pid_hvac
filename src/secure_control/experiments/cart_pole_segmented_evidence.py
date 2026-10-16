@@ -24,6 +24,7 @@ import numpy as np
 
 from secure_control.crypto import TwoPartySharing
 from secure_control.execution import PlaintextStateSpaceRuntime
+from secure_control.execution.cycle_timing import CycleTiming
 from secure_control.execution.lan_runtime import RunControl, _public_reachability_digest
 from secure_control.execution.localhost_codec import (
     LanContinuousSetupPayload,
@@ -1596,7 +1597,7 @@ class _Spool:
         self._append_step(data)
         self._checkpoint("running")
 
-    def _append_step(self, data, *, output=None):
+    def _append_step(self, data, *, output=None, canonical_row=None):
         """canonical 身份/哈希校验共用；batch 的文件由唯一 writer 一次 flush/fsync。"""
         identity = data["protocol"]
         if (identity["run_id"] != self.backend_id
@@ -1604,22 +1605,40 @@ class _Spool:
                 or identity["global_step"] != self.end + self.tail_count
                 or identity["local_step"] != self.tail_count):
             raise ValueError("动态公开步骤不连续。")
-        entry = {"step": data, "prev_sha256": self.tail_hash}
-        digest = sha256(_bytes(entry)).hexdigest()
-        raw = _bytes({**entry, "sha256": digest})
-        if len(raw) > INDEX_LINE_LIMIT:
+        if canonical_row is None:
+            entry = {"step": data, "prev_sha256": self.tail_hash}
+            digest = sha256(_bytes(entry)).hexdigest()
+            raw = _bytes({**entry, "sha256": digest})
+            chunks, size = (raw,), len(raw)
+        else:
+            # 仅 batch 在严格解析、canonical/身份比对后传入原始 immutable 行。
+            # 去掉恰好一个已验证 LF；保留 UTF-8、负零和数字原字节，不复制行体。
+            body = memoryview(canonical_row)[:-1]
+            prefix = b'{"prev_sha256":' + _bytes(self.tail_hash)[:-1]
+            # sort_keys 下的两个 wrapper 次序不同；哈希原像仍包含最终 LF。
+            size = len(prefix) + len(b',"sha256":"') + 64 + len(b'","step":') + len(body) + 2
+            if size > INDEX_LINE_LIMIT:
+                raise ValueError("动态步骤记录超出行界。")
+            chain = sha256()
+            for chunk in (prefix, b',"step":', body, b'}\n'):
+                chain.update(chunk)
+            digest = chain.hexdigest()
+            chunks = (prefix, b',"sha256":"', digest.encode("ascii"), b'","step":', body, b'}\n')
+        if size > INDEX_LINE_LIMIT:
             raise ValueError("动态步骤记录超出行界。")
         if output is None:
             with (self.stage / "journal" / f"{self.count}.jsonl").open("ab") as stream:
-                stream.write(raw)
+                for chunk in chunks:
+                    stream.write(chunk)
                 self.disk_metrics["write_calls"] += 1
-                self.disk_metrics["write_bytes"] += len(raw)
+                self.disk_metrics["write_bytes"] += size
                 stream.flush()
                 os.fsync(stream.fileno())
                 self.disk_metrics["fsync_count"] += 1
         else:
-            output.write(raw)
-        self.tail_bytes += len(raw)
+            for chunk in chunks:
+                output.write(chunk)
+        self.tail_bytes += size
         self.tail_count += 1
         self.tail_hash = digest
 
@@ -1668,7 +1687,7 @@ class _Spool:
                         stats["row_validation_ns"] += perf_counter_ns() - started
                         if observer is not None:
                             observer.end(token)
-                    self._append_step(data, output=buffer)
+                    self._append_step(data, output=buffer, canonical_row=raw)
                     del data
                 buffer.finish()
                 with _batch_phase(stats, "journal_flush_fsync"):
@@ -2060,10 +2079,112 @@ class _BatchWriter:
             raise OSError("后台批量保存失败。")
 
 
+_LIGHT_PHASES = frozenset((
+    "input", "material_bind", "online_distribution", "stage", "reconstruct", "commit",
+    "p1_commit", "p2_commit", "device", "recording", "maintenance", "maintenance_end",
+    "p1_commit_send", "p2_commit_send", "p1_commit_ack_wait", "p2_commit_ack_wait",
+    "p1_commit_latency", "p2_commit_latency",
+    "maintenance_seal", "maintenance_source", "maintenance_begin", "maintenance_release",
+))
+_LIGHT_QUEUES = frozenset((
+    "capacity", "level", "material_slots", "material_high_water",
+    "material_encoded_bound_high_water", "material_reserved_bytes", "material_prepare_ns",
+    "material_cpu_ns",
+))
+_LIGHT_DIRECTIONS = frozenset((
+    "Client->P1", "Client->P2", "P1->Client", "P2->Client", "P1->P2", "P2->P1",
+))
+_LIGHT_MAPS = {"phase_durations_ns": _LIGHT_PHASES, "queue_levels": _LIGHT_QUEUES,
+               "public_frame_counts": _LIGHT_DIRECTIONS, "public_byte_counts": _LIGHT_DIRECTIONS}
+
+
+def _project_cycle(timing):
+    """只复制固定公开计时字段，拒绝任意载荷；控制回调不编码或复制轨迹。"""
+    get = timing.get if isinstance(timing, Mapping) else lambda key: getattr(timing, key)
+    result = {key: get(key) for key in CycleTiming.__dataclass_fields__ if key not in _LIGHT_MAPS}
+    if any(value is not None and (type(value) not in (int, str)
+                                 or isinstance(value, str) and len(value) > 128)
+           for value in result.values()):
+        raise ValueError("轻量计时字段不是有界公开标量。")
+    for key, allowed in _LIGHT_MAPS.items():
+        values = get(key)
+        result[key] = None if values is None else {k: values[k] for k in allowed if k in values}
+        if result[key] is not None and any(type(v) is not int or v < 0 for v in result[key].values()):
+            raise ValueError("轻量计时映射必须是非负整数。")
+    return result
+
+
+def _correct_cycle_tail(rows, result, *, project=_project_cycle):
+    """停止后用唯一后端事实替换 provisional 周期，不另增同一尝试。"""
+    final = (result.get("cycle_summary") or {}).get("last_cycle")
+    if final is None:
+        return False
+    authoritative = project(final)
+    identity = ("run_id", "session_id", "controller_epoch", "global_step")
+    for index in range(len(rows) - 1, -1, -1):
+        previous = rows[index]
+        if all(previous[k] == authoritative[k] for k in identity):
+            # 外部通信观察属于同一身份；端点/状态/计数全部以原后端为准。
+            for key in ("public_frame_counts", "public_byte_counts"):
+                if previous.get(key) is not None:
+                    authoritative[key] = previous[key]
+            rows[index] = authoritative
+            return False
+    rows.append(authoritative)
+    return True
+
+
+class _LightRecording:
+    """仅有256近期周期和首周期；全程计数由原runner给出，没有可靠历史。"""
+
+    def __init__(self):
+        self.rows = deque(maxlen=256)
+        self.first = None
+        self.evicted = 0
+
+    def record_cycle(self, timing):
+        row = _project_cycle(timing)
+        if self.first is None:
+            self.first = row
+        self.evicted += len(self.rows) == self.rows.maxlen
+        self.rows.append(row)
+
+    def summary(self, result):
+        """后端已关闭后才权威校正、排序；分位仅代表最近窗口。"""
+        full = len(self.rows) == self.rows.maxlen
+        if _correct_cycle_tail(self.rows, result):
+            self.evicted += full
+            if self.first is None:
+                self.first = self.rows[-1]
+        if self.rows and self.first["global_step"] == self.rows[-1]["global_step"]:
+            self.first = self.rows[-1]
+        samples = sorted((r["cycle_completed_ns"] - r["scheduled_start_ns"]) / 1e6
+                         for r in self.rows if r["cycle_completed_ns"] is not None)
+        def quantile(p):
+            if not samples:
+                return None
+            at = (len(samples) - 1) * p
+            lo = int(at)
+            return samples[lo] + (samples[min(lo + 1, len(samples) - 1)] - samples[lo]) * (at - lo)
+        return {"recording_mode": "light", "capacity": 256, "recent_count": len(self.rows),
+                "evicted_count": self.evicted,
+                "recent_global_start": self.rows[0]["global_step"] if self.rows else None,
+                "recent_global_end": self.rows[-1]["global_step"] if self.rows else None,
+                "recent_cycles": list(self.rows), "first_cycle": self.first,
+                "final_failure": ({"status": result["status"], "category": result.get("category"),
+                                   "failure_phase": result.get("failure_phase"),
+                                   "cycle": self.rows[-1] if self.rows else None}
+                                  if result["status"] != "stopped" else None),
+                "recent_timing": {"scope": "recent window only; unfinished endpoints excluded",
+                                  "sample_count": len(samples), "p50_ms": quantile(.5),
+                                  "p95_ms": quantile(.95), "p99_ms": quantile(.99),
+                                  "max_ms": samples[-1] if samples else None}}
+
+
 def run_cart_pole_segmented(config, *, control: RunControl, session: InteractiveSession,
                            segment_steps=400, prepared: PreparedSegmentedExperiment | None = None,
                            on_step=None, phase=None, realtime=None,
-                           preload_steps=0, preload_execution="fused") -> dict:
+                           preload_steps=0, preload_execution="fused", recording_mode=None) -> dict:
     """Client 专用发布协调；安全循环只有一份，后端失败不会进入成功出版。"""
     if not isinstance(control, RunControl) or not isinstance(session, InteractiveSession):
         raise TypeError("持续发布需要原 RunControl/InteractiveSession。")
@@ -2074,7 +2195,22 @@ def run_cart_pole_segmented(config, *, control: RunControl, session: Interactive
     elif (prepared.scene.session is not session
           or prepared.segment_capacity != segment_steps):
         raise ValueError("必须消费同一次持续装配与队列。")
+    dynamic = prepared.spec.state_dimension != 0
+    if recording_mode is not None and (type(recording_mode) is not str
+                                      or recording_mode not in ("light", "full") or not dynamic):
+        raise ValueError("recording_mode 仅支持动态持续模式的 light/full。")
+    mode = recording_mode if recording_mode is not None else "light" if dynamic else "full"
     phase = phase if phase is not None else lambda _: None
+    if mode == "light":
+        recent = _LightRecording()
+        stopped = _run_prepared_segmented(
+            config, prepared, control=control, session=session, on_step=on_step,
+            phase=phase, realtime=realtime, on_cycle=recent.record_cycle,
+            preload_steps=preload_steps, preload_execution=preload_execution,
+        )
+        return {**stopped, "recording_mode": "light", "evidence_state": "not_recorded",
+                "run_dir": None, "prefix_dir": None, "durable_step_count": 0,
+                "recording_summary": recent.summary(stopped)}
     transaction = _Spool(prepared, config, session, phase)
     writer = _BatchWriter(transaction) if transaction.dynamic else None
     sink = writer if writer is not None else transaction
@@ -2103,7 +2239,7 @@ def run_cart_pole_segmented(config, *, control: RunControl, session: Interactive
                 if writer._thread is not None and writer._thread.is_alive():
                     # 真实磁盘阻塞时不能抢走 spool owner；旧 checkpoint 仍是唯一可靠依据。
                     return {**stopped, "prefix_dir": str(transaction.stage),
-                            "recording_summary": writer.snapshot()}
+                            "recording_summary": writer.snapshot(), "recording_mode": "full"}
             stopped["recording_summary"] = {**writer.snapshot(), "drain_ns": writer.drain_ns,
                                              "timing_path": str(writer.timing_path),
                                              "spool_io": dict(transaction.disk_metrics),
@@ -2116,12 +2252,12 @@ def run_cart_pole_segmented(config, *, control: RunControl, session: Interactive
                 stopped["checkpoint_error"] = type(error).__name__
             if transaction.dynamic and (transaction.stage / "checkpoint.json").is_file():
                 stopped["prefix_dir"] = str(transaction.stage)
-            return stopped
+            return {**stopped, "recording_mode": "full"}
         try:
             published = transaction.publish(stopped)
             if writer is not None:
                 published["recording_summary"] = stopped["recording_summary"]
-            return published
+            return {**published, "recording_mode": "full"}
         except Exception as error:
             if not transaction.dynamic:
                 raise
@@ -2132,7 +2268,7 @@ def run_cart_pole_segmented(config, *, control: RunControl, session: Interactive
                 transaction.fail(failure)
             except OSError as checkpoint_error:
                 failure["checkpoint_error"] = type(checkpoint_error).__name__
-            return failure
+            return {**failure, "recording_mode": "full"}
     finally:
         if writer is None or writer._thread is None or not writer._thread.is_alive():
             transaction.cleanup()

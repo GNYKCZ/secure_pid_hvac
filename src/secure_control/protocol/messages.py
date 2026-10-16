@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from hashlib import sha256
 from numbers import Integral
 from typing import Any, Literal
@@ -424,12 +424,28 @@ class StepResourcePlan:
         return len(self.state_truncation_resources)
 
 
+_PUBLIC_PLAN_JSON_FIELDS = {kind: tuple(item.name for item in fields(kind))
+                            for kind in (StepResourcePlan, ResourceMetadata, ControllerScaleLedger)}
+
+
+def _public_plan_json_fields(value):
+    """按标准JSON需求逐个投影公开记录，不预先复制整棵计划；只缓存有限类型的字段名。"""
+    names = _PUBLIC_PLAN_JSON_FIELDS.get(type(value))
+    if names is None:
+        if not isinstance(value, type) and is_dataclass(value):
+            names = tuple(item.name for item in fields(value))
+        else:
+            raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+    return {name: getattr(value, name) for name in names}
+
+
 def public_step_plan_sha256(plan: StepResourcePlan) -> str:
     """仅绑定公开 layout、尺度、资源身份和顺序，不摘要秘密矩阵值。"""
     if not isinstance(plan, StepResourcePlan):
         raise TypeError("批次计划需要 StepResourcePlan")
-    encoded = json.dumps(asdict(plan), sort_keys=True, separators=(",", ":"),
-                         ensure_ascii=False, allow_nan=False).encode("utf-8")
+    # 旧asdict在循环记录进入JSON前即RecursionError；保持非法循环的失败类别。
+    encoded = json.dumps(plan, default=_public_plan_json_fields, sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=False, allow_nan=False, check_circular=False).encode("utf-8")
     return sha256(b"control-batch-v1-plan\0" + encoded).hexdigest()
 
 
@@ -482,6 +498,9 @@ class Protocol3BatchPayload:
 
 class _ResourceLifecycle:
     """绑定同一逻辑资源的两份局部材料，阻止跨会话、跨轮次或失败后的重放。"""
+
+    # 每个逻辑资源仍拥有独立状态；固定字段只省实例字典，保留弱引用。
+    __slots__ = ("__weakref__", "claimed_by", "status")
 
     def __init__(self) -> None:
         self.claimed_by: set[int] = set()
@@ -561,6 +580,28 @@ class PreparedOnlineResources:
     p2_resources: PartyResources
     _owner: object = field(repr=False, compare=False)
     _token: object = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class _PreparedEncodedResources:
+    """专属本地工人字节的父进程原始能力；不能 pickle 后恢复授权。"""
+
+    plan: StepResourcePlan
+    fragments: tuple[bytes, bytes] = field(repr=False)
+    _owner: object = field(repr=False, compare=False)
+    _token: object = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _EncodedInputRound:
+    """测量后绑定的当前轮；仅有公开计划、输入份额和不透明静态字节。"""
+
+    session_id: str
+    round_id: str
+    step: int
+    p1_input: InputShareMessage
+    p2_input: InputShareMessage
+    prepared: _PreparedEncodedResources = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)

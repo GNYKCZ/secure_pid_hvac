@@ -20,7 +20,11 @@ if __name__ == "__main__":
     parser.add_argument("--preload-steps", type=int, default=0,
                         help="动态v2有限预送窗口，1..1000；耗尽后正常停止")
     parser.add_argument("--preload-execution", choices=("staged", "fused"), default="fused")
+    parser.add_argument("--recording", choices=("light", "full"),
+                        help="仅动态持续：默认light不保存完整轨迹；full可靠留证并支持回放")
     parser.add_argument("--full-output", type=Path)
+    parser.add_argument("--full-non-realtime", action="store_true",
+                        help="安全完整路线的显式非实时诊断；没有20ms资格")
     parser.add_argument("--swing-config", type=Path,
                         default=Path(__file__).resolve().parents[1]
                         / "configs/cart_pole_swing_up.yaml")
@@ -31,6 +35,10 @@ if __name__ == "__main__":
                         default=Path(__file__).resolve().parents[1]
                         / "configs/shared_prime_256_pocklington.yaml")
     args = parser.parse_args()
+    if args.recording is not None and (args.finite or args.full_route or args.full_gui_route):
+        parser.error("--recording 只支持动态observer持续入口")
+    if args.full_non_realtime and args.full_route != "secure" and args.full_gui_route != "secure":
+        parser.error("--full-non-realtime 只支持安全完整路线诊断")
     if (not 0 <= args.preload_steps <= 1000 or args.preload_steps and (
             args.finite or args.full_route or args.full_gui_route)):
         parser.error("--preload-steps 只支持动态v2持续入口，范围1..1000")
@@ -43,6 +51,7 @@ if __name__ == "__main__":
             args.config, route=args.full_gui_route, observer_path=args.observer_config,
             swing_path=args.swing_config, prime_path=args.prime_config,
             output=args.full_output, segment_steps=args.segment_steps,
+            realtime=not args.full_non_realtime,
         )
         sys.exit(0)
     if args.full_route:
@@ -80,9 +89,18 @@ if __name__ == "__main__":
                 design.plant, design.balance, swing, design, client,
                 modulus=modulus, modulus_evidence=evidence,
                 segment_capacity=args.segment_steps,
+                realtime=not args.full_non_realtime,
             )
-            target = write_cart_pole_full_run(result, args.full_output)
-        print(json.dumps({"route": args.full_route, "run_dir": str(target),
+            sealed = any(c["physical_end"] > 0 for e in result.epoch_events for c in e["closed_segments"])
+            target = write_cart_pole_full_run(result, args.full_output) if sealed else None
+        timing = ({} if args.full_route == "plaintext" else {
+            "timing_mode": "non_realtime_diagnostic" if args.full_non_realtime else "absolute",
+            "cycle_failure": result.cycle_failure,
+            "cycle_attempts": len(result.cycles),
+            "physically_confirmed_count": result.physically_confirmed_count,
+            "evidence_state": "published_verified_prefix" if target else "no_sealed_prefix",
+        })
+        print(json.dumps({"route": args.full_route, "run_dir": str(target) if target else None,
                           "completed_steps": (physical.completed_steps
                                               if args.full_route == "plaintext" else
                                               result.physical.completed_steps),
@@ -91,7 +109,7 @@ if __name__ == "__main__":
                                           result.physical.termination),
                           "goal_met": (physical.goal_met
                                        if args.full_route == "plaintext" else
-                                       result.physical.goal_met)},
+                                       result.physical.goal_met), **timing},
                          ensure_ascii=False))
         sys.exit(0 if (physical.goal_met if args.full_route == "plaintext"
                        else result.physical.goal_met) else 1)
@@ -110,6 +128,8 @@ if __name__ == "__main__":
         dynamic = load_cart_pole_lan_profile(config.experiment_config).observer_design is not None
         if args.preload_steps and not dynamic:
             parser.error("--preload-steps 需要动态observer配置")
+        if args.recording is not None and not dynamic:
+            parser.error("--recording 需要动态observer配置")
         # Ctrl+C 仅提交正常停止意图，不抛 KeyboardInterrupt 截断协议 I/O。
         previous = signal.signal(signal.SIGINT, lambda *_args: control.request_stop())
         try:
@@ -117,6 +137,7 @@ if __name__ == "__main__":
                 config, segment_steps=args.segment_steps, control=control,
                 session=InteractiveSession(),
                 preload_steps=args.preload_steps, preload_execution=args.preload_execution,
+                recording_mode=args.recording,
             ) if dynamic else run_client_segmented(
                 config, segment_steps=args.segment_steps, control=control,
             ))
@@ -129,4 +150,5 @@ if __name__ == "__main__":
 
     run_window(args.config, segment_steps=args.segment_steps,
                mode="finite" if args.finite else "segmented",
-               preload_steps=args.preload_steps, preload_execution=args.preload_execution)
+               preload_steps=args.preload_steps, preload_execution=args.preload_execution,
+               recording_mode=args.recording)

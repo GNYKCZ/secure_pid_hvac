@@ -44,6 +44,7 @@ from secure_control.protocol.messages import (
     Protocol3EndpointCommand,
     Protocol3StageReceipt,
     TruncationResourceMaterial,
+    _EncodedInputRound,
     preloaded_material_budget,
     public_step_plan_sha256,
 )
@@ -57,6 +58,7 @@ from ._localhost_workers import (
     _complete_client_round,
     _validate_party_reply,
 )
+from ._material_worker import _MaterialWorkerPool
 from .cycle_timing import check_deadline, network_deadline
 from .lan_config import LanConfig, Role
 from .lan_transport import accept_role, connect_role, listener
@@ -80,6 +82,7 @@ from .localhost_codec import (
     SegmentEndReceipt,
     WireEnvelope,
     _decode_preloaded_values,
+    _EncodedOnlinePayload,
     encode_wire_value,
 )
 from .localhost_transport import deadline_after, receive_envelope, send_envelope
@@ -459,7 +462,9 @@ class LanContinuousRuntime:
         _controller_epoch: str | None = None,
         batch: bool = True,
         preload_steps: int = 0, preload_execution: str = "fused",
+        deadline_ns: int | None = None,
     ) -> None:
+        check_deadline(deadline_ns, "DYNAMIC_SETUP")
         if config.role != "Client" or config.experiment_config is None:
             raise ValueError("连续运行必须使用 Client experiment 配置。")
         v2 = _segment_hello is not None and _segment_hello.mode in {
@@ -490,6 +495,7 @@ class LanContinuousRuntime:
                              modulus_evidence=modulus_evidence)
         # 所有参数、模数与范围验证在网络拨号及离线分享前完成。
         self.distribution = self.client.distribute_controller(spec, range_contract)
+        check_deadline(deadline_ns, "DYNAMIC_SETUP")
         if preload_steps:
             preloaded_material_budget(self.distribution.p1.layout, fixed_point.modulus, preload_steps)
         self.scale_ledger = self.distribution.p1.layout.scale_ledger
@@ -503,6 +509,9 @@ class LanContinuousRuntime:
         self._segment_capacity = _segment_capacity if v2 else range_contract.horizon_steps
         self._v2 = v2
         self._batch = batch
+        self._overlap_commit = bool(batch and spec.state_dimension and _segment_hello is not None
+                                    and _segment_hello.mode == "lan-segmented-v2")
+        self.last_commit_observation = None
         self._products = 0
         self._truncations = 0
         self._confirmed_steps: list[dict[str, int | str]] = []
@@ -529,13 +538,17 @@ class LanContinuousRuntime:
             for role, address in (("P1", config.topology.p1_client),
                                   ("P2", config.topology.p2_client)):
                 _LAN_LOG.info("Client 正在连接 %s…", role)
-                sock = connect_role(address, config, role, deadline_after(config.startup_timeout))
+                sock = connect_role(address, config, role,
+                                    network_deadline(config.startup_timeout, deadline_ns))
                 self._sockets.append(sock)
-                _hello(sock, "Client", role, self.session_id, hello, config.startup_timeout)
+                _hello(sock, "Client", role, self.session_id, hello, config.startup_timeout,
+                       **({"deadline": network_deadline(config.startup_timeout, deadline_ns)}
+                          if deadline_ns is not None else {}))
                 _LAN_LOG.info("Client 与 %s 的协议连接已建立。", role)
             for party, sock in enumerate(self._sockets):
                 _request(sock, "P1" if party == 0 else "P2", 1, "lan_ready",
-                         self.session_id, config.startup_timeout)
+                         self.session_id, config.startup_timeout,
+                         deadline=network_deadline(config.startup_timeout, deadline_ns))
             _LAN_LOG.info("三方已就绪，开始连续计算。")
             if v2:
                 setup = LanSegmentedSetupV2Payload(
@@ -557,10 +570,13 @@ class LanContinuousRuntime:
             for party, sock in enumerate(self._sockets):
                 role = "P1" if party == 0 else "P2"
                 _request(sock, role, 2, "lan_setup", self.session_id,
-                         config.startup_timeout, setup)
+                         config.startup_timeout, setup,
+                         deadline=network_deadline(config.startup_timeout, deadline_ns))
                 material = self.distribution.p1 if party == 0 else self.distribution.p2
                 _request(sock, role, 3, "offline", self.session_id,
-                         config.startup_timeout, PartyOfflineMaterial.from_message(material))
+                         config.startup_timeout, PartyOfflineMaterial.from_message(material),
+                         deadline=network_deadline(config.startup_timeout, deadline_ns))
+            check_deadline(deadline_ns, "DYNAMIC_SETUP")
         except Exception:
             self._failed = True
             self.close()
@@ -663,6 +679,7 @@ class LanContinuousRuntime:
         prepared = None
         endpoints = []
         self._last_phase_ns = {}
+        self.last_commit_observation = None
         try:
             deadline = (network_deadline(self.config.step_timeout, deadline_ns)
                         if deadline_ns is not None else None)
@@ -678,12 +695,18 @@ class LanContinuousRuntime:
                 current = self.client.prepare_online(self.distribution, value, step=self._step)
             else:
                 prepared = self._material_pool.take(self._step)
-                current = self.client.bind_online_input(self.distribution, prepared, value,
-                                                        step=self._step)
+                if isinstance(self._material_pool, _MaterialWorkerPool):
+                    current = self.client._bind_encoded_input(self.distribution, prepared, value,
+                                                             step=self._step)
+                else:
+                    current = self.client.bind_online_input(self.distribution, prepared, value,
+                                                            step=self._step)
             self._last_phase_ns["material_bind"] = time.perf_counter_ns() - started
             check_deadline(deadline_ns, "MATERIAL_BIND")
-            plan = current.plan if self._preload_steps else current.p1_resources.plan
-            if not self._preload_steps and current.p2_resources.plan != plan:
+            encoded_current = isinstance(current, _EncodedInputRound)
+            plan = (current.prepared.plan if encoded_current else
+                    current.plan if self._preload_steps else current.p1_resources.plan)
+            if not self._preload_steps and not encoded_current and current.p2_resources.plan != plan:
                 raise ValueError("两方在线资源计划不一致。")
             self._last_plan = plan
             if deadline is None:
@@ -699,6 +722,13 @@ class LanContinuousRuntime:
                 prepared_requests = _prepare_requests(materials,
                     "activate_stage" if fused else "activate", self.session_id,
                     plan.round_id, self._step, self._sequences, _FRAME_LIMIT)
+            elif encoded_current:
+                materials = tuple(_EncodedOnlinePayload(inp, plan, fragment) for inp, fragment in
+                    zip((current.p1_input, current.p2_input), current.prepared.fragments, strict=True))
+                prepared_requests = _prepare_online_requests(
+                    materials, self.session_id, plan.round_id, self._step, self._sequences)
+                self._material_pool.observe_current_encoded(sum(len(v[1]) for v in prepared_requests)
+                    + sum(len(v) for v in current.prepared.fragments))
             else:
                 materials = tuple(PartyOnlineMaterial.from_round(PartyOnlineRound(
                     current.p1_input if party == 0 else current.p2_input,
@@ -738,6 +768,7 @@ class LanContinuousRuntime:
             result = _complete_client_round(
                 self.client, endpoints[0], endpoints[1], plan, batch=self._batch,
                 on_phase=record_phase,
+                **({"overlap_commit": True} if self._overlap_commit else {}),
             )
             if self._preload_steps:
                 self.client.retire_preloaded_round(current, success=True)
@@ -746,9 +777,7 @@ class LanContinuousRuntime:
                                 ("commit", "reconstruct")):
                 if name in stamps and begin in stamps:
                     self._last_phase_ns[name] = stamps[name] - stamps[begin]
-            for party, endpoint in enumerate(endpoints):
-                if hasattr(endpoint, "commit_duration_ns"):
-                    self._last_phase_ns[f"p{party + 1}_commit"] = endpoint.commit_duration_ns
+            self._observe_commits(endpoints)
             self._sequences = [endpoint.sequence for endpoint in endpoints]
             self._step += 1
             self._products += result.products
@@ -766,9 +795,9 @@ class LanContinuousRuntime:
             self._last_result = result
             return np.array(result.output, dtype=float, copy=True)
         except Exception:
-            for party, endpoint in enumerate(endpoints):
-                if hasattr(endpoint, "commit_duration_ns"):
-                    self._last_phase_ns[f"p{party + 1}_commit"] = endpoint.commit_duration_ns
+            self._observe_commits(endpoints)
+            for endpoint in endpoints:
+                endpoint._commit_state = "failed"
             if current is not None:
                 identity = (current.session_id, current.round_id, current.step)
                 if self._preload_steps:
@@ -780,6 +809,22 @@ class LanContinuousRuntime:
             self._failed = True
             self.close()
             raise
+
+    def _observe_commits(self, endpoints):
+        if not endpoints:
+            return
+        self.last_commit_observation = {
+            "session_id": endpoints[0].session_id, "round_id": endpoints[0].plan.round_id,
+            "step": endpoints[0].plan.step,
+            "parties": {f"P{party + 1}": dict(endpoint.commit_observation)
+                        for party, endpoint in enumerate(endpoints)},
+        }
+        for party, endpoint in enumerate(endpoints):
+            if hasattr(endpoint, "commit_duration_ns"):
+                self._last_phase_ns[f"p{party + 1}_commit"] = endpoint.commit_duration_ns
+            else:
+                for key, value in endpoint.commit_timings.items():
+                    self._last_phase_ns[f"p{party + 1}_commit_{key}"] = value
 
     def begin_segment(self, begin: SegmentBeginPayload, *, deadline_ns: int | None = None) -> None:
         """v2 保留同一 controller/session 与全局 step，只确认新的逻辑段。"""
@@ -833,7 +878,11 @@ class LanContinuousRuntime:
         if self._material_pool is not None:
             pool, self._material_pool = self._material_pool, None
             self._material_statistics = pool.snapshot()
-            pool.close()
+            try:
+                pool.close()
+            finally:
+                if isinstance(pool, _MaterialWorkerPool):
+                    self._material_statistics = pool.snapshot()
 
 
 class RunControl:
@@ -926,7 +975,9 @@ class LanSegmentedRuntime:
                  *, control: RunControl, segment_capacity: int | None = None,
                  full_run_id: str | None = None,
                  previous_epoch_session: str | None = None,
-                 preload_steps: int = 0, preload_execution: str = "fused") -> None:
+                 preload_steps: int = 0, preload_execution: str = "fused",
+                 deadline_ns: int | None = None) -> None:
+        check_deadline(deadline_ns, "DYNAMIC_SETUP")
         self._v2 = spec.state_dimension != 0
         self._full_v3 = full_run_id is not None
         if (type(preload_steps) is not int or not 0 <= preload_steps <= 1000
@@ -965,11 +1016,15 @@ class LanSegmentedRuntime:
         self._products = self._truncations = 0
         self._last_end_round_id: str | None = None
         self._last_closed_segment_count = 0
+        self.last_sealed_record: SegmentRecord | None = None
         self._attempted_round: int | None = None
         self.phase = "CONNECTING"
-        self._connect()
+        if deadline_ns is None:
+            self._connect()
+        else:
+            self._connect(deadline_ns=deadline_ns)
 
-    def _connect(self) -> None:
+    def _connect(self, *, deadline_ns: int | None = None) -> None:
         self.phase = "CONNECTING" if self.segment_index == 0 else "CONNECTING_NEXT"
         self.hello = LanSegmentedHelloPayload(
             self.config.topology.digest, secrets.token_hex(32), self.run_id,
@@ -984,6 +1039,7 @@ class LanSegmentedRuntime:
             _segment_capacity=self.segment_capacity if self._v2 else None,
             _controller_epoch=self.controller_epoch,
             preload_steps=self.preload_steps, preload_execution=self.preload_execution,
+            **({"deadline_ns": deadline_ns} if deadline_ns is not None else {}),
         )
         self.connection_seconds = time.monotonic() - started
         self.phase = "RUNNING"
@@ -993,6 +1049,12 @@ class LanSegmentedRuntime:
         if self._segment is None:
             return self.global_start
         return self._segment._step if self._v2 else self.global_start + self._segment._step
+
+    @property
+    def last_commit_observation(self):
+        observation = self._segment.last_commit_observation if self._segment is not None else None
+        return ({**observation, "run_id": self.run_id, "controller_epoch": self.controller_epoch,
+                 "global_step": observation["step"]} if observation is not None else None)
 
     @property
     def resource_counts(self) -> dict[str, int]:
@@ -1024,7 +1086,7 @@ class LanSegmentedRuntime:
     def segment_full(self) -> bool:
         return self.confirmed_step_count - self.global_start == self.segment_capacity
 
-    def enable_material_preparation(self, *, slots: int = 16) -> None:
+    def enable_material_preparation(self, *, slots: int = 16, _candidate=None) -> None:
         """只在动态初始准备期填充库存；计时开始后禁止重新填充初始池。"""
         if (self.preload_steps or not self._v2 or self.confirmed_step_count
                 or self.phase != "RUNNING"):
@@ -1032,8 +1094,22 @@ class LanSegmentedRuntime:
         segment = self._segment
         if segment is None or segment._material_pool is not None:
             raise RuntimeError("材料池不存在或已经安装。")
-        segment._material_pool = _OnlineResourcePool(segment.client, segment.distribution,
-                                                   start=segment._step, slots=slots)
+        if _candidate not in (None, "thread", "worker") or _candidate and self._full_v3:
+            raise ValueError("实验供料只支持动态v2")
+        if _candidate == "worker":
+            try:
+                segment._material_pool = _MaterialWorkerPool(segment.client, segment.distribution,
+                    run_id=self.run_id, epoch=self.controller_epoch, start=segment._step, slots=slots)
+            except Exception as error:
+                segment._material_statistics = getattr(error, "_public_material_summary", {})
+                raise
+        else:
+            segment._material_pool = _OnlineResourcePool(segment.client, segment.distribution,
+                                                       start=segment._step, slots=slots)
+
+    def _begin_material_control(self):
+        if self._segment is not None and isinstance(self._segment._material_pool, _MaterialWorkerPool):
+            self._segment._material_pool.control_begin()
 
     def enable_material_preload(self, *, cancelled=None):
         if self.phase != "RUNNING" or self.confirmed_step_count or self._segment is None:
@@ -1054,12 +1130,17 @@ class LanSegmentedRuntime:
             return {"capacity": self.preload_steps,
                     "level": max(0, self.preload_steps - self._segment._step)}
         pool = self._segment._material_pool
-        return pool.snapshot() if pool is not None else getattr(self._segment, "_material_statistics", {})
+        summary = pool.snapshot() if pool is not None else getattr(self._segment, "_material_statistics", {})
+        # CycleTiming v1只接受非负整数；完整供料/清理摘要在停止报告中另行返回。
+        return {key: value for key, value in summary.items() if type(value) is int and value >= 0}
 
     @property
     def material_summary(self):
         if self.preload_steps and self._segment is not None:
             return {**self._segment._preload_statistics, **self.cycle_queue_levels}
+        if self._segment is not None:
+            pool = self._segment._material_pool
+            return pool.snapshot() if pool is not None else getattr(self._segment, "_material_statistics", {})
         return self.cycle_queue_levels
 
     def step(self, v: Any, *, deadline_ns: int | None = None) -> SegmentedStep | None:
@@ -1160,6 +1241,9 @@ class LanSegmentedRuntime:
             self._records.clear()
             self._last_end_round_id = end.last_round_id
             self._last_closed_segment_count = self.confirmed_step_count
+            # 双方密封是独立事实；周期出口超期也不能丢掉刚收到的真实回执。
+            if self._full_v3:
+                self.last_sealed_record = record
             self.phase = ("SWITCHED" if action == "switch" else
                           "STOPPED" if action == "stop" else "CONNECTING_NEXT")
             check_deadline(deadline_ns, "SEGMENT_END")
@@ -1658,6 +1742,7 @@ def _hello(
     session: str,
     hello: LanHelloPayload | LanSegmentedHelloPayload | BatchHelloPayload | PreloadedHelloPayload,
     timeout: float,
+    *, deadline: float | None = None,
 ) -> None:
     envelope = WireEnvelope(
         SCHEMA_VERSION,
@@ -1672,7 +1757,7 @@ def _hello(
         None,
         hello,
     )
-    deadline = deadline_after(timeout)
+    deadline = deadline_after(timeout) if deadline is None else deadline
     send_envelope(sock, envelope, deadline=deadline, limit=_FRAME_LIMIT)
     response = receive_envelope(sock, deadline=deadline, limit=_FRAME_LIMIT)
     if (

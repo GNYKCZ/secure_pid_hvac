@@ -1,6 +1,8 @@
 """Beaver Protocol 1 标量乘法、公开项归属和资源生命周期测试。"""
 
 import random
+from copy import copy, deepcopy
+from weakref import ref
 
 import pytest
 
@@ -68,7 +70,19 @@ def test_triple_cannot_be_reused_after_masking_or_completion() -> None:
     x_shares = sharing.share(8, rng=rng)
     y_shares = sharing.share(9, rng=rng)
     triples = multiplier.create_triple(rng=rng)
-    first_masked = multiplier.mask_inputs(x_shares[0], y_shares[0], triples[0])
+    lifecycle = triples[0]._lifecycle
+    assert lifecycle is triples[1]._lifecycle and not hasattr(lifecycle, "__dict__")
+    lifecycle_ref = ref(lifecycle)
+    state_copy = copy(lifecycle)
+    assert state_copy.owner is multiplier and state_copy.masked_parties is lifecycle.masked_parties
+    assert state_copy.finished_parties is lifecycle.finished_parties
+    assert not state_copy.opened and not state_copy.consumed
+    # 浅拷贝仍是同一资源；深拷贝的 owner 不能冒充当前乘法实例。
+    alias = copy(triples[0])
+    assert alias._lifecycle is lifecycle
+    with pytest.raises(ValueError, match="不属于"):
+        multiplier.mask_inputs(x_shares[0], y_shares[0], deepcopy(triples[0]))
+    first_masked = multiplier.mask_inputs(x_shares[0], y_shares[0], alias)
     second_masked = multiplier.mask_inputs(x_shares[1], y_shares[1], triples[1])
     opened = multiplier.open_masked_differences(first_masked, second_masked)
     multiplier.finish(triples[0], opened)
@@ -80,6 +94,7 @@ def test_triple_cannot_be_reused_after_masking_or_completion() -> None:
 
     multiplier.finish(triples[1], opened)
     assert triples[0].is_consumed
+    assert lifecycle_ref() is lifecycle and lifecycle.finished_parties == {0, 1}
     assert multiplier.consumed_triples == 1
 
 

@@ -6,10 +6,11 @@ import base64
 import binascii
 import json
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from fractions import Fraction
 from math import isfinite, prod
 from numbers import Integral
+from types import MappingProxyType
 from typing import Any, Literal
 
 import numpy as np
@@ -79,6 +80,20 @@ _CANONICAL_INTEGER = re.compile(r"(?:0|-[1-9][0-9]*|[1-9][0-9]*)\Z")
 _MAX_INTEGER_DIGITS = 100_000
 _MAX_ARRAY_ITEMS = 1_000_000
 _MAX_JSON_DEPTH = 32
+# 在线材料的公开固定字段名可共享；不缓存解码树、DTO 或秘密值。
+_ONLINE_FIELDS = MappingProxyType({
+    "share": frozenset({"type", "value"}),
+    "bigint": frozenset({"type", "decimal"}),
+    "bigint_array": frozenset({"type", "shape", "values"}),
+    "input_share": frozenset({"type", "recipient", "session_id", "round_id", "step", "value"}),
+    "resource_metadata": frozenset({"type", "resource_id", "session_id", "round_id", "step", "kind",
+        "term", "index", "shape", "left_fractional_bits", "right_fractional_bits", "output_fractional_bits"}),
+    "step_resource_plan": frozenset({"type", "session_id", "round_id", "step", "state_shape", "input_shape",
+        "output_shape", "scale_ledger", "product_resources", "state_truncation_resources"}),
+    "product_resource_material": frozenset({"type", "owner", "metadata", "a", "b", "c"}),
+    "truncation_resource_material": frozenset({"type", "owner", "metadata", "r", "r_prime"}),
+    "party_online_material": frozenset({"type", "input_message", "plan", "product_resources", "state_truncation_resources"}),
+})
 _RANGE_PROOF_MODES = {
     "finite_horizon",
     "closed_loop_invariant",
@@ -475,6 +490,8 @@ def encode_envelope(message: WireEnvelope) -> bytes:
     """将合法信封编码为字段顺序稳定、禁止 NaN 的 UTF-8 JSON。"""
     if not isinstance(message, WireEnvelope):
         raise TypeError("message 必须是 WireEnvelope。")
+    if isinstance(message.payload, _EncodedOnlinePayload):
+        return _encode_current_envelope(message)
     payload = {
         "schema_version": message.schema_version,
         "kind": message.kind,
@@ -495,6 +512,52 @@ def encode_envelope(message: WireEnvelope) -> bytes:
         separators=(",", ":"),
         allow_nan=False,
     ).encode("utf-8")
+
+
+@dataclass(frozen=True, slots=True)
+class _EncodedOnlinePayload:
+    """仅本地编码能力使用；原 decoder 始终恢复 PartyOnlineMaterial。"""
+
+    input_message: InputShareMessage
+    plan: StepResourcePlan
+    fragment: bytes = field(repr=False)
+
+
+def _canonical_json(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+
+def _encode_online_fragment(resources: PartyResources, modulus: int) -> bytes:
+    """工人内从类型受限原材料生成静态尾部；每个 residue 仍按原 bigint 编码。"""
+    products = tuple(ProductResourceMaterial(v.owner, v.metadata, v.triple.a, v.triple.b,
+                                             v.triple.c) for v in resources.product_resources)
+    truncations = tuple(TruncationResourceMaterial(v.owner, v.metadata, v.truncation.r,
+                                                 v.truncation.r_prime)
+                        for v in resources.state_truncation_resources)
+    values = [share.value for item in products for share in (item.a, item.b, item.c)]
+    values.extend(share.value for item in truncations for share in (item.r, item.r_prime))
+    if any(type(value) is not int or not 0 <= value < modulus for value in values):
+        raise LocalhostCodecError("静态材料存在非 canonical residue")
+    fields = {"plan": _encode_value(resources.plan),
+              "product_resources": [_encode_value(v) for v in products],
+              "state_truncation_resources": [_encode_value(v) for v in truncations],
+              "type": "party_online_material"}
+    # input_message 是排序后的第一字段；只截取此受限 dict 的外层花括号。
+    return b"," + _canonical_json(fields)[1:]
+
+
+def _encode_current_envelope(message):
+    """按原 sort_keys 顺序组合明确字段，不替换标记，不解码秘密材料树。"""
+    value = message.payload
+    payload = b'{"input_message":' + _canonical_json(_encode_value(value.input_message)) + value.fragment
+    fields = {name: getattr(message, name) for name in (
+        "schema_version", "kind", "sender", "recipient", "sequence", "operation",
+        "session_id", "round_id", "step", "resource_id")}
+    fields["payload"] = None
+    return b"{" + b",".join(_canonical_json(key) + b":" +
+        (payload if key == "payload" else _canonical_json(fields[key]))
+        for key in sorted(fields)) + b"}"
 
 
 def decode_envelope(payload: bytes) -> WireEnvelope:
@@ -1152,7 +1215,7 @@ def _decode_value(value: object) -> object:
         _exact_fields(mapping, {"type", "shape", "values"}, kind)
         return _decode_float_array(mapping["shape"], mapping["values"])
     if kind == "share":
-        _exact_fields(mapping, {"type", "value"}, kind)
+        _exact_fields(mapping, _ONLINE_FIELDS[kind], kind)
         return AdditiveShare(_decode_integer_value(mapping["value"]))
     if kind == "scale_ledger":
         names = set(ControllerScaleLedger.__dataclass_fields__)
@@ -1254,7 +1317,7 @@ def _decode_value(value: object) -> object:
     if kind == "input_share":
         _exact_fields(
             mapping,
-            {"type", "recipient", "session_id", "round_id", "step", "value"},
+            _ONLINE_FIELDS[kind],
             kind,
         )
         return InputShareMessage(
@@ -1265,20 +1328,7 @@ def _decode_value(value: object) -> object:
             _typed(mapping["value"], AdditiveShare),
         )
     if kind == "resource_metadata":
-        fields = {
-            "type",
-            "resource_id",
-            "session_id",
-            "round_id",
-            "step",
-            "kind",
-            "term",
-            "index",
-            "shape",
-            "left_fractional_bits",
-            "right_fractional_bits",
-            "output_fractional_bits",
-        }
+        fields = _ONLINE_FIELDS[kind]
         _exact_fields(mapping, fields, kind)
         right = mapping["right_fractional_bits"]
         return ResourceMetadata(
@@ -1295,18 +1345,7 @@ def _decode_value(value: object) -> object:
             _nonnegative(mapping["output_fractional_bits"], "output_fractional_bits"),
         )
     if kind == "step_resource_plan":
-        fields = {
-            "type",
-            "session_id",
-            "round_id",
-            "step",
-            "state_shape",
-            "input_shape",
-            "output_shape",
-            "scale_ledger",
-            "product_resources",
-            "state_truncation_resources",
-        }
+        fields = _ONLINE_FIELDS[kind]
         _exact_fields(mapping, fields, kind)
         return StepResourcePlan(
             _text(mapping["session_id"], "session_id"),
@@ -1320,7 +1359,7 @@ def _decode_value(value: object) -> object:
             _typed_tuple(mapping["state_truncation_resources"], ResourceMetadata),
         )
     if kind == "product_resource_material":
-        _exact_fields(mapping, {"type", "owner", "metadata", "a", "b", "c"}, kind)
+        _exact_fields(mapping, _ONLINE_FIELDS[kind], kind)
         return ProductResourceMaterial(
             _party(mapping["owner"]),
             _typed(mapping["metadata"], ResourceMetadata),
@@ -1329,7 +1368,7 @@ def _decode_value(value: object) -> object:
             _typed(mapping["c"], AdditiveShare),
         )
     if kind == "truncation_resource_material":
-        _exact_fields(mapping, {"type", "owner", "metadata", "r", "r_prime"}, kind)
+        _exact_fields(mapping, _ONLINE_FIELDS[kind], kind)
         return TruncationResourceMaterial(
             _party(mapping["owner"]),
             _typed(mapping["metadata"], ResourceMetadata),
@@ -1339,7 +1378,7 @@ def _decode_value(value: object) -> object:
     if kind == "party_online_material":
         _exact_fields(
             mapping,
-            {"type", "input_message", "plan", "product_resources", "state_truncation_resources"},
+            _ONLINE_FIELDS[kind],
             kind,
         )
         return PartyOnlineMaterial(
@@ -1529,7 +1568,7 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
     elif key == ("reply", "segment_end"):
         expected = (SegmentEndReceipt,)
     elif key == ("request", "online"):
-        expected = (PartyOnlineMaterial,)
+        expected = (PartyOnlineMaterial, _EncodedOnlinePayload)
     elif (
         key
         in {
@@ -1547,6 +1586,15 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
         expected = None
     if expected is None or not isinstance(payload, expected):
         raise LocalhostCodecError("wire kind/operation 与 payload 类型组合非法。")
+    if isinstance(payload, _EncodedOnlinePayload):
+        inp, plan = payload.input_message, payload.plan
+        if (type(payload.fragment) is not bytes or not payload.fragment.startswith(b',"plan":')
+                or not payload.fragment.endswith(b'"type":"party_online_material"}')
+                or (inp.session_id, inp.round_id, inp.step) != (plan.session_id, plan.round_id, plan.step)
+                or (message.session_id, message.round_id, message.step, message.resource_id)
+                   != (plan.session_id, plan.round_id, plan.step, None)
+                or inp.recipient != (0 if message.recipient == "P1" else 1)):
+            raise LocalhostCodecError("编码当前材料与信封方向或关联头不匹配")
     if isinstance(payload, BatchHelloPayload) and (
         message.operation == "hello" and not isinstance(payload.base, HelloPayload)
         or message.operation == "lan_hello" and not isinstance(
@@ -1665,6 +1713,9 @@ def _check_json_budget(value: object, depth: int) -> None:
 
 
 def _encode_integer_value(value: object) -> object:
+    # 标量直接保留任意精度十进制；bool 仍由同一验证器拒绝。
+    if isinstance(value, (int, np.integer)):
+        return {"type": "bigint", "decimal": _decimal(value)}
     array = np.asarray(value, dtype=object)
     if array.ndim == 0:
         return {"type": "bigint", "decimal": _decimal(array.item())}
@@ -1681,11 +1732,11 @@ def _decode_integer_value(value: object) -> int | np.ndarray:
     mapping = _mapping(value, "integer value")
     kind = mapping.get("type")
     if kind == "bigint":
-        _exact_fields(mapping, {"type", "decimal"}, "bigint")
+        _exact_fields(mapping, _ONLINE_FIELDS[kind], "bigint")
         return _parse_decimal(mapping["decimal"])
     if kind != "bigint_array":
         raise LocalhostCodecError("share value 必须是 bigint 或 bigint_array。")
-    _exact_fields(mapping, {"type", "shape", "values"}, "bigint_array")
+    _exact_fields(mapping, _ONLINE_FIELDS[kind], "bigint_array")
     shape = _shape(mapping["shape"], "shape")
     values = mapping["values"]
     if not isinstance(values, list) or len(values) != prod(shape):
@@ -1713,14 +1764,21 @@ def _decode_float_array(shape_value: object, values_value: object) -> np.ndarray
 
 
 def _mapping(value: object, name: str) -> dict[str, object]:
-    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+    if not isinstance(value, dict):
         raise LocalhostCodecError(f"{name} 必须是 JSON object。")
+    for key in value:
+        if not isinstance(key, str):
+            raise LocalhostCodecError(f"{name} 必须是 JSON object。")
     return value
 
 
-def _exact_fields(mapping: dict[str, object], fields: set[str], name: str) -> None:
-    if set(mapping) != fields:
+def _exact_fields(mapping: dict[str, object], fields: set[str] | frozenset[str], name: str) -> None:
+    # 数量相同还必须逐键包含，不能用数量检查接纳同数异名字段。
+    if len(mapping) != len(fields):
         raise LocalhostCodecError(f"{name} 字段集合不匹配。")
+    for key in mapping:
+        if key not in fields:
+            raise LocalhostCodecError(f"{name} 字段集合不匹配。")
 
 
 def _typed(value: object, expected: type[Any]) -> Any:

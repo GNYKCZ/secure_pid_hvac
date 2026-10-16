@@ -8,6 +8,7 @@ import subprocess
 import sys
 from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
+from io import BytesIO
 from math import pi
 from pathlib import Path
 from threading import Event
@@ -23,7 +24,7 @@ from test_lan_segmented import _PARTY
 from test_lan_single_step import _finish, deployment
 
 from secure_control.execution.lan_config import load_lan_config
-from secure_control.execution.lan_runtime import SegmentedStep, SegmentRecord
+from secure_control.execution.lan_runtime import RunControl, SegmentedStep, SegmentRecord
 from secure_control.execution.localhost_codec import decode_wire_value
 from secure_control.experiments import cart_pole_segmented_evidence as evidence
 from secure_control.experiments.lan_continuous_profile import load_segmented_experiment
@@ -298,7 +299,7 @@ def step(record):
 try:
     result = run_cart_pole_segmented(config, control=control, session=session,
                                      segment_steps=capacity, on_step=step, phase=phase,
-                                     prepared=prepared, realtime=False)
+                                     prepared=prepared, realtime=False, recording_mode='full')
 except Exception as error:
     import traceback
     result = {'status':'failed', 'category':type(error).__name__, 'traceback':traceback.format_exc()}
@@ -313,7 +314,7 @@ print(json.dumps({'result':result,'boundaries':boundaries,
 
 
 def _run(tmp_path, *, count=7, capacity=3, mode="normal", tls=False, client_code=_CLIENT,
-         party_fault="none", dynamic=False, dynamic_initial=(0, 0, .005, 0)):
+         party_fault="none", dynamic=False, dynamic_initial=(0, 0, .005, 0), party_code=_PARTY):
     paths = deployment.__wrapped__(tmp_path) if tls else _plain_deployment(tmp_path)
     profile = (_observer_profile_for(paths, initial_state=dynamic_initial)
                if dynamic else _profile_for(paths))
@@ -326,7 +327,7 @@ def _run(tmp_path, *, count=7, capacity=3, mode="normal", tls=False, client_code
     try:
         for role in ("P1", "P2"):
             processes.append(subprocess.Popen(
-                [sys.executable, "-c", _PARTY, role, str(paths[role]), party_fault], cwd=ROOT,
+                [sys.executable, "-c", party_code, role, str(paths[role]), party_fault], cwd=ROOT,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             ))
         client = subprocess.Popen(
@@ -344,10 +345,11 @@ def _run(tmp_path, *, count=7, capacity=3, mode="normal", tls=False, client_code
             pytest.fail(f"Client timeout: {output} / {errors}")
         if code != 0:
             pytest.fail(json.dumps(report, ensure_ascii=False, indent=2) + "\n" + errors)
-        if report["result"]["status"] == "complete":
+        if report["result"]["status"] in ("complete", "stopped"):
             outcomes = [_finish(p, 20) for p in processes[:2]]
             assert all(row[0] == 0 for row in outcomes), outcomes
-            assert len({report["result"]["backend"]["pid"], *(row[1]["pid"] for row in outcomes)}) == 3
+            backend = report["result"].get("backend", report["result"])
+            assert len({backend["pid"], *(row[1]["pid"] for row in outcomes)}) == 3
             expected = 1 if dynamic and mode == "stop_inflight" else count
             assert all(row[1]["steps_committed"] == expected for row in outcomes)
         return report
@@ -528,6 +530,158 @@ def test_batch_writer_counts_inflight_and_preserves_checkpoint_on_disk_failure(
         assert spool.disk_metrics["fsync_count"] == 8  # 两批均 fsync，只有首批 checkpoint 发布
     else:
         assert spool.disk_metrics["fsync_count"] < 8  # 来源变化在第二批写盘前拒绝。
+
+
+def test_batch_journal_reuses_canonical_rows_with_identical_bytes_and_line_limit():
+    """独立旧 JSON 编码 oracle 覆盖首行/续行、UTF-8 及完整 wrapper 行界。"""
+    def old_bytes(value):
+        return (json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False,
+                           separators=(",", ":")) + "\n").encode("utf-8")
+
+    for previous in (None, "a" * 64):
+        spool = evidence._Spool.__new__(evidence._Spool)
+        spool.backend_id, spool.count, spool.end = "run", 2, 10
+        spool.tail_count, spool.tail_bytes, spool.tail_hash = 0, 0, previous
+        data = {"protocol": {"run_id": "run", "segment_index": 2,
+                             "global_step": 10, "local_step": 0},
+                "snapshot": {"文本": "引号\"与换行\n", "values": [-0.0, 1e-12, 1 << 200]},
+                "padding": ""}
+        digest = sha256(old_bytes({"prev_sha256": previous, "step": data})).hexdigest()
+        wrapped = old_bytes({"prev_sha256": previous, "sha256": digest, "step": data})
+        data["padding"] = "x" * (evidence.INDEX_LINE_LIMIT - len(wrapped))
+        raw = old_bytes(data)
+        digest = sha256(old_bytes({"prev_sha256": previous, "step": data})).hexdigest()
+        expected = old_bytes({"prev_sha256": previous, "sha256": digest, "step": data})
+        assert len(expected) == evidence.INDEX_LINE_LIMIT
+        stream = BytesIO()
+        buffer = evidence._BufferedChunks(stream)
+        spool._append_step(data, output=buffer, canonical_row=raw)
+        buffer.finish()
+        assert stream.getvalue() == expected
+        assert (spool.tail_count, spool.tail_bytes, spool.tail_hash) == (1, len(expected), digest)
+
+        # 输入行本身合法但加 wrapper 后超限，不能写入或推进任何计数。
+        spool.tail_count, spool.tail_bytes, spool.tail_hash = 0, 0, previous
+        data["padding"] += "x"
+        rejected = BytesIO()
+        buffer = evidence._BufferedChunks(rejected)
+        with pytest.raises(ValueError, match="行界"):
+            spool._append_step(data, output=buffer, canonical_row=old_bytes(data))
+        assert rejected.getvalue() == b"" and not buffer.buffer
+        assert (spool.tail_count, spool.tail_bytes, spool.tail_hash) == (0, 0, previous)
+
+
+def test_light_recent_window_is_bounded_and_final_cycle_is_authoritative():
+    from secure_control.execution.cycle_timing import CycleTiming
+    recorder = evidence._LightRecording()
+    for step in range(300):
+        timing = CycleTiming("run", "session", "epoch", step // 100, step, "round",
+                             20, step * 20, step * 20, (step + 1) * 20,
+                             cycle_completed_ns=step * 20 + 5, status="confirmed",
+                             protocol_committed_count=step + 1, physically_confirmed_count=step + 1,
+                             phase_durations_ns={"input": 2, "p1_commit_send": 3, "private-key": 123})
+        recorder.record_cycle(timing)
+    final = asdict(replace(timing, status="miss_after_apply", failure_phase="CYCLE_OBSERVATION",
+                           cycle_completed_ns=None))
+    result = {"status": "failed", "category": "CycleDeadlineExceeded",
+              "cycle_summary": {"attempts": 300, "misses": 1, "last_cycle": final}}
+    summary = recorder.summary(result)
+    assert summary["recent_count"] == 256 and summary["evicted_count"] == 44
+    assert (summary["recent_global_start"], summary["recent_global_end"]) == (44, 299)
+    assert summary["first_cycle"]["global_step"] == 0
+    assert summary["recent_cycles"][-1]["status"] == "miss_after_apply"
+    assert summary["recent_cycles"][-1]["cycle_completed_ns"] is None
+    assert summary["recent_timing"]["sample_count"] == 255
+    assert all(row["phase_durations_ns"] == {"input": 2, "p1_commit_send": 3}
+               for row in summary["recent_cycles"])
+    assert summary["final_failure"]["category"] == "CycleDeadlineExceeded"
+    assert result["cycle_summary"]["attempts"] == 300
+    missing = evidence._LightRecording()
+    recovered = missing.summary(result)
+    assert recovered["recent_count"] == 1 and recovered["first_cycle"]["status"] == "miss_after_apply"
+
+
+def test_light_coordinator_never_constructs_or_reads_artifacts(tmp_path, monkeypatch):
+    from secure_control.execution.cycle_timing import CycleTiming
+    paths = _plain_deployment(tmp_path)
+    _observer_profile_for(paths)
+    config = load_lan_config(paths["Client"], "Client")
+    def forbidden(*args, **kwargs):
+        pytest.fail("light must not construct or verify recording artifacts")
+    for name in ("_Spool", "_BatchWriter", "open_verified_cart_pole_segmented_run"):
+        monkeypatch.setattr(evidence, name, forbidden)
+    before = set(tmp_path.rglob("*"))
+    for status in ("stopped", "failed", "uncertain", "cancelled"):
+        def run(config, prepared, status=status, **kwargs):
+            assert not any(kwargs.get(k) for k in ("on_segment", "on_start", "before_sample", "cycle_snapshot"))
+            timing = CycleTiming("run", "session", "epoch", 0, 0, "round", 20, 0, 0, 20,
+                                 status="failed" if status != "stopped" else "confirmed")
+            kwargs["on_cycle"](timing)
+            return {"status": status, "confirmed_step_count": 0,
+                    "cycle_summary": {"attempts": 1, "misses": 0, "last_cycle": asdict(timing)}}
+        monkeypatch.setattr(evidence, "_run_prepared_segmented", run)
+        result = evidence.run_cart_pole_segmented(config, control=RunControl(),
+                                                  session=InteractiveSession())
+        assert result["status"] == status and result["recording_mode"] == "light"
+        assert result["run_dir"] is result["prefix_dir"] is None
+        assert result["durable_step_count"] == 0 and result["evidence_state"] == "not_recorded"
+    for selector in (False, "invalid", []):
+        with pytest.raises(ValueError):
+            evidence.run_cart_pole_segmented(config, control=RunControl(),
+                                             session=InteractiveSession(), recording_mode=selector)
+    assert set(tmp_path.rglob("*")) == before
+
+
+@pytest.mark.integration
+def test_light_real_dynamic_segments_obey_integer_and_physical_oracles(tmp_path, dynamic_published):
+    source, _ = dynamic_published
+    code = _DYNAMIC_CLIENT.replace("recording_mode='full'", "recording_mode='light'")
+    code = code.replace("from dataclasses import replace", "from dataclasses import replace, asdict\nlight_records = []")
+    code = code.replace("def step(record):", "def step(record):\n    light_records.append(asdict(record))")
+    code = code.replace("'result':result,'boundaries':boundaries", "'result':result,'light_records':light_records,'boundaries':boundaries")
+    code = code.replace("from secure_control.protocol import Client", "from secure_control.protocol import Client\n"
+                        "import secure_control.experiments.lan_runner as runner\n"
+                        "def unused_packet(*args, **kwargs): raise AssertionError('unused segment packet')\n"
+                        "runner.CompletedSegment = unused_packet")
+    report = _run(tmp_path, dynamic=True, client_code=code)
+    result = report["result"]
+    assert result["status"] == "stopped" and result["recording_mode"] == "light"
+    assert result["confirmed_step_count"] == 7
+    assert result["resource_counts"] == {"products_consumed": 210, "truncations_consumed": 28}
+    assert result["run_dir"] is None and result["prefix_dir"] is None
+    # 两次安全运行使用独立随机 Trunc 材料；用原整数递推包络与独立物理模型核验。
+    oracle = evidence._DynamicReplay(evidence._DynamicDefinition(
+        json.loads((source / "config.json").read_bytes())))
+    replay, _ = oracle.convert({"steps": report["light_records"]}, "test", 0, lambda: None)
+    assert oracle.step == 7 and replay.time.size == 7
+    assert len({row["session"] for row in report["boundaries"]}) == 1
+    assert not list(tmp_path.rglob("checkpoint.json")) and not list(tmp_path.rglob("journal"))
+
+
+@pytest.mark.parametrize("actor", ["P1", "P2"])
+@pytest.mark.integration
+def test_light_unknown_ack_after_both_real_parties_commit_has_no_device_or_next_round(tmp_path, actor):
+    code = _PARTY.replace("message.sender == 'P2'", f"message.sender == '{actor}'")
+    code = code.replace("    global ready_count", "    global ready_count\n"
+        "    if message.kind == 'reply' and message.operation == 'endpoint' and message.payload is None:\n"
+        "        Path(sys.argv[2]).with_suffix('.committed').write_text('committed')\n")
+    code = code.replace("sock.close()\n                raise RuntimeError('injected lost commit')",
+                        "time.sleep(.05)\n                sock.close()\n                raise RuntimeError('injected lost commit')")
+    client_code = _DYNAMIC_CLIENT.replace("recording_mode='full'", "recording_mode='light'")
+    report = _run(tmp_path, dynamic=True, client_code=client_code,
+                  party_fault="commit_lost", party_code=code)
+    result = report["result"]
+    assert result["status"] == "uncertain" and result["confirmed_step_count"] == 0
+    assert result["protocol_committed_count"] == 0 and result["attempted_round"] == 0
+    assert not report["boundaries"]  # 本数值/通信测试显式关闭实时调度，不伪造周期记录。
+    assert {p.name: p.read_text() for p in tmp_path.glob("*.committed")} == {
+        "lab-p1.example.committed": "committed", "lab-p2.example.committed": "committed"}
+    parties = result["last_commit_observation"]["parties"]
+    assert all(row["request_state"] == "sent" for row in parties.values())
+    assert not parties[actor]["valid_ack_received"]
+    assert parties["P1"]["valid_ack_received"] == (actor == "P2")
+    assert result["recording_summary"]["recent_count"] == 0
+    assert result["run_dir"] is None and result["durable_step_count"] == 0
 
 
 def test_stream_batch_rejects_invalid_data_and_partial_io_without_promoting_prefix(

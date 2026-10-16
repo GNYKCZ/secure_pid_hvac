@@ -81,6 +81,344 @@ def scalar_inputs():
     return replace(design, **arrays), *rest
 
 
+@pytest.mark.parametrize("late", ["sample", "material", "before_device", "callback", "switch"])
+def test_full_absolute_cycle_preserves_facts_and_rejects_next_command(monkeypatch, scalar_inputs, late):
+    """固定钟覆盖旧路径缺失的采样/CPU/切换/设备前/已执行后截止边界。"""
+    from types import SimpleNamespace
+
+    from secure_control.execution.cycle_timing import check_deadline
+    design, swing, modulus, evidence, _, _ = scalar_inputs
+    ns, reads, sends = [0], [], []
+    original_device = secure_full_module.CartPoleObserverSimulation
+
+    class Device(original_device):
+        def read_measurement(self):
+            reads.append(ns[0])
+            if late == "sample":
+                ns[0] += 20_000_000
+            return super().read_measurement()
+
+        def send_control(self, command):
+            sends.append(command.sample_id)
+            return super().send_control(command)
+
+    class Scalar:
+        def __init__(self, config, program, certificate, **kwargs):
+            self.session_id = "session-" + kwargs["epoch_id"]
+            self.epoch_id, self.certificate = kwargs["epoch_id"], certificate
+            self.start_physical_step = kwargs["start_physical_step"]
+            self.local_step = 0
+            self.last_round_id = None
+            self.cycle_phase_ns = {}
+            self.last_end_receipts = ()
+            self._failed = self._ended = False
+            ns[0] += 30_000_000 if self.start_physical_step and late == "switch" else 1_000_000
+            check_deadline(kwargs.get("deadline_ns"), "SCALAR_SETUP")
+
+        @property
+        def protocol_committed_count(self):
+            return self.local_step
+
+        def step(self, values, step, *, deadline_ns=None):
+            self.last_round_id = "round-" + str(step)
+            if late == "material":
+                ns[0] += 20_000_000
+                check_deadline(deadline_ns, "SCALAR_MATERIAL")
+            self.local_step += 1
+            ns[0] += 21_000_000 if late == "before_device" else 1_000_000
+            return SimpleNamespace(output=0., local_step=self.local_step - 1,
+                                   round_id=self.last_round_id, resource_ids=(),
+                                   products=0, truncations=0)
+
+        def end(self, *args, **kwargs):
+            self._ended = True
+            return ()
+
+        def close(self):
+            pass
+
+    def sleep(seconds):
+        ns[0] += round(seconds * 1e9)
+
+    def callback(*args):
+        if late == "callback":
+            ns[0] += 20_000_000
+
+    monkeypatch.setattr(secure_full_module, "CartPoleObserverSimulation", Device)
+    monkeypatch.setattr(secure_full_module, "LanScalarRuntime", Scalar)
+    monkeypatch.setattr(secure_full_module.time, "perf_counter_ns", lambda: ns[0])
+    monkeypatch.setattr(secure_full_module.time, "sleep", sleep)
+    config = SimpleNamespace(role="Client", experiment_config="owned-fixture")
+    result = run_secure_full_experiment(
+        design.plant, design.balance, replace(swing, horizon_steps=20, acquisition_deadline_steps=20),
+        design, config, modulus=modulus, modulus_evidence=evidence, realtime=True,
+        on_step=callback,
+    )
+    assert result.physical.termination == "failed"
+    failed = result.cycles[-1]
+    expected = 10 if late == "switch" else 1 if late == "callback" else 0
+    assert len(sends) == result.physically_confirmed_count == expected
+    assert result.physical.completed_steps == expected
+    assert len(result.cycles) == (11 if late == "switch" else 1)
+    assert all(b.scheduled_start_ns - a.scheduled_start_ns == 20_000_000
+               for a, b in zip(result.cycles, result.cycles[1:]))
+    assert failed.cycle_completed_ns is None
+    assert failed.status == ("miss_after_apply" if late == "callback" else "miss_before_apply")
+    assert failed.protocol_committed_count == expected + (late == "before_device")
+    assert reads[0] == result.cycles[0].actual_sample_start_ns
+    assert result.cycle_failure["physical_step"] == failed.global_step
+    assert result.cycle_failure["physically_confirmed_count"] == expected
+
+
+@pytest.mark.integration
+def test_full_v4_real_parties_observer_overrun_and_strict_timing(tmp_path, monkeypatch, scalar_inputs):
+    """真协议/物理回执，虚拟本机钟注入观察出口；不是性能资格测试。"""
+    import json
+    ns = [1_000_000]
+    paths = _plain_deployment(tmp_path)
+    design, swing, modulus, evidence, _, _ = scalar_inputs
+    monkeypatch.setattr(secure_full_module.time, "perf_counter_ns", lambda: ns[0])
+    snapshots = []
+    def observer(cycle):
+        snapshots.append(cycle)
+        ns[0] += 20_000_000
+    parties = start_processes([[sys.executable, "-c", _PARTY, role, str(paths[role])]
+                              for role in ("P1", "P2")])
+    try:
+        result = run_secure_full_experiment(
+            design.plant, design.balance, replace(swing, horizon_steps=20, acquisition_deadline_steps=20),
+            design, load_lan_config(paths["Client"], "Client"), modulus=modulus,
+            modulus_evidence=evidence, realtime=True, on_cycle=observer,
+        )
+        assert result.physical.completed_steps == result.physically_confirmed_count == 1
+        assert result.physical.failure_interval_step is None
+        assert result.unconfirmed_protocol_step is None
+        assert snapshots[0].cycle_completed_ns is None and snapshots[0].status == "observing"
+        assert result.cycles[0].status == "miss_after_apply"
+        run = write_cart_pole_full_run(result, tmp_path / "v4-overrun")
+        verified = open_verified_cart_pole_full_run(run)
+        assert verified.manifest["format_version"] == 4
+        assert verified.cycles == result.cycles
+        assert verified.manifest["N"] == 1
+        assert verified.manifest["cycle_failure"]["sealed_step_count"] == 0  # stop密封晚于失败事实
+        assert verified.manifest["timing_summary"]["misses"] == 1
+        baseline = {p.name: p.read_bytes() for p in run.iterdir()}
+        for fault in ("omitted", "fake_complete", "fake_durable", "wrong_epoch", "wrong_step", "bool_ns", "missing_hash", "config", "failure_count"):
+            for name, raw in baseline.items():
+                (run / name).write_bytes(raw)
+            manifest = json.loads(baseline["run.json"])
+            timing = json.loads(baseline["timing.jsonl"])
+            if fault == "omitted":
+                (run / "timing.jsonl").write_bytes(b"")
+            elif fault == "fake_complete":
+                timing.update(status="confirmed", failure_phase=None, cycle_completed_ns=ns[0])
+            elif fault == "fake_durable":
+                timing["durable_step_count"] = 1
+            elif fault == "wrong_epoch":
+                timing["controller_epoch"] = "different-epoch"
+            elif fault == "wrong_step":
+                timing["global_step"] = 1
+            elif fault == "bool_ns":
+                timing["actual_sample_start_ns"] = True
+            elif fault == "missing_hash":
+                del manifest["timing_sha256"]
+            elif fault == "config":
+                manifest["timing_context"]["configuration_sha256"] = "0" * 64
+            else:
+                manifest["cycle_failure"]["physically_confirmed_count"] = 0
+                physical = json.loads(baseline["physical.json"])
+                physical["cycle_failure"] = manifest["cycle_failure"]
+                (run / "physical.json").write_bytes(_bytes(physical))
+                manifest["physical_sha256"] = hashlib.sha256((run / "physical.json").read_bytes()).hexdigest()
+            if fault != "omitted":
+                (run / "timing.jsonl").write_bytes(_bytes(timing))
+            if fault != "missing_hash":
+                manifest["timing_sha256"] = hashlib.sha256((run / "timing.jsonl").read_bytes()).hexdigest()
+            (run / "run.json").write_bytes(_bytes(manifest))
+            with pytest.raises(ValueError):
+                open_verified_cart_pole_full_run(run)
+        for name, raw in baseline.items():
+            (run / name).write_bytes(raw)
+        for process in parties:
+            out, err = process.communicate(timeout=20)
+            assert process.returncode == 0, (out, err)
+    finally:
+        reap_processes(parties)
+
+
+@pytest.mark.integration
+def test_scalar_shared_deadline_burns_prepared_round_before_any_send(tmp_path, monkeypatch, scalar_inputs):
+    """实际38门新鲜材料准备超期后不发material，失败session不可重试。"""
+    from secure_control.execution.cycle_timing import CycleDeadlineExceeded
+    _, _, modulus, evidence, program, certificate = scalar_inputs
+    paths = _plain_deployment(tmp_path)
+    parties = start_processes([[sys.executable, "-c", _PARTY, role, str(paths[role])]
+                              for role in ("P1", "P2")])
+    ns, sent = [0], []
+    original_prepare = scalar_runtime_module.prepare_scalar_round
+    original_send = scalar_runtime_module._send
+    try:
+        runtime = LanScalarRuntime(load_lan_config(paths["Client"], "Client"), program, certificate,
+                                   modulus=modulus, modulus_evidence=evidence,
+                                   run_id="cpu-boundary", epoch_id="energy", start_physical_step=0)
+        monkeypatch.setattr(secure_full_module.time, "perf_counter_ns", lambda: ns[0])
+        def prepare(*args, **kwargs):
+            material = original_prepare(*args, **kwargs)
+            ns[0] += 20_000_000
+            return material
+        def send(sock, frame, deadline):
+            sent.append(frame.operation)
+            return original_send(sock, frame, deadline)
+        monkeypatch.setattr(scalar_runtime_module, "prepare_scalar_round", prepare)
+        monkeypatch.setattr(scalar_runtime_module, "_send", send)
+        with pytest.raises(CycleDeadlineExceeded, match="截止"):
+            runtime.step({"p": 0., "v": 0., "beta": 2., "omega": .1}, 0, deadline_ns=20_000_000)
+        assert not sent and len(runtime._spent) == 38
+        assert runtime.protocol_committed_count == 0
+        with pytest.raises(RuntimeError):
+            runtime.step({"p": 0., "v": 0., "beta": 2., "omega": .1}, 0)
+    finally:
+        reap_processes(parties)
+
+
+@pytest.mark.parametrize("fault", ["last_cycle", "sealed_maintenance"])
+@pytest.mark.integration
+def test_full_v4_real_capture_segments_and_last_applied_cycle(tmp_path, monkeypatch, scalar_inputs, fault):
+    """真实full-v3控制/身份/密封，虚拟Clock+I/O预算验证段尾及最后一步，非性能测试。"""
+    from secure_control.execution import cycle_timing, lan_transport, localhost_transport
+    ns = [1_000_000]
+    paths = _plain_deployment(tmp_path)
+    design, swing, modulus, evidence, _, _ = scalar_inputs
+    monkeypatch.setattr(secure_full_module.time, "perf_counter_ns", lambda: ns[0])
+    monkeypatch.setattr(secure_full_module.time, "sleep", lambda seconds: ns.__setitem__(0, ns[0] + round(seconds * 1e9)))
+    # 冻结虚拟时间时，真实内核等待不能偷用另一个时钟的20ms；仍走真实frame/ACK校验。
+    remaining = cycle_timing.remaining_seconds
+    def virtual_remaining(deadline):
+        if isinstance(deadline, cycle_timing._CycleDeadline):
+            return max(0., (deadline.deadline_ns - ns[0]) / 20_000_000)
+        return remaining(deadline)
+    monkeypatch.setattr(lan_transport, "remaining_seconds", virtual_remaining)
+    monkeypatch.setattr(localhost_transport, "remaining_seconds", virtual_remaining)
+    original_end = LanSegmentedRuntime.end_segment
+    def late_end(runtime, **kwargs):
+        record = original_end(runtime, **kwargs)
+        if fault == "sealed_maintenance" and kwargs.get("deadline_ns") is not None:
+            ns[0] += 20_000_000
+        return record
+    monkeypatch.setattr(LanSegmentedRuntime, "end_segment", late_end)
+    def callback(step, *args):
+        if fault == "last_cycle" and step == 20:
+            ns[0] += 20_000_000
+    parties = start_processes([[sys.executable, "-c", _PARTY, role, str(paths[role])]
+                              for role in ("P1", "P2")])
+    try:
+        result = run_secure_full_experiment(
+            design.plant, design.balance,
+            replace(swing, initial_state=(0., 0., -.01, 0.), kick_steps=1,
+                    kick_force_n=.1, horizon_steps=20, acquisition_deadline_steps=20),
+            design, load_lan_config(paths["Client"], "Client"), modulus=modulus,
+            modulus_evidence=evidence, realtime=True, segment_capacity=3, on_step=callback,
+        )
+        n = 20 if fault == "last_cycle" else 4
+        assert result.physical.completed_steps == n
+        assert len(result.cycles) == n
+        assert result.cycles[-1].status == "miss_after_apply"
+        assert result.cycles[-1].global_step == n - 1
+        assert result.physical.failure_interval_step is None
+        assert [e["phase"] for e in result.epoch_events] == ["kick", "dynamic"]
+        verified = open_verified_cart_pole_full_run(write_cart_pole_full_run(result, tmp_path / fault))
+        assert verified.manifest["N"] == n
+        assert verified.cycles == result.cycles
+        assert verified.cycles[-1].protocol_committed_count == n
+        assert verified.manifest["cycle_failure"]["sealed_step_count"] == (19 if fault == "last_cycle" else 4)
+        assert all(c.scheduled_start_ns == result.cycles[0].scheduled_start_ns + c.global_step * 20_000_000
+                   for c in verified.cycles)
+    finally:
+        reap_processes(parties)
+
+
+def test_epoch_initialization_deadline_covers_connect_and_dynamic_cpu(tmp_path, monkeypatch, scalar_inputs):
+    """新epoch的认证连接与控制器核验都消费同一预算，不能刷新启动timeout。"""
+    from types import SimpleNamespace
+
+    from secure_control.execution import lan_runtime
+    from secure_control.execution.cycle_timing import CycleDeadlineExceeded
+    design, _, modulus, evidence, program, certificate = scalar_inputs
+    config = load_lan_config(_plain_deployment(tmp_path)["Client"], "Client")
+    ns = [0]
+    monkeypatch.setattr(secure_full_module.time, "perf_counter_ns", lambda: ns[0])
+    sock = SimpleNamespace(close=lambda: setattr(sock, "closed", True))
+    with monkeypatch.context() as patch:
+        def connect(*args):
+            ns[0] = 20_000_000
+            return sock
+        patch.setattr(scalar_runtime_module, "connect_role", connect)
+        with pytest.raises(CycleDeadlineExceeded):
+            LanScalarRuntime(config, program, certificate, modulus=modulus, modulus_evidence=evidence,
+                             run_id="r", epoch_id="e", start_physical_step=0, deadline_ns=20_000_000)
+        assert sock.closed
+    init = design.initialize(MeasurementSample(0, 0., 0., .1), velocity_seed=(0., 0.))
+    fixed, contract, _ = sustained_observer_numeric_contract(init, fractional_bits=32,
+                              parameter_bits=40, runtime_payload_bits=46, modulus=modulus)
+    distribute = lan_runtime.Client.distribute_controller
+    def slow_distribute(*args):
+        result = distribute(*args)
+        ns[0] += 20_000_000
+        return result
+    monkeypatch.setattr(lan_runtime.Client, "distribute_controller", slow_distribute)
+    monkeypatch.setattr(lan_runtime, "connect_role", lambda *a: pytest.fail("CPU已超期，不得建连"))
+    ns[0] = 0
+    with pytest.raises(CycleDeadlineExceeded):
+        LanSegmentedRuntime(config, init.spec, fixed, contract, 80, evidence, control=RunControl(),
+                            segment_capacity=3, full_run_id="r", previous_epoch_session="old",
+                            deadline_ns=20_000_000)
+
+
+@pytest.mark.parametrize("diagnostic", [False, True])
+def test_full_cli_and_gui_use_same_mode_and_report_unsealed_failure(tmp_path, monkeypatch, capsys, diagnostic):
+    """无显示窗口核对正式两入口默认保护及无密封失败事实，避免误报已验证成功。"""
+    import json
+    import runpy
+    import threading
+    from types import SimpleNamespace
+
+    from secure_control.scenarios.cart_pole.gui import FullRouteWindow
+    paths = _plain_deployment(tmp_path)
+    calls = []
+    failure = {"physical_step": 1, "status": "miss_before_apply"}
+    result = SimpleNamespace(epoch_events=(), physically_confirmed_count=1, cycle_failure=failure,
+                             cycles=(None, None), physical=SimpleNamespace(completed_steps=1,
+                                                   termination="failed", goal_met=False))
+    def run(*args, **kwargs):
+        calls.append(kwargs["realtime"])
+        return result
+    monkeypatch.setattr(secure_full_module, "run_secure_full_experiment", run)
+    argv = [str(ROOT / "scripts/run_cart_pole_client.py"), str(paths["Client"]),
+            "--full-route", "secure", "--full-output", str(tmp_path / "no-artifact")]
+    if diagnostic:
+        argv.append("--full-non-realtime")
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit) as exit_info:
+        runpy.run_path(argv[0], run_name="__main__")
+    assert exit_info.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["run_dir"] is None and payload["evidence_state"] == "no_sealed_prefix"
+    assert payload["physically_confirmed_count"] == 1 and not payload["goal_met"]
+    window = FullRouteWindow.__new__(FullRouteWindow)
+    window.route, window.realtime = "secure", not diagnostic
+    window.observer_path = ROOT / "configs/cart_pole_observer.yaml"
+    window.swing_path = ROOT / "configs/cart_pole_swing_up.yaml"
+    window.prime_path = ROOT / "configs/shared_prime_256_pocklington.yaml"
+    window.client_path = paths["Client"]
+    window.output, window.segment_steps = tmp_path / "no-gui-artifact", 3
+    window.stop_event, window._lock = threading.Event(), threading.Lock()
+    window._confirmed = lambda *args: None
+    window._work()
+    assert window._terminal == ("unsealed", (1, failure))
+    assert calls == [not diagnostic, not diagnostic]
+    assert not window.output.exists()
+
+
 def test_v3_codec_sends_topology_without_secret_constants(scalar_inputs):
     _, _, modulus, evidence, program, _ = scalar_inputs
     frame = ScalarFrameV3(

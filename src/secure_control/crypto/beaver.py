@@ -13,6 +13,9 @@ from .secret_sharing import AdditiveShare, TwoPartySharing
 class _TripleLifecycle:
     """记录一个三元组的分阶段使用状态，阻止跨乘法或跨参与方复用。"""
 
+    # 固定字段省去每份材料的实例字典；仍新建状态/集合并保留原弱引用能力。
+    __slots__ = ("__weakref__", "consumed", "finished_parties", "masked_parties", "opened", "owner")
+
     def __init__(self, owner: object) -> None:
         self.owner = owner
         self.masked_parties: set[int] = set()
