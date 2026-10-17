@@ -17,7 +17,9 @@
 
 真实socket就绪、FIFO积压和实际派发仍会增加开销。公开环记录入队/到期/首次尝试/就绪返回/推进/偏移及字节数，累计统计完整；超过1 ms而缺少既有FIFO积压或实际would-block解释的派发超出拒绝模型资格。select返回时刻是用户态观察，不宣称内核就绪时刻或独占CPU/GIL原因。所有实际时延仍计原20 ms，不给控制额外1 ms。公开环固定30 KiB、退出后编码总预算64 KiB，淘汰和首异常明确报告，不冒称保存全部块轨迹。
 
-Windows代理存在尚未到期的队首时，先以`select(0)`检查即时就绪；无事件则使用严格正的`time.sleep(min(剩余等待, 250微秒))`阻塞让出CPU，醒后重新核对原QPC到期时间。Python3.11在Windows使用waitable timer实现正sleep；不忙等或调用`sleep(0)`，不依赖正select timeout的亚毫秒精度。空闲或仅有已到期但不可写的队列保留原阻塞等待，仍须到期且可写才发送。宿主抢占仍可能超期，原1 ms模型门禁不变；不改系统计时器、优先级、生产角色或GC。
+Windows代理对尚未首次尝试的未来队首采用有界近到期检查：距due不超过500000ns时，只读QPC、非阻塞就绪和STOP，每次计划至多500000ns；就绪、due、资源检查点或本段上限到达即返回原外层。远期先检查即时事件，无事件才正sleep，最多`min(250000ns, remaining_to_due-500000ns, remaining_to_resource_check)`；不调用sleep(0)，不依赖正select timeout的亚毫秒精度。空FD不调用Windows select；空闲或仅有真实背压继续原阻塞等待，不忙重发已尝试块。非Windows沿原selector阻塞路径。
+
+此策略依据文末第14次续接，替代旧“每次无就绪必正sleep”的策略。每遍仍先公平推进到期首次发送，每方向至多一个原块；真实selector返回时刻与主动检查episode区间分别记录。宿主抢占仍可能使实际检查超过计划上限，保留真实值和全部原误差，不裁剪或扣除CPU开销，原1ms门禁不变。不改系统计时器、优先级、生产角色或GC。
 
 原动态n4/m2/p1、ell32、逐行Trunc/旧state出力、数值证明、双提交及材料一次性不变；库存16、preload0、light、段400。正常GC700/10/10、freeze0/debug0；保留既有控制前清理，不在控制内主动collect或调整GC。原历史预算Client最多32 MiB、party各16 MiB/合计48 MiB（定位1000使用原较小布局），材料8 MiB及各进程256 MiB保护保持；离散RSS不等于连续峰值。转发进程同样受256 MiB保护。
 
@@ -177,3 +179,28 @@ approval、manifest及第六项共同绑定`certificate_change_authorization_url
 
 新结果明确属于当前compact-v2源码加新证书条件，不能称为证书字节完全相同的配对A/B或排他的优化净收益。
 失败启动同样消费唯一调用；结果完整发布并独立只读审计后停止，仍不恢复10000、不自动返工或合并。
+
+## 第14次人工续接：有界等待与CPU保护，仅软件阶段
+
+[本次设计及直接用户批准](https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6235065606)仅允许修改实验relay等待及资源保护、对应软件测试和本文档。
+原六项历史、预留6000/实际3802、旧新证书和全部原件保留；本次新增性能调用/周期预算均0，不恢复候选/10000，不为后续试验生成证书或运行许可。
+上次e09807c的1000/1000完整按时、最大19.0414ms与79/16811读块模型误差超1ms仍归旧head/新证书条件，整体FAIL；新策略真实性能未知。
+
+固定guard和连续检查计划上限各500000ns，CPU完整观测窗目标100000000ns；初始参数不按软件/实际结果自动调节。
+CPU在外层约100ms资源检查点用QPC及process_time_ns采样，以真实相邻采样时刻作窗，不假定恰好100ms、不除以整机核数。
+完整窗须满足`2*cpu_delta_ns <= wall_delta_ns`；超过单核50%即RelayCpuLimitError、保存首超限窗并关闭relay，model_valid=false，无旧策略回退或容差放宽。
+该CPU包含relay服务观测区间的全部进程CPU，不从模型误差中扣除；短于100ms的退出尾窗单列且标complete_window=false，不能稀释已有超限完整窗。
+[CPU起止澄清](https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6235428785)：lifecycle累计量起于原started_qpc_ns，位于局部导入、selector/环/状态/模型准备之后、首个监听初始化之前；止于关闭资源后的最终QPC/CPU采样。
+它包括该区间的监听初始化、建连、等待/转发、资源检查及关闭，不包括起点前准备、最终采样后的报告整理/JSON编码/pipe发送与关闭、进程最后退出；不涵盖整个OS进程或纯控制期CPU。
+外层ended_qpc_ns不必等于CPU摘要结束点，不混用分母；lifecycle_complete=true仅表示服务区间最终采样完成，超限终窗也可完整观测而资格失败。
+窗口及连续检查上限是进程获调度后的检查策略，不是OS硬配额或排他CPU隔离；实际被抢占时长仍完整记录。
+
+报告追加`wait_policy.version=1`，含实际策略、guard/max_poll_episode/cpu_window纳秒参数、cpu_limit_percent=50、poll_episodes/poll_wall_ns/max_poll_wall_ns、
+cpu_complete_windows、峰值/首超限窗（含实际起止和cpu/wall delta）、实际退出尾窗、生命周期起止/累计CPU与wall及lifecycle_complete。
+失败取样的未知量不补零，cpu_sample_error_type明确；cleanup_error_type单列且不覆盖首个运行错误。时间/计数为整数ns，布尔状态另列。
+wait_kinds只追加4=bounded_poll，原0–3及15列/256行数值环、9项首异常时序保持；selector事件携带真实返回时刻，主动到期不伪造可写事件。
+新增摘要与旧记录仍受64KiB总预算约束；不缩环、删首异常或减累计。历史报告缺wait_policy表示未记录，不追认CPU通过。
+
+软件检查包括可控时钟驱动真实relay的旧近到期正sleep晚醒反例、N1/N2/N3/空FD/背压、到期公平与真实就绪、STOP/排空、资源检查点、
+CPU恰50%/超限/延长完整窗/不足尾窗/异常时钟、首错保护和满256行摘要边界，并沿用原短socket/TLS及协议功能夹具。
+软件fixture不形成性能资格；完成新head必要软件验证、提交推送及独立审查后停止，若审查需要再次源码返工先报告，不自动循环。

@@ -115,18 +115,21 @@ def test_full_queue_stops_reading_and_admits_only_available_room():
     assert direction.stats["received_bytes"] == 3 and direction.stats["queue_high_water"] == emulator.QUEUE_LIMIT
 
 
-@pytest.mark.parametrize("profile,empty_readers,late_sleep", (
-    ("N1", False, False), ("N2", False, False), ("N3", False, False),
-    ("N2", True, False), ("N2", False, True)))
-def test_windows_relay_due_does_not_depend_on_positive_select_timer(monkeypatch, profile, empty_readers, late_sleep):
+@pytest.mark.parametrize("profile,empty_readers,late_sleep,near_no_sleep", (
+    ("N1", False, False, False), ("N2", False, False, False), ("N3", False, False, False),
+    ("N2", True, False, False), ("N2", False, True, False), ("N2", False, False, True),
+    ("N3", False, True, False)))
+def test_windows_relay_due_does_not_depend_on_positive_select_timer(
+        monkeypatch, profile, empty_readers, late_sleep, near_no_sleep):
     """驱动真实代理循环：模拟正timeout延后一个tick，不运行socket或性能补测。"""
     clock = [1_000_000_000]
     stopped, reports = [False], []
     payload = b"opaque" * 246 + b"xx"
     written, idle_waits, sleeps = bytearray(), [], []
     startup_idle, blocked, waited_for_writable = [False], [False], [False]
-    selectors, sleeps_without_fds = [], []
+    selectors, empty_poll_reads = [], []
     scheduled_due = [None]
+    poll_preempted = [False]
 
     class Socket:
         def __init__(self, *_args):
@@ -217,13 +220,23 @@ def test_windows_relay_due_does_not_depend_on_positive_select_timer(monkeypatch,
                 clock[0] += 10_000
             else:
                 idle_waits.append(timeout)
-                clock[0] += 15_625_000 if timeout > 0 else 50_000
+                if late_sleep and profile == "N2" and not poll_preempted[0]:
+                    poll_preempted[0] = True
+                    clock[0] += 1_451_000  # 主动检查也会被抢占；原1ms门禁仍须失败。
+                else:
+                    clock[0] += 15_625_000 if timeout > 0 else 50_000
             return ready
 
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setattr(emulator.socket, "socket", socket_factory)
     monkeypatch.setattr(emulator.selectors, "DefaultSelector", Selector)
-    monkeypatch.setattr(emulator.time, "perf_counter_ns", lambda: clock[0])
+    def read_clock():
+        clock[0] += 1_000
+        if selectors and not selectors[0].mapping and scheduled_due[0] is not None and not blocked[0]:
+            empty_poll_reads.append(True)
+        return clock[0]
+    monkeypatch.setattr(emulator.time, "perf_counter_ns", read_clock)
+    monkeypatch.setattr(emulator.time, "process_time_ns", lambda: clock[0]//10)
     enqueue = emulator.Schedule.enqueue
     def remember_due(self, *args):
         row = enqueue(self, *args)
@@ -233,8 +246,7 @@ def test_windows_relay_due_does_not_depend_on_positive_select_timer(monkeypatch,
     def sleep(delay):
         assert 0 < delay <= min(.00025, (scheduled_due[0] - clock[0])/1e9)
         sleeps.append(delay)
-        sleeps_without_fds.append(not selectors[0].mapping)
-        clock[0] += math.ceil(delay * 10**9) + (15_625_000 if late_sleep else 0)
+        clock[0] += (1_451_000 if near_no_sleep else math.ceil(delay * 10**9) + (15_625_000 if late_sleep else 0))
     monkeypatch.setattr(emulator.time, "sleep", sleep)
     monkeypatch.setattr(benchmark, "_process_memory", lambda: {"current_rss_bytes": 32 * 1024**2})
     stop = SimpleNamespace(is_set=lambda: stopped[0], wait=lambda _timeout: pytest.fail("不应丢失活动FD"))
@@ -250,15 +262,21 @@ def test_windows_relay_due_does_not_depend_on_positive_select_timer(monkeypatch,
         assert report["first_anomaly"] is not None and direction["unexplained_over_tolerance"] > 0
     if profile != "N1":
         assert all(timeout == 0 for timeout in idle_waits)
-        assert sleeps and len(idle_waits) <= len(sleeps) + 1  # 每次无就绪都阻塞，不忙等。
-        assert any(sleeps_without_fds) is empty_readers
+        if profile == "N3":
+            assert sleeps  # 远期仍正sleep，到guard外沿后进入有界检查。
+        else:
+            assert not sleeps  # 近到期不再以正sleep主动让出CPU。
+        if not late_sleep:
+            assert report["wait_policy"]["poll_episodes"] > 0
+        if empty_readers:
+            assert empty_poll_reads
     else:
         assert not sleeps
     assert report["ring"][0][7] >= report["ring"][0][6]
     assert report["ring_version"] == 2 and report["ring"][0][13] == -1
     if late_sleep:
         snapshot = dict(zip(report["first_anomaly_timing_fields"], report["first_anomaly_timing"], strict=True))
-        assert snapshot["wait_kind"] == 2
+        assert snapshot["wait_kind"] == (4 if profile == "N2" else 2)
         assert snapshot["wait_returned_ns"] > snapshot["planned_wake_ns"]
         assert snapshot["send_ended_ns"] >= snapshot["send_started_ns"]
 
@@ -338,6 +356,156 @@ def test_relay_missing_or_excess_rss_still_fails_before_wait(monkeypatch, memory
         SimpleNamespace(is_set=lambda: False), SimpleNamespace(send=reports.append, close=lambda: None))
     assert reports[-1]["error_type"] == "MemoryError" and not reports[-1]["model_valid"]
     assert reports[-1]["first_failure"]["operation"] == "rss"
+
+
+def test_relay_cpu_windows_use_actual_intervals_keep_first_limit_and_partial_tail(monkeypatch):
+    wall, cpu = [1_000_000_000], [0]
+    monkeypatch.setattr(emulator.time, "perf_counter_ns", lambda: wall[0])
+    monkeypatch.setattr(emulator.time, "process_time_ns", lambda: cpu[0])
+    policy = emulator._WaitPolicy()
+    policy.start(wall[0], cpu[0])
+    for elapsed, consumed in ((100_000_000, 50_000_000), (300_000_000, 150_000_000)):
+        wall[0] += elapsed
+        cpu[0] += consumed
+        policy.sample_cpu()
+    assert policy.windows == 2 and policy.first_over is None
+    assert policy.next_cpu_check == 1_500_000_000  # 长窗从实际采样时点重新计时。
+    wall[0] += 100_000_000
+    cpu[0] += 50_000_001
+    with pytest.raises(emulator.RelayCpuLimitError):
+        policy.sample_cpu()
+    first = dict(policy.first_over)
+    assert first["wall_delta_ns"] == 100_000_000 and first["cpu_delta_ns"] == 50_000_001
+    wall[0] += 50_000_000
+    cpu[0] += 50_000_000
+    policy.sample_cpu(final=True)
+    report = policy.report()
+    assert report["cpu_complete_windows"] == 3 and report["first_cpu_limit_window"] == first
+    assert report["tail_cpu_window"] == {"start_qpc_ns": 1_500_000_000, "end_qpc_ns": 1_550_000_000,
+        "wall_delta_ns": 50_000_000, "cpu_delta_ns": 50_000_000, "complete_window": False}
+    assert report["lifecycle_wall_ns"] == 550_000_000 and report["lifecycle_cpu_ns"] == 300_000_001
+    assert report["lifecycle_complete"] and report["peak_cpu_window"] == first
+    for bad in (True, False, 1.5, -1, 2**63):
+        with pytest.raises(ValueError):
+            emulator._clock_ns(bad)
+    wall[0] -= 1
+    with pytest.raises(ValueError, match="倒退"):
+        policy.sample_cpu()
+    wall[0] += 1
+    cpu[0] -= 1
+    with pytest.raises(ValueError, match="倒退"):
+        policy.sample_cpu()
+
+
+def test_bounded_wait_edges_stop_readiness_resource_and_empty_sets(monkeypatch):
+    """可控QPC验证真实事件时刻；主动检查不读CPU/RSS、不处理字节流。"""
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(emulator.time, "process_time_ns", lambda: pytest.fail("CPU sampled inside wait"))
+    for mode, remaining in (("due", 396_000), ("guard", 500_000), ("outside", 500_001),
+            ("far", 3_000_000), ("empty", 396_000), ("idle", None), ("blocked", None),
+            ("event", 396_000), ("stop", 396_000), ("draining", 396_000),
+            ("resource", 396_000), ("preempted", 396_000)):
+        state = {"now": 1_000_000_000, "reads": 0, "stop": mode == "draining"}
+        calls, sleeps, waits = [], [], []
+        def clock(state=state):
+            if state["reads"]:
+                state["now"] += 1_000
+            state["reads"] += 1
+            return state["now"]
+        def select(timeout, state=state, mode=mode, calls=calls):
+            calls.append(timeout)
+            state["now"] += 2_000_000 if mode == "preempted" else 10_000
+            if mode == "stop":
+                state["stop"] = True
+            return [("actual-ready", emulator.selectors.EVENT_WRITE)] if mode == "event" else []
+        def sleep(delay, state=state, sleeps=sleeps):
+            sleeps.append(delay)
+            state["now"] += math.ceil(delay*1e9)
+        selector = SimpleNamespace(get_map=lambda mode=mode: {} if mode in ("empty", "idle") else {1: True}, select=select)
+        stop = SimpleNamespace(is_set=lambda state=state: state["stop"], wait=waits.append)
+        monkeypatch.setattr(emulator.time, "perf_counter_ns", clock)
+        monkeypatch.setattr(emulator.time, "sleep", sleep)
+        policy, ring = emulator._WaitPolicy(), emulator.PublicRing()
+        policy.start(state["now"], 0)
+        resource = state["now"]+(100_000 if mode == "resource" else 100_000_000)
+        selected, returned = emulator._wait_for_events(selector, stop,
+            None if remaining is None else state["now"]+remaining, resource, policy, ring, stopping=mode == "draining")
+        report = policy.report()
+        assert report["cpu_complete_windows"] == 0
+        if mode == "event":
+            assert selected and returned == ring.timing[2] == state["now"] and returned != ring.timing[1]
+        else:
+            assert not selected and returned is None
+        if mode in ("idle", "blocked"):
+            assert not sleeps and not report["poll_episodes"]
+            assert waits and not calls if mode == "idle" else calls and calls[0] > 0
+        elif mode in ("far", "outside"):
+            assert not report["poll_episodes"]
+            if mode == "far":
+                assert sleeps and 0 < sleeps[0] <= .00025
+        else:
+            assert report["poll_episodes"] == 1 and not sleeps
+            assert ring.timing[0] == 4 and report["poll_wall_ns"] == ring.timing[2]-ring.timing[1]
+            if mode == "preempted":
+                assert report["max_poll_wall_ns"] > 500_000 and ring.timing[2] > ring.timing[3]
+            else:
+                assert ring.timing[3]-ring.timing[1] <= 500_000
+                assert report["max_poll_wall_ns"] <= ring.timing[3]-ring.timing[1]+11_000
+            if mode == "empty":
+                assert not calls  # Windows空FD不交给selector。
+            if mode == "stop":
+                assert ring.timing[2] < ring.timing[3]
+            if mode == "resource":
+                assert ring.timing[3] == resource
+    # 已到资源检查点的立即返回清空旧等待，不能关联无关旧sleep。
+    ring.timing[:4] = [2, 1, 2, 2]
+    emulator._wait_for_events(selector, stop, None, 0, policy, ring)
+    assert ring.timing[:4] == [0, -1, -1, -1]
+
+
+@pytest.mark.parametrize("first_rss_failure", [False, True])
+def test_relay_cpu_failure_exports_full_bounded_ring_and_preserves_first_error(monkeypatch, first_rss_failure):
+    clock, cpu = [4_000_000_000_000_000_000], [0]
+    reports, closed = [], []
+    class Socket:
+        def close(self):
+            closed.append(True)
+            if first_rss_failure:
+                raise OSError("software cleanup failure")
+        def __getattr__(self, _name):
+            return lambda *a: None
+    def select(_timeout):
+        clock[0] += 120_000_000
+        cpu[0] += 60_000_001
+        return []
+    def close_selector():
+        clock[0] += 120_000_000
+        cpu[0] += 60_000_001  # 退出完整窗也要检查，但不能覆盖先发生的RSS错误。
+    selector = SimpleNamespace(register=lambda *a: None, get_map=lambda: {1: True}, select=select,
+                               close=close_selector)
+    monkeypatch.setattr(emulator.time, "perf_counter_ns", lambda: clock[0])
+    monkeypatch.setattr(emulator.time, "process_time_ns", lambda: cpu[0])
+    monkeypatch.setattr(emulator.socket, "socket", lambda *a: Socket())
+    monkeypatch.setattr(emulator.selectors, "DefaultSelector", lambda: selector)
+    monkeypatch.setattr(benchmark, "_process_memory", lambda: {"current_rss_bytes": None if first_rss_failure else 32*1024**2})
+    def fill_ring(_directions, _rotation, ring):
+        if not ring.seen:
+            for i in range(300):
+                ring.append((0, i*4096, 4096, clock[0], clock[0], 500_000, clock[0], clock[0]+2_000_000,
+                    4096, 0, 2_000_000, 0, clock[0]+1_000_000, -1, clock[0]))
+        return set()
+    monkeypatch.setattr(emulator, "_serve_due", fill_ring)
+    emulator._relay_main("N2", [("127.0.0.1", p, "127.0.0.2") for p in (1, 2, 3)],
+        SimpleNamespace(is_set=lambda: False), SimpleNamespace(send=reports.append, close=lambda: None))
+    report = reports[-1]
+    assert report["error_type"] == ("MemoryError" if first_rss_failure else "RelayCpuLimitError")
+    assert report["first_failure"]["operation"] == ("rss" if first_rss_failure else "cpu")
+    assert report["wait_policy"]["first_cpu_limit_window"]["cpu_delta_ns"] == 60_000_001
+    assert not report["model_valid"] and len(closed) == 3
+    assert report["cleanup_error_type"] == ("OSError" if first_rss_failure else None)
+    assert len(report["ring"]) == 256 and report["ring_evicted"] == 44 and report["first_anomaly"] is not None
+    assert len(report["first_anomaly_timing_fields"]) == 9 and report["wait_kinds"]["4"] == "bounded_poll"
+    assert len(json.dumps(report, separators=(",", ":")).encode()) <= 64*1024
 
 
 def _entry(profile, *, passed=True, head="a", sources=None, phase="discovery"):

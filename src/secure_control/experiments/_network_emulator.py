@@ -21,6 +21,90 @@ QUEUE_LIMIT = 1024 * 1024
 READ_LIMIT = 4096
 MODEL_TOLERANCE_NS = 1_000_000
 DIRECTIONS = ("Client->P1", "P1->Client", "Client->P2", "P2->Client", "P2->P1", "P1->P2")
+WAIT_GUARD_NS = 500_000
+MAX_POLL_EPISODE_NS = 500_000
+CPU_WINDOW_NS = 100_000_000
+
+
+def _clock_ns(value):
+    """时间事实仅接受非负整数；不截断浮点或把布尔值当ns。"""
+    if type(value) is not int or not 0 <= value < 2**63:
+        raise ValueError("转发器时钟必须是非负有符号64位整数ns。")
+    return value
+
+
+class RelayCpuLimitError(RuntimeError):
+    """完整实际观测窗超过单核50%；不能用CPU开销解释掉模型误差。"""
+
+
+class _WaitPolicy:
+    """单个relay拥有的有界等待/CPU累计事实，无逐窗列表或额外采样线程。"""
+
+    def __init__(self):
+        self.start_wall = self.start_cpu = self.wall = self.cpu = None
+        self.poll_count = self.poll_wall = self.poll_max = self.windows = 0
+        self.peak = self.first_over = self.tail = None
+        self.sample_error = None
+        self.final_sample_complete = False
+
+    def start(self, wall, cpu):
+        self.start_wall = self.wall = _clock_ns(wall)
+        self.start_cpu = self.cpu = _clock_ns(cpu)
+
+    @property
+    def next_cpu_check(self):
+        """从上次实际采样计时；延后的窗口不得伪装为固定100ms。"""
+        return self.wall + CPU_WINDOW_NS
+
+    def sample_cpu(self, *, final=False):
+        """仅在外层资源点和退出时采样，超限窗先保存再抛错。"""
+        wall, cpu = _clock_ns(time.perf_counter_ns()), _clock_ns(time.process_time_ns())
+        if wall < self.wall or cpu < self.cpu:
+            raise ValueError("转发器CPU或QPC时钟倒退。")
+        elapsed, consumed = wall-self.wall, cpu-self.cpu
+        complete = elapsed >= CPU_WINDOW_NS
+        if not complete and not final:
+            return
+        row = {"start_qpc_ns": self.wall, "end_qpc_ns": wall,
+               "cpu_delta_ns": consumed, "wall_delta_ns": elapsed, "complete_window": complete}
+        self.wall, self.cpu = wall, cpu
+        if final:
+            self.tail = row
+            self.final_sample_complete = True
+        if complete:
+            self.windows += 1
+            if self.peak is None or consumed*self.peak["wall_delta_ns"] > self.peak["cpu_delta_ns"]*elapsed:
+                self.peak = row
+            if 2*consumed > elapsed:
+                if self.first_over is None:
+                    self.first_over = row
+                raise RelayCpuLimitError("转发器完整CPU观测窗超过单核50%。")
+
+    def poll_finished(self, start, end):
+        """保留真实持续时间；被抢占超过计划上限时不裁剪。"""
+        _clock_ns(start)
+        _clock_ns(end)
+        if end < start:
+            raise ValueError("转发器主动检查QPC倒退。")
+        self.poll_count += 1
+        self.poll_wall += end-start
+        self.poll_max = max(self.poll_max, end-start)
+
+    def report(self):
+        """仅追加固定大小的公开摘要；旧报告缺此字段表示未记录。"""
+        return {"version": 1, "strategy": "bounded-near-due-v1" if sys.platform == "win32" else "selector-blocking",
+            "guard_ns": WAIT_GUARD_NS, "max_poll_episode_ns": MAX_POLL_EPISODE_NS,
+            "cpu_window_ns": CPU_WINDOW_NS, "cpu_limit_percent": 50,
+            "poll_episodes": self.poll_count, "poll_wall_ns": self.poll_wall, "max_poll_wall_ns": self.poll_max,
+            "cpu_complete_windows": self.windows, "peak_cpu_window": self.peak,
+            "first_cpu_limit_window": self.first_over, "tail_cpu_window": self.tail,
+            "cpu_sample_error_type": self.sample_error,
+            "lifecycle_start_qpc_ns": self.start_wall, "lifecycle_end_qpc_ns": self.wall,
+            "lifecycle_start_cpu_ns": self.start_cpu, "lifecycle_end_cpu_ns": self.cpu,
+            "lifecycle_wall_ns": None if self.start_wall is None else self.wall-self.start_wall,
+            "lifecycle_cpu_ns": None if self.start_cpu is None else self.cpu-self.start_cpu,
+            "lifecycle_complete": self.final_sample_complete,
+            "scope": "actual process CPU / actual QPC wall; one-core ratio; relay service interval after imports, includes socket startup/exit; sampled guard, not OS quota"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,13 +311,77 @@ def _serve_due(directions, rotation, ring):
     return serviced
 
 
+def _wait_for_events(selector, stop, future_due, wake_at, policy, ring, *, stopping=False):
+    """只等待并返回真实就绪时刻；所有收发/FIFO仍由原外层循环处理。"""
+    ring.timing[:4] = [0, -1, -1, -1]
+    now = _clock_ns(time.perf_counter_ns())
+    if now >= wake_at or stop.is_set() and not stopping:
+        return [], None
+    if sys.platform == "win32" and future_due is not None:
+        if future_due <= now:
+            return [], None
+        if future_due-now <= WAIT_GUARD_NS:
+            start = now
+            deadline = min(future_due, wake_at, start+MAX_POLL_EPISODE_NS)
+            ring.timing[:4] = [4, start, -1, deadline]
+            selected, returned, last = [], None, start
+            try:
+                while True:
+                    now = _clock_ns(time.perf_counter_ns())
+                    if now < last:
+                        raise ValueError("转发器主动检查QPC倒退。")
+                    last = now
+                    if now >= deadline or stop.is_set() and not stopping:
+                        break
+                    # Windows不接受空FD；空集合时仅检查QPC/STOP，仍受同一episode上限。
+                    if selector.get_map():
+                        selected = selector.select(0)
+                        returned = _clock_ns(time.perf_counter_ns())
+                        if returned < last:
+                            raise ValueError("转发器selector返回QPC倒退。")
+                        last = returned
+                        if selected:
+                            break
+            finally:
+                ring.timing[2] = last
+                policy.poll_finished(start, last)
+            return selected, returned if selected else None
+        # 远期先服务即时事件；正sleep仅走到guard外沿，醒后回外层重新求due。
+        if selector.get_map():
+            ring.timing[:4] = [1, now, -1, now]
+            selected = selector.select(0)
+            returned = _clock_ns(time.perf_counter_ns())
+            ring.timing[2] = returned
+            if selected:
+                return selected, returned
+        now = _clock_ns(time.perf_counter_ns())
+        delay = min(250_000, future_due-now-WAIT_GUARD_NS, wake_at-now)
+        if delay > 0:
+            ring.timing[:4] = [2, now, -1, now+delay]
+            time.sleep(delay/1e9)
+            ring.timing[2] = _clock_ns(time.perf_counter_ns())
+        return [], None
+    # 没有未来首次发送（含仅真实背压）、空闲和非Windows路径保留阻塞。
+    wait = min(100_000_000, wake_at-now)/1e9
+    ring.timing[:4] = [1 if selector.get_map() else 3, now, -1, now+int(wait*1e9)]
+    if selector.get_map():
+        selected = selector.select(wait)
+        returned = _clock_ns(time.perf_counter_ns())
+        ring.timing[2] = returned
+        return selected, returned if selected else None
+    stop.wait(wait)
+    ring.timing[2] = _clock_ns(time.perf_counter_ns())
+    return [], None
+
+
 def _relay_main(profile, endpoints, stop, pipe):
     """一个临时子进程、一个selector，三连接六方向；TLS在原角色内完成。"""
     from .communication_benchmark import _process_memory
 
     selector = selectors.DefaultSelector()
     listeners, sockets, directions, pending = [], [], [], {}
-    ring, error, ready = PublicRing(), None, False
+    ring, policy, error, ready = PublicRing(), _WaitPolicy(), None, False
+    cleanup_error = None
     failure_at, operation, event_direction, error_errno, error_winerror = None, "startup", None, None, None
     peak, next_memory, stopping_at = 0, 0, None
     accepted = set()
@@ -245,6 +393,7 @@ def _relay_main(profile, endpoints, stop, pipe):
     link_models = models(profile)
     started = time.perf_counter_ns()
     try:
+        policy.start(started, time.process_time_ns())
         for index, (host, port, backend) in enumerate(endpoints):
             listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             listeners.append(listener)
@@ -263,6 +412,9 @@ def _relay_main(profile, endpoints, stop, pipe):
             serviced = _serve_due(directions, rotation, ring)
             rotation = (rotation + 1) % max(1, len(directions))
             now = time.perf_counter_ns()
+            if now >= policy.next_cpu_check:
+                operation, event_direction = "cpu", None
+                policy.sample_cpu()
             if now >= next_memory:
                 operation, event_direction = "rss", None
                 ring.timing[5] = time.perf_counter_ns()
@@ -279,7 +431,8 @@ def _relay_main(profile, endpoints, stop, pipe):
                     break
                 if now-stopping_at > 5_000_000_000:
                     raise TimeoutError("网络队列关闭排空超时。")
-            next_due = next_memory
+            next_due = min(next_memory, policy.next_cpu_check)
+            future_due = None
             # 后端监听可能稍晚于P2拨号；只在尚未转发字节的建连阶段等待。
             # 使用同一selector，不让一条启动连接阻塞其他TLS字节流。
             for index, connection in list(pending.items()):
@@ -314,6 +467,8 @@ def _relay_main(profile, endpoints, stop, pipe):
                         mask |= selectors.EVENT_WRITE
                     else:
                         next_due = min(next_due, due)
+                        if incoming.queue[0].first_attempt is None:
+                            future_due = due if future_due is None else min(future_due, due)
                 if incoming.eof and not incoming.queue and not incoming.shutdown:
                     operation, event_direction = "shutdown_write", incoming.name
                     sock.shutdown(socket.SHUT_WR)
@@ -330,40 +485,9 @@ def _relay_main(profile, endpoints, stop, pipe):
                         selector.modify(sock, mask, key.data)
             if len(directions) == 6 and not pending and all(d.eof and d.shutdown and not d.queue for d in directions):
                 break
-            wait = max(0., min(.1, (next_due-time.perf_counter_ns())/1e9))
-            operation, event_direction = "select", None
-            if sys.platform == "win32" and any(d.queue and d.queue[0].due > now for d in directions):
-                # 正select timeout不能充当亚毫秒定时器；先处理即时就绪，无事件才阻塞让出CPU。
-                # Python3.11在Windows以waitable timer执行正sleep；每次最多250us后重新核对QPC。
-                selected = []
-                if selector.get_map():
-                    ring.timing[:4] = [1, time.perf_counter_ns(), -1, 0]
-                    ring.timing[3] = ring.timing[1]
-                    selected = selector.select(0)
-                    ring.timing[2] = time.perf_counter_ns()
-                if not selected:
-                    remaining = (next_due-time.perf_counter_ns())/1e9
-                    if remaining > 0:
-                        operation = "release_wait"
-                        delay = min(remaining, .00025)
-                        ring.timing[:4] = [2, time.perf_counter_ns(), -1, 0]
-                        ring.timing[3] = ring.timing[1] + int(delay * 1e9)
-                        time.sleep(delay)
-                        ring.timing[2] = time.perf_counter_ns()
-                    continue
-            else:
-                # Windows select不接受空集合；空闲或已到期但不可写时保留原阻塞等待。
-                if not selector.get_map():
-                    ring.timing[:4] = [3, time.perf_counter_ns(), -1, 0]
-                    ring.timing[3] = ring.timing[1] + int(wait * 1e9)
-                    stop.wait(wait)
-                    ring.timing[2] = time.perf_counter_ns()
-                    continue
-                ring.timing[:4] = [1, time.perf_counter_ns(), -1, 0]
-                ring.timing[3] = ring.timing[1] + int(wait * 1e9)
-                selected = selector.select(wait)
-                ring.timing[2] = time.perf_counter_ns()
-            writable_at = time.perf_counter_ns()
+            operation, event_direction = "wait", None
+            selected, writable_at = _wait_for_events(selector, stop, future_due, next_due, policy, ring,
+                                                     stopping=stopping_at is not None)
             for key, mask in selected:
                 if key.data[0] == "accept":
                     operation, event_direction = "accept", None
@@ -416,17 +540,35 @@ def _relay_main(profile, endpoints, stop, pipe):
         failure_at = time.perf_counter_ns()
         error_errno, error_winerror = getattr(failure, "errno", None), getattr(failure, "winerror", None)
     finally:
-        selector.close()
-        for sock in (*sockets, *listeners):
-            sock.close()
+        resources = [selector, *sockets, *listeners]
         for connection in pending.values():
-            connection["front"].close()
+            resources.append(connection["front"])
             if connection["rear"] is not None:
-                connection["rear"].close()
+                resources.append(connection["rear"])
+        for resource in resources:
+            try:
+                resource.close()
+            except Exception as failure:  # noqa: BLE001 - 继续关闭其余资源且不覆盖首错。
+                cleanup_error = cleanup_error or type(failure).__name__
+                if error is None:
+                    error, operation, event_direction = type(failure).__name__, "cleanup", None
+                    failure_at = time.perf_counter_ns()
+                    error_errno, error_winerror = getattr(failure, "errno", None), getattr(failure, "winerror", None)
+        # 退出窗不稀释完整超限窗；后续采样错误不得覆盖已经保留的首个运行错误。
+        try:
+            if policy.start_cpu is not None:
+                policy.sample_cpu(final=True)
+        except Exception as failure:  # noqa: BLE001 - 公开类别，保留既有首错。
+            if not isinstance(failure, RelayCpuLimitError):
+                policy.sample_error = type(failure).__name__
+            if error is None:
+                error, operation, event_direction = type(failure).__name__, "cpu_exit", None
+                failure_at = time.perf_counter_ns()
         public = {d.name: {**d.stats, "queued_at_exit": d.queued, "read_eof": d.eof,
             "write_shutdown": d.shutdown} for d in directions}
         report = {"profile": profile, "seed": SEED, "pid": mp.current_process().pid,
             "ready": ready, "error_type": error, "directions": public,
+            "cleanup_error_type": cleanup_error,
             "accepted_connections": len(accepted), "peak_sampled_rss_bytes": peak,
             "backend_connection_attempts": connection_attempts,
             "started_qpc_ns": started, "ended_qpc_ns": time.perf_counter_ns(),
@@ -438,7 +580,8 @@ def _relay_main(profile, endpoints, stop, pipe):
             "ring_version": 2, "missing_writable_return_ns": -1,
             "first_anomaly_timing_fields": PublicRing.TIMING_FIELDS,
             "first_anomaly_timing": ring.first_anomaly_timing,
-            "wait_kinds": {"0": "none", "1": "selector", "2": "release_wait", "3": "stop_wait"},
+            "wait_kinds": {"0": "none", "1": "selector", "2": "release_wait", "3": "stop_wait", "4": "bounded_poll"},
+            "wait_policy": policy.report(),
             "ring_capacity": ring.CAPACITY, "ring_reserved_bytes": len(ring.data)*ring.data.itemsize,
             "ring_evicted": max(0, ring.seen-ring.CAPACITY), "encoded_limit": 64*1024,
             "first_failure": {"error_type": error, "qpc_ns": failure_at, "operation": operation,
