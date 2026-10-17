@@ -16,6 +16,7 @@ import tempfile
 import time
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, replace
+from functools import cache
 from hashlib import sha256
 from itertools import count, pairwise
 from math import isfinite
@@ -30,6 +31,7 @@ import numpy as np
 from secure_control.execution.lan_config import LanConfig, LanEndpoint, LanTopology, load_lan_config
 from secure_control.execution.lan_runtime import LanContinuousRuntime, run_party_single_step
 from secure_control.execution.lan_scalar_runtime import LanScalarRuntime
+from secure_control.execution.localhost_codec import _COMPACT_PROFILE_V2
 
 _ROOT = Path(__file__).resolve().parents[3]
 
@@ -151,7 +153,10 @@ class _CompactHistory:
     DIRECTIONS = ("Client->P1", "Client->P2", "P1->Client", "P1->P2", "P2->Client", "P2->P1")
 
     @classmethod
-    def schemas(cls, role, steps, *, qualification=False):
+    def schemas(cls, role, steps, *, qualification=False, wire_profile=None):
+        if wire_profile not in (None, _COMPACT_PROFILE_V2):
+            raise ValueError("非法维护历史版本")
+        phases = (*cls.PHASES, "maintenance_advance") if wire_profile else cls.PHASES
         if (role not in ("Client", "P1", "P2") or type(steps) is not int or type(qualification) is not bool
                 or not (steps == 10000 if qualification else 1 <= steps <= 4000)):
             raise ValueError("非法紧凑历史范围")
@@ -163,7 +168,7 @@ class _CompactHistory:
         if role == "Client":
             row.update({("segment_index",): "u", ("session_id",): 128, ("status",): 64,
                         ("duration_ms",): "d", ("failure_phase",): 64, ("error_type",): 64})
-            mapping(row, "components_ms", ((k+"_ms", "d") for k in cls.PHASES))
+            mapping(row, "components_ms", ((k+"_ms", "d") for k in phases))
             mapping(row, "storage", ((k, "u" if k.endswith("count") else "d") for k in cls.STORAGE))
         mapping(row, activity_name, ((k, "d") for k in cls.ACTIVITY))
         row[("sent",)] = "m"
@@ -179,7 +184,7 @@ class _CompactHistory:
                 "cycle_completed_ns", "protocol_committed_count", "physically_confirmed_count", "durable_step_count",
                 "format_version")})
             cycle.update({("status",): 64, ("failure_phase",): 64})
-            mapping(cycle, "phase_durations_ns", ((k, "u") for k in cls.PHASES))
+            mapping(cycle, "phase_durations_ns", ((k, "u") for k in phases))
             mapping(cycle, "queue_levels", ((k, "u") for k in cls.QUEUE))
             for name in ("public_frame_counts", "public_byte_counts"):
                 mapping(cycle, name, ((k, "u") for k in cls.DIRECTIONS))
@@ -188,11 +193,12 @@ class _CompactHistory:
         return tables
 
     @classmethod
-    def layout(cls, role, steps=4000, *, qualification=False):
+    def layout(cls, role, steps=4000, *, qualification=False, wire_profile=None):
         if type(qualification) is not bool or qualification and (steps != 10000 or role not in {"Client", "P1", "P2"}):
             raise ValueError("资格历史只支持固定10000及三个原角色。")
         tables = {}
-        for name, (capacity, schema) in cls.schemas(role, steps, **({"qualification": True} if qualification else {})).items():
+        for name, (capacity, schema) in cls.schemas(role, steps, qualification=qualification,
+                                                  wire_profile=wire_profile).items():
             row_bytes = sum(1 + (code+2 if type(code) is int else 8 if code in ("u", "d") else 0)
                             for code in schema.values())
             tables[name] = {"capacity": capacity, "row_bytes": row_bytes, "buffer_bytes": capacity*row_bytes,
@@ -206,13 +212,14 @@ class _CompactHistory:
         return {"role": role, "tables": tables, "buffer_bytes": buffer_bytes,
                 "metadata_bound_bytes": 512*1024, "reserved_bound_bytes": reserved, "limit_bytes": limit}
 
-    def __init__(self, role, steps=4000, *, qualification=False):
+    def __init__(self, role, steps=4000, *, qualification=False, wire_profile=None):
         if type(qualification) is not bool:
             raise ValueError("资格历史选择必须为bool。")
         self.role, self.target = role, steps
-        self.layout_info = self.layout(role, steps, **({"qualification": True} if qualification else {}))
+        self.wire_profile = wire_profile
+        self.layout_info = self.layout(role, steps, qualification=qualification, wire_profile=wire_profile)
         self.tables = {k: _HistoryTable(n, schema) for k, (n, schema) in
-                       self.schemas(role, steps, **({"qualification": True} if qualification else {})).items()}
+                       self.schemas(role, steps, qualification=qualification, wire_profile=wire_profile).items()}
         self.threads, self.error_type = [], None
         self.tail_correction = None
         self.last_confirmed_step = self.last_confirmed_return_qpc_ns = self.normal_stop_start_qpc_ns = None
@@ -317,7 +324,9 @@ class _CompactHistory:
     def report(self):
         tables = {name: {"captured": t.count, "expanded": t.expanded_count, "error_type": t.error_type,
                          "expansion_error_type": t.expansion_error_type} for name, t in self.tables.items()}
-        return {"role": self.role, "format_version": 1, "layout": self.layout_info, "tables": tables,
+        return {"role": self.role, "format_version": 2 if self.wire_profile else 1,
+            **({"wire_profile": self.wire_profile} if self.wire_profile else {}),
+            "layout": self.layout_info, "tables": tables,
             "representation_complete": self.error_type is None and all(t.error_type is None
                 and t.expansion_error_type is None and t.expanded_count == t.count for t in self.tables.values()),
             "error_type": self.error_type, "threads": self.threads, "preallocated_memory": self.preallocated_memory,
@@ -1158,7 +1167,8 @@ class _TraceSocket:
         except BaseException as error:
             ended = observer.wall()
             origin = "socket_send" if operation == "send" else "socket_recv" if operation == "recv" else "unknown"
-            recoverable = (operation == "recv" and getattr(observer.state, "qpc_receive_probe", None) is self
+            recoverable = ((operation == "recv" and getattr(observer.state, "qpc_receive_probe", None) is self
+                            or operation in {"send", "recv"} and getattr(observer.state, "duplex_probe", None) is self)
                            and isinstance(error, (BlockingIOError, ssl.SSLWantReadError, ssl.SSLWantWriteError)))
             self.native_error = None if recoverable else origin
             record = observer.values(self, operation, started, ended, requested=requested,
@@ -1544,10 +1554,47 @@ class _StageWaitDiagnostic(_TimeoutDiagnostic):
                      "stage_batch", self._public(request.session_id), self._public(request.round_id),
                      self._public(request.step), self._public(request.sequence), *self.run_identity, self._public(request.step)))
                 def replied(sock, request, *args, **kwargs):
-                    selected = (request.operation == "endpoint"
+                    selected = (request.operation == "online_stage" or request.operation == "endpoint"
                                 and getattr(request.payload, "operation", None) == "stage_batch")
                     return (stage_reply if selected else reply)(sock, request, *args, **kwargs)
                 install(lan_runtime, "_party_reply", replied)
+                exchange = _localhost_peer._exchange_frame
+                def duplex(sock, payload, *, deadline, limit):
+                    # 同阶段双向帧的瞬态 WANT 只在这个原调用内可恢复，不污染终止首错。
+                    try:
+                        probe = self.probe(sock)
+                    except Exception as error:  # noqa: BLE001 - 观察失败不改变原传输。
+                        self._observe_error(error)
+                        return exchange(sock, payload, deadline=deadline, limit=limit)
+                    previous = (probe.deadline, probe.context, probe.direction, probe.part,
+                                probe.confirmed, probe.frame_requested, probe.current_entry)
+                    previous_probe = getattr(self.state, "duplex_probe", None)
+                    self.state.duplex_probe = probe
+                    probe.deadline, probe.context = deadline, getattr(self.state, "context", None)
+                    probe.direction, probe.part = "duplex", "duplex_frame"
+                    probe.confirmed, probe.frame_requested, probe.current_entry = 0, len(payload)+4, None
+                    probe.native_error = None
+                    started = self.wall()
+                    try:
+                        return exchange(probe, payload, deadline=deadline, limit=limit)
+                    except BaseException as error:
+                        from secure_control.execution.cycle_timing import remaining_seconds
+                        origin = ("absolute_precheck" if isinstance(error, TimeoutError)
+                                  and remaining_seconds(deadline) <= 0 else probe.native_error or "unknown")
+                        if origin == "absolute_precheck" and probe.native_error is None:
+                            probe.current_entry = None  # 没有观察到该期限检查入口，不能借用已返回的 native 入口。
+                        record = self.values(probe, "frame_exchange", started, self.wall(),
+                            error=error, origin=origin)
+                        self.failed(record)
+                        if self.outer_failure is None:
+                            self.outer_failure = record
+                        self.put("critical", record)
+                        raise
+                    finally:
+                        self.state.duplex_probe = previous_probe
+                        (probe.deadline, probe.context, probe.direction, probe.part,
+                         probe.confirmed, probe.frame_requested, probe.current_entry) = previous
+                install(_localhost_peer, "_exchange_frame", duplex)
                 for name in ("exchange_products", "product_complete", "send_truncations", "receive_truncations", "state_complete"):
                     owner = _localhost_peer.LocalhostProtocol3PeerPort
                     install(owner, name, self._wrapped(getattr(owner, name), name,
@@ -1636,20 +1683,30 @@ def _source_fingerprints(extra=()):
     return {name: sha256((_ROOT / name).read_bytes()).hexdigest() for name in (*paths, *extra)}
 
 
+@cache
+def _windows_memory_api():
+    """每进程只初始化结构和函数签名；不保存任何 RSS 样本。"""
+    import ctypes
+    from ctypes import wintypes
+    class Counters(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("faults", wintypes.DWORD),
+                    *((name, ctypes.c_size_t) for name in (
+                        "peak", "current", "peak_paged", "paged", "peak_nonpaged",
+                        "nonpaged", "pagefile", "peak_pagefile"))]
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    api = ctypes.WinDLL("psapi", use_last_error=True)
+    kernel.GetCurrentProcess.restype = wintypes.HANDLE
+    api.GetProcessMemoryInfo.argtypes = (wintypes.HANDLE, ctypes.POINTER(Counters), wintypes.DWORD)
+    kernel.GetCurrentProcess.argtypes = ()
+    api.GetProcessMemoryInfo.restype = wintypes.BOOL
+    return Counters, kernel, api
+
+
 def _process_memory():
-    """读取本进程 OS 峰值 RSS/working set；不把 canonical 编码预算当成 RSS。"""
+    """每次重新读取 OS RSS/working set；仅缓存平台 API 绑定。"""
     if os.name == "nt":
         import ctypes
-        from ctypes import wintypes
-        class Counters(ctypes.Structure):
-            _fields_ = [("cb", wintypes.DWORD), ("faults", wintypes.DWORD),
-                        *((name, ctypes.c_size_t) for name in (
-                            "peak", "current", "peak_paged", "paged", "peak_nonpaged",
-                            "nonpaged", "pagefile", "peak_pagefile"))]
-        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-        api = ctypes.WinDLL("psapi", use_last_error=True)
-        kernel.GetCurrentProcess.restype = wintypes.HANDLE
-        api.GetProcessMemoryInfo.argtypes = (wintypes.HANDLE, ctypes.POINTER(Counters), wintypes.DWORD)
+        Counters, kernel, api = _windows_memory_api()
         value = Counters()
         value.cb = ctypes.sizeof(value)
         if not api.GetProcessMemoryInfo(kernel.GetCurrentProcess(), ctypes.byref(value), value.cb):
@@ -1739,10 +1796,7 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
             diagnostic.end(token, status=status, direction=direction,
                            public_bytes=len(value) if isinstance(value, bytes) else None)
 
-    def measured(sock, payload, deadline):
-        started = time.perf_counter_ns()
-        if delay_ms:
-            time.sleep(delay_ms / 1000)
+    def count_frame(sock, length):
         local = sock.getsockname()[1]
         remote = sock.getpeername()[1]
         if role == "Client":
@@ -1754,7 +1808,14 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
         direction = f"{role}->{recipient}"
         entry = counts.setdefault(direction, {"frames": 0, "application_bytes": 0})
         entry["frames"] += 1
-        entry["application_bytes"] += len(payload)
+        entry["application_bytes"] += length
+        return direction
+
+    def measured(sock, payload, deadline):
+        started = time.perf_counter_ns()
+        if delay_ms:
+            time.sleep(delay_ms / 1000)
+        direction = count_frame(sock, len(payload))
         # S0区间包住原_send_exact；原meter另含公开计数/注入等待，不声称纯OS耗时。
         token = diagnostic.begin("send_ms") if diagnostic and diagnostic.supply else None
         status = "complete"
@@ -1786,12 +1847,23 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
     from secure_control.execution import _localhost_peer, lan_runtime
     from secure_control.protocol import coordinator
 
+    original_exchange = _localhost_peer._exchange_frame
+    def exchanged(sock, payload, *, deadline, limit):
+        # 与旧 _send_exact 相同：包含4字节帧头，失败调用也保留已尝试发送计数。
+        count_frame(sock, len(payload) + 4)
+        return original_exchange(sock, payload, deadline=deadline, limit=limit)
+    observations.enter_context(patch.object(_localhost_peer, "_exchange_frame", exchanged))
+    observations.enter_context(patch.object(_localhost_peer, "encode_envelope",
+        timed("encode_ms", _localhost_peer.encode_envelope)))
+    observations.enter_context(patch.object(_localhost_peer, "decode_envelope",
+        timed("decode_ms", _localhost_peer.decode_envelope)))
+
     if gc_boundaries is not None and role != "Client":
         # 每层保留独立前驱；后续诊断包装不能重绑定本层闭包而形成自递归。
         boundary_receive = lan_runtime.receive_envelope
         def boundary_request(*args, **kwargs):
             request = boundary_receive(*args, **kwargs)
-            if request.sender == "Client" and request.operation == "online" and "begin" not in gc_boundaries:
+            if request.sender == "Client" and request.operation in {"online", "online_stage"} and "begin" not in gc_boundaries:
                 gc_boundaries["begin"] = {"stats": gc.get_stats(), "enabled": gc.isenabled(),
                                            "threshold": list(gc.get_threshold())}
             if (request.sender == "Client" and request.operation == "segment_end"
@@ -1944,14 +2016,15 @@ def _party_job(
     diagnostic_enabled=False, full_observation=False, tcp_nodelay=None, supply_diagnostic=False,
     timeout_trace=False, material_comparison=False, worker_wait_diagnostic=False, server_gc_candidate=False,
     stage_wait_diagnostic=False, compact_history_candidate=False, compact_history_steps=4000,
-    compact_history_qualification=False,
+    compact_history_qualification=False, network_observation=False, wire_profile=None,
 ) -> None:
     role_steps = []
     history = None
     if compact_history_candidate:
         try:
             history = _CompactHistory(config.role, compact_history_steps,
-                **({"qualification": True} if compact_history_qualification else {}))
+                **({"qualification": True} if compact_history_qualification else {}),
+                **({"wire_profile": wire_profile} if wire_profile == _COMPACT_PROFILE_V2 else {}))
         except Exception as error:  # noqa: BLE001 - 启动失败不建角色，不隐去缺失记录
             queue.put({"role": config.role, "status": "failed", "error_type": type(error).__name__,
                        "steps": [], "directions": {}, "activity_ms": {},
@@ -1961,6 +2034,9 @@ def _party_job(
     diagnostic = (_TimeoutDiagnostic(config.role, ports, wait_profile=worker_wait_diagnostic) if timeout_trace else
                   _Diagnostic(config.role, supply=supply_diagnostic) if diagnostic_enabled else None)
     observations = ExitStack()
+    network_tls = {"links": [], "restored": False}
+    if network_observation:
+        observations.enter_context(_observe_network_tls(config.role, network_tls))
     socket_options = []
     gc_boundaries = {} if material_comparison else None
     observations.enter_context(_observe_tcp(socket_options, tcp_nodelay))
@@ -1979,7 +2055,8 @@ def _party_job(
             observations.enter_context(server_gc.installed())
         if stage_wait:
             observations.enter_context(stage_wait.installed())
-        result = run_party_single_step(config, batch=batch)
+        result = run_party_single_step(config, batch=batch,
+            **({"wire_profile": wire_profile} if wire_profile is not None else {}))
         outcome.update({"status": result.get("status", "closed"),
                    "directions": counts, "activity_ms": activity, "steps": role_steps,
                    "memory": _process_memory(), "material_summary": result.get("material_summary")})
@@ -1998,6 +2075,10 @@ def _party_job(
             restore()
             observations.close()
         outcome["tcp_socket_options"] = socket_options
+        if network_observation:
+            outcome["network_tls"] = network_tls
+        if wire_profile is not None:
+            outcome["wire_profile"] = wire_profile
         if diagnostic:
             outcome["diagnostic"] = diagnostic.report()
         if stage_wait:
@@ -2951,7 +3032,7 @@ def _compact_gc_boundary(cycles, roles):
 
 
 def _finish_compact_history(result, report, history, *, qpc_stage_receive_candidate=False,
-                            qpc_dynamic_qualification=False):
+                            qpc_dynamic_qualification=False, network_observation=False):
     """S13完整展开与有限样本检查独立记账，绝不借用原资格flag。"""
     if history is not None and history.expansion_ns is None:
         expanded = history.expand()
@@ -2964,7 +3045,9 @@ def _finish_compact_history(result, report, history, *, qpc_stage_receive_candid
     cycles = result.get("cycles", [])
     attempts = (result.get("cycle_summary") or {}).get("attempts", len(cycles))
     stage = result.get("stage_wait_diagnostic") or {}
-    target = 10000 if qpc_dynamic_qualification else result.get("requested_steps", 1000) if qpc_stage_receive_candidate else 4000
+    target = (result.get("requested_steps", 1000) if network_observation else
+              10000 if qpc_dynamic_qualification else result.get("requested_steps", 1000) if qpc_stage_receive_candidate else 4000)
+    large_history = qpc_dynamic_qualification or network_observation and target == 10000
     meta = {"format_version": 1, "target_steps": target, "maximum_attempts": (10000 if qpc_dynamic_qualification else
         1000 if qpc_stage_receive_candidate else 4000),
         "first_failure_stop": True, "actual_attempts": attempts, "captured_cycles": len(cycles),
@@ -2979,11 +3062,13 @@ def _finish_compact_history(result, report, history, *, qpc_stage_receive_candid
     if qpc_stage_receive_candidate or qpc_dynamic_qualification:
         meta.update(profile="canonical-qpc-receive-v1" if qpc_dynamic_qualification else "qpc-stage-receive-v1",
                     qpc_receive_location="stage_wait_diagnostic.roles[Client].qpc_receive")
-    if qpc_dynamic_qualification:
+    if network_observation:
+        meta.update(profile="network-cycle-v1", maximum_attempts=target)
+    if large_history:
         meta["client_role_limit_bytes"] = 32*1024*1024
     meta["representation_complete"] = (len(roles) == 3 and {r.get("role") for r in roles} == {"Client", "P1", "P2"}
         and all(r.get("representation_complete") is True and r.get("layout", {}).get("reserved_bound_bytes", 2**63)
-                <= (32 if qpc_dynamic_qualification and r.get("role") == "Client" else 16)*1024*1024
+                <= (32 if large_history and r.get("role") == "Client" else 16)*1024*1024
                 for r in roles) and meta["combined_reserved_bound_bytes"] <= 48*1024*1024
         and len(cycles) == attempts)
     meta["thread_registration_complete"] = len(roles) == 3 and all(
@@ -3020,7 +3105,7 @@ def _finish_compact_history(result, report, history, *, qpc_stage_receive_candid
                 "pid": match[0]["pid"] if len(match) == 1 else None,
                 "classification": classification, "coverage_evidence_complete": reliable,
                 "scope": "registered identity/lifetime; not allocation stack or exclusive CPU"})
-    result["qpc_dynamic_qualification" if qpc_dynamic_qualification else
+    result["network_history" if network_observation else "qpc_dynamic_qualification" if qpc_dynamic_qualification else
            "qpc_stage_receive_candidate" if qpc_stage_receive_candidate else "compact_history_candidate"] = meta
     if result.get("status") == "stopped" and not meta["representation_complete"]:
         result.update(status="failed", failure_category="CompactHistoryObservation", failed_phase="HISTORY_EXPANSION")
@@ -3047,6 +3132,8 @@ def _finish_compact_history(result, report, history, *, qpc_stage_receive_candid
         result.update(status="failed", failure_category="QPCReceiveObservation", failed_phase="QPC_RECEIVE_REPORT")
     if qpc_dynamic_qualification:
         result["local_dynamic_qualification_pass"] = meta["finite_sample_pass"]
+    if network_observation and result.get("status") == "stopped" and not meta["finite_sample_pass"]:
+        result.update(status="failed", failure_category="NetworkObservation", failed_phase="HISTORY_REPORT")
     result.update(diagnostic=True, comparison_only=True, server_gc_candidate_gate_pass=False,
                   candidate_gate_pass=False, worker_long_run_gate_pass=False, stage_pass=False, qualification_pass=False)
 
@@ -3062,13 +3149,15 @@ def _run_material_comparison(options, candidate, *, target_steps=1000):
     server_gc_candidate = options.get("server_gc_candidate", False)
     qpc_candidate = options.get("qpc_stage_receive_candidate", False)
     qpc_qualification = options.get("qpc_dynamic_qualification", False)
-    compact_candidate = options.get("compact_history_candidate", False) or qpc_candidate or qpc_qualification
+    network = options.get("network_configs") is not None
+    large_history = qpc_qualification or network and target_steps == 10000
+    compact_candidate = options.get("compact_history_candidate", False) or qpc_candidate or qpc_qualification or network
     history = None
     stage_wait_diagnostic = options.get("stage_wait_diagnostic", False) or compact_candidate
     if compact_candidate:
         options = {**options, "stage_wait_diagnostic": True}
     traced = options.get("worker_timeout_diagnostic", False) or wait_diagnostic
-    long_run = target_steps == 10000 and not qpc_qualification
+    long_run = target_steps == 10000 and not qpc_qualification and not network
     long_metadata = {"format_version": 1, "target_steps": 10000, "maximum_attempts": 10000,
                      "candidate": "worker", "period_ns": 20000000, "segment_steps": 400,
                      "recording_mode": "light", "first_failure_stop": True,
@@ -3079,7 +3168,7 @@ def _run_material_comparison(options, candidate, *, target_steps=1000):
         "first_failure_stop": True, "numeric_contract": None} if server_gc_candidate else None
     stage_metadata = {"format_version": 1, "profile": ("canonical-qpc-receive-v1" if qpc_qualification else
         "qpc-stage-receive-v1" if qpc_candidate else "stage-wait-light-v1"),
-        "maximum_attempts": 10000 if qpc_qualification else 1000 if qpc_candidate else 4000,
+        "maximum_attempts": target_steps if network else 10000 if qpc_qualification else 1000 if qpc_candidate else 4000,
         "first_failure_stop": True, "numeric_contract": None} if stage_wait_diagnostic else None
     stage_observers = []
     trace_observers = []
@@ -3127,8 +3216,10 @@ def _run_material_comparison(options, candidate, *, target_steps=1000):
     try:
         with ExitStack() as cleanup:
             if compact_candidate:
-                history = _CompactHistory("Client", target_steps if qpc_candidate or qpc_qualification else 4000,
-                    **({"qualification": True} if qpc_qualification else {}))
+                history = _CompactHistory("Client", target_steps if qpc_candidate or qpc_qualification or network else 4000,
+                    **({"qualification": True} if large_history else {}),
+                    **({"wire_profile": _COMPACT_PROFILE_V2}
+                       if options.get("network_wire_profile") == _COMPACT_PROFILE_V2 else {}))
             cleanup.enter_context(patch.object(lan_runtime.LanContinuousRuntime, "close", close))
             if history is not None:
                 cleanup.enter_context(patch.object(lan_runtime._MaterialWorkerPool, "__init__", initialized))
@@ -3177,7 +3268,8 @@ def _run_material_comparison(options, candidate, *, target_steps=1000):
     if stage_wait_diagnostic:
         _finish_stage_wait(result, report, stage_metadata, stage_observers)
     if compact_candidate:
-        _finish_compact_history(result, report, history, **({"qpc_dynamic_qualification": True} if qpc_qualification else
+        _finish_compact_history(result, report, history, **({"network_observation": True} if network else
+                                                        {"qpc_dynamic_qualification": True} if qpc_qualification else
                                                         {"qpc_stage_receive_candidate": True} if qpc_candidate else {}))
     if traced:
         result["diagnostic"] = True
@@ -3237,6 +3329,63 @@ def _run_material_comparison(options, candidate, *, target_steps=1000):
     return result
 
 
+@contextmanager
+def _observe_network_tls(role, facts):
+    """仅新实验记录原认证成功事实；证书/SAN/TLS核验仍由transport拥有。"""
+    from secure_control.execution import lan_transport
+
+    original = lan_transport._verify_identity
+    def verified(sock, expected):
+        original(sock, expected)
+        if len(facts["links"]) >= 2:
+            raise RuntimeError("网络实验角色出现额外连接。")
+        facts["links"].append({"role": role, "peer_identity": expected, "version": sock.version(),
+            "peer_san": list(sock.getpeercert()["subjectAltName"]),
+            "tcp_nodelay": sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY),
+            "local": list(sock.getsockname()), "remote": list(sock.getpeername())})
+    try:
+        with patch.object(lan_transport, "_verify_identity", verified):
+            yield
+    finally:
+        facts["restored"] = lan_transport._verify_identity is original
+
+
+def run_network_observation(*, configs, steps, wire_profile=None, candidate_manifest=None):
+    """独立TLS实验共享入口；先严格校验再复用原循环，旧裸TCP门禁不变。"""
+    from secure_control.execution.localhost_codec import _COMPACT_PROFILES
+
+    if (wire_profile not in (None, *_COMPACT_PROFILES)
+            or wire_profile == _COMPACT_PROFILE_V2 and steps != 1000
+            or wire_profile != _COMPACT_PROFILE_V2 and candidate_manifest is not None
+            or type(configs) is not tuple or len(configs) != 3 or type(steps) is not int or steps not in (1000, 10000)
+            or tuple(getattr(c, "role", None) for c in configs) != ("Client", "P1", "P2")
+            or not all(isinstance(c, LanConfig) and c.transport == "mutual_tls" for c in configs)
+            or any(c.topology != configs[0].topology or c.startup_timeout != 30. or c.step_timeout != 30.
+                   or c.shutdown_timeout != 5. or c.idle_timeout != 30. for c in configs)
+            or configs[0].experiment_config != _ROOT / "configs/cart_pole_observer_lan.example.yaml"
+            or any(c.ca is None or c.certificate is None or c.private_key is None for c in configs)
+            or any(c.controller_config is not None for c in configs)
+            or not gc.isenabled() or gc.get_threshold() != (700, 10, 10)
+            or gc.get_freeze_count() or gc.get_debug() or gc.callbacks):
+        raise ValueError("网络实验只允许原配置、正常GC、三角色TLS及固定1000/10000。")
+    if wire_profile == _COMPACT_PROFILE_V2:
+        from .network_benchmark import require_v2_candidate
+        require_v2_candidate(candidate_manifest, configs)
+    topology = configs[0].topology
+    endpoints = (topology.p1_client, topology.p2_client, topology.p1_peer)
+    if (topology.identities != {r: f"{r.lower()}.secure-control.test" for r in ("Client", "P1", "P2")}
+            or len({e.port for e in endpoints}) != 3
+            or any(e.host != "127.0.0.1" or e.bind not in ("127.0.0.1", "127.0.0.2") for e in endpoints)
+            or len({e.bind for e in endpoints}) != 1):
+        raise ValueError("网络实验拓扑/身份不匹配。")
+    return _run_material_comparison({"steps": steps, "delay_ms": 0., "segment_steps": 400, "optimized": True,
+        "material_slots": 16, "role_config": None, "preload_steps": 0, "preload_execution": "fused", "diagnostic": False,
+        "recording_mode": "light", "tcp_nodelay": None, "commit_policy": "default", "timeout_trace": False,
+        "network_configs": configs, **({"network_wire_profile": wire_profile} if wire_profile is not None else {}),
+        **({"network_candidate_manifest": candidate_manifest} if wire_profile == _COMPACT_PROFILE_V2 else {})},
+        "worker", target_steps=steps)
+
+
 def _run_continuous_observation(*, steps: int, delay_ms: float,
                                segment_steps: int, optimized=False, material_slots=16,
                                role_config: Path | None = None, preload_steps=0,
@@ -3248,14 +3397,36 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
                                _long_run_metadata=None, worker_wait_diagnostic=False,
                                server_gc_candidate=False, stage_wait_diagnostic=False, _stage_observers=None,
                                compact_history_candidate=False, _compact_history=None,
-                               qpc_stage_receive_candidate=False, qpc_dynamic_qualification=False) -> dict[str, object]:
+                               qpc_stage_receive_candidate=False, qpc_dynamic_qualification=False,
+                               network_configs=None, network_wire_profile=None,
+                               network_candidate_manifest=None) -> dict[str, object]:
     """实际持续动态循环及原同步 writer；退出后报告观察，不发布图或更改调度。"""
     from secure_control.execution.lan_runtime import RunControl
+    from secure_control.execution.localhost_codec import _COMPACT_PROFILES
     from secure_control.scenarios.cart_pole.interactive import InteractiveSession
 
     from .cart_pole_segmented_evidence import _BatchWriter, _correct_cycle_tail, _Spool
     from .lan_continuous_profile import load_segmented_experiment
     from .lan_runner import _run_prepared_segmented
+
+    if network_wire_profile is not None and (network_wire_profile not in _COMPACT_PROFILES
+            or network_configs is None or material_candidate != "worker" or not optimized
+            or preload_steps or material_slots != 16 or recording_mode != "light"):
+        raise ValueError("紧凑动态 profile 只允许显式原网络工人实验入口")
+    if network_wire_profile == _COMPACT_PROFILE_V2:
+        from .network_benchmark import require_v2_candidate
+        if (steps != 1000 or delay_ms != 0 or segment_steps != 400 or role_config is not None
+                or tcp_nodelay is not None or commit_policy != "default" or _gc_trial is not None
+                or any((diagnostic, timeout_trace, worker_timeout_diagnostic, worker_wait_diagnostic,
+                        server_gc_candidate, compact_history_candidate,
+                        qpc_stage_receive_candidate, qpc_dynamic_qualification))
+                or stage_wait_diagnostic is not True
+                or not gc.isenabled() or gc.get_threshold() != (700, 10, 10)
+                or gc.get_freeze_count() or gc.get_debug()):
+            raise ValueError("v2仅允许固定1000/400和正常GC的原候选入口")
+        require_v2_candidate(network_candidate_manifest, network_configs)
+    elif network_candidate_manifest is not None:
+        raise ValueError("候选manifest只能用于v2")
 
     maximum = 10000 if optimized else 400
     if tcp_nodelay is not None and type(tcp_nodelay) is not bool:
@@ -3287,8 +3458,10 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
     supply_diagnostic = (diagnostic and light and not preload_steps and material_slots == 16
                          and (not comparison_only or _gc_trial is not None or worker_timeout_diagnostic
                               or worker_wait_diagnostic))
-    ports = _ports()
-    config = _config("Client", ports) if role_config is None else load_lan_config(role_config, "Client")
+    ports = _ports() if network_configs is None else tuple(e.port for e in (
+        network_configs[0].topology.p1_client, network_configs[0].topology.p2_client, network_configs[0].topology.p1_peer))
+    config = (network_configs[0] if network_configs is not None else
+              _config("Client", ports) if role_config is None else load_lan_config(role_config, "Client"))
     if (qpc_stage_receive_candidate or qpc_dynamic_qualification) and config.transport != "insecure_tcp":
         raise ValueError("S15不适用于TLS或未知传输。")
     if role_config is not None:
@@ -3315,16 +3488,19 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
     if _register_trace_cleanup:
         stop_roles = _register_trace_cleanup(stop_roles)
     parties = [context.Process(target=_party_job, args=(
-        _config(role, ports), ports, delay_ms, True, queue, diagnostic, False, tcp_nodelay,
+        network_configs[index+1] if network_configs is not None else _config(role, ports), ports, delay_ms, True, queue, diagnostic, False, tcp_nodelay,
         supply_diagnostic, timeout_trace, material_candidate is not None, worker_wait_diagnostic, server_gc_candidate,
-        stage_wait_diagnostic, compact_history_candidate or qpc_stage_receive_candidate or qpc_dynamic_qualification,
-        steps if qpc_stage_receive_candidate or qpc_dynamic_qualification else 4000, qpc_dynamic_qualification,
-    )) for role in ("P1", "P2")] if role_config is None else []
+        stage_wait_diagnostic, compact_history_candidate or qpc_stage_receive_candidate or qpc_dynamic_qualification or network_configs is not None,
+        steps if qpc_stage_receive_candidate or qpc_dynamic_qualification or network_configs is not None else 4000,
+        qpc_dynamic_qualification or network_configs is not None and steps == 10000,
+        *((True, network_wire_profile) if network_configs is not None else ()),
+    )) for index, role in enumerate(("P1", "P2"))] if role_config is None else []
     records, events, outcomes, writer_batches = [], [], [], []
     history = _compact_history
     def record_count():
         return history.tables["steps"].count if history is not None else len(records)
     socket_options = []
+    network_tls = {"links": [], "restored": False}
     cycles = []
     marks, storage = {}, {"fsync_ms": 0., "fsync_count": 0, "checkpoint_ms": 0.,
                           "source_check_ms": 0., "source_check_control_ms": 0.,
@@ -3520,6 +3696,7 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
             for party in parties:
                 party.start()
             with (_observe_dynamic(marks), _commit_policy(commit_policy),
+                  _observe_network_tls("Client", network_tls) if network_configs is not None else nullcontext(),
                   _observe_tcp(socket_options, tcp_nodelay), ExitStack() as io_hooks):
                 if not light:
                     io_hooks.enter_context(patch.object(os, "fsync", measured_fsync))
@@ -3535,6 +3712,7 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
                     cycle_snapshot=writer.snapshot if writer else None,
                     before_sample=writer.check if writer else None,
                     **({"_material_candidate": material_candidate} if material_candidate else {}),
+                    **({"_wire_profile": network_wire_profile} if network_wire_profile is not None else {}),
                 )
                 if _gc_trial:
                     _gc_trial.report["original_startup_gc"] = result.get("startup_gc")
@@ -3644,6 +3822,8 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
             raise RuntimeError("有限诊断编码超出预声明预算。")
     return {
         "schema": "cycle-qualification-v1" if optimized else "continuous-observation-v1",
+        **({"network_tls": network_tls} if network_configs is not None else {}),
+        **({"wire_profile": network_wire_profile} if network_wire_profile is not None else {}),
         "recording_mode": recording_mode,
         "evidence_state": "not_recorded" if light else "full_observation_spool",
         "diagnostic": diagnostic, "diagnostic_report": diagnostic_report,

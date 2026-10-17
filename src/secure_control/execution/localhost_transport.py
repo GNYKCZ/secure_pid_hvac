@@ -177,6 +177,81 @@ def receive_frame(sock: socket.socket, *, deadline: float, limit: int) -> bytes:
     return _receive_exact(sock, length, deadline)
 
 
+def _exchange_frame(sock, payload: bytes, *, deadline, limit: int) -> bytes:
+    """单 owner 同时推进各一帧；只在双方均无进展时等待原绝对期限。"""
+    _validate_frame_payload(payload, limit)
+    outgoing = memoryview(_HEADER.pack(len(payload)) + payload)
+    incoming = bytearray()
+    target, header_done = _HEADER.size, False
+    send_want, recv_want = "write", "read"
+    previous, primary = sock.gettimeout(), None
+
+    def budget():
+        remaining = remaining_seconds(deadline)
+        if remaining <= 0:
+            raise LocalhostTransportTimeout("双向 frame 交换超过原绝对 deadline。")
+        return remaining
+
+    try:
+        budget()
+        sock.settimeout(0.)
+        while outgoing or not header_done or len(incoming) < target:
+            budget()
+            progressed = False
+            if outgoing:
+                try:
+                    sent = sock.send(outgoing)
+                except ssl.SSLWantReadError:
+                    send_want = "read"
+                except (ssl.SSLWantWriteError, BlockingIOError):
+                    send_want = "write"
+                else:
+                    if sent == 0:
+                        raise LocalhostTransportDisconnected("双向交换发送时连接关闭。")
+                    outgoing = outgoing[sent:]
+                    progressed = True
+            budget()
+            if not header_done or len(incoming) < target:
+                try:
+                    chunk = sock.recv(target - len(incoming))
+                except ssl.SSLWantWriteError:
+                    recv_want = "write"
+                except (ssl.SSLWantReadError, BlockingIOError):
+                    recv_want = "read"
+                else:
+                    if not chunk:
+                        raise LocalhostTransportDisconnected("对端在双向完整 frame 到达前关闭。")
+                    incoming.extend(chunk)
+                    progressed = True
+                    if not header_done and len(incoming) == _HEADER.size:
+                        (target,) = _HEADER.unpack(incoming)
+                        if not 0 < target <= limit:
+                            raise LocalhostTransportProtocolError("双向 frame 声明长度为空或超限。")
+                        incoming.clear()
+                        header_done = True
+            budget()
+            if progressed:
+                continue
+            # TLS recv 先行尝试，已覆盖 pending；WANT 的相反方向也必须等待。
+            wants = ([send_want] if outgoing else []) + (
+                [recv_want] if not header_done or len(incoming) < target else [])
+            select.select([sock] if "read" in wants else [],
+                          [sock] if "write" in wants else [], [], budget())
+        result = bytes(incoming)
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        try:
+            sock.settimeout(previous)
+        except BaseException:
+            if primary is None:
+                raise
+            BaseException.add_note(primary, "双向 frame 交换恢复 socket timeout 失败。")
+    budget()
+    return result
+
+
 def send_envelope(
     sock: socket.socket,
     message: WireEnvelope,

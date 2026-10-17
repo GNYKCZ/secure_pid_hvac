@@ -36,7 +36,7 @@ from secure_control.execution.lan_transport import (
     LanIdentityError,
     LanTimeoutError,
 )
-from secure_control.execution.localhost_codec import LocalhostCodecError
+from secure_control.execution.localhost_codec import _COMPACT_PROFILE_V2, LocalhostCodecError
 from secure_control.execution.localhost_transport import (
     LocalhostTransportDisconnected,
     LocalhostTransportTimeout,
@@ -145,7 +145,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                             on_cycle=None, cycle_snapshot=None,
                             before_sample=None, preload_steps=0,
                             preload_execution="fused", on_segment_ready=None,
-                            _material_candidate=None) -> dict[str, object]:
+                            _material_candidate=None, _wire_profile=None) -> dict[str, object]:
     """唯一持续循环接收已装配场景；保存/GUI 与 headless 不重复 parse 或创建 plant。"""
     control.bind_stop(session.reject_new)
     if preload_steps and material_slots != 16:
@@ -199,11 +199,14 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                 return action()
             finally:
                 if attempt is not None:
-                    attempt["durations"]["maintenance_" + name] = perf_counter_ns() - started
+                    key = name() if callable(name) else name
+                    attempt["durations"]["maintenance_" + key] = perf_counter_ns() - started
 
         progress("ENDING_SEGMENT", "STOPPING" if control.stop_requested else None)
-        segment = measured("end", lambda: runtime.end_segment() if deadline_ns is None
+        segment = measured(lambda: getattr(runtime, "last_maintenance_operation", "end"),
+                           lambda: runtime.end_segment() if deadline_ns is None
                            else runtime.end_segment(deadline_ns=deadline_ns))
+        compound = getattr(runtime, "last_maintenance_operation", "end") == "advance"
         if session.cancelled.is_set():
             raise RuntimeError("Client 运行已取消。")
         progress("RECORDING_SEGMENT")
@@ -211,6 +214,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
         if on_segment is not None:
             measured("seal", lambda: on_segment(packet))
         primary = None
+        released = False
         try:
             records.clear()
             check_deadline(deadline_ns, "RECORDING_SEGMENT")
@@ -242,15 +246,25 @@ def _run_prepared_segmented(config, experiment, *, control, session,
             check_deadline(deadline_ns, "SOURCE_CHECK")
             if session.cancelled.is_set():
                 raise RuntimeError("Client 运行已取消。")
-            measured("begin", lambda: runtime.next_segment() if deadline_ns is None
-                     else runtime.next_segment(deadline_ns=deadline_ns))
+            if compound:
+                if on_segment is not None and on_segment_ready is not None:
+                    released = True
+                    measured("release", lambda: on_segment_ready(packet))
+                check_deadline(deadline_ns, "SEGMENT_RELEASE")
+                if session.cancelled.is_set():
+                    raise RuntimeError("Client 运行已取消。")
+                # 网络已双确认；release/source/原截止检查后才允许本地激活。
+                runtime.next_segment(deadline_ns=deadline_ns)
+            else:
+                measured("begin", lambda: runtime.next_segment() if deadline_ns is None
+                         else runtime.next_segment(deadline_ns=deadline_ns))
             progress("RUNNING")
             return None
         except Exception as error:
             primary = error
             raise
         finally:
-            if on_segment is not None and on_segment_ready is not None:
+            if not released and on_segment is not None and on_segment_ready is not None:
                 try:
                     measured("release", lambda: on_segment_ready(packet))
                 except Exception as release_error:
@@ -274,6 +288,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
             segment_capacity=(experiment.segment_capacity
                               if experiment.spec.state_dimension else None),
             preload_steps=preload_steps, preload_execution=preload_execution,
+            **({"wire_profile": _wire_profile} if _wire_profile is not None else {}),
         )
         if on_start is not None:
             on_start(runtime.snapshot(), runtime.public_setup)
@@ -380,6 +395,13 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                 last_cycle["cycle_completed_ns"] = None
                 raise CycleDeadlineExceeded("CYCLE_OBSERVATION")
     except Exception as error:  # noqa: BLE001 - 生命周期出口不披露协议秘密或异常载荷
+        if (runtime is not None and _wire_profile == _COMPACT_PROFILE_V2
+                and runtime.last_maintenance_operation == "advance"
+                and (runtime.phase == "CONNECTING_NEXT" or attempt is not None
+                     and "maintenance_advance" in attempt["durations"]
+                     or attempt is None and last_cycle is not None and "maintenance_advance" in last_cycle["phase_durations_ns"]
+                     and last_cycle["global_step"] == runtime.confirmed_step_count - 1)):
+            runtime.abort_segment_transition()
         lifecycle = runtime.snapshot() if runtime is not None else None
         uncertain = lifecycle is not None and lifecycle.phase == "UNCERTAIN"
         failure_phase = getattr(error, "phase", phase_name)
@@ -415,6 +437,10 @@ def _run_prepared_segmented(config, experiment, *, control, session,
             "material_summary": getattr(runtime, "material_summary", runtime.cycle_queue_levels) if runtime is not None else {},
             "startup_gc": startup_gc,
             "last_commit_observation": getattr(runtime, "last_commit_observation", None),
+            **({"last_sealed_segment": asdict(runtime.last_sealed_record)
+                if runtime.last_sealed_record is not None else None,
+                "known_segment_receipts": [asdict(r) for r in runtime.last_segment_receipts]}
+               if runtime is not None and _wire_profile == _COMPACT_PROFILE_V2 else {}),
             "recording_error": getattr(error, "_public_recording_error", None),
         }
     finally:
@@ -567,9 +593,9 @@ def _run() -> int:
     benchmark = commands.add_parser("benchmark")
     benchmark.add_argument("--case", required=True, choices=("dynamic", "scalar", "continuous", "cycle", "full-observation"))
     benchmark.add_argument("--mode", default="batch", choices=("legacy", "batch"))
-    benchmark.add_argument("--steps", required=True, type=int)
+    benchmark.add_argument("--steps", type=int)
     benchmark.add_argument("--delay-ms", type=float, default=0.)
-    benchmark.add_argument("--segment-steps", type=int, default=8)
+    benchmark.add_argument("--segment-steps", type=int)
     benchmark.add_argument("--material-slots", type=int, choices=(0, 4, 16), default=16)
     benchmark.add_argument("--preload-steps", type=int, default=0)
     benchmark.add_argument("--preload-execution", choices=("staged", "fused"), default="fused")
@@ -604,10 +630,43 @@ def _run() -> int:
     benchmark.add_argument("--fixed-proof-cache", action="store_true",
                            help="full-observation固定精确矩阵计算的显式候选对照")
     benchmark.add_argument("--role-config", type=Path)
+    benchmark.add_argument("--network-profile", choices=("N0", "N1", "N2", "N3"))
+    benchmark.add_argument("--network-phase", choices=("discovery", "recheck", "qualification", "candidate"))
+    benchmark.add_argument("--network-certs", type=Path)
+    benchmark.add_argument("--network-ports", help="预声明的三个固定端口，逗号分隔")
+    benchmark.add_argument("--network-ledger", type=Path)
+    benchmark.add_argument("--network-approval", type=Path)
+    benchmark.add_argument("--network-repair-note")
+    benchmark.add_argument("--network-wire-profile", choices=("control-dynamic-compact-v1", _COMPACT_PROFILE_V2))
+    benchmark.add_argument("--network-authorization", help="当前 Issue 的直接用户批准登记评论 URL")
     benchmark.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     _enable_terminal_progress()
     if args.role == "benchmark":
+        if any(getattr(args, name) is not None for name in ("network_profile", "network_phase", "network_certs",
+                "network_ports", "network_ledger", "network_approval", "network_repair_note",
+                "network_wire_profile", "network_authorization")):
+            from .network_benchmark import run_network_benchmark, validate_cli
+
+            try:
+                ports = validate_cli(args)
+                report = run_network_benchmark(profile=args.network_profile, phase=args.network_phase,
+                    certs=args.network_certs, ports=ports, ledger=args.network_ledger,
+                    approval=args.network_approval, output=args.output, repair_note=args.network_repair_note,
+                    **({"wire_profile": args.network_wire_profile, "authorization": args.network_authorization}
+                       if args.network_wire_profile is not None else {}))
+            except (OSError, ValueError, RuntimeError) as error:
+                return _failure("Client", 5, "network_benchmark", error)
+            print(json.dumps({"status": report["status"], "profile": args.network_profile, "phase": args.network_phase,
+                "network_sample_pass": report["network_sample_pass"],
+                "network_dynamic_qualification_pass": report["network_dynamic_qualification_pass"],
+                "attempts": len(report.get("cycles", [])), "history_export_ns": report["network_export_ns"],
+                "report": str(args.output)}, ensure_ascii=False, sort_keys=True))
+            return 0 if report["network_sample_pass"] else 5
+        if args.steps is None:
+            parser.error("benchmark requires --steps outside the fixed network profiles")
+        if args.segment_steps is None:
+            args.segment_steps = 8
         from .communication_benchmark import (
             run_continuous_observation,
             run_full_observation,

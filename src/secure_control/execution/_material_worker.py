@@ -17,7 +17,14 @@ from secure_control.crypto import BeaverMultiplier, SecureTruncation, TwoPartySh
 from secure_control.protocol.messages import public_step_plan_sha256
 from secure_control.protocol.roles import Client, _create_resource_pair
 
-from .localhost_codec import _canonical_json, _encode_online_fragment, _load_json
+from .localhost_codec import (
+    _COMPACT_PROFILES,
+    _canonical_json,
+    _encode_online_fragment,
+    _encode_preloaded_values,
+    _load_json,
+    _preloaded_values_size,
+)
 
 _SLOT_LIMIT = 512 * 1024
 _RSS_LIMIT = 256 * 1024 * 1024
@@ -39,10 +46,12 @@ class _WorkerSpec:
     epoch: str
     start: int
     slots: int
+    encoding_profile: str = "control-batch-v1"
 
 
 def _check_spec(spec):
-    if (not isinstance(spec, _WorkerSpec) or type(spec.slots) is not int
+    if (not isinstance(spec, _WorkerSpec) or spec.encoding_profile not in {"control-batch-v1", *_COMPACT_PROFILES}
+            or type(spec.slots) is not int
             or not 1 <= spec.slots <= 16 or type(spec.start) is not int or spec.start < 0
             or any(type(v) is not str or not 1 <= len(v) <= 256
                    for v in (spec.run_id, spec.session_id, spec.epoch))):
@@ -52,7 +61,13 @@ def _check_spec(spec):
     truncations = n if spec.layout.scale_ledger.state_truncation_bits else 0
     digits = spec.modulus.bit_length() * 30103 // 100000 + 1
     bound = products * (4096 + 12 * digits) + truncations * (4096 + 8 * digits) + 4096 + 512 * m
-    if 2 * bound > _SLOT_LIMIT:
+    if spec.encoding_profile in _COMPACT_PROFILES:
+        row = (3 * products + 2 * truncations) * ((spec.modulus.bit_length() + 7) // 8)
+        # 三份 IPC 临时包均计入原槽上限；生成资源前就排除最大合法头的最坏尺寸。
+        bound = 3 * (2 * row + _HEADER_LIMIT + 5)
+    else:
+        bound *= 2
+    if bound > _SLOT_LIMIT:
         raise ValueError("公开布局超过材料编码预留，不能先生成后拒绝")
 
 
@@ -90,7 +105,7 @@ def _package(spec, plan, fragments, prepared_ns, cpu_ns):
               "step": plan.step, "round": plan.round_id, "plan": public_step_plan_sha256(plan),
               "recipients": [0, 1], "lengths": [len(v) for v in fragments],
               "sha256": [hashlib.sha256(v).hexdigest() for v in fragments],
-              "prepared_ns": prepared_ns, "cpu_ns": cpu_ns}
+              "prepared_ns": prepared_ns, "cpu_ns": cpu_ns, "encoding_profile": spec.encoding_profile}
     encoded = _canonical_json(header)
     package = b"M" + struct.pack(">I", len(encoded)) + encoded + b"".join(fragments)
     # 保守预留包含片段、编码包与 IPC 临时副本；已领取当前轮另报。
@@ -108,9 +123,10 @@ def _unpack(spec, packet, step):
         raise ValueError("材料包头被截断或超限")
     head = _load_json(packet[5:5 + size])
     fields = {"version", "run", "session", "epoch", "step", "round", "plan", "recipients",
-              "lengths", "sha256", "prepared_ns", "cpu_ns"}
+              "lengths", "sha256", "prepared_ns", "cpu_ns", "encoding_profile"}
     if (type(head) is not dict or set(head) != fields or type(head["version"]) is not int
-            or head["version"] != 1 or type(head["step"]) is not int or head["step"] != step
+            or head["version"] != 1 or head["encoding_profile"] != spec.encoding_profile
+            or type(head["step"]) is not int or head["step"] != step
             or (head["run"], head["session"], head["epoch"]) != (spec.run_id, spec.session_id, spec.epoch)
             or head["recipients"] != [0, 1] or any(type(v) is not int for v in head["recipients"])
             or type(head["round"]) is not str or len(head["round"]) != 38
@@ -125,6 +141,9 @@ def _unpack(spec, packet, step):
     plan = Client._resource_plan(spec.layout, spec.session_id, head["round"], step)
     if head["plan"] != public_step_plan_sha256(plan):
         raise ValueError("材料包与父进程公开计划摘要不匹配")
+    if spec.encoding_profile in _COMPACT_PROFILES and head["lengths"] != [
+        _preloaded_values_size(plan, spec.modulus)] * 2:
+        raise ValueError("紧凑材料片段长度与公开计划不匹配")
     split = 5 + size + head["lengths"][0]
     fragments = (packet[5 + size:split], packet[split:])
     if any(hashlib.sha256(v).hexdigest() != digest for v, digest in zip(fragments, head["sha256"], strict=True)):
@@ -135,6 +154,7 @@ def _unpack(spec, packet, step):
 def _worker_main(spec, credit, output):
     """唯一生产者；只使用新的安全随机源，累计前缀不依赖材料总步数。"""
     report = {"pid": os.getpid(), "generated": 0, "error_type": None,
+              "encoding_profile": spec.encoding_profile,
               "memory": deque(maxlen=32), "memory_guard_failed": False,
               "gc_begin": None, "gc_end": None, "process_cpu_ns": 0}
     cpu_started = time.process_time_ns()
@@ -179,7 +199,8 @@ def _worker_main(spec, credit, output):
             started, cpu = time.perf_counter_ns(), time.process_time_ns()
             plan = Client._resource_plan(spec.layout, spec.session_id, "round-" + secrets.token_hex(16), next_step)
             resources = _create_resource_pair(plan, multiplier, truncation)
-            fragments = tuple(_encode_online_fragment(v, spec.modulus) for v in resources)
+            encoder = _encode_preloaded_values if spec.encoding_profile in _COMPACT_PROFILES else _encode_online_fragment
+            fragments = tuple(encoder(v, spec.modulus) for v in resources)
             packet = _package(spec, plan, fragments, time.perf_counter_ns() - started,
                               time.process_time_ns() - cpu)
             output.send_bytes(packet)
@@ -212,12 +233,13 @@ def _worker_main(spec, credit, output):
 class _MaterialWorkerPool:
     """父进程专属接收器/额度线程；控制线程只领取，不触碰 Pipe。"""
 
-    def __init__(self, client, distribution, *, run_id, epoch, start=0, slots=16):
+    def __init__(self, client, distribution, *, run_id, epoch, start=0, slots=16,
+                 encoding_profile="control-batch-v1"):
         self.owner = client._material_owner(distribution)
         self.spec = _WorkerSpec(self.owner.layout, client.fixed_point.modulus,
             client.fixed_point.fractional_bits, client.truncation.security_parameter,
             client.truncation.modulus_evidence, self.owner.horizon,
-            run_id, distribution.session_id, epoch, start, slots)
+            run_id, distribution.session_id, epoch, start, slots, encoding_profile)
         _check_spec(self.spec)
         self._condition, self._queue = Condition(), deque()
         self._stop = self._closed = self._begin = False
@@ -228,6 +250,7 @@ class _MaterialWorkerPool:
         self._report = None
         self._current = None
         self._stats = {"material_mode": "local-worker-v1", "material_slots": 0,
+            "encoding_profile": encoding_profile,
             "material_high_water": 0, "inventory_inflight_high_water": slots,
             "material_reserved_bytes": slots * _SLOT_LIMIT, "material_encoded_bound_high_water": 0,
             "material_prepare_ns": 0, "material_cpu_ns": 0, "ipc_bytes": 0,
@@ -235,7 +258,7 @@ class _MaterialWorkerPool:
             "credits_sent": 0, "cleanup_failed": False, "worker_exited": False,
             "receiver_exited": False, "credit_thread_exited": False}
         self._source = object()
-        self.owner.open_encoded_source(self._source)
+        self.owner.open_encoded_source(self._source, encoding_profile=encoding_profile)
         context = mp.get_context("spawn")
         worker_credit, self._credit = context.Pipe(duplex=False)
         self._output, worker_output = context.Pipe(duplex=False)
@@ -295,7 +318,8 @@ class _MaterialWorkerPool:
                         continue
                     if self._received >= self._allowed or len(self._queue) >= self.spec.slots:
                         raise ValueError("材料超出已授累计额度")
-                    capability = self.owner.register_encoded(self._source, plan, fragments)
+                    capability = self.owner.register_encoded(self._source, plan, fragments,
+                        encoding_profile=self.spec.encoding_profile)
                     self._queue.append((capability, len(packet)))
                     self._received += 1
                     stats["material_high_water"] = max(stats["material_high_water"], len(self._queue))
