@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 from dataclasses import replace
+from datetime import timedelta
 from fractions import Fraction
 from threading import Event, Thread
 from types import SimpleNamespace
@@ -551,6 +552,175 @@ def test_v2_candidate_real_adapter_selects_versioned_history_before_processes(v2
     assert captured[0]["_compact_history"].wire_profile == network._COMPACT_PROFILE_V2
     assert captured[0]["network_candidate_manifest"] == manifest
     assert result["status"] == "failed" and result["cycles"] == []
+
+
+@pytest.mark.parametrize("entrypoint", ["shared", "actual"])
+def test_v2_changed_certificate_and_matching_reservation_cannot_bypass_history(
+        v2_candidate_context, monkeypatch, entrypoint):
+    """RV-005：同时改候选和占项也不能自行改变冻结条件。"""
+    _history, manifest, ledger, certs = v2_candidate_context
+    configs = network.role_configs(certs, network.V2_PORTS, "N2")
+    captured = []
+    monkeypatch.setattr(benchmark, "_run_material_comparison", lambda options, *a, **k: captured.append(options))
+    with network.RunBudget(ledger) as budget:
+        budget.reserve("N2", "candidate", manifest["head"], manifest["source_sha256"], ledger.parent/"raw.json",
+            conditions_sha256=manifest["conditions_sha256"], continuation={k: manifest[k] for k in
+                ("wire_profile", "authorization_url", "closed_history_sha256")})
+        benchmark.run_network_observation(configs=configs, steps=1000,
+            wire_profile=network._COMPACT_PROFILE_V2, candidate_manifest=manifest)
+        (certs/"p1.pem").write_bytes(b"unapproved replacement")
+        changed = copy.deepcopy(manifest)
+        changed["public_certificate_sha256"]["p1.pem"] = network.hashlib.sha256(b"unapproved replacement").hexdigest()
+        changed["conditions_sha256"] = network.digest({k: changed[k] for k in
+            ("ports", "environment", "public_certificate_sha256", "seed")})
+        budget.entries[-1]["conditions_sha256"] = changed["conditions_sha256"]
+        budget._save()
+        def forbidden(*_args):
+            pytest.fail("unapproved conditions reached process creation")
+        monkeypatch.setattr(benchmark.mp, "get_context", forbidden)
+        with pytest.raises(ValueError):
+            if entrypoint == "shared":
+                benchmark.run_network_observation(configs=configs, steps=1000,
+                    wire_profile=network._COMPACT_PROFILE_V2, candidate_manifest=changed)
+            else:
+                benchmark._run_continuous_observation(**(captured[0]|{"stage_wait_diagnostic": True,
+                    "network_candidate_manifest": changed}), material_candidate="worker")
+
+
+@pytest.fixture
+def v2_certificate_context(v2_candidate_context):
+    """只在隔离测试根目录生成软件证书；不创建本次真实运行证书。"""
+    history, original, ledger, _certs = v2_candidate_context
+    certs = ledger.parent/"issue120-compact-v2-certs"
+    subprocess.run([sys.executable, str(ROOT/"tests/fixtures/prepare_local_lan_certs.py"),
+                    "--output", str(certs)], check=True, capture_output=True)
+    validity = {}
+    for name in original["public_certificate_sha256"]:
+        decoded = network.ssl._ssl._test_decode_cert(str(certs/name))
+        validity[name] = {key: network.datetime.fromtimestamp(network.ssl.cert_time_to_seconds(decoded[field]),
+            network.UTC).isoformat() for key, field in (("not_before", "notBefore"), ("not_after", "notAfter"))}
+    manifest = original | {"certificate_change_authorization_url": network.V2_CERTIFICATE_AUTHORIZATION,
+        "previous_public_certificate_sha256": original["public_certificate_sha256"],
+        "previous_conditions_sha256": original["conditions_sha256"],
+        "public_certificate_sha256": {name: network.hashlib.sha256((certs/name).read_bytes()).hexdigest()
+                                      for name in original["public_certificate_sha256"]},
+        "public_certificate_validity": validity, "certificate_change_reason": "expired_test_certificates"}
+    manifest["conditions_sha256"] = network.digest({k: manifest[k] for k in
+        ("ports", "environment", "public_certificate_sha256", "seed")})
+    return history, manifest, ledger, certs
+
+
+def test_v2_certificate_exception_is_bound_before_shared_and_actual_processes(v2_certificate_context, monkeypatch):
+    history, manifest, ledger, certs = v2_certificate_context
+    configs = network.role_configs(certs, network.V2_PORTS, "N2")
+    captured, contexts = [], []
+    original = benchmark._run_continuous_observation
+    def observe(**kwargs):
+        captured.append(kwargs)
+        return original(**kwargs)
+    def forbidden(*_args):
+        contexts.append(True)
+        raise RuntimeError("approved software boundary; no role constructed")
+    monkeypatch.setattr(benchmark, "_run_continuous_observation", observe)
+    monkeypatch.setattr(benchmark.mp, "get_context", forbidden)
+    continuation = {k: manifest[k] for k in ("wire_profile", "authorization_url", "closed_history_sha256",
+                                            *network.V2_CERTIFICATE_FIELDS, "public_certificate_sha256")}
+    with network.RunBudget(ledger) as budget:
+        budget.reserve("N2", "candidate", manifest["head"], manifest["source_sha256"], ledger.parent/"raw.json",
+            conditions_sha256=manifest["conditions_sha256"], continuation=continuation)
+        result = benchmark.run_network_observation(configs=configs, steps=1000,
+            wire_profile=network._COMPACT_PROFILE_V2, candidate_manifest=manifest)
+        assert result["failure_category"] == "RuntimeError" and contexts == [True]
+        assert budget.entries[:5] == history
+        for field in (*network.V2_CERTIFICATE_FIELDS, "public_certificate_sha256"):
+            assert budget.entries[-1][field] == manifest[field]
+        wrongs = [{k: v for k, v in manifest.items() if k != field} for field in network.V2_CERTIFICATE_FIELDS]
+        wrongs += [manifest|{"certificate_change_authorization_url": network.V2_CERTIFICATE_AUTHORIZATION+"0"},
+                   manifest|{"previous_conditions_sha256": "0"*64}]
+        for field, value in (("ports", [55131, 55132, 55133]), ("environment", manifest["environment"]|{"python": "other"}),
+                             ("seed", network.SEED+1)):
+            changed = manifest | {field: value}
+            changed["conditions_sha256"] = network.digest({k: changed[k] for k in
+                ("ports", "environment", "public_certificate_sha256", "seed")})
+            wrongs.append(changed)
+        for wrong in wrongs:
+            # 占项跟着错误manifest一起改，仍须由共同历史约束拒绝。
+            budget.entries[-1].update({k: wrong.get(k) for k in (*continuation, "conditions_sha256")})
+            budget._save()
+            with pytest.raises(ValueError):
+                benchmark.run_network_observation(configs=configs, steps=1000,
+                    wire_profile=network._COMPACT_PROFILE_V2, candidate_manifest=wrong)
+            with pytest.raises(ValueError):
+                original(**(captured[0]|{"network_candidate_manifest": wrong}))
+        assert contexts == [True]
+        budget.entries[-1].update(continuation, conditions_sha256=manifest["conditions_sha256"])
+        budget._save()
+        (certs/"p1.pem").write_bytes(b"changed after public fingerprint freeze")
+        with pytest.raises(ValueError):
+            benchmark.run_network_observation(configs=configs, steps=1000,
+                wire_profile=network._COMPACT_PROFILE_V2, candidate_manifest=manifest)
+        assert contexts == [True]
+
+
+def test_v2_certificate_wrapper_preflight_and_startup_failure_preserve_five(v2_certificate_context, monkeypatch):
+    history, manifest, ledger, certs = v2_certificate_context
+    approval = ledger.parent/"approval.json"
+    options = {"profile": "N2", "phase": "candidate", "certs": certs, "ports": network.V2_PORTS,
+        "ledger": ledger, "approval": approval, "output": ledger.parent/"raw.json",
+        "wire_profile": network._COMPACT_PROFILE_V2, "authorization": network.V2_AUTHORIZATION}
+    wrong_hash = manifest|{"public_certificate_sha256": manifest["public_certificate_sha256"]|{"p1.pem": "0"*64}}
+    wrong_hash["conditions_sha256"] = network.digest({k: wrong_hash[k] for k in
+        ("ports", "environment", "public_certificate_sha256", "seed")})
+    for wrong in (manifest|{"previous_conditions_sha256": "0"*64},
+                  manifest|{"public_certificate_validity": {}},
+                  {k: v for k, v in manifest.items() if k != "certificate_change_authorization_url"},
+                  wrong_hash):
+        approval.write_text(json.dumps(wrong|{"software_pass": True, "readback_exact": True}), encoding="utf-8")
+        with pytest.raises(ValueError):
+            network.run_network_benchmark(**options)
+        assert json.loads(ledger.read_text())["entries"] == history and not options["output"].exists()
+    class Relay:
+        def __init__(self, *_args):
+            pytest.fail("software startup stopped before relay creation")
+    def startup(*_args):
+        raise RuntimeError("software startup failure after reservation")
+    monkeypatch.setattr(network, "NetworkRelay", Relay)
+    monkeypatch.setattr(network, "role_configs", startup)
+    approval.write_text(json.dumps(manifest|{"software_pass": True, "readback_exact": True}), encoding="utf-8")
+    result = network.run_network_benchmark(**options)
+    saved = json.loads(ledger.read_text())["entries"]
+    assert saved[:5] == history and len(saved) == 6 and saved[-1]["finished"]
+    assert saved[-1]["actual_attempts"] == 0 and not result["network_sample_pass"]
+    assert result["network_manifest"]["certificate_change_authorization_url"] == network.V2_CERTIFICATE_AUTHORIZATION
+    with pytest.raises(ValueError):
+        network.run_network_benchmark(**(options|{"output": ledger.parent/"retry.json"}))
+
+
+def test_v2_certificate_offline_check_rejects_expiry_identity_chain_and_hash(v2_certificate_context):
+    from cryptography import x509
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.serialization import Encoding
+
+    _history, manifest, _ledger, certs = v2_certificate_context
+    assert network.certificate_validity(certs) == manifest["public_certificate_validity"]
+    end = network.datetime.fromisoformat(manifest["public_certificate_validity"]["p1.pem"]["not_after"])
+    for offset in (0, 3599, 25*3600+1):
+        with pytest.raises(ValueError):
+            network.certificate_validity(certs, now=end-timedelta(seconds=offset))
+    original = (certs/"p1.pem").read_bytes()
+    (certs/"p1.pem").write_bytes((certs/"p2.pem").read_bytes())
+    with pytest.raises(ValueError):
+        network.certificate_validity(certs)
+    (certs/"p1.pem").write_bytes(original)
+    encoded = bytearray(x509.load_pem_x509_certificate(original).public_bytes(Encoding.DER))
+    encoded[-1] ^= 1
+    (certs/"p1.pem").write_bytes(x509.load_der_x509_certificate(bytes(encoded)).public_bytes(Encoding.PEM))
+    with pytest.raises(InvalidSignature):
+        network.certificate_validity(certs)
+    (certs/"p1.pem").write_bytes(original)
+    (certs/"ca.pem").write_bytes(original)
+    with pytest.raises(ValueError):
+        network.certificate_validity(certs)
 
 
 def test_budget_failure_repair_recheck_and_final_call_cap(tmp_path):

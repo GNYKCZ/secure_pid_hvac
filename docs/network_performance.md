@@ -158,3 +158,22 @@ v2始终不授予network_dynamic_qualification_pass或任何长期资格；结�
 控制/通信/运行首失败即停；模型误差沿原退出汇总，未新增实时首模型异常停机机制，即使1000控制全按时也可能因模型错误判FAIL。
 成功失败均发布完整可恢复原件、native日志及hash，并交Review只读核查来源、全分母、边界/首轮、模型和现有退出证据后停止。
 新10000、qualification、后续优化、自动合并和关闭Issue继续禁止。
+
+### 同次续接的过期测试证书例外
+
+[限定证书设计](https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6231758304)已由用户
+[明确批准](https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6231986263)，只解除证书到期阻挡，不新增调用或其他优化。
+原四份证书和五项账本保留。入口软件经新head独立审查后，临运行前才使用原生成器向新空目录
+`.tmp/issue120-compact-v2-certs`生成一日测试证书，不覆盖`.tmp/issue120-network-certs`，不公开或提交私钥。
+不进行TLS试连或热身；离线检查原CA/角色身份、RSA-2048/SHA-256、SAN、双用途、签名关系及有效期，启动前至少剩一小时。
+
+approval、manifest及第六项共同绑定`certificate_change_authorization_url`（本次6231986263批准）、
+`previous_public_certificate_sha256`、`previous_conditions_sha256`、`public_certificate_sha256`、
+`public_certificate_validity`（四份证书各自UTC not_before/not_after）及`certificate_change_reason=expired_test_certificates`。
+原`authorization_url`仍为6231537918的一次调用许可，两者不得互换。
+用当前ports/environment/seed和旧证书hash重算摘要，必须等于原五项逐项冻结摘要；只有证书hash可变。
+新条件仅写第六项；共同候选校验同时约束外层、共享入口和实际循环，未经精确例外的相互一致新manifest/占项仍拒绝（RV-005）。
+新文件hash、有效期或批准不符，夹带端口/环境/seed变化、已有第六项或任何qualification都不能启动。
+
+新结果明确属于当前compact-v2源码加新证书条件，不能称为证书字节完全相同的配对A/B或排他的优化净收益。
+失败启动同样消费唯一调用；结果完整发布并独立只读审计后停止，仍不恢复10000、不自动返工或合并。

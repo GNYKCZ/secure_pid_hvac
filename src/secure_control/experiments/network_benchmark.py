@@ -37,6 +37,83 @@ COMMENT = re.compile(r"https://github\.com/GNYKCZ/secure_pid_hvac/issues/120#iss
 V2_AUTHORIZATION = "https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6231537918"
 V2_CLOSED_HISTORY = "ae524efc8bc7f8495ea511406a62410afdeb98a6761716ed2fe5610f5058aa2c"
 V2_PORTS = (55121, 55122, 55123)
+V2_CERTIFICATE_AUTHORIZATION = "https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6231986263"
+V2_CERTIFICATE_FIELDS = ("certificate_change_authorization_url", "previous_public_certificate_sha256",
+                         "previous_conditions_sha256", "public_certificate_validity", "certificate_change_reason")
+
+
+def certificate_validity(directory, *, now=None):
+    """离线核验原生成器的四份公开证书；不读私钥、不连接TLS、不修改信任。"""
+    from cryptography import x509
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+    now = datetime.now(UTC) if now is None else now
+    certificates = {name: x509.load_pem_x509_certificate((Path(directory)/name).read_bytes())
+                    for name in ("ca.pem", "client.pem", "p1.pem", "p2.pem")}
+    ca = certificates["ca.pem"]
+    validity = {}
+    for name, cert in certificates.items():
+        key = cert.public_key()
+        is_ca = name == "ca.pem"
+        expected = "LAN local test CA" if is_ca else name[:-4]+".secure-control.test"
+        if (not isinstance(key, rsa.RSAPublicKey) or key.key_size != 2048 or key.public_numbers().e != 65537
+                or cert.signature_hash_algorithm.name != "sha256"
+                or cert.subject != x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, expected)])
+                or cert.extensions.get_extension_for_class(x509.BasicConstraints).value
+                    != x509.BasicConstraints(ca=is_ca, path_length=0 if is_ca else None)
+                or (cert.not_valid_after_utc-cert.not_valid_before_utc).total_seconds() != 25*3600
+                or now < cert.not_valid_before_utc or (cert.not_valid_after_utc-now).total_seconds() < 3600):
+            raise ValueError("测试证书身份/规格/有效期不符合本次条件，启动前须至少余一小时。")
+        cert.verify_directly_issued_by(ca)
+        if not is_ca and (
+                cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+                    != x509.SubjectAlternativeName([x509.DNSName(expected)])
+                or set(cert.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value)
+                    != {ExtendedKeyUsageOID.SERVER_AUTH, ExtendedKeyUsageOID.CLIENT_AUTH}):
+            raise ValueError("角色证书SAN/用途不符合原TLS身份。")
+        validity[name] = {"not_before": cert.not_valid_before_utc.isoformat(),
+                          "not_after": cert.not_valid_after_utc.isoformat()}
+    return validity
+
+
+def _v2_certificate_change_valid(manifest):
+    """证书例外只改变公开证书输入；旧摘要随后必须与原历史相等。"""
+    if not any(k in manifest for k in V2_CERTIFICATE_FIELDS):
+        return True
+    previous = manifest.get("previous_public_certificate_sha256")
+    current = manifest.get("public_certificate_sha256")
+    validity = manifest.get("public_certificate_validity")
+    if (manifest.get("certificate_change_authorization_url") != V2_CERTIFICATE_AUTHORIZATION
+            or manifest.get("certificate_change_reason") != "expired_test_certificates"
+            or not isinstance(previous, dict) or not isinstance(current, dict)
+            or set(previous) != {"ca.pem", "client.pem", "p1.pem", "p2.pem"}
+            or set(current) != set(previous) or not isinstance(validity, dict) or set(validity) != set(previous)
+            or any(not isinstance(v, str) or re.fullmatch(r"[0-9a-f]{64}", v) is None
+                   or v == current[k] for k, v in previous.items())
+            or manifest.get("previous_conditions_sha256") != digest({"ports": manifest.get("ports"),
+                "environment": manifest.get("environment"), "public_certificate_sha256": previous, "seed": SEED})):
+        return False
+    try:
+        for row in validity.values():
+            if set(row) != {"not_before", "not_after"}:
+                return False
+            start, end = (datetime.fromisoformat(row[k]) for k in ("not_before", "not_after"))
+            if start.utcoffset() != UTC.utcoffset(start) or end.utcoffset() != UTC.utcoffset(end) or end <= start:
+                return False
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return True
+
+
+def _require_v2_conditions(manifest, history):
+    """共同入口把候选条件锚定到原五项；精确证书例外不能夹带其他变化。"""
+    previous = (manifest.get("previous_conditions_sha256") if any(k in manifest for k in V2_CERTIFICATE_FIELDS)
+                else manifest.get("conditions_sha256"))
+    if (not _v2_certificate_change_valid(manifest) or len(history) != 5
+            or digest(history) != V2_CLOSED_HISTORY
+            or any(e.get("conditions_sha256") != previous for e in history)):
+        raise ValueError("v2候选与原五项冻结条件不符，或缺少精确证书变更依据。")
 
 
 def digest(value):
@@ -223,13 +300,30 @@ def _v2_candidate_manifest_valid(manifest):
         and m.get("gc") == {"enabled": True, "threshold": [700, 10, 10], "freeze_count": 0, "debug": 0}
         and m.get("budget_path") == str((ROOT / ".tmp/issue120-network-budget.json").resolve())
         and m.get("conditions_sha256") == digest({"ports": list(V2_PORTS), "environment": environment,
-            "public_certificate_sha256": certificates, "seed": SEED}) and m.get("seed") == SEED)
+            "public_certificate_sha256": certificates, "seed": SEED}) and m.get("seed") == SEED
+        and _v2_certificate_change_valid(m))
 
 
 def require_v2_candidate(manifest, configs=None):
     """共享/实际循环都核对当前来源和原账本的已占第六项，不能私有入口旁路。"""
     if not _v2_candidate_manifest_valid(manifest):
         raise ValueError("v2缺少本次已审N2/candidate/1000的完整绑定。")
+    head, fingerprints = source()
+    ledger = Path(manifest["budget_path"])
+    entries = json.loads(ledger.read_text(encoding="utf-8"))["entries"]
+    if (head != manifest["head"] or fingerprints != manifest["source_sha256"] or len(entries) != 6
+            or ledger.with_suffix(ledger.suffix + ".lock").read_text(encoding="utf-8").strip() != str(os.getpid())):
+        raise ValueError("v2来源或原账本占项不匹配。")
+    _next_compact_call(entries[:5], "N2", "candidate", head, fingerprints, manifest)
+    _require_v2_conditions(manifest, entries[:5])
+    entry = entries[-1]
+    if (entry.get("finished") is not False or any(entry.get(k) != manifest[k] for k in (
+            "call", "profile", "phase", "head", "source_sha256", "wire_profile", "authorization_url",
+            "closed_history_sha256", "maximum_attempts", "conditions_sha256"))
+            or any(entry.get(k) != manifest.get(k) for k in V2_CERTIFICATE_FIELDS)
+            or "certificate_change_authorization_url" in manifest
+                and entry.get("public_certificate_sha256") != manifest["public_certificate_sha256"]):
+        raise ValueError("v2第六项不是本次未完成的唯一占项。")
     if configs is not None:
         if (type(configs) is not tuple or len(configs) != 3
                 or tuple(c.role for c in configs) != ("Client", "P1", "P2")
@@ -243,18 +337,12 @@ def require_v2_candidate(manifest, configs=None):
                        or hashlib.sha256(c.certificate.read_bytes()).hexdigest()
                        != manifest["public_certificate_sha256"][c.role.lower()+".pem"] for c in configs)):
             raise ValueError("v2拓扑/公开证书不符合原N2条件。")
-    head, fingerprints = source()
-    ledger = Path(manifest["budget_path"])
-    entries = json.loads(ledger.read_text(encoding="utf-8"))["entries"]
-    if (head != manifest["head"] or fingerprints != manifest["source_sha256"] or len(entries) != 6
-            or ledger.with_suffix(ledger.suffix + ".lock").read_text(encoding="utf-8").strip() != str(os.getpid())):
-        raise ValueError("v2来源或原账本占项不匹配。")
-    _next_compact_call(entries[:5], "N2", "candidate", head, fingerprints, manifest)
-    entry = entries[-1]
-    if (entry.get("finished") is not False or any(entry.get(k) != manifest[k] for k in (
-            "call", "profile", "phase", "head", "source_sha256", "wire_profile", "authorization_url",
-            "closed_history_sha256", "maximum_attempts", "conditions_sha256"))):
-        raise ValueError("v2第六项不是本次未完成的唯一占项。")
+        if "certificate_change_authorization_url" in manifest:
+            directories = {c.certificate.parent.resolve() for c in configs}
+            expected = (ROOT/".tmp/issue120-compact-v2-certs").resolve()
+            if (directories != {expected} or any(c.ca.resolve() != expected/"ca.pem" for c in configs)
+                    or certificate_validity(next(iter(directories))) != manifest["public_certificate_validity"]):
+                raise ValueError("新公开证书的离线核验与冻结有效期不符。")
 
 
 class RunBudget:
@@ -407,7 +495,22 @@ def run_network_benchmark(*, profile, phase, certs, ports, ledger, approval, out
     with RunBudget(ledger) as budget:
         conditions = digest({"ports": list(ports), "environment": environment,
             "public_certificate_sha256": approval.get("public_certificate_sha256"), "seed": SEED})
-        if budget.entries and budget.entries[0].get("conditions_sha256") != conditions:
+        if wire_profile == _COMPACT_PROFILE_V2:
+            if approval.get("conditions_sha256") != conditions:
+                raise ValueError("v2预声明新条件摘要不匹配。")
+            condition_record = approval | {"ports": list(ports), "environment": environment,
+                                           "seed": SEED, "conditions_sha256": conditions}
+            _require_v2_conditions(condition_record, budget.entries)
+            _next_compact_call(budget.entries, profile, phase, head, fingerprints, continuation)
+            if "certificate_change_authorization_url" in approval:
+                if (Path(certs).resolve() != (ROOT/".tmp/issue120-compact-v2-certs").resolve()
+                        or certificate_validity(certs) != approval["public_certificate_validity"]):
+                    raise ValueError("新公开证书有效期不符合预声明。")
+                if any(hashlib.sha256((Path(certs)/name).read_bytes()).hexdigest() != value
+                       for name, value in approval["public_certificate_sha256"].items()):
+                    raise ValueError("新公开证书指纹不符合预声明。")
+                continuation.update({k: approval[k] for k in (*V2_CERTIFICATE_FIELDS, "public_certificate_sha256")})
+        elif budget.entries and budget.entries[0].get("conditions_sha256") != conditions:
             raise ValueError("同一闭环的端口/环境/证书/公开seed不能改变。")
         if phase == "qualification":
             candidates = [e for e in budget.entries if e["profile"] == "N2" and e.get("sample_pass")
