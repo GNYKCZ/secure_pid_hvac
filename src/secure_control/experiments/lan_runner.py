@@ -637,7 +637,7 @@ def _run() -> int:
     benchmark.add_argument("--network-ledger", type=Path)
     benchmark.add_argument("--network-approval", type=Path)
     benchmark.add_argument("--network-repair-note")
-    benchmark.add_argument("--network-wire-profile", choices=("control-dynamic-compact-v1",))
+    benchmark.add_argument("--network-wire-profile", choices=("control-dynamic-compact-v1", _COMPACT_PROFILE_V2))
     benchmark.add_argument("--network-authorization", help="当前 Issue 的直接用户批准登记评论 URL")
     benchmark.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()

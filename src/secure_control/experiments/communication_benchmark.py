@@ -2023,7 +2023,8 @@ def _party_job(
     if compact_history_candidate:
         try:
             history = _CompactHistory(config.role, compact_history_steps,
-                **({"qualification": True} if compact_history_qualification else {}))
+                **({"qualification": True} if compact_history_qualification else {}),
+                **({"wire_profile": wire_profile} if wire_profile == _COMPACT_PROFILE_V2 else {}))
         except Exception as error:  # noqa: BLE001 - 启动失败不建角色，不隐去缺失记录
             queue.put({"role": config.role, "status": "failed", "error_type": type(error).__name__,
                        "steps": [], "directions": {}, "activity_ms": {},
@@ -3216,7 +3217,9 @@ def _run_material_comparison(options, candidate, *, target_steps=1000):
         with ExitStack() as cleanup:
             if compact_candidate:
                 history = _CompactHistory("Client", target_steps if qpc_candidate or qpc_qualification or network else 4000,
-                    **({"qualification": True} if large_history else {}))
+                    **({"qualification": True} if large_history else {}),
+                    **({"wire_profile": _COMPACT_PROFILE_V2}
+                       if options.get("network_wire_profile") == _COMPACT_PROFILE_V2 else {}))
             cleanup.enter_context(patch.object(lan_runtime.LanContinuousRuntime, "close", close))
             if history is not None:
                 cleanup.enter_context(patch.object(lan_runtime._MaterialWorkerPool, "__init__", initialized))
@@ -3347,11 +3350,13 @@ def _observe_network_tls(role, facts):
         facts["restored"] = lan_transport._verify_identity is original
 
 
-def run_network_observation(*, configs, steps, wire_profile=None):
+def run_network_observation(*, configs, steps, wire_profile=None, candidate_manifest=None):
     """独立TLS实验共享入口；先严格校验再复用原循环，旧裸TCP门禁不变。"""
-    from secure_control.execution.localhost_codec import _COMPACT_PROFILE
+    from secure_control.execution.localhost_codec import _COMPACT_PROFILES
 
-    if (wire_profile not in (None, _COMPACT_PROFILE)
+    if (wire_profile not in (None, *_COMPACT_PROFILES)
+            or wire_profile == _COMPACT_PROFILE_V2 and steps != 1000
+            or wire_profile != _COMPACT_PROFILE_V2 and candidate_manifest is not None
             or type(configs) is not tuple or len(configs) != 3 or type(steps) is not int or steps not in (1000, 10000)
             or tuple(getattr(c, "role", None) for c in configs) != ("Client", "P1", "P2")
             or not all(isinstance(c, LanConfig) and c.transport == "mutual_tls" for c in configs)
@@ -3363,6 +3368,9 @@ def run_network_observation(*, configs, steps, wire_profile=None):
             or not gc.isenabled() or gc.get_threshold() != (700, 10, 10)
             or gc.get_freeze_count() or gc.get_debug() or gc.callbacks):
         raise ValueError("网络实验只允许原配置、正常GC、三角色TLS及固定1000/10000。")
+    if wire_profile == _COMPACT_PROFILE_V2:
+        from .network_benchmark import require_v2_candidate
+        require_v2_candidate(candidate_manifest, configs)
     topology = configs[0].topology
     endpoints = (topology.p1_client, topology.p2_client, topology.p1_peer)
     if (topology.identities != {r: f"{r.lower()}.secure-control.test" for r in ("Client", "P1", "P2")}
@@ -3373,7 +3381,8 @@ def run_network_observation(*, configs, steps, wire_profile=None):
     return _run_material_comparison({"steps": steps, "delay_ms": 0., "segment_steps": 400, "optimized": True,
         "material_slots": 16, "role_config": None, "preload_steps": 0, "preload_execution": "fused", "diagnostic": False,
         "recording_mode": "light", "tcp_nodelay": None, "commit_policy": "default", "timeout_trace": False,
-        "network_configs": configs, **({"network_wire_profile": wire_profile} if wire_profile is not None else {})},
+        "network_configs": configs, **({"network_wire_profile": wire_profile} if wire_profile is not None else {}),
+        **({"network_candidate_manifest": candidate_manifest} if wire_profile == _COMPACT_PROFILE_V2 else {})},
         "worker", target_steps=steps)
 
 
@@ -3389,20 +3398,35 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
                                server_gc_candidate=False, stage_wait_diagnostic=False, _stage_observers=None,
                                compact_history_candidate=False, _compact_history=None,
                                qpc_stage_receive_candidate=False, qpc_dynamic_qualification=False,
-                               network_configs=None, network_wire_profile=None) -> dict[str, object]:
+                               network_configs=None, network_wire_profile=None,
+                               network_candidate_manifest=None) -> dict[str, object]:
     """实际持续动态循环及原同步 writer；退出后报告观察，不发布图或更改调度。"""
     from secure_control.execution.lan_runtime import RunControl
-    from secure_control.execution.localhost_codec import _COMPACT_PROFILE
+    from secure_control.execution.localhost_codec import _COMPACT_PROFILES
     from secure_control.scenarios.cart_pole.interactive import InteractiveSession
 
     from .cart_pole_segmented_evidence import _BatchWriter, _correct_cycle_tail, _Spool
     from .lan_continuous_profile import load_segmented_experiment
     from .lan_runner import _run_prepared_segmented
 
-    if network_wire_profile is not None and (network_wire_profile != _COMPACT_PROFILE
+    if network_wire_profile is not None and (network_wire_profile not in _COMPACT_PROFILES
             or network_configs is None or material_candidate != "worker" or not optimized
             or preload_steps or material_slots != 16 or recording_mode != "light"):
         raise ValueError("紧凑动态 profile 只允许显式原网络工人实验入口")
+    if network_wire_profile == _COMPACT_PROFILE_V2:
+        from .network_benchmark import require_v2_candidate
+        if (steps != 1000 or delay_ms != 0 or segment_steps != 400 or role_config is not None
+                or tcp_nodelay is not None or commit_policy != "default" or _gc_trial is not None
+                or any((diagnostic, timeout_trace, worker_timeout_diagnostic, worker_wait_diagnostic,
+                        server_gc_candidate, compact_history_candidate,
+                        qpc_stage_receive_candidate, qpc_dynamic_qualification))
+                or stage_wait_diagnostic is not True
+                or not gc.isenabled() or gc.get_threshold() != (700, 10, 10)
+                or gc.get_freeze_count() or gc.get_debug()):
+            raise ValueError("v2仅允许固定1000/400和正常GC的原候选入口")
+        require_v2_candidate(network_candidate_manifest, network_configs)
+    elif network_candidate_manifest is not None:
+        raise ValueError("候选manifest只能用于v2")
 
     maximum = 10000 if optimized else 400
     if tcp_nodelay is not None and type(tcp_nodelay) is not bool:

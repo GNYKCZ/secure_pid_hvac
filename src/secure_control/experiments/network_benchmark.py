@@ -34,6 +34,9 @@ EXTRA_SOURCE = ("src/secure_control/experiments/network_benchmark.py",
                 "configs/cart_pole_plant.yaml", "configs/cart_pole_balance.yaml",
                 "configs/shared_prime_256_pocklington.yaml", "pyproject.toml", "uv.lock")
 COMMENT = re.compile(r"https://github\.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-[0-9]+\Z")
+V2_AUTHORIZATION = "https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6231537918"
+V2_CLOSED_HISTORY = "ae524efc8bc7f8495ea511406a62410afdeb98a6761716ed2fe5610f5058aa2c"
+V2_PORTS = (55121, 55122, 55123)
 
 
 def digest(value):
@@ -65,16 +68,19 @@ def validate_cli(args):
     wire = getattr(args, "network_wire_profile", None)
     authorization = getattr(args, "network_authorization", None)
     if (wire is None and (authorization is not None or args.network_phase == "candidate")
-            or wire is not None and (wire != _COMPACT_PROFILE or args.network_profile != "N2"
-                or args.network_phase not in {"candidate", "qualification"}
-                or not isinstance(authorization, str) or not COMMENT.fullmatch(authorization))):
-        raise ValueError("紧凑候选仅允许用户明确批准的两次 N2 阶段。")
+            or wire is not None and (wire not in _COMPACT_PROFILES or args.network_profile != "N2"
+                or args.network_phase not in ({"candidate"} if wire == _COMPACT_PROFILE_V2 else {"candidate", "qualification"})
+                or not isinstance(authorization, str) or not COMMENT.fullmatch(authorization)
+                or wire == _COMPACT_PROFILE_V2 and authorization != V2_AUTHORIZATION)):
+        raise ValueError("紧凑候选须匹配批准和N2阶段；v2仅本次candidate。")
     try:
         ports = tuple(int(p) for p in args.network_ports.split(","))
     except (ValueError, AttributeError) as error:
         raise ValueError("网络端口应为三个逗号分隔的整数。") from error
     if len(ports) != 3 or len(set(ports)) != 3 or any(not 1 <= p <= 65535 for p in ports):
         raise ValueError("网络端口必须固定且互异。")
+    if wire == _COMPACT_PROFILE_V2 and ports != V2_PORTS:
+        raise ValueError("v2必须保留原三个端口。")
     return ports
 
 
@@ -146,6 +152,19 @@ def next_call(entries, profile, phase, head, sources, repair_note=None):
 
 def _next_compact_call(entries, profile, phase, head, sources, continuation):
     """在同一已停止账本追加一次人工续接；旧循环与失败记录不可重置。"""
+    if isinstance(continuation, dict) and continuation.get("wire_profile") == _COMPACT_PROFILE_V2:
+        if (type(entries) is not list or len(entries) != 5
+                or continuation.get("authorization_url") != V2_AUTHORIZATION
+                or continuation.get("closed_history_sha256") != V2_CLOSED_HISTORY
+                or digest(entries) != V2_CLOSED_HISTORY or profile != "N2" or phase != "candidate"
+                or any(not isinstance(e, dict) or e.get("finished") is not True
+                       or type(e.get("maximum_attempts")) is not int or e["maximum_attempts"] != 1000 for e in entries)
+                or entries[-1].get("wire_profile") != _COMPACT_PROFILE
+                or entries[-1].get("phase") != "candidate" or entries[-1].get("profile") != "N2"
+                or entries[-1].get("sample_pass") is not False
+                or head == entries[-1].get("head") or sources == entries[-1].get("source_sha256")):
+            raise ValueError("v2仅允许保留原五项历史后的唯一第六项N2/candidate/1000。")
+        return 1000
     if (type(entries) is not list or not isinstance(continuation, dict)
             or continuation.get("wire_profile") != _COMPACT_PROFILE
             or not COMMENT.fullmatch(continuation.get("authorization_url", ""))
@@ -176,6 +195,66 @@ def _next_compact_call(entries, profile, phase, head, sources, continuation):
     if sum(e.get("maximum_attempts", 15000) for e in entries) + 10000 > 15000:
         raise ValueError("候选续接不得突破原总账上限。")
     return 10000
+
+
+def _v2_candidate_manifest_valid(manifest):
+    """本次有限样本的公开来源/许可绑定；不是长期资格或新认证系统。"""
+    if not isinstance(manifest, dict):
+        return False
+    m = manifest
+    certificates = m.get("public_certificate_sha256")
+    sources = m.get("source_sha256")
+    environment = m.get("environment")
+    return (m.get("wire_profile") == _COMPACT_PROFILE_V2
+        and m.get("authorization_url") == V2_AUTHORIZATION and m.get("closed_history_sha256") == V2_CLOSED_HISTORY
+        and m.get("profile") == "N2" and m.get("phase") == "candidate"
+        and m.get("eligible_for_candidate") is True and m.get("qualification_allowed") is False
+        and all(type(m.get(k)) is int and m[k] == v for k, v in {
+            "call": 6, "maximum_calls": 6, "maximum_attempts": 1000, "total_maximum_attempts": 6000,
+            "continuation_maximum_calls": 1, "continuation_maximum_attempts": 1000}.items())
+        and m.get("ports") == list(V2_PORTS)
+        and isinstance(m.get("head"), str) and re.fullmatch(r"[0-9a-f]{40}", m["head"]) is not None
+        and isinstance(sources, dict) and bool(sources)
+        and all(isinstance(k, str) and isinstance(v, str) and re.fullmatch(r"[0-9a-f]{64}", v) for k, v in sources.items())
+        and isinstance(environment, dict) and set(environment) == {"platform", "python", "openssl"}
+        and isinstance(certificates, dict) and set(certificates) == {"ca.pem", "client.pem", "p1.pem", "p2.pem"}
+        and all(isinstance(v, str) and re.fullmatch(r"[0-9a-f]{64}", v) for v in certificates.values())
+        and isinstance(m.get("review_url"), str) and COMMENT.fullmatch(m["review_url"]) is not None
+        and m.get("gc") == {"enabled": True, "threshold": [700, 10, 10], "freeze_count": 0, "debug": 0}
+        and m.get("budget_path") == str((ROOT / ".tmp/issue120-network-budget.json").resolve())
+        and m.get("conditions_sha256") == digest({"ports": list(V2_PORTS), "environment": environment,
+            "public_certificate_sha256": certificates, "seed": SEED}) and m.get("seed") == SEED)
+
+
+def require_v2_candidate(manifest, configs=None):
+    """共享/实际循环都核对当前来源和原账本的已占第六项，不能私有入口旁路。"""
+    if not _v2_candidate_manifest_valid(manifest):
+        raise ValueError("v2缺少本次已审N2/candidate/1000的完整绑定。")
+    if configs is not None:
+        if (type(configs) is not tuple or len(configs) != 3
+                or tuple(c.role for c in configs) != ("Client", "P1", "P2")
+                or any(c.transport != "mutual_tls" or c.topology != configs[0].topology for c in configs)):
+            raise ValueError("v2必须使用原三角色TLS配置。")
+        topology = configs[0].topology
+        endpoints = (topology.p1_client, topology.p2_client, topology.p1_peer)
+        if (tuple(e.port for e in endpoints) != V2_PORTS
+                or any(e.bind != "127.0.0.2" or e.host != "127.0.0.1" for e in endpoints)
+                or any(hashlib.sha256(c.ca.read_bytes()).hexdigest() != manifest["public_certificate_sha256"]["ca.pem"]
+                       or hashlib.sha256(c.certificate.read_bytes()).hexdigest()
+                       != manifest["public_certificate_sha256"][c.role.lower()+".pem"] for c in configs)):
+            raise ValueError("v2拓扑/公开证书不符合原N2条件。")
+    head, fingerprints = source()
+    ledger = Path(manifest["budget_path"])
+    entries = json.loads(ledger.read_text(encoding="utf-8"))["entries"]
+    if (head != manifest["head"] or fingerprints != manifest["source_sha256"] or len(entries) != 6
+            or ledger.with_suffix(ledger.suffix + ".lock").read_text(encoding="utf-8").strip() != str(os.getpid())):
+        raise ValueError("v2来源或原账本占项不匹配。")
+    _next_compact_call(entries[:5], "N2", "candidate", head, fingerprints, manifest)
+    entry = entries[-1]
+    if (entry.get("finished") is not False or any(entry.get(k) != manifest[k] for k in (
+            "call", "profile", "phase", "head", "source_sha256", "wire_profile", "authorization_url",
+            "closed_history_sha256", "maximum_attempts", "conditions_sha256"))):
+        raise ValueError("v2第六项不是本次未完成的唯一占项。")
 
 
 class RunBudget:
@@ -264,21 +343,27 @@ def assemble(result, *, profile, phase, manifest, relay):
     wire_profile = manifest.get("wire_profile")
     compact = wire_profile in _COMPACT_PROFILES
     material = result.get("material_summary") or {}
-    wire_valid = wire_profile is None or compact and (result.get("wire_profile") == wire_profile
+    wire_valid = (wire_profile is None and result.get("wire_profile") is None) or compact and (result.get("wire_profile") == wire_profile
         and material.get("encoding_profile") == wire_profile
         and (material.get("worker") or {}).get("encoding_profile") == wire_profile
         and len(result.get("party_outcomes", [])) == 2
         and all(row.get("wire_profile") == wire_profile for row in result["party_outcomes"]))
     sample = (result.get("status") == "stopped" and result.get("requested_steps") == target
-        and wire_profile != _COMPACT_PROFILE_V2  # v2 本轮只有软件许可，不能获得性能资格。
+        and (wire_profile != _COMPACT_PROFILE_V2 or profile == "N2" and phase == "candidate"
+             and _v2_candidate_manifest_valid(manifest) and result.get("code_sha") == manifest["head"]
+             and result.get("source_sha256") == manifest["source_sha256"]
+             and result.get("network_source_integrity_failed") is not True)
         and complete and wire_valid and (result.get("network_history") or {}).get("finite_sample_pass") is True and _tls_pass(result)
         and relay.get("model_valid") is True and relay.get("process_exited") is True
         and not relay.get("forced_termination"))
     result.update(network_sample_pass=bool(sample),
-        network_dynamic_qualification_pass=bool(sample and profile == "N2" and phase == "qualification"),
+        network_dynamic_qualification_pass=bool(sample and wire_profile != _COMPACT_PROFILE_V2
+                                                and profile == "N2" and phase == "qualification"),
         local_dynamic_qualification_pass=False, qualification_pass=False, stage_pass=False,
         worker_long_run_gate_pass=False, candidate_gate_pass=False, server_gc_candidate_gate_pass=False,
         comparison_only=True, diagnostic=True)
+    if wire_profile == _COMPACT_PROFILE_V2:
+        result.update(eligible_for_candidate=False, qualification_allowed=False)
     if not sample and result.get("status") == "stopped":
         result.update(status="failed", failure_category="NetworkEvidenceOrModel", failed_phase="NETWORK_REPORT")
     return result
@@ -297,13 +382,22 @@ def run_network_benchmark(*, profile, phase, certs, ports, ledger, approval, out
         raise ValueError("缺少当前head/源指纹对应的独立软件审查放行。")
     continuation = None
     if wire_profile is not None:
-        if (wire_profile != _COMPACT_PROFILE or approval.get("wire_profile") != wire_profile
+        if (wire_profile not in _COMPACT_PROFILES or approval.get("wire_profile") != wire_profile
                 or not isinstance(authorization, str) or not COMMENT.fullmatch(authorization)
                 or approval.get("authorization_url") != authorization
                 or not isinstance(approval.get("closed_history_sha256"), str)):
             raise ValueError("缺少绑定本候选编码、人工批准和旧历史的独立审查放行。")
         continuation = {"wire_profile": wire_profile, "authorization_url": authorization,
                         "closed_history_sha256": approval["closed_history_sha256"]}
+        if wire_profile == _COMPACT_PROFILE_V2 and (
+                profile != "N2" or phase != "candidate" or authorization != V2_AUTHORIZATION
+                or approval["closed_history_sha256"] != V2_CLOSED_HISTORY
+                or ports != V2_PORTS or Path(ledger).resolve() != (ROOT / ".tmp/issue120-network-budget.json").resolve()
+                or approval.get("phase") != "candidate" or approval.get("eligible_for_candidate") is not True
+                or approval.get("qualification_allowed") is not False
+                or type(approval.get("continuation_maximum_calls")) is not int or approval["continuation_maximum_calls"] != 1
+                or type(approval.get("continuation_maximum_attempts")) is not int or approval["continuation_maximum_attempts"] != 1000):
+            raise ValueError("v2仅开放本次原账本上的一次1000候选，不允许长期资格。")
     elif authorization is not None or phase == "candidate":
         raise ValueError("候选续接必须显式指定编码 profile 与批准。")
     output = Path(output)
@@ -338,7 +432,12 @@ def run_network_benchmark(*, profile, phase, certs, ports, ledger, approval, out
             "conditions_sha256": conditions,
             "scope": "single computer; opaque read-block propagation/rate model; not measured WiFi, packets or hardware"}
         if continuation is not None:
-            manifest.update(continuation, continuation_maximum_calls=2, continuation_maximum_attempts=11000)
+            v2 = wire_profile == _COMPACT_PROFILE_V2
+            manifest.update(continuation, continuation_maximum_calls=1 if v2 else 2,
+                            continuation_maximum_attempts=1000 if v2 else 11000)
+            if v2:
+                manifest.update(total_maximum_attempts=6000, eligible_for_candidate=True,
+                                qualification_allowed=False, budget_path=str(Path(ledger).resolve()))
         with output.open("x", encoding="utf-8") as stream:
             try:
                 configs = role_configs(certs, ports, profile)
@@ -350,7 +449,8 @@ def run_network_benchmark(*, profile, phase, certs, ports, ledger, approval, out
                 relay = NetworkRelay(profile, tuple(("127.0.0.1", port, "127.0.0.2") for port in ports)) if profile != "N0" else None
                 with relay if relay is not None else nullcontext():
                     result = benchmark.run_network_observation(configs=configs, steps=steps,
-                        **({"wire_profile": wire_profile} if wire_profile is not None else {}))
+                        **({"wire_profile": wire_profile} if wire_profile is not None else {}),
+                        **({"candidate_manifest": manifest} if wire_profile == _COMPACT_PROFILE_V2 else {}))
                 final_head, final_fingerprints = source()
                 if final_head != head or final_fingerprints != fingerprints:
                     result["network_source_integrity_failed"] = True
@@ -367,9 +467,9 @@ def run_network_benchmark(*, profile, phase, certs, ports, ledger, approval, out
                               "cycle_timing": benchmark._timing([]), "requested_steps": steps}
             relay_report = relay.report if relay is not None else {"model_valid": True, "process_exited": True,
                 "forced_termination": False, "scope": "N0 direct TLS, no relay process or injected delay"}
+            result.update(code_sha=head, source_sha256=fingerprints)
             result = assemble(result, profile=profile, phase=phase, manifest=manifest, relay=relay_report or {})
-            result.update(code_sha=head, source_sha256=fingerprints,
-                          network_budget={"call": budget.entries[-1]["call"], "reserved_attempts": steps,
+            result.update(network_budget={"call": budget.entries[-1]["call"], "reserved_attempts": steps,
                               "calls_spent": len(budget.entries),
                               "attempts_reserved": sum(e["maximum_attempts"] for e in budget.entries),
                               "startup_failure_consumes_call": True})

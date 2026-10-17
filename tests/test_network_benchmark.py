@@ -344,6 +344,215 @@ def _entry(profile, *, passed=True, head="a", sources=None, phase="discovery"):
             "maximum_attempts": 10000 if phase == "qualification" else 1000, "finished": True, "sample_pass": passed}
 
 
+@pytest.fixture
+def v2_candidate_context(tmp_path, monkeypatch):
+    """软件夹具的五项封闭历史；只替换测试根目录及对应固定摘要，不读真实账本。"""
+    monkeypatch.setattr(network, "ROOT", tmp_path)
+    head, sources = "c"*40, {"src": "d"*64}
+    monkeypatch.setattr(network, "source", lambda: (head, sources))
+    directory = tmp_path/".tmp"
+    directory.mkdir()
+    certs = directory/"certs"
+    certs.mkdir()
+    hashes = {}
+    for name in ("ca.pem", "client.pem", "p1.pem", "p2.pem"):
+        (certs/name).write_bytes(name.encode())
+        hashes[name] = network.hashlib.sha256(name.encode()).hexdigest()
+    environment = {"platform": network.platform.platform(), "python": sys.version.split()[0],
+                   "openssl": network.ssl.OPENSSL_VERSION}
+    conditions = network.digest({"ports": list(network.V2_PORTS), "environment": environment,
+                                "public_certificate_sha256": hashes, "seed": network.SEED})
+    history = [_entry("N0"), _entry("N1"), _entry("N2", passed=False),
+        _entry("N2", head="b", phase="recheck", passed=False),
+        dict(_entry("N2", head="b", phase="candidate", passed=False), wire_profile=network._COMPACT_PROFILE,
+             authorization_url="https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-2")]
+    for i, entry in enumerate(history):
+        entry.update(call=i+1, conditions_sha256=conditions)
+    closed = network.digest(history)
+    monkeypatch.setattr(network, "V2_CLOSED_HISTORY", closed)
+    ledger = directory/"issue120-network-budget.json"
+    ledger.write_text(json.dumps({"schema": "network-call-budget-v1", "entries": history}), encoding="utf-8")
+    manifest = {"wire_profile": network._COMPACT_PROFILE_V2, "authorization_url": network.V2_AUTHORIZATION,
+        "closed_history_sha256": closed, "profile": "N2", "phase": "candidate", "head": head,
+        "source_sha256": sources, "call": 6, "maximum_calls": 6, "maximum_attempts": 1000,
+        "total_maximum_attempts": 6000, "continuation_maximum_calls": 1, "continuation_maximum_attempts": 1000,
+        "eligible_for_candidate": True, "qualification_allowed": False, "ports": list(network.V2_PORTS),
+        "environment": environment, "public_certificate_sha256": hashes, "conditions_sha256": conditions,
+        "seed": network.SEED, "gc": {"enabled": True, "threshold": [700, 10, 10], "freeze_count": 0, "debug": 0},
+        "review_url": "https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-1",
+        "budget_path": str(ledger.resolve())}
+    return history, manifest, ledger, certs
+
+
+def test_v2_candidate_reserves_original_sixth_once_and_never_qualification(v2_candidate_context):
+    history, manifest, ledger, _certs = v2_candidate_context
+    for entries in ([], history[:4], history+[dict(history[-1])],
+                    [dict(e, finished=False) if i == 4 else e for i, e in enumerate(history)],
+                    [dict(e, head="changed") if i == 0 else e for i, e in enumerate(history)]):
+        with pytest.raises(ValueError):
+            network._next_compact_call(entries, "N2", "candidate", manifest["head"], manifest["source_sha256"], manifest)
+    for changes in ({"authorization_url": "https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-9"},
+                    {"closed_history_sha256": network.digest(history[:4])}, {"wire_profile": network._COMPACT_PROFILE}):
+        with pytest.raises(ValueError):
+            network._next_compact_call(history, "N2", "candidate", manifest["head"], manifest["source_sha256"], manifest|changes)
+    with network.RunBudget(ledger) as budget:
+        assert budget.reserve("N2", "candidate", manifest["head"], manifest["source_sha256"], ledger.parent/"raw.json",
+            conditions_sha256=manifest["conditions_sha256"], continuation={k:manifest[k] for k in
+                ("wire_profile", "authorization_url", "closed_history_sha256")}) == 1000
+        # 实际entry只包含生产reserve生成的字段；夹具manifest的多余报告字段不充当许可。
+        network.require_v2_candidate(manifest)
+        assert budget.entries[:5] == history and len(budget.entries) == 6
+        with pytest.raises(ValueError):
+            network.require_v2_candidate(manifest|{"head": "f"*40})
+        budget.finish({"cycles": [], "network_sample_pass": False, "failure_category": "StartupError"}, "raw")
+    saved = json.loads(ledger.read_text())["entries"]
+    assert saved[:5] == history and saved[-1]["actual_attempts"] == 0 and saved[-1]["finished"]
+    for entries in (saved, [*history, dict(saved[-1], sample_pass=True)]):
+        for phase in ("candidate", "qualification"):
+            with pytest.raises(ValueError):
+                network._next_compact_call(entries, "N2", phase, manifest["head"], manifest["source_sha256"], manifest)
+
+
+@pytest.mark.parametrize("passed", [False, True])
+def test_v2_candidate_original_wrapper_preserves_manifest_and_consumes_startup(v2_candidate_context, monkeypatch, passed):
+    history, manifest, ledger, certs = v2_candidate_context
+    approval = ledger.parent/"approval.json"
+    approval.write_text(json.dumps(manifest|{"software_pass": True, "readback_exact": True}), encoding="utf-8")
+    calls = []
+    def observed(**kwargs):
+        calls.append(kwargs)
+        network.require_v2_candidate(kwargs["candidate_manifest"])
+        assert kwargs["steps"] == 1000 and kwargs["wire_profile"] == network._COMPACT_PROFILE_V2
+        if not passed:
+            raise RuntimeError("software startup witness")
+        return {"status": "stopped", "requested_steps": 1000, "cycles": [{}]*1000,
+            "wire_profile": network._COMPACT_PROFILE_V2, "network_history": {"finite_sample_pass": True},
+            "material_summary": {"encoding_profile": network._COMPACT_PROFILE_V2,
+                                 "worker": {"encoding_profile": network._COMPACT_PROFILE_V2}},
+            "party_outcomes": [{"wire_profile": network._COMPACT_PROFILE_V2} for _ in range(2)]}
+    class Relay:
+        def __init__(self, *_args):
+            self.report = {"model_valid": True, "process_exited": True, "forced_termination": False}
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            pass
+    monkeypatch.setattr(network, "NetworkRelay", Relay)
+    monkeypatch.setattr(benchmark, "run_network_observation", observed)
+    monkeypatch.setattr(benchmark, "_compact_sample_pass", lambda *a, **k: True)
+    monkeypatch.setattr(network, "_tls_pass", lambda _r: True)
+    options = {"profile": "N2", "phase": "candidate", "certs": certs, "ports": network.V2_PORTS,
+        "ledger": ledger, "approval": approval, "wire_profile": network._COMPACT_PROFILE_V2,
+        "authorization": network.V2_AUTHORIZATION}
+    result = network.run_network_benchmark(**options, output=ledger.parent/"raw.json")
+    assert len(calls) == 1 and result["network_sample_pass"] is passed
+    assert all(result[k] is False for k in ("network_dynamic_qualification_pass", "qualification_pass", "stage_pass"))
+    assert result["network_manifest"]["continuation_maximum_calls"] == 1
+    assert result["network_manifest"]["total_maximum_attempts"] == 6000
+    saved = json.loads(ledger.read_text())["entries"]
+    assert saved[:5] == history and len(saved) == 6 and saved[-1]["finished"]
+    assert saved[-1]["actual_attempts"] == (1000 if passed else 0)
+    for changed in ({}, {"phase": "qualification"}, {"authorization": network.V2_AUTHORIZATION+"0"}):
+        with pytest.raises(ValueError):
+            network.run_network_benchmark(**(options|changed), output=ledger.parent/"retry.json")
+    assert len(calls) == 1 and not (ledger.parent/"retry.json").exists()
+
+
+def test_v2_candidate_assembly_requires_exact_finite_binding(v2_candidate_context, monkeypatch):
+    _history, manifest, _ledger, _certs = v2_candidate_context
+    monkeypatch.setattr(benchmark, "_compact_sample_pass", lambda *a, **k: True)
+    monkeypatch.setattr(network, "_tls_pass", lambda _r: True)
+    result = {"status": "stopped", "requested_steps": 1000, "code_sha": manifest["head"],
+        "source_sha256": manifest["source_sha256"], "wire_profile": network._COMPACT_PROFILE_V2,
+        "network_history": {"finite_sample_pass": True}, "party_outcomes": [{"wire_profile": network._COMPACT_PROFILE_V2}]*2,
+        "material_summary": {"encoding_profile": network._COMPACT_PROFILE_V2,
+                             "worker": {"encoding_profile": network._COMPACT_PROFILE_V2}}}
+    relay = {"model_valid": True, "process_exited": True, "forced_termination": False}
+    assert network.assemble(copy.deepcopy(result), profile="N2", phase="candidate", manifest=manifest,
+                            relay=relay)["network_sample_pass"]
+    assert not network.assemble(copy.deepcopy(result), profile="N2", phase="candidate", manifest={},
+                                relay=relay)["network_sample_pass"]
+    for key, value in (("head", "old"), ("closed_history_sha256", "0"*64), ("phase", "qualification"),
+            ("authorization_url", network.V2_AUTHORIZATION+"0"), ("maximum_attempts", 10000),
+            ("eligible_for_candidate", False), ("qualification_allowed", True), ("maximum_calls", True),
+            ("continuation_maximum_calls", 2), ("ports", [1,2,3])):
+        assert not network.assemble(copy.deepcopy(result), profile="N2", phase="candidate", manifest=manifest|{key:value},
+                                    relay=relay)["network_sample_pass"]
+    for changed in ({"model_valid": False}, {"forced_termination": True}, {"process_exited": False}):
+        assert not network.assemble(copy.deepcopy(result), profile="N2", phase="candidate", manifest=manifest,
+                                    relay=relay|changed)["network_sample_pass"]
+    for changed in ({"code_sha": "old"}, {"source_sha256": {}}, {"network_source_integrity_failed": True},
+                    {"network_history": {"finite_sample_pass": False}}, {"requested_steps": 10000}):
+        assert not network.assemble(copy.deepcopy(result)|changed, profile="N2", phase="candidate", manifest=manifest,
+                                    relay=relay)["network_sample_pass"]
+    assert not network.assemble(copy.deepcopy(result), profile="N2", phase="qualification", manifest=manifest,
+                                relay=relay)["network_dynamic_qualification_pass"]
+
+
+def test_v2_candidate_shared_and_actual_loop_require_reserved_context(v2_candidate_context, monkeypatch):
+    _history, manifest, ledger, certs = v2_candidate_context
+    configs = network.role_configs(certs, network.V2_PORTS, "N2")
+    captured = []
+    monkeypatch.setattr(benchmark, "_run_material_comparison", lambda options, *a, **k: captured.append(options))
+    with pytest.raises(ValueError):
+        benchmark.run_network_observation(configs=configs, steps=1000, wire_profile=network._COMPACT_PROFILE_V2)
+    with network.RunBudget(ledger) as budget:
+        budget.reserve("N2", "candidate", manifest["head"], manifest["source_sha256"], ledger.parent/"raw.json",
+            conditions_sha256=manifest["conditions_sha256"], continuation={k:manifest[k] for k in
+                ("wire_profile", "authorization_url", "closed_history_sha256")})
+        benchmark.run_network_observation(configs=configs, steps=1000,
+            wire_profile=network._COMPACT_PROFILE_V2, candidate_manifest=manifest)
+        assert len(captured) == 1 and captured[0]["network_candidate_manifest"] == manifest
+        for wrong in (network.role_configs(certs, network.V2_PORTS, "N0"),
+                      network.role_configs(certs, (55131, 55132, 55133), "N2")):
+            with pytest.raises(ValueError):
+                benchmark.run_network_observation(configs=wrong, steps=1000,
+                    wire_profile=network._COMPACT_PROFILE_V2, candidate_manifest=manifest)
+        with pytest.raises(ValueError):
+            benchmark.run_network_observation(configs=configs, steps=10000,
+                wire_profile=network._COMPACT_PROFILE_V2, candidate_manifest=manifest)
+        def forbidden_context(*_args):
+            raise RuntimeError("software witness before creating any process")
+        monkeypatch.setattr(benchmark.mp, "get_context", forbidden_context)
+        actual_options = captured[0]|{"stage_wait_diagnostic": True}
+        with pytest.raises(ValueError):
+            benchmark._run_continuous_observation(**(actual_options|{"network_candidate_manifest": None}),
+                material_candidate="worker")
+        for wrong in ({"steps": 10000}, {"segment_steps": 2}, {"delay_ms": 1}, {"_gc_trial": object()},
+                      {"recording_mode": "full"}, {"timeout_trace": True}, {"preload_steps": 1000},
+                      {"stage_wait_diagnostic": False}):
+            with pytest.raises(ValueError):
+                benchmark._run_continuous_observation(**(actual_options|wrong), material_candidate="worker")
+        with pytest.raises(RuntimeError, match="software witness"):
+            benchmark._run_continuous_observation(**actual_options, material_candidate="worker")
+
+
+def test_v2_candidate_real_adapter_selects_versioned_history_before_processes(v2_candidate_context, monkeypatch):
+    _history, manifest, ledger, certs = v2_candidate_context
+    configs = network.role_configs(certs, network.V2_PORTS, "N2")
+    captured, process_contexts = [], []
+    original = benchmark._run_continuous_observation
+    def observed(**kwargs):
+        captured.append(kwargs)
+        return original(**kwargs)
+    def context(*_args):
+        process_contexts.append(True)
+        raise RuntimeError("software witness before constructing any role")
+    monkeypatch.setattr(benchmark, "_run_continuous_observation", observed)
+    monkeypatch.setattr(benchmark.mp, "get_context", context)
+    with network.RunBudget(ledger) as budget:
+        budget.reserve("N2", "candidate", manifest["head"], manifest["source_sha256"], ledger.parent/"raw.json",
+            conditions_sha256=manifest["conditions_sha256"], continuation={k:manifest[k] for k in
+                ("wire_profile", "authorization_url", "closed_history_sha256")})
+        result = benchmark.run_network_observation(configs=configs, steps=1000,
+            wire_profile=network._COMPACT_PROFILE_V2, candidate_manifest=manifest)
+    assert len(captured) == len(process_contexts) == 1
+    assert captured[0]["stage_wait_diagnostic"] is True
+    assert captured[0]["_compact_history"].wire_profile == network._COMPACT_PROFILE_V2
+    assert captured[0]["network_candidate_manifest"] == manifest
+    assert result["status"] == "failed" and result["cycles"] == []
+
+
 def test_budget_failure_repair_recheck_and_final_call_cap(tmp_path):
     entries = [_entry("N0", passed=False)]
     with pytest.raises(ValueError, match="暂停"):
@@ -529,6 +738,16 @@ def test_network_cli_is_exclusive_and_does_not_accept_arbitrary_steps(tmp_path, 
         invalid[invalid.index(key)+1] = bad
         monkeypatch.setattr(sys, "argv", invalid)
         assert lan_runner._run() == 5 and len(calls) == 2
+    v2 = [network._COMPACT_PROFILE_V2 if v == network._COMPACT_PROFILE else
+          network.V2_AUTHORIZATION if v.endswith("issuecomment-2") else v for v in compact]
+    monkeypatch.setattr(sys, "argv", v2)
+    assert lan_runner._run() == 0 and calls[-1]["wire_profile"] == network._COMPACT_PROFILE_V2
+    for key, bad in (("--network-phase", "qualification"), ("--network-profile", "N3"),
+                     ("--network-authorization", network.V2_AUTHORIZATION+"0"), ("--network-ports", "55131,55132,55133")):
+        invalid = list(v2)
+        invalid[invalid.index(key)+1] = bad
+        monkeypatch.setattr(sys, "argv", invalid)
+        assert lan_runner._run() == 5 and len(calls) == 3
 
 
 def test_startup_failure_is_exported_and_consumes_unique_discovery(tmp_path, monkeypatch):

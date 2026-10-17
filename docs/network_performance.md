@@ -131,3 +131,30 @@ Windows内存API的结构和签名只初始化一次，每次采样仍查询OS�
 短TLS夹具可使用较小段容量验证重复维护结构，不形成设备确认或20 ms性能证据；正式配置仍为400。
 新profile只可解析软件证据，现有性能入口和额度函数不为它开放，报告组装也不能使它获得性能资格。
 软件通过及独立审查后停止；发现新缺陷先报告用户，不自动增加返工。新版本20 ms性能与模型验收仍未知，PR继续Draft且不合并。
+
+## 第13次人工续接：唯一一次compact-v2 N2候选验证
+
+[本次设计与批准方向](https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6231537918)将上一节零运行预算替换为**一次、最多1000次尝试的N2/candidate**；其他旧许可不恢复。
+仅接通已有v2实验入口、预算和有限结果，M/R、控制算法、密码与材料内核、模型/seed、正常GC和正式默认不改。
+入口修改产生的新head必须先完成软件检查并独立审查，通过后发布完整预声明并全文读回，才执行唯一native调用。
+
+v2仅接受本次真实批准URL、N2/candidate、固定1000和原端口55121/55122/55123。
+原账本`.tmp/issue120-network-budget.json`的全部五项规范摘要固定为
+`ae524efc8bc7f8495ea511406a62410afdeb98a6761716ed2fe5610f5058aa2c`，最后一项必须是已失败的v1候选；此前5项/预留5000/实际2802保持。
+只能追加第六项1000，实际累计不超过3802、预留合计6000；第六项已存在或在途、换URL/输出名/空账本/改历史/qualification均拒绝。
+旧账本顶层6/15000是历史上限，不能作为本轮额外剩余额度。
+
+新approval须精确绑定本次独立软件报告、新head/全部源码指纹、原环境/公开证书/端口、v2/candidate、全部五项摘要、一次/1000，eligible_for_candidate只允许本次、qualification_allowed=false。
+manifest记录continuation_maximum_calls=1、continuation_maximum_attempts=1000和total_maximum_attempts=6000。
+共享观察入口和实际循环都要求该manifest匹配当前源码以及原账本由当前进程锁定的未完成第六项，不能直接调用私有循环绕开占项。
+Client及Party选择既有v2历史format_version=2以保留maintenance_advance；不会修改原M/R实现或把旧end/begin补零。
+
+完整1000、20ms原全周期、原样本/材料/身份/退出/记录、TLS、1ms模型门禁及本次manifest全部成立才可network_sample_pass=true。
+v2始终不授予network_dynamic_qualification_pass或任何长期资格；结果中的eligible_for_candidate/qualification_allowed均为false，说明本次调用退出后没有可用后续项。
+只有本次绑定的有限candidate可能通过，纯软件v2数据或旧审核来源不能获得运行许可。
+
+固定原5度初态、n4/m2/p1、ell32、原数值与认证模数、20ms、段400、库存16/preload0、持续worker/light、TLS和N2六方向250–500us/100Mbit/s/seed。
+只读前置检查不消费调用；实际启动失败也消费，不重跑、热身、补足、A/B、额外探针或自动源码返工。
+控制/通信/运行首失败即停；模型误差沿原退出汇总，未新增实时首模型异常停机机制，即使1000控制全按时也可能因模型错误判FAIL。
+成功失败均发布完整可恢复原件、native日志及hash，并交Review只读核查来源、全分母、边界/首轮、模型和现有退出证据后停止。
+新10000、qualification、后续优化、自动合并和关闭Issue继续禁止。
