@@ -188,6 +188,89 @@ def test_native_wait_notification_state_relative_timer_and_no_fabricated_write(m
     assert not api.open
 
 
+def test_native_half_close_does_not_restore_write_after_backpressure(monkeypatch):
+    """读侧 EOF 不替代发送 would-block 后所需的新 FD_WRITE。"""
+    from secure_control.experiments import _network_wait_win32 as native
+    api, clock = _WaitAPI(), [10000]
+    monkeypatch.setattr(native.time, "perf_counter_ns", lambda: clock[0])
+    sock = SimpleNamespace(fileno=lambda: 101)
+    with native.NativeWait(_api=api) as wait:
+        wait.register(sock, 3, ("stream", None, None))
+        api.events[101] = (native.FD_WRITE | native.FD_CLOSE, {})
+        assert wait.wait_until(11000)[0][0][1] == 3
+        assert wait.writable_return(sock) == 10000
+        wait.read_started(sock)
+        wait.write_blocked(sock)
+        # EOF 仍可读，但关闭通知不得合成写就绪或新可写取回时刻。
+        assert wait.wait_until(11000)[0][0][1] == emulator.selectors.EVENT_READ
+        wait.modify(sock, emulator.selectors.EVENT_WRITE, ("stream", None, None))
+        assert not wait.wait_until(11000)[0] and wait.writable_return(sock) is None
+        api.events[101] = (native.FD_WRITE, {})
+        clock[0] = 10500
+        assert wait.wait_until(11000)[0][0][1] == emulator.selectors.EVENT_WRITE
+        assert wait.writable_return(sock) == 10500
+    assert not api.open
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows原生半关闭与发送背压组合")
+def test_native_half_close_backpressure_preserves_pending_reverse_bytes():
+    """原生 socket 与真实 relay 派发：半关闭后排空反向数据，绝不测量性能。"""
+    from secure_control.experiments._network_wait_win32 import NativeWait
+    left, right = socket.socketpair()
+    left.setblocking(False)
+    right.setblocking(False)
+    left.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+    right.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    try:
+        with NativeWait() as wait:
+            wait.register(left, 3, ("stream", None, None))
+            assert wait.wait_until(time.perf_counter_ns()+1_000_000_000)[0]
+            wait.writable_return(left)
+            right.shutdown(socket.SHUT_WR)
+            assert wait.wait_until(time.perf_counter_ns()+1_000_000_000)[0]
+            wait.read_started(left)
+            assert left.recv(1) == b""
+            wait.modify(left, emulator.selectors.EVENT_WRITE, ("stream", None, None))
+            filled = 0
+            for _ in range(128):
+                try:
+                    filled += left.send(b"x"*65536)
+                except BlockingIOError:
+                    wait.write_blocked(left)
+                    break
+            else:
+                pytest.fail("有界发送没有产生预期背压")
+            pending = b"pending-reverse-bytes"
+            direction = emulator.Direction(None, left, "P1->Client", None)
+            now = time.perf_counter_ns()
+            direction.queue.append(emulator.Block(pending, 0, now, now, 0, now))
+            direction.queued = len(pending)
+            ring = emulator.PublicRing()
+            emulator._dispatch(direction, now, None, ring, wait)
+            assert direction.stats["backpressure_count"] == 1 and direction.queued == len(pending)
+            assert not wait.wait_until(time.perf_counter_ns()+1_000_000)[0]
+            assert wait.writable_return(left) is None
+            right.settimeout(1)
+            received = bytearray()
+            while len(received) < filled:
+                received.extend(right.recv(min(65536, filled-len(received))))
+            assert received == b"x"*filled
+            selected, returned, _kind = wait.wait_until(time.perf_counter_ns()+1_000_000_000)
+            assert selected and selected[0][1] == emulator.selectors.EVENT_WRITE
+            writable = wait.writable_return(left)
+            assert writable is not None and writable <= returned
+            emulator._dispatch(direction, returned, writable, ring, wait)
+            assert not direction.queue and direction.queued == 0
+            assert direction.stats["sent_bytes"] == len(pending)
+            assert right.recv(len(pending)) == pending
+            left.shutdown(socket.SHUT_WR)
+            assert right.recv(1) == b""
+        assert wait.report()["handles_open"] == 0
+    finally:
+        left.close()
+        right.close()
+
+
 @pytest.mark.parametrize("failure", ["create", "bind", "enum", "timer", "wait", "event_close", "cancel", "close"])
 def test_native_wait_fail_closed_and_partial_initialization_reclaims_handles(failure):
     from secure_control.experiments._network_wait_win32 import NativeWait

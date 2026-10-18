@@ -218,7 +218,8 @@ class NativeWait:
             mask = 0
             if entry.key.events & selectors.EVENT_READ and (entry.readable or entry.closed):
                 mask |= selectors.EVENT_READ
-            if entry.key.events & selectors.EVENT_WRITE and (entry.writable or entry.closed):
+            # FD_CLOSE 只保留读 EOF；反向发送背压必须等真实 FD_WRITE 重新激活。
+            if entry.key.events & selectors.EVENT_WRITE and entry.writable:
                 mask |= selectors.EVENT_WRITE
             if mask:
                 ready.append((entry.key, mask))
