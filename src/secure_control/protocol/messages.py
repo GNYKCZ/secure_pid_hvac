@@ -590,6 +590,7 @@ class _PreparedEncodedResources:
     fragments: tuple[bytes, bytes] = field(repr=False)
     _owner: object = field(repr=False, compare=False)
     _token: object = field(repr=False, compare=False)
+    encoding_profile: str = "control-batch-v1"
 
 
 @dataclass(frozen=True, slots=True)

@@ -6,6 +6,7 @@ import json
 import multiprocessing as mp
 import os
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -854,6 +855,119 @@ def test_canonical_qpc_observation_and_restore_errors_keep_primary_cause(monkeyp
         f.transport._receive_qpc_exact(f.channel, 4, f.deadline, _observe=broken_observer)
     assert caught.value.__cause__ is original and f.channel.timeout == 0
     assert len(caught.value.__notes__) == 2
+
+
+def test_duplex_frame_real_tls_small_buffers_large_frames(tmp_path):
+    """双方发送均超过内核窗口；必须在同 owner 同时读写才能完成。"""
+    from secure_control.execution.localhost_transport import _exchange_frame
+
+    subprocess.run([sys.executable, str(Path(__file__).parent / "fixtures/prepare_local_lan_certs.py"),
+                    "--output", str(tmp_path)], check=True, capture_output=True)
+    server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_context.load_cert_chain(tmp_path / "p1.pem", tmp_path / "p1.key")
+    client_context = ssl.create_default_context(cafile=str(tmp_path / "ca.pem"))
+    client_context.load_cert_chain(tmp_path / "client.pem", tmp_path / "client.key")
+    server_context.load_verify_locations(cafile=str(tmp_path / "ca.pem"))
+    server_context.verify_mode = ssl.CERT_REQUIRED
+    payloads = (bytes(range(256)) * 1024, bytes(reversed(range(256))) * 1024)
+    results, errors = [], []
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+
+    def exchange(raw, context, index):
+        with raw:
+            raw.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+            raw.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            raw.settimeout(10.)
+            with context.wrap_socket(raw, server_side=index == 0,
+                    server_hostname="p1.secure-control.test" if index else None) as secure:
+                assert secure.version() == "TLSv1.3"
+                assert _exchange_frame(secure, payloads[index], deadline=deadline_after(10.),
+                                       limit=300000) == payloads[1-index]
+                assert secure.gettimeout() == 10.
+                results.append(index)
+
+    def accept():
+        try:
+            raw, _ = listener.accept()
+            exchange(raw, server_context, 0)
+        except BaseException as error:  # noqa: BLE001 - 子线程原始失败交回主线程断言。
+            errors.append(error)
+
+    thread = threading.Thread(target=accept)
+    thread.start()
+    try:
+        exchange(socket.create_connection(listener.getsockname(), timeout=10.), client_context, 1)
+    finally:
+        listener.close()
+        thread.join(12.)
+    assert not thread.is_alive() and not errors and sorted(results) == [0, 1]
+
+
+@pytest.mark.parametrize("fault", (None, "eof", "oversize", "deadline", "late_restore", "restore", "primary_restore"))
+def test_duplex_frame_partial_wants_deadline_and_timeout_owner(monkeypatch, fault):
+    """短读写及 TLS WANT 可换向；首错和恢复后的期限均不可丢失。"""
+    from secure_control.execution import localhost_transport as transport
+    from secure_control.execution.cycle_timing import _CycleDeadline
+
+    now, selected, sent = [0.], [], bytearray()
+    original, restore = OSError("primary"), OSError("restore")
+    incoming = bytearray(struct.pack("!I", 99 if fault == "oversize" else 4) + b"data")
+    class Channel:
+        timeout = .7
+        calls = 0
+        reads = 0
+        def gettimeout(self):
+            return self.timeout
+        def settimeout(self, value):
+            if value == .7 and fault == "late_restore":
+                now[0] = 1.
+            if value == .7 and fault in {"restore", "primary_restore"}:
+                raise restore
+            self.timeout = value
+        def send(self, data):
+            self.calls += 1
+            if fault == "primary_restore":
+                raise original
+            if self.calls <= 2:
+                raise ssl.SSLWantReadError()
+            sent.extend(data[:2])
+            return min(2, len(data))
+        def recv(self, size):
+            self.reads += 1
+            if fault == "eof":
+                return b""
+            if self.reads <= 2:
+                raise ssl.SSLWantWriteError()
+            chunk = bytes(incoming[:min(size, 2)])
+            del incoming[:len(chunk)]
+            return chunk
+    channel = Channel()
+    def select(read, write, errors, timeout):
+        selected.append((read, write, timeout))
+        now[0] += 2. if fault == "deadline" else .01
+        return read, write, []
+    monkeypatch.setattr(transport.select, "select", select)
+    deadline = _CycleDeadline(1_000_000_000)
+    monkeypatch.setattr(transport, "remaining_seconds", lambda current: (
+        current.deadline_ns / 1e9 - now[0] if current is deadline else pytest.fail("deadline changed")))
+    if fault is None:
+        assert transport._exchange_frame(channel, b"out", deadline=deadline, limit=8) == b"data"
+        assert sent == struct.pack("!I", 3) + b"out"
+        assert selected[0][:2] == ([channel], [channel]) and channel.timeout == .7
+    else:
+        expected = {"eof": LocalhostTransportDisconnected, "oversize": LocalhostTransportProtocolError,
+                    "deadline": LocalhostTransportTimeout, "late_restore": LocalhostTransportTimeout, "restore": OSError,
+                    "primary_restore": OSError}[fault]
+        with pytest.raises(expected) as caught:
+            transport._exchange_frame(channel, b"out", deadline=deadline, limit=8)
+        if fault == "primary_restore":
+            assert caught.value is original and caught.value.__notes__
+        elif fault == "restore":
+            assert caught.value is restore
+        else:
+            assert channel.timeout == .7
 
 
 @pytest.mark.integration

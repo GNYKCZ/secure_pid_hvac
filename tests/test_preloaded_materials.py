@@ -233,6 +233,7 @@ def test_fused_activation_preflights_both_frames_and_burns_window_on_partial_fai
         client.record_preloaded_receipts(distribution, batch, receipts("seal"))
         runtime = lan.LanContinuousRuntime.__new__(lan.LanContinuousRuntime)
         runtime.__dict__.update(_v2=True, _failed=False, _finished=False, _step=0,
+            _wire_profile="control-batch-v1",
             _segment_start=0, _segment_capacity=400, _preload_steps=1, _preload_execution=mode,
             _preloaded=batch, _preload_digest=manifest.sha256(), _material_pool=None,
             _sockets=["p1", "p2"], _sequences=[7, 7], _batch=True, _overlap_commit=True,

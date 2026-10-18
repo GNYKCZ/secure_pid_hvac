@@ -1431,27 +1431,31 @@ class _PreparedResourceOwner:
         self._encoded_source = None
         self._encoded_tokens = WeakValueDictionary()
 
-    def open_encoded_source(self, source):
+    def open_encoded_source(self, source, *, encoding_profile="control-batch-v1"):
         """只给同 session 的一个专属接收器登记能力；停止后不能换工人续接。"""
         with self._lock:
-            if self._encoded_source is not None:
+            if (self._encoded_source is not None or type(encoding_profile) is not str
+                    or not 1 <= len(encoding_profile) <= 128):
                 raise ValueError("编码材料来源已安装")
             self._encoded_source = source
+            self._encoded_profile = encoding_profile
 
-    def register_encoded(self, source, plan, fragments):
+    def register_encoded(self, source, plan, fragments, *, encoding_profile="control-batch-v1"):
         """接收器已校验原始通道/额度/摘要；此处只登记本机原对象。"""
         with self._lock:
-            if source is not self._encoded_source or source is None:
+            if (source is not self._encoded_source or source is None
+                    or encoding_profile != self._encoded_profile):
                 raise ValueError("不是专属编码材料来源")
             if plan.session_id != self.session_id or (self.horizon is not None and plan.step >= self.horizon):
                 raise ValueError("编码计划超出本 session 范围")
-            result = _PreparedEncodedResources(plan, fragments, self, object())
+            result = _PreparedEncodedResources(plan, fragments, self, object(), encoding_profile)
             self._encoded_tokens[result._token] = result
             return result
 
     def _validate_encoded(self, prepared, step):
         if (not isinstance(prepared, _PreparedEncodedResources) or prepared._owner is not self
                 or self._encoded_tokens.get(prepared._token) is not prepared
+                or prepared.encoding_profile != self._encoded_profile
                 or prepared.plan.step != _require_step(step)):
             raise ValueError("编码材料不是本 Client/step 的原始未领取能力")
 

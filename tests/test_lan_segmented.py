@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from dataclasses import FrozenInstanceError, asdict, replace
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -32,6 +33,253 @@ from secure_control.experiments.cart_pole_lan_profile import load_cart_pole_lan_
 from secure_control.experiments.lan_continuous_profile import load_segmented_experiment
 from secure_control.protocol import ControllerRangeContract
 from secure_control.scenarios.cart_pole.interactive import InteractiveSession
+
+
+@pytest.fixture
+def compact_advance(monkeypatch):
+    """400个已双提交且确认的公开条目；所有网络操作可逐项注入失败。"""
+    from secure_control.execution import localhost_codec as codec
+
+    runtime = LanSegmentedRuntime.__new__(LanSegmentedRuntime)
+    segment = lan_runtime.LanContinuousRuntime.__new__(lan_runtime.LanContinuousRuntime)
+    closed, sent, fault = [], [], {"kind": None}
+    segment.__dict__.update(_v2=True, _failed=False, _finished=False, _step=400,
+        _segment_start=0, _confirmed_steps=list(range(400)), _confirmed_plans=list(range(400)),
+        _sequences=[17, 17], _sockets=["P1", "P2"], session_id="session",
+        _products=12000, _truncations=1600, setup=None, scale_ledger=None,
+        range_verification=None, modulus_verification=None, _material_pool=None,
+        last_commit_observation=None, _last_phase_ns={}, close=lambda: closed.append(True))
+    runtime.__dict__.update(_v2=True, _full_v3=False, _wire_profile=codec._COMPACT_PROFILE_V2,
+        config=SimpleNamespace(shutdown_timeout=1.), control=RunControl(), _segment=segment,
+        _pending=None, phase="RUNNING", run_id="run", controller_epoch="e"*64,
+        segment_capacity=400, segment_index=0, global_start=0, confirmed_step_count=400,
+        _last_end_round_id=None, _last_closed_segment_count=0, last_sealed_record=None,
+        last_segment_receipts=(), _advance_begin=None, connection_seconds=0.,
+        preload_steps=0, _attempted_round=None, _products=12000, _truncations=1600,
+        hello=codec.LanSegmentedHelloPayload("a"*64, "b"*64, "run", 0, 0, None, "lan-segmented-v2"),
+        _records=[lan_runtime.SegmentedStep("run", 0, "session", f"round-{i}", i, i,
+                    (0.,), 30, 4, ()) for i in range(400)])
+
+    def send(sock, data, **_kwargs):
+        request = decode_envelope(data)
+        if fault["kind"] == "partial_send" and sock == "P2":
+            raise TimeoutError("partial request")
+        sent.append(request)
+
+    def receive(sock, **_kwargs):
+        assert len(sent) % 2 == 0  # 两方先发后收。
+        request = next(r for r in reversed(sent) if r.recipient == sock)
+        if sock == "P2" and fault["kind"] in {"timeout", "partial_reply", "eof"}:
+            raise (EOFError() if fault["kind"] == "eof" else TimeoutError())
+        payload = request.payload
+        end = payload.end if isinstance(payload, codec.SegmentAdvancePayload) else payload
+        receipt = codec.SegmentEndReceipt(sock, "session", end, 400, 12000, 1600)
+        if fault["kind"] == "both_wrong":
+            receipt = replace(receipt, products=11999)
+        if isinstance(payload, codec.SegmentAdvancePayload):
+            begin = payload.begin
+            if fault["kind"] == "bad_begin" and sock == "P2":
+                begin = replace(begin, controller_epoch="f"*64)
+            payload = codec.SegmentAdvanceReceipt(receipt, begin)
+        else:
+            payload = receipt
+        if fault["kind"] == "stop_after_send":
+            runtime.control.request_stop()
+        return replace(request, kind="reply", sender=sock, recipient="Client", payload=payload)
+
+    monkeypatch.setattr(lan_runtime.localhost_transport, "send_frame", send)
+    monkeypatch.setattr(lan_runtime, "send_envelope", lambda sock, request, **kw: send(sock, encode_envelope(request), **kw))
+    monkeypatch.setattr(lan_runtime, "receive_envelope", receive)
+    return runtime, sent, fault, closed
+
+
+@pytest.mark.parametrize("fault", ["timeout", "partial_send", "partial_reply", "eof", "both_wrong", "bad_begin"])
+def test_compact_advance_partial_confirmation_never_allows_next_input(compact_advance, fault):
+    runtime, sent, injection, closed = compact_advance
+    injection["kind"] = fault
+    with pytest.raises((ValueError, TimeoutError, EOFError)):
+        runtime.end_segment()
+    assert runtime.phase == "UNCERTAIN" and closed
+    assert runtime.confirmed_step_count == 400 and runtime._segment._step == 400
+    assert runtime.last_sealed_record is None
+    assert len(runtime.last_segment_receipts) == (1 if fault in {"timeout", "partial_reply", "eof", "bad_begin"} else 0)
+    assert len(sent) <= 2
+    with pytest.raises(RuntimeError):
+        runtime.next_segment()
+    with pytest.raises(RuntimeError):
+        runtime.step([0.])
+
+
+def test_compact_advance_keeps_old_seal_and_sequence_then_zero_step_stop(compact_advance):
+    runtime, sent, injection, _closed = compact_advance
+    injection["kind"] = "stop_after_send"
+    record = runtime.end_segment()
+    assert record.hello.segment_index == 0 and len(record.steps) == 400
+    assert record.receipts == runtime.last_segment_receipts and runtime.last_sealed_record is record
+    assert runtime._segment._sequences == [18, 18]
+    assert runtime.phase == "CONNECTING_NEXT" and runtime.segment_index == 0
+    runtime.next_segment()
+    assert len(sent) == 2 and runtime._segment._step == 400
+    assert runtime._segment._products == 12000 and runtime._segment._truncations == 1600
+    assert runtime._segment._segment_start == 400 and not runtime._segment._confirmed_steps
+    assert runtime.segment_index == 1 and runtime.global_start == 400
+    final = runtime.end_segment()
+    assert runtime.phase == "STOPPED" and not final.steps
+    assert final.receipts[0].end.action == "stop" and final.receipts[0].end.confirmed_count == 0
+    assert [r.operation for r in sent] == ["segment_advance"]*2 + ["segment_end"]*2
+    assert runtime._segment._sequences == [19, 19]
+
+
+@pytest.mark.parametrize("stage", ["seal", "source", "release", "deadline"])
+def test_compact_advance_local_failure_keeps_both_known_seals(compact_advance, monkeypatch, stage):
+    from secure_control.execution.cycle_timing import CycleDeadlineExceeded
+    from secure_control.experiments import lan_runner
+
+    runtime, sent, _injection, closed = compact_advance
+    calls = []
+    def source():
+        calls.append("source")
+        if stage == "source" and calls.count("source") == 2:
+            raise RuntimeError("source changed")
+    def callback(name):
+        calls.append(name)
+        assert runtime.phase == "CONNECTING_NEXT" and runtime.segment_index == 0
+        if name == stage:
+            raise RuntimeError(name)
+    def deadline(_ns, phase):
+        if stage == "deadline" and phase == "SEGMENT_RELEASE":
+            raise CycleDeadlineExceeded(phase)
+    monkeypatch.setattr(lan_runner, "LanSegmentedRuntime", lambda *a, **k: runtime)
+    monkeypatch.setattr(lan_runner, "check_deadline", deadline)
+    experiment = SimpleNamespace(spec=SimpleNamespace(state_dimension=1), context=None,
+        contract=None, security_parameter=8, evidence=None, segment_capacity=400,
+        recheck_sources=source, scene=SimpleNamespace(period=.02))
+    result = lan_runner._run_prepared_segmented(SimpleNamespace(transport="fixture"), experiment,
+        control=runtime.control, session=InteractiveSession(), realtime=False,
+        on_segment=lambda _packet: callback("seal"), on_segment_ready=lambda _packet: callback("release"),
+        _wire_profile="control-dynamic-compact-v2")
+    assert runtime.phase == "UNCERTAIN" and closed and len(sent) == 2
+    assert result["status"] == "uncertain" and len(result["known_segment_receipts"]) == 2
+    assert result["last_sealed_segment"]["hello"]["segment_index"] == 0
+    assert runtime.last_sealed_record is not None and len(runtime.last_segment_receipts) == 2
+    assert runtime.confirmed_step_count == 400 and runtime.segment_index == 0
+
+
+def test_compact_advance_preflights_second_request_before_any_send(compact_advance, monkeypatch):
+    runtime, sent, _injection, closed = compact_advance
+    encode = lan_runtime.localhost_transport.encode_envelope
+    def fail_second(request):
+        if request.recipient == "P2":
+            raise ValueError("invalid second request")
+        return encode(request)
+    monkeypatch.setattr(lan_runtime.localhost_transport, "encode_envelope", fail_second)
+    with pytest.raises(ValueError):
+        runtime.end_segment()
+    assert not sent and closed and runtime.phase == "UNCERTAIN"
+
+
+def test_compact_advance_stop_before_decision_uses_original_stop(compact_advance):
+    runtime, sent, _injection, closed = compact_advance
+    runtime.control.request_stop()
+    record = runtime.end_segment()
+    assert runtime.phase == "STOPPED" and closed and runtime._advance_begin is None
+    assert all(r.operation == "segment_end" and r.payload.action == "stop" for r in sent)
+    assert record.hello.segment_index == 0 and len(record.steps) == 400
+    with pytest.raises(RuntimeError):
+        runtime.next_segment()
+
+
+def test_compact_advance_already_expired_budget_closes_without_send(compact_advance):
+    from secure_control.execution.cycle_timing import CycleDeadlineExceeded
+    runtime, sent, _injection, closed = compact_advance
+    with pytest.raises(CycleDeadlineExceeded):
+        runtime.end_segment(deadline_ns=1)
+    assert runtime.phase == "UNCERTAIN" and closed and not sent
+    assert runtime.confirmed_step_count == 400 and not runtime.last_segment_receipts
+
+
+@pytest.mark.parametrize("expected", ["control-batch-v1", "control-dynamic-compact-v1"])
+def test_party_rejects_mixed_compact_hello_before_offline_or_peer(monkeypatch, expected):
+    from secure_control.execution import localhost_codec as codec
+    hello = codec._CompactHelloPayload(codec.BatchHelloPayload(codec.LanSegmentedHelloPayload(
+        "a"*64, "b"*64, "run", 0, 0, None, "lan-segmented-v2")), codec._COMPACT_PROFILE_V2)
+    closed = []
+    monkeypatch.setattr(lan_runtime, "accept_role", lambda *a: SimpleNamespace(close=lambda: closed.append(True)))
+    monkeypatch.setattr(lan_runtime, "_accept_hello", lambda *a: ("session", hello))
+    with pytest.raises(ValueError, match="profile"):
+        lan_runtime._run_party_session(SimpleNamespace(role="P1", startup_timeout=1.), None, None,
+            None, expected_batch=True, expected_wire_profile=expected)
+    assert closed == [True]
+
+
+@pytest.mark.parametrize("mode", ["release_overrun", "stop_receipt_failure"])
+def test_compact_advance_maintenance_overrun_has_no_complete_cycle(compact_advance, monkeypatch, mode):
+    from secure_control.execution import cycle_timing
+    from secure_control.experiments import lan_runner
+
+    runtime, sent, injection, closed = compact_advance
+    identity = runtime._records.pop()
+    runtime.confirmed_step_count = runtime._segment._step = 399
+    clock = [1_000_000_000]
+    inputs, cycles = [], []
+    def step(value, **_kw):
+        inputs.append(value)
+        runtime._segment._step = 400
+        runtime._pending = identity
+        runtime.phase = "AWAITING_PLANT"
+        return identity
+    runtime.step = step
+    monkeypatch.setattr(cycle_timing.time, "perf_counter_ns", lambda: clock[0])
+    monkeypatch.setattr(lan_runner, "perf_counter_ns", lambda: clock[0])
+    monkeypatch.setattr(lan_runner, "LanSegmentedRuntime", lambda *a, **k: runtime)
+    monkeypatch.setattr(lan_runner, "AbsoluteCycleClock", lambda _p: SimpleNamespace(
+        period_ns=20_000_000, wait=lambda _step: (1_000_000_000, 1_020_000_000)))
+    def release(_packet):
+        assert runtime.phase == "CONNECTING_NEXT"
+        if mode == "release_overrun":
+            clock[0] += 21_000_000
+    def observed(cycle):
+        cycles.append(cycle)
+        if mode == "stop_receipt_failure":
+            runtime.control.request_stop()
+            injection["kind"] = "timeout"
+    scene = SimpleNamespace(period=.02, controller_input=lambda: [0.], advance=lambda *a, **k: None)
+    experiment = SimpleNamespace(spec=SimpleNamespace(state_dimension=1), context=None,
+        contract=None, security_parameter=8, evidence=None, segment_capacity=400,
+        recheck_sources=lambda: None, scene=scene)
+    result = lan_runner._run_prepared_segmented(SimpleNamespace(transport="fixture"), experiment,
+        control=runtime.control, session=InteractiveSession(), realtime=True, material_slots=0,
+        on_segment=lambda _p: None, on_segment_ready=release, on_cycle=observed,
+        _wire_profile="control-dynamic-compact-v2")
+    if mode == "stop_receipt_failure":
+        assert result["status"] == "uncertain" and result["category"] == "TimeoutError"
+        assert len(sent) == 4 and len(inputs) == len(cycles) == 1 and closed
+        assert cycles[0].status == "confirmed" and runtime.confirmed_step_count == 400
+        assert result["last_sealed_segment"]["hello"]["segment_index"] == 0
+        return
+    assert result["status"] == "uncertain" and result["failure_phase"] == "SEGMENT_RELEASE"
+    assert runtime.confirmed_step_count == 400 and runtime.segment_index == 0 and closed
+    assert len(inputs) == 1 and len(sent) == 2 and len(cycles) == 1
+    cycle = cycles[0]
+    assert cycle.global_step == 399 and cycle.status == "miss_after_apply" and cycle.cycle_completed_ns is None
+    assert cycle.device_completed_ns == 1_000_000_000 and cycle.deadline_ns == 1_020_000_000
+    assert "maintenance_advance" in cycle.phase_durations_ns
+    assert "maintenance_end" not in cycle.phase_durations_ns and "maintenance_begin" not in cycle.phase_durations_ns
+    assert len(result["known_segment_receipts"]) == 2
+
+
+@pytest.mark.parametrize("field,value", [("segment_index", 2), ("global_start", 401),
+                                         ("run_id", "wrong"), ("previous_round_id", "wrong")])
+def test_compact_advance_codec_rejects_bad_begin_link(field, value):
+    from secure_control.execution import localhost_codec as codec
+    end = codec.SegmentEndPayload("run", 0, 0, 400, 400, "last", "continue")
+    begin = codec.SegmentBeginPayload("run", 1, 400, "e"*64, "last")
+    payload = codec.SegmentAdvancePayload(end, begin)
+    frame = codec.WireEnvelope(codec.SCHEMA_VERSION, "request", "Client", "P1", 7,
+                              "segment_advance", "session", None, None, None, payload)
+    assert decode_envelope(encode_envelope(frame)) == frame
+    with pytest.raises(ValueError):
+        codec.SegmentAdvancePayload(end, replace(begin, **{field: value}))
 
 _PARTY = r"""
 import json, sys, time

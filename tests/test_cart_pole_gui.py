@@ -3,15 +3,42 @@
 from __future__ import annotations
 
 import gc
+import os
+import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
 from collections import deque
+from functools import wraps
+from pathlib import Path
 
 import pytest
 from test_cart_pole_segmented_evidence import _run
 
 from secure_control.scenarios.cart_pole.gui import CartPoleWindow
+
+_GUI_NODE = "SECURE_CONTROL_GUI_TEST_NODE"
+
+
+def _isolated_tk_test(test):
+    """每项 Tk 断言在独立进程执行一次；子进程失败直接传播，不重试。"""
+    node = f"tests/test_cart_pole_gui.py::{test.__name__}"
+
+    @wraps(test)
+    def run(*args, **kwargs):
+        if os.environ.get(_GUI_NODE) == node:
+            return test(*args, **kwargs)
+        # 全仓收集后的同进程 Tcl 重建曾失败；隔离解释器生命周期，保留原测试体。
+        result = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", node, "-p", "no:cacheprovider"],
+            cwd=Path(__file__).resolve().parents[1], env=os.environ | {_GUI_NODE: node},
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        assert result.returncode == 0, f"GUI 子进程退出 {result.returncode}\n{result.stdout}\n{result.stderr}"
+        return None
+
+    return run
 
 
 def _test_tk_root():
@@ -21,8 +48,12 @@ def _test_tk_root():
 
 
 @pytest.fixture
-def tk_root():
+def tk_root(request):
     """每个测试拥有自己的 Tcl 解释器，构造窗口失败也能释放 root。"""
+    if os.environ.get(_GUI_NODE) != request.node.nodeid:
+        # 父进程仅收集结果；真正的 Tk 构造与所有原始断言由该项子进程执行。
+        yield None
+        return
     root = _test_tk_root()
     try:
         yield root
@@ -53,6 +84,7 @@ def test_mailbox_bounds_notifications_and_preserves_terminal_latest_frame():
 
 @pytest.mark.integration
 @pytest.mark.gui
+@_isolated_tk_test
 def test_async_seek_coalesces_requests_and_old_generation_cannot_override(tmp_path, tk_root):
     """可控后台屏障，不依赖拖动时序；Tk 线程不执行 reader。"""
     from test_cart_pole_lan import _profile_for
@@ -109,6 +141,7 @@ def test_async_seek_coalesces_requests_and_old_generation_cannot_override(tmp_pa
 
 @pytest.mark.integration
 @pytest.mark.gui
+@_isolated_tk_test
 def test_finite_window_initial_replay_remains_finite_and_stop_disabled(tmp_path, tk_root):
     from test_cart_pole_lan import _profile_for
     from test_lan_continuous import _plain_deployment
@@ -127,6 +160,7 @@ def test_finite_window_initial_replay_remains_finite_and_stop_disabled(tmp_path,
 
 
 @pytest.mark.gui
+@_isolated_tk_test
 def test_dynamic_recording_windows_keep_light_frame_and_full_verified_reader(tmp_path, tk_root, monkeypatch):
     from test_cart_pole_lan import _observer_profile_for
     from test_lan_continuous import _plain_deployment
