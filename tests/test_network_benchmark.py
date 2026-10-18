@@ -25,6 +25,281 @@ from secure_control.experiments import communication_benchmark as benchmark
 from secure_control.experiments import network_benchmark as network
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows原生事件ABI功能检查")
+def test_native_wait_socket_read_pause_halfclose_and_reused_timer():
+    """只有本机socket字节/句柄功能，没有控制循环或性能分位测量。"""
+    from secure_control.experiments._network_wait_win32 import NativeWait
+    left, right = socket.socketpair()
+    left.setblocking(False)
+    try:
+        with NativeWait() as wait:
+            wait.register(left, emulator.selectors.EVENT_READ, ("stream", None, None))
+            timer = wait.timer
+            right.sendall(b"ab")
+            selected, returned, kind = wait.wait_until(time.perf_counter_ns()+1_000_000_000)
+            assert selected[0][0].fileobj is left and selected[0][1] & emulator.selectors.EVENT_READ
+            assert type(returned) is int and kind == 5
+            wait.read_started(left)
+            assert left.recv(1) == b"a"
+            wait.modify(left, 0, ("stream", None, None))
+            due = time.perf_counter_ns()+1_000_000
+            assert wait.wait_until(due)[0] == []
+            wait.modify(left, emulator.selectors.EVENT_READ, ("stream", None, None))
+            assert wait.wait_until(time.perf_counter_ns()+1_000_000_000)[0]
+            wait.read_started(left)
+            assert left.recv(1) == b"b"
+            right.shutdown(socket.SHUT_WR)
+            assert wait.wait_until(time.perf_counter_ns()+1_000_000_000)[0]
+            wait.read_started(left)
+            assert left.recv(1) == b""
+            wait.unregister(left)
+            assert not wait.get_map() and wait.timer == timer
+            due = time.perf_counter_ns()+1_000_000
+            selected, returned, kind = wait.wait_until(due)
+            assert not selected and returned >= due and kind == 6
+            assert wait.report()["active_poll"] is False and wait.report()["handle_high_water"] <= 16
+        assert wait.report()["handles_open"] == 0
+    finally:
+        left.close()
+        right.close()
+
+
+class _WaitAPI:
+    """确定性FFI替身只查通知/生命周期/失败，不提供性能成绩。"""
+
+    def __init__(self):
+        self.next_handle = 10
+        self.open = set()
+        self.events = {}
+        self.fail = None
+        self.bound = {}
+        self.due = None
+
+    def error(self, *_args):
+        return OSError("native fixture failure")
+
+    def CreateWaitableTimerExW(self, security, name, flags, access):
+        assert security is name is None and flags == 2 and access == 0x100002
+        return self.WSACreateEvent() if self.fail != "create" else 0
+
+    def WSACreateEvent(self):
+        self.next_handle += 1
+        self.open.add(self.next_handle)
+        return self.next_handle
+
+    def WSAEventSelect(self, fd, handle, mask):
+        self.bound[fd] = (handle, mask)
+        return -1 if self.fail == "bind" and mask else 0
+
+    def WSAEnumNetworkEvents(self, fd, _handle, pointer):
+        bits, errors = self.events.pop(fd, (0, {}))
+        pointer._obj.events = bits
+        for index, value in errors.items():
+            pointer._obj.errors[index] = value
+        return -1 if self.fail == "enum" else 0
+
+    def SetWaitableTimerEx(self, _timer, due, period, apc, argument, context, tolerance):
+        assert period == 0 and apc is argument is context is None and tolerance == 0
+        self.due = due._obj.value
+        return self.fail != "timer"
+
+    def WaitForMultipleObjects(self, count, _handles, all_events, timeout):
+        assert 1 <= count <= 16 and all_events is False and timeout == 0xFFFFFFFF
+        return 0xFFFFFFFF if self.fail == "wait" else 0
+
+    def WSACloseEvent(self, handle):
+        self.open.remove(handle)
+        return self.fail != "event_close"
+
+    def CancelWaitableTimer(self, _handle):
+        return self.fail != "cancel"
+
+    def CloseHandle(self, handle):
+        self.open.remove(handle)
+        return self.fail != "close"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows原生背压通知")
+def test_native_write_would_block_then_real_notification_and_bounded_handles():
+    from secure_control.experiments._network_wait_win32 import NativeWait
+    left, right = socket.socketpair()
+    left.setblocking(False)
+    right.setblocking(False)
+    left.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+    try:
+        with NativeWait() as wait:
+            wait.register(left, emulator.selectors.EVENT_WRITE, ("stream", None, None))
+            assert wait.wait_until(time.perf_counter_ns()+1_000_000_000)[0]
+            assert wait.writable_return(left) is not None
+            total, blocked = 0, False
+            for _ in range(128):
+                try:
+                    total += left.send(b"x"*65536)
+                except BlockingIOError:
+                    wait.write_blocked(left)
+                    blocked = True
+                    break
+            assert blocked and total <= 8*1024**2
+            received = 0
+            while received < total:
+                try:
+                    received += len(right.recv(65536))
+                except BlockingIOError:
+                    # 有界等待socket数据，不测量吞吐或循环控制性能。
+                    right.settimeout(1)
+                    received += len(right.recv(65536))
+                    right.setblocking(False)
+            selected, _returned, _kind = wait.wait_until(time.perf_counter_ns()+1_000_000_000)
+            assert selected and wait.writable_return(left) is not None and left.send(b"y") == 1
+            assert wait.report()["handle_high_water"] == 2
+    finally:
+        left.close()
+        right.close()
+
+
+def test_native_wait_notification_state_relative_timer_and_no_fabricated_write(monkeypatch):
+    from secure_control.experiments import _network_wait_win32 as native
+    api, clock = _WaitAPI(), [10000]
+    monkeypatch.setattr(native.time, "perf_counter_ns", lambda: clock[0])
+    sock = SimpleNamespace(fileno=lambda: 101)
+    with native.NativeWait(_api=api) as wait:
+        wait.register(sock, emulator.selectors.EVENT_WRITE, ("stream", None, None))
+        api.events[101] = (native.FD_WRITE, {})
+        assert wait.wait_until(11000)[0][0][1] == emulator.selectors.EVENT_WRITE
+        assert wait.writable_return(sock) == 10000
+        clock[0] = 10200
+        assert wait.wait_until(11000)[0] and wait.writable_return(sock) is None  # 缓存状态不伪造新通知。
+        wait.write_blocked(sock)
+        selected, _returned, kind = wait.wait_until(11001)
+        assert not selected and kind == 6 and api.due == -9  # ceil(801ns/100)，不是UTC/QPC绝对值。
+        api.events[101] = (native.FD_WRITE | native.FD_READ, {})
+        wait.modify(sock, emulator.selectors.EVENT_READ | emulator.selectors.EVENT_WRITE, ("stream", None, None))
+        assert wait.wait_until(11000)[0][0][1] == 3
+        wait.read_started(sock)
+        wait.modify(sock, 0, ("stream", None, None))
+        assert not wait.wait_until(11000)[0]
+        with pytest.raises(ValueError, match="复用"):
+            wait.get_key(SimpleNamespace(fileno=lambda: 101))
+        wait.unregister(sock)
+        wait.register(sock, emulator.selectors.EVENT_WRITE, ("connect", 0))
+        api.events[101] = (native.FD_CONNECT, {4: 10061})
+        assert wait.wait_until(11000)[0] and wait.connection_error(sock) == 10061
+        assert wait.report()["native_wait_calls"] == 2
+    assert not api.open
+
+
+@pytest.mark.parametrize("failure", ["create", "bind", "enum", "timer", "wait", "event_close", "cancel", "close"])
+def test_native_wait_fail_closed_and_partial_initialization_reclaims_handles(failure):
+    from secure_control.experiments._network_wait_win32 import NativeWait
+    api = _WaitAPI()
+    if failure == "create":
+        api.fail = failure
+        with pytest.raises(OSError):
+            NativeWait(_api=api)
+    else:
+        wait = NativeWait(_api=api)
+        sock = SimpleNamespace(fileno=lambda: 101)
+        if failure == "bind":
+            api.fail = failure
+            with pytest.raises(OSError):
+                wait.register(sock, 1, ("stream", None, None))
+        else:
+            wait.register(sock, 1, ("stream", None, None))
+            api.fail = failure
+            if failure in ("enum", "timer", "wait"):
+                with pytest.raises(OSError):
+                    wait.wait_until(time.perf_counter_ns()+1_000_000_000)
+        if failure in ("event_close", "cancel", "close"):
+            with pytest.raises(OSError):
+                wait.close()
+            assert wait.report()["handles_open"] == (0 if failure == "cancel" else None)
+        else:
+            api.fail = None
+            wait.close()
+        wait.close()
+    assert not api.open
+
+
+def test_native_wait_collects_all_notifications_caps_handles_and_rejects_clock_errors(monkeypatch):
+    from secure_control.experiments import _network_wait_win32 as native
+    api, clock = _WaitAPI(), [100]
+    monkeypatch.setattr(native.time, "perf_counter_ns", lambda: clock[0])
+    with native.NativeWait(_api=api) as wait:
+        socks = [SimpleNamespace(fileno=lambda i=i: 100+i) for i in range(16)]
+        for sock in socks[:15]:
+            wait.register(sock, 1, ("stream", None, None))
+        with pytest.raises(ValueError, match="上限"):
+            wait.register(socks[15], 1, ("stream", None, None))
+        api.events[100] = (native.FD_READ, {})
+        api.events[114] = (native.FD_READ | native.FD_CLOSE, {})
+        selected, _returned, _kind = wait.wait_until(200)
+        assert {x[0].fd for x in selected} == {100, 114} and wait.report()["handle_high_water"] == 16
+        clock[0] = 99
+        with pytest.raises(ValueError, match="QPC"):
+            wait.wait_until(200)
+    assert not api.open
+
+
+def test_native_short_write_continuation_keeps_real_elapsed_and_requires_write_after_block(monkeypatch):
+    clock = [100]
+    monkeypatch.setattr(emulator.time, "perf_counter_ns", lambda: clock[0])
+    actions = [2, BlockingIOError(), 2]
+    def send(_data):
+        action = actions.pop(0)
+        if isinstance(action, Exception):
+            raise action
+        return action
+    direction = emulator.Direction(None, SimpleNamespace(send=send), "Client->P1", None)
+    direction.queue.append(emulator.Block(b"abcd", 0, 0, 0, 0, 100))
+    direction.queued = 4
+    ring = emulator.PublicRing()
+    blocked = []
+    native = SimpleNamespace(write_blocked=blocked.append, writable_return=lambda _sock: None)
+    emulator._dispatch(direction, 100, None, ring, native)
+    clock[0] = 1000101
+    emulator._dispatch(direction, clock[0], None, ring, native)
+    assert blocked == [direction.destination] and ring.rows()[-1][10] == 1000001
+    assert ring.rows()[-1][13] == -1 and direction.queue[0].continuation_at is None
+    with pytest.raises(RuntimeError):
+        emulator._dispatch(direction, clock[0], None, ring, native)
+    emulator._dispatch(direction, clock[0], clock[0], ring, native)
+    assert not direction.queue and direction.stats["sent_bytes"] == 4
+
+
+def test_native_first_due_send_consumes_old_write_notification_before_short_continuation(monkeypatch):
+    clock, pending = [2000000], [1]
+    monkeypatch.setattr(emulator.time, "perf_counter_ns", lambda: clock[0])
+    def consume(_sock):
+        value, pending[0] = pending[0], None
+        return value
+    native = SimpleNamespace(writable_return=consume, write_blocked=lambda _sock: None)
+    direction = emulator.Direction(None, SimpleNamespace(send=lambda _data: 2), "Client->P1", None)
+    direction.queue.append(emulator.Block(b"abcd", 0, 0, 0, 0, 2000000))
+    direction.queued = 4
+    ring = emulator.PublicRing()
+    emulator._dispatch(direction, clock[0], None, ring, native)
+    assert pending == [None]
+    clock[0] += 100
+    emulator._dispatch(direction, clock[0], native.writable_return(direction.destination), ring, native)
+    assert not direction.queue and direction.stats["max_unexplained_excess_ns"] == 100
+    assert ring.rows()[-1][13] == -1  # 没有新FD_WRITE的继续发送，不能填入旧时刻。
+
+
+def test_native_initialization_failure_is_reported_without_fallback_or_fake_policy(monkeypatch):
+    from secure_control.experiments import _network_wait_win32 as native
+    reports = []
+    def unsupported():
+        raise OSError("software native initialization failure")
+    monkeypatch.setattr(native, "NativeWait", unsupported)
+    monkeypatch.setattr(emulator.selectors, "DefaultSelector", lambda: pytest.fail("不得降级selector"))
+    emulator._relay_main("N2", [], SimpleNamespace(is_set=lambda: False),
+        SimpleNamespace(send=reports.append, close=lambda: None), native.STRATEGY)
+    report = reports[-1]
+    assert report["error_type"] == "OSError" and report["first_failure"]["operation"] == "wait_initialization"
+    assert not report["ready"] and not report["model_valid"] and report["wait_policy"] is None
+    assert report["requested_wait_strategy"] == native.STRATEGY and not report["directions"]
+
+
 def test_schedule_matches_independent_fraction_oracle_and_direction_domains():
     schedule = emulator.Schedule(emulator.LinkModel(250000, 500000, 100000003), "Client->P1")
     twin = emulator.Schedule(schedule.model, "Client->P1")
@@ -1093,6 +1368,185 @@ def test_closure_v2_10000_history_preserves_all_rows_and_missing_failure_endpoin
     assert rows[-1]["phase_durations_ns"]["maintenance_advance"] == 9999 and history.report()["format_version"] == 2
 
 
+@pytest.fixture
+def event_context(closure_context, monkeypatch):
+    """真实A的隔离结构反例，原件/门禁替身仅验证新许可，不读真实预算。"""
+    _history, a, ledger, certs = closure_context
+    monkeypatch.setattr(benchmark, "_compact_sample_pass", lambda *a, **k: True)
+    monkeypatch.setattr(network, "_tls_pass", lambda _r: True)
+    path = ledger.parent/"A.json"
+    with network.RunBudget(ledger) as budget:
+        budget.reserve("N2", "candidate", a["head"], a["source_sha256"], path,
+            conditions_sha256=a["conditions_sha256"], continuation=a)
+        result = _closure_software_result(a, model=False)
+        result = network.assemble(result, profile="N2", phase="candidate", manifest=a, relay=result["network_relay"])
+        path.write_text(json.dumps(result), encoding="utf-8")
+        budget.finish(result, network.hashlib.sha256(path.read_bytes()).hexdigest())
+        entries = copy.deepcopy(budget.entries)
+    closed = network.digest(entries)
+    monkeypatch.setattr(network, "EVENT_HISTORY", closed)
+    sources = {"src": "f"*64, "src/secure_control/experiments/_network_wait_win32.py": "b"*64}
+    m = a|{"head": "e"*40, "source_sha256": sources, "closure_stage": "B", "call": 8,
+        "wait_strategy": network.EVENT_STRATEGY, "wait_design_url": network.EVENT_DESIGN,
+        "wait_authorization_url": network.EVENT_AUTHORIZATION, "closed_seven_history_sha256": closed,
+        "patch_evidence_url": network.EVENT_DESIGN, "predecessor_raw_sha256": entries[-1]["raw_sha256"],
+        "predecessor_review_url": a["review_url"], "predecessor_readback_exact": True}
+    monkeypatch.setattr(network, "source", lambda: (m["head"], m["source_sha256"]))
+    return entries, m, ledger, certs
+
+
+def _event_software_result(m, *, model=True, goal=True):
+    result = _closure_software_result(m, model=model, goal=goal)
+    result["network_relay"]["wait_policy"].update(version=2, strategy=network.EVENT_STRATEGY, guard_ns=None,
+        max_poll_episode_ns=0, active_poll=False, poll_episodes=0, poll_wall_ns=0, max_poll_wall_ns=0,
+        native_wait_calls=10, network_notifications=5, handle_high_water=7, handles_open=0,
+        last_wait_started_ns=10, last_wait_returned_ns=20, last_wait_target_ns=20)
+    return network.assemble(result, profile="N2", phase=m["phase"], manifest=m, relay=result["network_relay"])
+
+
+def test_event_B_C_exact_new_strategy_history_and_predecessor_goals(event_context):
+    entries, b, ledger, certs = event_context
+    assert network._closure_manifest_valid(b)
+    for wrong in (b|{"wait_strategy": "other"}, b|{"wait_authorization_url": network.EVENT_DESIGN},
+                  b|{"closed_seven_history_sha256": "0"*64}, b|{"closure_stage": "A", "call": 7},
+                  {k:v for k,v in b.items() if k not in network.EVENT_FIELDS}):
+        with pytest.raises(ValueError):
+            network._next_closure_call(entries, "N2", wrong["phase"], wrong["head"], wrong["source_sha256"], wrong)
+    with network.RunBudget(ledger) as budget:
+        budget.reserve("N2", "candidate", b["head"], b["source_sha256"], ledger.parent/"B.json",
+            conditions_sha256=b["conditions_sha256"], continuation=b)
+        network.require_v2_candidate(b, network.role_configs(certs, network.V2_PORTS, "N2"))
+        result = _event_software_result(b)
+        assert result["network_sample_pass"] and result["network_progress_goal_pass"]
+        path = ledger.parent/"B.json"
+        def finish(value):
+            path.write_text(json.dumps(value), encoding="utf-8")
+            budget.finish(value, network.hashlib.sha256(path.read_bytes()).hexdigest())
+        finish(result)
+        c = b|{"closure_stage": "C", "call": 9, "phase": "qualification", "maximum_attempts": 10000,
+            "eligible_for_candidate": False, "qualification_allowed": True, "predecessor_raw_sha256": budget.entries[-1]["raw_sha256"]}
+        for bad in ({"head": "d"*40}, {"conditions_sha256": "0"*64}, {"certificate_directory": str(certs.parent/"other")}):
+            wrong = c|bad
+            with pytest.raises(ValueError):
+                network._next_closure_call(budget.entries, "N2", "qualification", wrong["head"], wrong["source_sha256"], wrong)
+        for fail in (_event_software_result(b, goal=False), _event_software_result(b, model=False)):
+            finish(fail)
+            c["predecessor_raw_sha256"] = budget.entries[-1]["raw_sha256"]
+            with pytest.raises(ValueError):
+                network._next_closure_call(budget.entries, "N2", "qualification", c["head"], c["source_sha256"], c)
+        finish(result)
+        c["predecessor_raw_sha256"] = budget.entries[-1]["raw_sha256"]
+        assert budget.reserve("N2", "qualification", c["head"], c["source_sha256"], ledger.parent/"C.json",
+            conditions_sha256=c["conditions_sha256"], continuation=c) == 10000
+        network.require_v2_candidate(c)
+        assert _event_software_result(c)["network_dynamic_qualification_pass"]
+        budget.finish({"cycles": [], "network_sample_pass": False}, "software fixture")
+        with pytest.raises(ValueError):
+            network._next_closure_call(budget.entries, "N2", "qualification", c["head"], c["source_sha256"], c)
+        assert budget.entries[:7] == entries
+
+
+def test_event_cpu_version_cannot_accept_poll_or_unknown_strategy(event_context):
+    _entries, b, _ledger, _certs = event_context
+    relay = _event_software_result(b)["network_relay"]
+    assert network._closure_cpu_pass(relay, native=True)
+    assert not network._closure_cpu_pass(relay)
+    for wrong in ({"strategy": "other"}, {"active_poll": True}, {"poll_wall_ns": 1},
+                  {"handle_high_water": 17}, {"handles_open": 1}, {"cpu_limit_percent": 51}, {"guard_ns": 500000}):
+        altered = copy.deepcopy(relay)
+        altered["wait_policy"].update(wrong)
+        assert not network._closure_cpu_pass(altered, native=True)
+    legacy = _closure_software_result(b)["network_relay"]
+    assert not network._closure_cpu_pass(legacy, native=True)
+
+
+def test_event_wrapper_passes_explicit_strategy_and_consumes_failed_startup(event_context, monkeypatch):
+    entries, b, ledger, certs = event_context
+    approval = ledger.parent/"event-approval.json"
+    approval.write_text(json.dumps(b), encoding="utf-8")
+    observed = []
+    class Relay:
+        def __init__(self, profile, endpoints, *, wait_strategy):
+            assert profile == "N2" and len(endpoints) == 3 and wait_strategy == network.EVENT_STRATEGY
+            observed.append(wait_strategy)
+            self.report = {"model_valid": False, "process_exited": True, "forced_termination": False}
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return None
+    def start(**kwargs):
+        network.require_v2_candidate(kwargs["candidate_manifest"], kwargs["configs"])
+        raise RuntimeError("software startup boundary")
+    monkeypatch.setattr(network, "NetworkRelay", Relay)
+    monkeypatch.setattr(benchmark, "run_network_observation", start)
+    r = network.run_network_benchmark(profile="N2", phase="candidate", certs=certs, ports=network.V2_PORTS,
+        ledger=ledger, approval=approval, output=ledger.parent/"B.json", wire_profile=network._COMPACT_PROFILE_V2,
+        authorization=network.CLOSURE_AUTHORIZATION)
+    assert observed == [network.EVENT_STRATEGY] and r["failure_category"] == "RuntimeError"
+    saved = json.loads(ledger.read_text())["entries"]
+    assert saved[:7] == entries and saved[-1]["finished"] and saved[-1]["actual_attempts"] == 0
+    assert not r["network_progress_goal_pass"]
+    with pytest.raises(ValueError):
+        network.require_v2_candidate(b)
+
+
+def test_event_B_certificate_exception_requires_expired_previous_and_exact_approval(event_context, monkeypatch):
+    entries, b, ledger, certs = event_context
+    new = ledger.parent/"issue120-network-closure-certs"
+    subprocess.run([sys.executable, str(ROOT/"tests/fixtures/prepare_local_lan_certs.py"), "--output", str(new)],
+        check=True, capture_output=True)
+    hashes = {name: network.hashlib.sha256((new/name).read_bytes()).hexdigest() for name in b["public_certificate_sha256"]}
+    m = b|{"certificate_directory": str(new.resolve()), "public_certificate_sha256": hashes,
+        "public_certificate_validity": network.certificate_validity(new),
+        "conditions_sha256": network.digest({"ports": b["ports"], "environment": b["environment"],
+            "public_certificate_sha256": hashes, "seed": network.SEED}),
+        "certificate_change_authorization_url": network.EVENT_AUTHORIZATION,
+        "certificate_change_reason": "insufficient_validity_before_B"}
+    assert network._next_closure_call(entries, "N2", "candidate", m["head"], m["source_sha256"], m) == 1000
+    with pytest.raises(ValueError):  # 原证仍充分有效，不得借例外搜索条件。
+        network._require_closure_certificates(m)
+    decode = network.ssl._ssl._test_decode_cert
+    def expired(path):
+        result = decode(path)
+        if network.Path(path).parent == certs:
+            result["notAfter"] = "Oct 17 00:00:00 2000 GMT"
+        return result
+    monkeypatch.setattr(network.ssl._ssl, "_test_decode_cert", expired)
+    network._require_closure_certificates(m, network.role_configs(new, network.V2_PORTS, "N2"))
+    for wrong in ({"certificate_change_authorization_url": network.EVENT_DESIGN},
+                  {"certificate_change_reason": "insufficient_validity_before_A"},
+                  {"public_certificate_validity": {}},
+                  {"previous_public_certificate_sha256": hashes}):
+        with pytest.raises(ValueError):
+            network._require_closure_certificates(m|wrong)
+
+
+def test_native_wait_late_return_is_still_model_failure_and_stop_is_not_a_write(monkeypatch):
+    clock = [100]
+    monkeypatch.setattr(emulator.time, "perf_counter_ns", lambda: clock[0])
+    policy, ring = emulator._WaitPolicy(), emulator.PublicRing()
+    calls = []
+    def wait_until(target):
+        calls.append(target)
+        clock[0] = target+1000001  # 原生timer不是调度保证，真实迟醒不能删去。
+        return [], clock[0], 6
+    native = SimpleNamespace(wait_until=wait_until, last_start=100)
+    policy.native_wait = native
+    selected, returned = emulator._wait_for_events(native, Event(), 200, 100000000, policy, ring)
+    assert not selected and returned is None and calls == [200] and ring.timing[:4] == [6, 100, 1000201, 200]
+    direction = emulator.Direction(None, SimpleNamespace(send=lambda data: len(data)), "Client->P1", None)
+    direction.queue.append(emulator.Block(b"x", 0, 0, 0, 0, 200))
+    direction.queued = 1
+    emulator._serve_due([direction], 0, ring)
+    assert direction.stats["unexplained_over_tolerance"] == 1 and ring.rows()[-1][13] == -1
+    stop = Event()
+    stop.set()
+    emulator._wait_for_events(native, stop, None, clock[0]+1000, policy, ring)
+    assert calls == [200]
+    emulator._wait_for_events(native, stop, None, clock[0]+1000, policy, ring, stopping=True)
+    assert len(calls) == 2
+
+
 def test_budget_failure_repair_recheck_and_final_call_cap(tmp_path):
     entries = [_entry("N0", passed=False)]
     with pytest.raises(ValueError, match="暂停"):
@@ -1321,7 +1775,9 @@ def test_startup_failure_is_exported_and_consumes_unique_discovery(tmp_path, mon
 
 
 @pytest.mark.integration
-def test_three_tls_links_cross_opaque_relay_and_wrong_role_still_fails(tmp_path):
+@pytest.mark.parametrize("wait_strategy", [None, pytest.param(network.EVENT_STRATEGY,
+    marks=pytest.mark.skipif(sys.platform != "win32", reason="Windows原生等待"))])
+def test_three_tls_links_cross_opaque_relay_and_wrong_role_still_fails(tmp_path, wait_strategy):
     subprocess.run([sys.executable, str(ROOT/"tests/fixtures/prepare_local_lan_certs.py"),
                     "--output", str(tmp_path)], check=True, capture_output=True)
     ports = free_ports()
@@ -1330,7 +1786,7 @@ def test_three_tls_links_cross_opaque_relay_and_wrong_role_still_fails(tmp_path)
     servers = [lan_transport.listener(e) for e in endpoints]
     payload = b"opaque-test-marker-" + bytes(range(256))*64
     errors, versions = [], []
-    relay = emulator.NetworkRelay("N1", tuple(("127.0.0.1", p, "127.0.0.2") for p in ports))
+    relay = emulator.NetworkRelay("N1", tuple(("127.0.0.1", p, "127.0.0.2") for p in ports), wait_strategy=wait_strategy)
     try:
         with relay:
             for index, (dialer, acceptor) in enumerate((("Client", "P1"), ("Client", "P2"), ("P2", "P1"))):
@@ -1369,6 +1825,10 @@ def test_three_tls_links_cross_opaque_relay_and_wrong_role_still_fails(tmp_path)
         assert versions == ["TLSv1.3"]*6 and relay.report["process_exited"]
         assert relay.report["encoded_bytes"] <= 64*1024 and "opaque-test-marker" not in json.dumps(relay.report)
         assert all(s["received_bytes"] == s["sent_bytes"] for s in relay.report["directions"].values())
+        if wait_strategy is not None:
+            policy = relay.report["wait_policy"]
+            assert policy["version"] == 2 and policy["strategy"] == network.EVENT_STRATEGY
+            assert policy["active_poll"] is False and policy["poll_episodes"] == policy["handles_open"] == 0
     finally:
         for server in servers:
             server.close()

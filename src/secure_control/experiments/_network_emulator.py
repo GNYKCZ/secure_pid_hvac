@@ -46,6 +46,7 @@ class _WaitPolicy:
         self.peak = self.first_over = self.tail = None
         self.sample_error = None
         self.final_sample_complete = False
+        self.native_wait = None
 
     def start(self, wall, cpu):
         self.start_wall = self.wall = _clock_ns(wall)
@@ -92,7 +93,7 @@ class _WaitPolicy:
 
     def report(self):
         """仅追加固定大小的公开摘要；旧报告缺此字段表示未记录。"""
-        return {"version": 1, "strategy": "bounded-near-due-v1" if sys.platform == "win32" else "selector-blocking",
+        report = {"version": 1, "strategy": "bounded-near-due-v1" if sys.platform == "win32" else "selector-blocking",
             "guard_ns": WAIT_GUARD_NS, "max_poll_episode_ns": MAX_POLL_EPISODE_NS,
             "cpu_window_ns": CPU_WINDOW_NS, "cpu_limit_percent": 50,
             "poll_episodes": self.poll_count, "poll_wall_ns": self.poll_wall, "max_poll_wall_ns": self.poll_max,
@@ -105,6 +106,11 @@ class _WaitPolicy:
             "lifecycle_cpu_ns": None if self.start_cpu is None else self.cpu-self.start_cpu,
             "lifecycle_complete": self.final_sample_complete,
             "scope": "actual process CPU / actual QPC wall; one-core ratio; relay service interval after imports, includes socket startup/exit; sampled guard, not OS quota"}
+        if self.native_wait is not None:
+            from ._network_wait_win32 import STRATEGY
+            report.update(version=2, strategy=STRATEGY, guard_ns=None, max_poll_episode_ns=0,
+                          **self.native_wait.report())
+        return report
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +174,7 @@ class Block:
     cursor: int = 0
     first_attempt: int | None = None
     blocked: bool = False
+    continuation_at: int | None = None
 
 
 @dataclass(slots=True)
@@ -244,29 +251,33 @@ def _read(direction):
     direction.stats["queue_high_water"] = max(direction.stats["queue_high_water"], direction.queued)
 
 
-def _progress(direction, now, writable_at, ring):
+def _progress(direction, now, writable_at, ring, *, known_writable=False):
     """就绪后推进一次短写；FIFO阻挡和已观察到的socket背压单列。"""
     block = direction.queue[0]
     if now < block.due:
         raise RuntimeError("禁止提前转发字节。")
     eligible = max(block.due, direction.previous_completed)
     first = block.first_attempt is None
-    if not first and writable_at is None:
+    if not first and writable_at is None and not (known_writable and block.continuation_at is not None):
         raise RuntimeError("已尝试块只能由真实可写事件推进")
     if first:
         block.first_attempt = now
     # 首次尝试必须及时；发生真实would-block后，另记录等待及返回就绪后的派发开销。
-    residual = max(0, now - (eligible if first else writable_at))
+    # Native FD_WRITE是边沿状态：正短写后的继续发送从上次实际send结束计时，
+    # 不伪造一次新可写事件。真正would-block必须由下次FD_WRITE重新激活。
+    ready_at = eligible if first else writable_at if writable_at is not None else block.continuation_at
+    residual = max(0, now - ready_at)
     stats = direction.stats
     try:
         sent = direction.destination.send(memoryview(block.data)[block.cursor:])
     except BlockingIOError:
         observed = time.perf_counter_ns()
-        residual = max(residual, observed-(eligible if first else writable_at))
+        residual = max(residual, observed-ready_at)
         stats["max_unexplained_excess_ns"] = max(stats["max_unexplained_excess_ns"], residual)
         stats["unexplained_over_tolerance"] += residual > MODEL_TOLERANCE_NS
         stats["backpressure_count"] += 1
         block.blocked = True
+        block.continuation_at = None
         ring.append((DIRECTIONS.index(direction.name), block.offset, len(block.data), block.arrival, block.tx,
                      block.propagation, block.due, observed, 0, direction.queued, residual, 1,
                      block.first_attempt, -1 if writable_at is None else writable_at, eligible), send_started_ns=now)
@@ -274,7 +285,7 @@ def _progress(direction, now, writable_at, ring):
     if sent <= 0:
         raise ConnectionError("网络字节流写端已关闭。")
     completed = time.perf_counter_ns()
-    residual = max(residual, completed-(eligible if first else writable_at))
+    residual = max(residual, completed-ready_at)
     stats["max_unexplained_excess_ns"] = max(stats["max_unexplained_excess_ns"], residual)
     stats["unexplained_over_tolerance"] += residual > MODEL_TOLERANCE_NS
     short = sent < len(block.data) - block.cursor
@@ -284,6 +295,7 @@ def _progress(direction, now, writable_at, ring):
     stats["max_release_excess_ns"] = max(stats["max_release_excess_ns"], completed-block.due)
     stats["early_sends"] += completed < block.due
     block.cursor += sent
+    block.continuation_at = completed
     direction.queued -= sent
     ring.append((DIRECTIONS.index(direction.name), block.offset, len(block.data), block.arrival, block.tx,
                  block.propagation, block.due, completed, sent, direction.queued, residual, int(block.blocked),
@@ -296,7 +308,18 @@ def _progress(direction, now, writable_at, ring):
         direction.queue.popleft()
 
 
-def _serve_due(directions, rotation, ring):
+def _dispatch(direction, now, writable_at, ring, native=None):
+    """原一次send责任不变，仅将真实would-block反馈给FD_WRITE状态owner。"""
+    if native is not None and direction.queue[0].first_attempt is None:
+        # 首次到期发送已使用此前的可写状态；旧通知不得留给将来的短写继续。
+        native.writable_return(direction.destination)
+    before = direction.stats["backpressure_count"]
+    _progress(direction, now, writable_at, ring, **({"known_writable": True} if native is not None else {}))
+    if native is not None and direction.stats["backpressure_count"] != before:
+        native.write_blocked(direction.destination)
+
+
+def _serve_due(directions, rotation, ring, native=None):
     """每方向每遍至多一个原读块；只直接首次尝试，短写/背压等待可写事件。"""
     serviced = set()
     for offset in range(len(directions)):
@@ -305,7 +328,7 @@ def _serve_due(directions, rotation, ring):
         if (direction.queue and direction.queue[0].first_attempt is None
                 and direction.queue[0].due <= now):
             ring.active_direction = direction.name
-            _progress(direction, now, None, ring)
+            _dispatch(direction, now, None, ring, native)
             serviced.add(direction.name)
     ring.active_direction = None
     return serviced
@@ -317,6 +340,11 @@ def _wait_for_events(selector, stop, future_due, wake_at, policy, ring, *, stopp
     now = _clock_ns(time.perf_counter_ns())
     if now >= wake_at or stop.is_set() and not stopping:
         return [], None
+    if policy.native_wait is not None:
+        target = min(wake_at, future_due) if future_due is not None else wake_at
+        selected, returned, kind = selector.wait_until(target)
+        ring.timing[:4] = [kind, selector.last_start, returned, target]
+        return selected, returned if selected else None
     if sys.platform == "win32" and future_due is not None:
         if future_due <= now:
             return [], None
@@ -374,13 +402,25 @@ def _wait_for_events(selector, stop, future_due, wake_at, policy, ring, *, stopp
     return [], None
 
 
-def _relay_main(profile, endpoints, stop, pipe):
+def _relay_main(profile, endpoints, stop, pipe, wait_strategy=None):
     """一个临时子进程、一个selector，三连接六方向；TLS在原角色内完成。"""
     from .communication_benchmark import _process_memory
 
-    selector = selectors.DefaultSelector()
+    selector, initialization_error = None, None
+    try:
+        if wait_strategy is not None:
+            from ._network_wait_win32 import STRATEGY, NativeWait
+            if wait_strategy != STRATEGY:
+                raise ValueError("未知原生等待候选。")
+            selector = NativeWait()
+        else:
+            selector = selectors.DefaultSelector()
+    except Exception as failure:  # noqa: BLE001 - 初始化能力失败也由原报告保存首因，绝不回退。
+        initialization_error = failure
     listeners, sockets, directions, pending = [], [], [], {}
     ring, policy, error, ready = PublicRing(), _WaitPolicy(), None, False
+    native = selector if wait_strategy is not None else None
+    policy.native_wait = native
     cleanup_error = None
     failure_at, operation, event_direction, error_errno, error_winerror = None, "startup", None, None, None
     peak, next_memory, stopping_at = 0, 0, None
@@ -393,6 +433,9 @@ def _relay_main(profile, endpoints, stop, pipe):
     link_models = models(profile)
     started = time.perf_counter_ns()
     try:
+        if initialization_error is not None:
+            operation = "wait_initialization"
+            raise initialization_error
         policy.start(started, time.process_time_ns())
         for index, (host, port, backend) in enumerate(endpoints):
             listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -409,7 +452,7 @@ def _relay_main(profile, endpoints, stop, pipe):
             now = time.perf_counter_ns()
             ring.timing[4] = now
             operation, event_direction = "due_first", None
-            serviced = _serve_due(directions, rotation, ring)
+            serviced = _serve_due(directions, rotation, ring, *([native] if native is not None else []))
             rotation = (rotation + 1) % max(1, len(directions))
             now = time.perf_counter_ns()
             if now >= policy.next_cpu_check:
@@ -479,7 +522,7 @@ def _relay_main(profile, endpoints, stop, pipe):
                     if mask:
                         selector.register(sock, mask, ("stream", outgoing, incoming))
                 else:
-                    if not mask:
+                    if not mask and native is None:
                         selector.unregister(sock)
                     elif key.events != mask:
                         selector.modify(sock, mask, key.data)
@@ -498,6 +541,9 @@ def _relay_main(profile, endpoints, stop, pipe):
                         raise ConnectionError("同一网络链路禁止第二条连接。")
                     accepted.add(index)
                     pending[index] = {"front": front, "rear": None, "retry_at": 0}
+                    if native is not None:
+                        # Winsock accept继承listener事件，先解绑再关闭listener。
+                        native.detach_accepted(front)
                     selector.unregister(key.fileobj)
                     key.fileobj.close()
                     continue
@@ -506,7 +552,7 @@ def _relay_main(profile, endpoints, stop, pipe):
                     _, index = key.data
                     connection = pending[index]
                     front, rear = connection["front"], connection["rear"]
-                    result = rear.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                    result = (native.connection_error(rear) if native is not None else 0) or rear.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
                     selector.unregister(rear)
                     if result:
                         if result not in (errno.ECONNREFUSED, 10061):
@@ -528,11 +574,14 @@ def _relay_main(profile, endpoints, stop, pipe):
                 _, outgoing, incoming = key.data
                 if mask & selectors.EVENT_READ:
                     operation, event_direction = "recv", outgoing.name
+                    if native is not None:
+                        native.read_started(key.fileobj)
                     _read(outgoing)
                 if (mask & selectors.EVENT_WRITE and incoming.queue and incoming.name not in serviced
                         and incoming.queue[0].due <= time.perf_counter_ns()):
                     operation, event_direction = "send", incoming.name
-                    _progress(incoming, time.perf_counter_ns(), writable_at, ring)
+                    actual_write_return = native.writable_return(key.fileobj) if native is not None else writable_at
+                    _dispatch(incoming, time.perf_counter_ns(), actual_write_return, ring, native)
     except Exception as failure:  # noqa: BLE001 - 不保存载荷、异常对象或异常原文。
         if operation == "due_first":
             event_direction = ring.active_direction
@@ -540,7 +589,7 @@ def _relay_main(profile, endpoints, stop, pipe):
         failure_at = time.perf_counter_ns()
         error_errno, error_winerror = getattr(failure, "errno", None), getattr(failure, "winerror", None)
     finally:
-        resources = [selector, *sockets, *listeners]
+        resources = [*([selector] if selector is not None else []), *sockets, *listeners]
         for connection in pending.values():
             resources.append(connection["front"])
             if connection["rear"] is not None:
@@ -581,7 +630,7 @@ def _relay_main(profile, endpoints, stop, pipe):
             "first_anomaly_timing_fields": PublicRing.TIMING_FIELDS,
             "first_anomaly_timing": ring.first_anomaly_timing,
             "wait_kinds": {"0": "none", "1": "selector", "2": "release_wait", "3": "stop_wait", "4": "bounded_poll"},
-            "wait_policy": policy.report(),
+            "wait_policy": policy.report() if selector is not None else None,
             "ring_capacity": ring.CAPACITY, "ring_reserved_bytes": len(ring.data)*ring.data.itemsize,
             "ring_evicted": max(0, ring.seen-ring.CAPACITY), "encoded_limit": 64*1024,
             "first_failure": {"error_type": error, "qpc_ns": failure_at, "operation": operation,
@@ -591,6 +640,12 @@ def _relay_main(profile, endpoints, stop, pipe):
                                b.first_attempt, b.blocked] for d in directions if d.queue for b in [d.queue[0]]],
             "encoded_omitted": 0, "encoded_bytes": 0,
             "scope": "opaque TCP read blocks; no packet/loss/WiFi model; readiness timestamp is userspace select return; sampled RSS"}
+        if wait_strategy is not None:
+            report["requested_wait_strategy"] = wait_strategy
+        if native is not None:
+            report.update(ring_version=3, scope="opaque TCP read blocks; native event notification and cached write state; sampled RSS",
+                writable_state_scope="writable_return_ns=-1: no new FD_WRITE; positive short-write continuation measured from prior send completion")
+            report["wait_kinds"].update({"5": "native_network", "6": "native_timer"})
         for _ in range(3):
             report["encoded_bytes"] = len(json.dumps(report, separators=(",", ":")).encode())
         report["model_valid"] = (error is None and set(public) == set(DIRECTIONS)
@@ -609,7 +664,7 @@ def _relay_main(profile, endpoints, stop, pipe):
 class NetworkRelay:
     """实验编排持有的单个转发进程；启动失败和强制退出均显式拒绝模型资格。"""
 
-    def __init__(self, profile, endpoints):
+    def __init__(self, profile, endpoints, *, wait_strategy=None):
         if profile not in ("N1", "N2", "N3") or len(endpoints) != 3:
             raise ValueError("转发器仅支持三条固定本机实验链路。")
         for host, port, backend in endpoints:
@@ -617,10 +672,15 @@ class NetworkRelay:
                 raise ValueError("网络模型不能转发任意外部地址。")
         if len({v[1] for v in endpoints}) != 3:
             raise ValueError("三链路端口必须互异。")
+        if wait_strategy is not None:
+            from ._network_wait_win32 import STRATEGY
+            if sys.platform != "win32" or wait_strategy != STRATEGY:
+                raise ValueError("显式原生候选只允许固定Windows策略。")
         context = mp.get_context("spawn")
         self.stop = context.Event()
         self.reader, writer = context.Pipe(duplex=False)
-        self.process = context.Process(target=_relay_main, args=(profile, endpoints, self.stop, writer))
+        args = (profile, endpoints, self.stop, writer)
+        self.process = context.Process(target=_relay_main, args=args+((wait_strategy,) if wait_strategy is not None else ()))
         self.writer = writer
         self.report = None
         self.closed = False

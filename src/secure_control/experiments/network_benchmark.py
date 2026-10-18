@@ -31,7 +31,8 @@ from ._network_emulator import SEED, NetworkRelay, models
 ROOT = Path(__file__).resolve().parents[3]
 PROFILES = ("N0", "N1", "N2", "N3")
 EXTRA_SOURCE = ("src/secure_control/experiments/network_benchmark.py",
-                "src/secure_control/experiments/_network_emulator.py", "src/secure_control/execution/lan_config.py",
+                "src/secure_control/experiments/_network_emulator.py", "src/secure_control/experiments/_network_wait_win32.py",
+                "src/secure_control/execution/lan_config.py",
                 "configs/cart_pole_plant.yaml", "configs/cart_pole_balance.yaml",
                 "configs/shared_prime_256_pocklington.yaml", "pyproject.toml", "uv.lock")
 COMMENT = re.compile(r"https://github\.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-[0-9]+\Z")
@@ -43,6 +44,21 @@ V2_CERTIFICATE_FIELDS = ("certificate_change_authorization_url", "previous_publi
                          "previous_conditions_sha256", "public_certificate_validity", "certificate_change_reason")
 CLOSURE_AUTHORIZATION = "https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6235872603"
 CLOSURE_HISTORY = "da18c50ed0e175257b7c058943dd2ff3c470669573672179c16d1e47b59e18c4"
+EVENT_DESIGN = "https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6245910420"
+EVENT_AUTHORIZATION = "https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6245981263"
+EVENT_HISTORY = "cc6b6a46b009fbebc32700e32ac65e348f3f10c474e6f219f2a39ecb0785c3b4"
+EVENT_STRATEGY = "win32-event-wait-v1"
+EVENT_FIELDS = ("wait_strategy", "wait_design_url", "wait_authorization_url", "closed_seven_history_sha256")
+
+
+def _event_manifest_valid(m):
+    """只接受具体已批准的B/C与新增来源，不接受任意strategy或新A。"""
+    return (m.get("wait_strategy") == EVENT_STRATEGY and m.get("wait_design_url") == EVENT_DESIGN
+        and m.get("wait_authorization_url") == EVENT_AUTHORIZATION
+        and m.get("closed_seven_history_sha256") == EVENT_HISTORY
+        and (m.get("closure_stage"), m.get("call")) in (("B", 8), ("C", 9))
+        and isinstance(m.get("source_sha256"), dict)
+        and "src/secure_control/experiments/_network_wait_win32.py" in (m.get("source_sha256") or {}))
 
 
 def _closure_manifest_valid(m):
@@ -58,6 +74,7 @@ def _closure_manifest_valid(m):
         total_maximum_attempts=6000, continuation_maximum_calls=1, continuation_maximum_attempts=1000,
         eligible_for_candidate=True, qualification_allowed=False)
     return (stage in ("A", "B", "C") and m.get("authorization_url") == CLOSURE_AUTHORIZATION
+        and (not any(k in m for k in EVENT_FIELDS) or _event_manifest_valid(m))
         and m.get("closed_history_sha256") == CLOSURE_HISTORY
         and m.get("profile") == "N2" and m.get("phase") == ("qualification" if stage == "C" else "candidate")
         and all(type(m.get(k)) is int and m[k] == v for k, v in {
@@ -72,15 +89,25 @@ def _closure_manifest_valid(m):
         and _v2_candidate_manifest_valid(legacy))
 
 
-def _closure_cpu_pass(relay):
+def _closure_cpu_pass(relay, *, native=False):
     """只核已记录CPU服务区间；不是全OS进程或纯控制CPU。"""
     p = relay.get("wait_policy") or {}
-    normal = {"version": 1, "guard_ns": 500000, "max_poll_episode_ns": 500000,
+    normal = {"version": 2 if native else 1, "max_poll_episode_ns": 0 if native else 500000,
               "cpu_window_ns": 100000000, "cpu_limit_percent": 50}
     if (any(type(p.get(k)) is not int or p[k] != v for k, v in normal.items())
-            or p.get("strategy") != "bounded-near-due-v1" or p.get("lifecycle_complete") is not True
+            or p.get("strategy") != (EVENT_STRATEGY if native else "bounded-near-due-v1")
+            or (p.get("guard_ns") is not None if native else type(p.get("guard_ns")) is not int or p["guard_ns"] != 500000)
+            or p.get("lifecycle_complete") is not True
             or p.get("first_cpu_limit_window") is not None or p.get("cpu_sample_error_type") is not None
             or type(p.get("cpu_complete_windows")) is not int or p["cpu_complete_windows"] < 1):
+        return False
+    if native and (p.get("active_poll") is not False
+            or any(type(p.get(k)) is not int or p[k] != 0 for k in ("poll_episodes", "poll_wall_ns", "max_poll_wall_ns", "handles_open"))
+            or type(p.get("handle_high_water")) is not int or not 1 <= p["handle_high_water"] <= 16
+            or type(p.get("native_wait_calls")) is not int or p["native_wait_calls"] < 1
+            or any(type(p.get(k)) is not int or p[k] < 0 for k in
+                ("network_notifications", "last_wait_started_ns", "last_wait_returned_ns", "last_wait_target_ns"))
+            or p["last_wait_returned_ns"] < p["last_wait_started_ns"]):
         return False
     for row in (p.get("peak_cpu_window"), p.get("tail_cpu_window")):
         if (not isinstance(row, dict) or any(type(row.get(k)) is not int or row[k] < 0 for k in
@@ -135,6 +162,10 @@ def _next_closure_call(entries, profile, phase, head, sources, m):
             or sum(e["maximum_attempts"] for e in current)+m["maximum_attempts"] > 12000):
         raise ValueError("闭环阶段结束或预算耗尽。")
     stage = m["closure_stage"]
+    if len(entries) >= 7 and digest(entries[:7]) == EVENT_HISTORY and not _event_manifest_valid(m):
+        raise ValueError("固定A之后只允许本次已批准事件候选，不能回退旧B许可。")
+    if _event_manifest_valid(m):
+        return _next_event_call(entries, m, head, sources)
     if not current:
         if stage != "A" or head == entries[-1]["head"] or sources == entries[-1]["source_sha256"]:
             raise ValueError("新闭环必须先唯一A，不能从旧来源开始。")
@@ -165,8 +196,42 @@ def _next_closure_call(entries, profile, phase, head, sources, m):
     return m["maximum_attempts"]
 
 
+def _next_event_call(entries, m, head, sources):
+    """原七项绝不改写；B前证书例外只属于具体新批准，C严格绑定B。"""
+    if len(entries) not in (7, 8) or digest(entries[:7]) != EVENT_HISTORY:
+        raise ValueError("事件候选必须延续固定七项，不重跑A。")
+    previous, a = entries[-1], entries[6]
+    if (m.get("predecessor_raw_sha256") != previous.get("raw_sha256")
+            or m.get("predecessor_readback_exact") is not True
+            or not isinstance(m.get("predecessor_review_url"), str) or not COMMENT.fullmatch(m["predecessor_review_url"])):
+        raise ValueError("事件候选缺精确前件原件/独立审计。")
+    goal = _closure_predecessor(previous)
+    if m["closure_stage"] == "B":
+        if (len(entries) != 7 or goal or head == previous["head"] or sources == previous["source_sha256"]
+                or m.get("patch_evidence_url") != EVENT_DESIGN
+                or m.get("previous_conditions_sha256") != a["conditions_sha256"]
+                or m.get("previous_public_certificate_sha256") != a["public_certificate_sha256"]
+                or digest({"ports": m["ports"], "environment": m["environment"],
+                    "public_certificate_sha256": m["previous_public_certificate_sha256"], "seed": SEED}) != a["conditions_sha256"]):
+            raise ValueError("B只允许本批准候选及原条件或明确证书例外。")
+        same = all(m.get(k) == a.get(k) for k in
+            ("conditions_sha256", "certificate_directory", "public_certificate_sha256", "public_certificate_validity"))
+        if not same and (m["certificate_directory"] != str((ROOT/".tmp/issue120-network-closure-certs").resolve())
+                or m.get("certificate_change_authorization_url") != EVENT_AUTHORIZATION
+                or m.get("certificate_change_reason") != "insufficient_validity_before_B"):
+            raise ValueError("B换证缺少具体一次例外，不能改变其他条件。")
+    elif (len(entries) != 8 or not goal or not _event_manifest_valid(previous)
+            or previous.get("closure_stage") != "B" or previous["head"] != head or previous["source_sha256"] != sources
+            or previous["maximum_attempts"] != 1000 or any(m.get(k) != previous.get(k) for k in
+                ("conditions_sha256", "certificate_directory", "public_certificate_sha256", "public_certificate_validity",
+                 "previous_conditions_sha256", "previous_public_certificate_sha256", "certificate_change_authorization_url",
+                 "certificate_change_reason", *EVENT_FIELDS))):
+        raise ValueError("事件C须绑定同源/同条件、完整有效且18/16通过的唯一B。")
+    return m["maximum_attempts"]
+
+
 def _require_closure_certificates(m, configs=None):
-    """本闭环每次离线核证，A后不换证；只在A前旧证不足时允许新目录。"""
+    """每次离线核证；只有具体批准的A前或事件B前一次准备例外。"""
     directory = Path(m["certificate_directory"])
     if (certificate_validity(directory) != m.get("public_certificate_validity")
             or any(hashlib.sha256((directory/name).read_bytes()).hexdigest() != sha
@@ -179,10 +244,12 @@ def _require_closure_certificates(m, configs=None):
         now = datetime.now(UTC).timestamp()
         insufficient = any(ssl.cert_time_to_seconds(ssl._ssl._test_decode_cert(str(original/name))["notAfter"])-now < 3600
                            for name in m["public_certificate_sha256"])
-        if (not insufficient or m.get("certificate_change_reason") != "insufficient_validity_before_A"
+        expected = "insufficient_validity_before_B" if _event_manifest_valid(m) else "insufficient_validity_before_A"
+        if (not insufficient or m.get("certificate_change_reason") != expected
+                or _event_manifest_valid(m) and m.get("certificate_change_authorization_url") != EVENT_AUTHORIZATION
                 or any(hashlib.sha256((original/name).read_bytes()).hexdigest() != sha
                        for name, sha in m["previous_public_certificate_sha256"].items())):
-            raise ValueError("只允许A前原证书余期不足时按设计换证。")
+            raise ValueError("仅允许原证书余期不足且与本阶段具体批准相符的换证。")
 
 
 def _require_closure(m, configs=None):
@@ -619,7 +686,7 @@ def assemble(result, *, profile, phase, manifest, relay):
              and result.get("network_source_integrity_failed") is not True)
         and complete and wire_valid and (result.get("network_history") or {}).get("finite_sample_pass") is True and _tls_pass(result)
         and relay.get("model_valid") is True and relay.get("process_exited") is True
-        and not relay.get("forced_termination") and (not closure or _closure_cpu_pass(relay)))
+        and not relay.get("forced_termination") and (not closure or _closure_cpu_pass(relay, native=_event_manifest_valid(manifest))))
     result.update(network_sample_pass=bool(sample),
         network_dynamic_qualification_pass=bool(sample and (wire_profile != _COMPACT_PROFILE_V2 or closure)
                                                 and profile == "N2" and phase == "qualification"),
@@ -742,7 +809,8 @@ def run_network_benchmark(*, profile, phase, certs, ports, ledger, approval, out
                     for name in ("ca.pem", "client.pem", "p1.pem", "p2.pem")}
                 if manifest["public_certificate_sha256"] != approval.get("public_certificate_sha256"):
                     raise ValueError("公开证书指纹不符合预声明。")
-                relay = NetworkRelay(profile, tuple(("127.0.0.1", port, "127.0.0.2") for port in ports)) if profile != "N0" else None
+                relay = NetworkRelay(profile, tuple(("127.0.0.1", port, "127.0.0.2") for port in ports),
+                    **({"wait_strategy": EVENT_STRATEGY} if _event_manifest_valid(manifest) else {})) if profile != "N0" else None
                 with relay if relay is not None else nullcontext():
                     result = benchmark.run_network_observation(configs=configs, steps=steps,
                         **({"wire_profile": wire_profile} if wire_profile is not None else {}),

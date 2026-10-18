@@ -239,3 +239,50 @@ A/B/C冻结同一套条件/证书，每次启动仍需至少一小时余期；A�
 
 先软件验证、提交推送与独立审查，再发布并全文读回精确预声明，才能执行A。每次实际运行保存全量原件、native日志/退出码、hash及独立数据审计。
 本节仅登记许可与验收方法，尚未产生本轮性能成绩；不自动合并、关闭Issue或开始下一Issue。
+
+## 第16次人工单次候选：Windows统一事件等待
+
+[具体设计](https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6245910420)和
+[直接用户批准](https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6245981263)
+允许现有relay进程内的一个新等待候选。原自动3/3、前15次人工历史保留，不授权下一次自动源码返工。
+旧A仅211尝试/210完整确认，因CPU窗62.4962%保护停止且5/3610块模型超1ms，仍为FAIL；
+210前缀max13.9258/p9911.768198ms不能当作有效1000/10000成绩，完整原件与版本1事实保持。
+
+新私有`_network_wait_win32.py`只封装标准库ctypes的Win32 ABI、socket事件状态和一个可复用高精度timer。
+显式选择`win32-event-wait-v1`后，由原relay调用WSAEventSelect/WSAEnumNetworkEvents及WaitForMultipleObjects，
+统一等待真实网络通知或最近due/原100ms资源检查期限；不增加线程、进程、依赖、驱动、优先级、绑核或管理员操作。
+未显式选择的旧入口/默认策略不变。原调用者继续拥有FIFO、due-first轮转/每方向单块、收发、STOP/5s排空和CPU/RSS保护。
+
+QPC绝对期限先扣当前QPC，再向上取整为负相对100ns的一次性timer期限，无APC/周期/合并容差；
+timer可唤醒但不等于socket可写，到期后仍由原QPC判是否可发，不提前发送。能力/系统调用失败明确退出，不降级sleep/忙等。
+每次返回有界收集全部当前通知，避免较小句柄索引偏置。STOP仍由原循环检查，计划最晚100ms资源唤醒；实际迟醒照实计入，不承诺OS硬实时。
+WSA网络事件用原子枚举消费/复位，不能任意ResetEvent丢通知。FD_READ在recv前消费，队列暂停/恢复保留状态；FD_CLOSE仍先读完缓冲再EOF。
+FD_CONNECT错误交原重拨逻辑，accept继承listener事件后先解绑；socket对象/FD复用不能认领旧事件。
+
+FD_WRITE为边沿，收到后保留可写状态；只有实际would-block清除，等待下一次真实FD_WRITE。
+首次到期发送消费此前已使用的可写通知，不将旧时刻遗留给后续短写。原生等待初始化失败也进入结构化首错报告，wait_policy=null表示尚未建立策略，不伪填旧策略或继续运行。
+正数短写按原公平上限继续；缓存状态不伪造新的可写返回QPC。为保留完整派发/处理时间，短写继续从上次send实际完成计到下次send完成；
+真正背压恢复从真实FD_WRITE返回计时，首次发送仍从原eligible计时。全部实际迟延仍受1ms门禁。
+数值环仍15列/256项/30KiB，native分支`ring_version=3`且`writable_return_ns=-1`表示没有新可写通知（含已验证正短写的缓存状态）；旧1/2版本不改写。
+等待类型新增5=native_network、6=native_timer，原0–4保留；首异常仍9项实际时序，摘要总64KiB上限不变。
+
+新报告`wait_policy.version=2`、strategy严格固定上述名称、active_poll=false、guard_ns=null、max_poll_episode_ns=0，
+原poll计数/墙钟/峰值均0。固定追加native_wait_calls、network_notifications、handle_high_water、handles_open、最后等待实际起止/目标QPC；
+每socket一个独占事件和每relay一个timer，句柄总数≤16，非继承/无名称，无每读块句柄；部分失败与退出继续关闭全部资源，首错不被清理错覆盖。
+CPU起止仍在等待器/局部准备后、首监听初始化前至关闭资源后的最终采样；包括该服务区间的初始化/转发/等待/关闭，
+不包括此前ABI/适配器准备或之后报告编码/IPC/最终进程退出，不称全OS或纯控制CPU。约100ms实际完整窗单核50%、峰/首超限/退出尾窗不移动、不平均、不豁免。
+新许可只接受版本2固定策略/零poll/句柄清理事实，不能靠任意strategy绕过；旧A仍要求其原版本1事实。
+
+许可在原owner中绑定本设计/批准URL、包含适配器的全部来源及固定七项规范摘要
+`cc6b6a46b009fbebc32700e32ac65e348f3f10c474e6f219f2a39ecb0785c3b4`。
+旧七项对象/raw/native不变；固定A后禁止回退旧B许可或重跑A。仅复用原call8 B≤1000；B完整有效N2且18/16通过、独立原件审计后，严格同源/同条件call9 C≤10000。
+剩余条件额度2调用/11000，不新增次数；A未用789作废，历史预留7000/实际4013保持至B真正启动。
+原正式默认、控制/数学/材料/TLS、15帧及跨段额外4帧、双提交/设备确认、20ms/18-16、正常GC及全部资源门禁均不变。
+
+仅B前旧证余期不足1小时，准在新独立`.tmp/issue120-network-closure-certs`一次准备原同规格证书，
+绑定certificate_change_authorization_url=本次6245981263、reason=insufficient_validity_before_B、新旧公开hash/有效期及conditions差异；旧证保留。
+不能在旧证充分有效时换证搜索条件，B/C固定同一套，C再过期则停。不是新A或配对A/B收益证明。
+
+必要软件/原生功能检查和独立软件审查后才预声明并执行唯一B。原生功能夹具只验证ABI、字节/通知/背压/半关/句柄与失败，
+没有plant/20ms控制循环、时延分位、额外性能或参数搜索。模拟迟醒仍应模型FAIL，timer不保证调度准时。
+B或C失败停止本候选，不添加探针/变体/自动返工或自行换平台；只有完整有效C/10000零失败零超期且18/16通过才达成本轮目标。
