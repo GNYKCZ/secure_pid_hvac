@@ -3355,7 +3355,6 @@ def run_network_observation(*, configs, steps, wire_profile=None, candidate_mani
     from secure_control.execution.localhost_codec import _COMPACT_PROFILES
 
     if (wire_profile not in (None, *_COMPACT_PROFILES)
-            or wire_profile == _COMPACT_PROFILE_V2 and steps != 1000
             or wire_profile != _COMPACT_PROFILE_V2 and candidate_manifest is not None
             or type(configs) is not tuple or len(configs) != 3 or type(steps) is not int or steps not in (1000, 10000)
             or tuple(getattr(c, "role", None) for c in configs) != ("Client", "P1", "P2")
@@ -3371,6 +3370,8 @@ def run_network_observation(*, configs, steps, wire_profile=None, candidate_mani
     if wire_profile == _COMPACT_PROFILE_V2:
         from .network_benchmark import require_v2_candidate
         require_v2_candidate(candidate_manifest, configs)
+        if steps != candidate_manifest["maximum_attempts"]:
+            raise ValueError("实际步数必须等于本次已占许可。")
     topology = configs[0].topology
     endpoints = (topology.p1_client, topology.p2_client, topology.p1_peer)
     if (topology.identities != {r: f"{r.lower()}.secure-control.test" for r in ("Client", "P1", "P2")}
@@ -3415,7 +3416,7 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
         raise ValueError("紧凑动态 profile 只允许显式原网络工人实验入口")
     if network_wire_profile == _COMPACT_PROFILE_V2:
         from .network_benchmark import require_v2_candidate
-        if (steps != 1000 or delay_ms != 0 or segment_steps != 400 or role_config is not None
+        if (type(steps) is not int or steps not in (1000, 10000) or delay_ms != 0 or segment_steps != 400 or role_config is not None
                 or tcp_nodelay is not None or commit_policy != "default" or _gc_trial is not None
                 or any((diagnostic, timeout_trace, worker_timeout_diagnostic, worker_wait_diagnostic,
                         server_gc_candidate, compact_history_candidate,
@@ -3423,8 +3424,10 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
                 or stage_wait_diagnostic is not True
                 or not gc.isenabled() or gc.get_threshold() != (700, 10, 10)
                 or gc.get_freeze_count() or gc.get_debug()):
-            raise ValueError("v2仅允许固定1000/400和正常GC的原候选入口")
+            raise ValueError("v2仅允许已批准1000或10000、段400和正常GC的原网络入口")
         require_v2_candidate(network_candidate_manifest, network_configs)
+        if steps != network_candidate_manifest["maximum_attempts"]:
+            raise ValueError("实际步数必须等于本次已占许可。")
     elif network_candidate_manifest is not None:
         raise ValueError("候选manifest只能用于v2")
 
