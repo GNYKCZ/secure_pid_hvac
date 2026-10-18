@@ -286,3 +286,30 @@ CPU起止仍在等待器/局部准备后、首监听初始化前至关闭资源�
 必要软件/原生功能检查和独立软件审查后才预声明并执行唯一B。原生功能夹具只验证ABI、字节/通知/背压/半关/句柄与失败，
 没有plant/20ms控制循环、时延分位、额外性能或参数搜索。模拟迟醒仍应模型FAIL，timer不保证调度准时。
 B或C失败停止本候选，不添加探针/变体/自动返工或自行换平台；只有完整有效C/10000零失败零超期且18/16通过才达成本轮目标。
+
+## 第19次限定续接：修复后复验与条件资格
+
+[设计](https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6251910122)与
+[直接用户批准](https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6251961861)
+仅新增两个阶段：`continuation_stage=repair_recheck`（call9，candidate，最多1000周期一次）和
+`repair_qualification`（call10，qualification，最多10000周期一次）。R1完整通过全部原门禁及
+max≤18ms/p99≤16ms，原件经独立审计且同源/同条件后才有Q1。任一步失败或证据不足停止，不补跑/热身/追加探针或自动返工。
+旧A/B剩余步数作废、旧C未解锁；新的上限不是复活旧C。原八次8000预留/4014实际保持，新增最多2次/11000，累计封顶10次/19000。
+
+原RunBudget仍是唯一预算owner；同一正式CLI/共享/实际入口都核对本次批准、完整head/来源、固定八项canonical与native历史、当前native START和在途占项。
+原八项摘要分别为`5e28dad8b899e1653f0c165ef5661027ac1f9d9fd684bc2ec2ac64a3ef3dc99c`和
+`f429510fb22e70ea865b10dd084581e56199bf087cc81c44ed071ed7ebc6e120`；前缀对象/原件不改，只有真正追加后账本整体hash自然改变。
+native记录工具在发起CLI前持久化START并保留原生exit，不能另行放行；CLI启动失败也消费，native/canonical不齐或有在途即阻断，不能删除记录重试。
+新manifest加入`continuation_design_url`、`closed_native_history_sha256`、`native_ledger_path`，authorization必须是本批批准URL，不能填旧批准或设计URL。
+准备工具只负责冻结/公开/核对事实，不得猴子补丁或另开账本绕过入口。
+
+优先复用`.tmp/issue120-network-closure-certs`；每次启动离线核验至少一小时余期。仅R1前原证不足时，按批准在此前不存在的
+`.tmp/issue120-network-repair-certs`一次生成同身份RSA2048/SHA256/25h证书，记录新旧公开hash、有效期、条件和
+`certificate_change_reason=insufficient_validity_before_R1`、`certificate_change_authorization_url=本批批准`。
+旧证仍足够有效不得换，Q1同套且不得再换；私钥/旧证均保留，不试连搜索条件。
+
+本批不改relay候选、控制算法、协议、材料/worker、正常GC、正式默认或N2模型。新授权严格选择原native版本2策略并执行
+原50%实际CPU窗/零poll/句柄/1ms模型/完整周期和18–16门禁，缺失wait返回仍拒绝。
+入口适配的新head须相关与全量软件检查、独立软件审查、完整预声明及全文读回后才运行。R1/Q1各自全部原件/命令/native退出、
+材料/状态/资源/清理和后置退出观察均保存并独立核验；失败/null/慢步不删、不将成功前缀冒作完整样本。
+软件通过、R1有限样本、Q1本机N2资格分别记录；不据此宣布真实Wi-Fi/设备/长期硬实时、gen2专项或完整路线通过，不自动合并或关闭Issue。

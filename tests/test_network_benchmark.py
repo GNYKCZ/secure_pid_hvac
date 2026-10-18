@@ -1644,6 +1644,236 @@ def _event_software_result(m, *, model=True, goal=True):
     return network.assemble(result, profile="N2", phase=m["phase"], manifest=m, relay=result["network_relay"])
 
 
+@pytest.fixture
+def repair_real_gates():
+    """在历史fixture替身生效前保存真正的完整样本和TLS事实门禁。"""
+    return benchmark._compact_sample_pass,network._tls_pass
+
+
+@pytest.fixture
+def repair_context(repair_real_gates,event_context, monkeypatch):
+    """封闭八项软件历史和native START；不访问真实实验账本或运行控制。"""
+    _old, b, ledger, certs = event_context
+    directory = ledger.parent/"issue120-network-closure-certs"
+    directory.mkdir()
+    for path in certs.iterdir():
+        (directory/path.name).write_bytes(path.read_bytes())
+    b = b|{"certificate_directory": str(directory.resolve()),
+           "certificate_change_authorization_url": network.EVENT_AUTHORIZATION,
+           "certificate_change_reason": "insufficient_validity_before_B"}
+    with network.RunBudget(ledger) as budget:
+        path = ledger.parent/"B.json"
+        budget.reserve("N2", "candidate", b["head"], b["source_sha256"], path,
+            conditions_sha256=b["conditions_sha256"], continuation=b)
+        result = _event_software_result(b, model=False)
+        path.write_text(json.dumps(result), encoding="utf8")
+        budget.finish(result, network.hashlib.sha256(path.read_bytes()).hexdigest())
+        entries = copy.deepcopy(budget.entries)
+    native_path = ledger.parent/"issue120-network-invocations.json"
+    native = [{"completed": True, "native_exit": 5, "call": i+1} for i in range(8)]
+    native_path.write_text(json.dumps({"entries": native}), encoding="utf8")
+    monkeypatch.setattr(network, "REPAIR_HISTORY", network.digest(entries))
+    monkeypatch.setattr(network, "REPAIR_NATIVE_HISTORY", network.digest(native))
+    m = {k:v for k,v in b.items() if k not in ("closure_stage", *network.EVENT_FIELDS, *network.V2_CERTIFICATE_FIELDS)}
+    m.update(authorization_url=network.REPAIR_AUTHORIZATION, continuation_design_url=network.REPAIR_DESIGN,
+        closed_history_sha256=network.REPAIR_HISTORY, closed_native_history_sha256=network.REPAIR_NATIVE_HISTORY,
+        continuation_stage="repair_recheck", call=9, maximum_calls=10, total_maximum_attempts=19000,
+        continuation_maximum_calls=2, continuation_maximum_attempts=11000,
+        head="9"*40, source_sha256={"src":"9"*64,"src/secure_control/experiments/_network_wait_win32.py":"b"*64},
+        native_ledger_path=str(native_path.resolve()),wait_strategy=network.EVENT_STRATEGY,
+        predecessor_raw_sha256=entries[-1]["raw_sha256"],predecessor_review_url=b["review_url"],
+        predecessor_readback_exact=True,public_certificate_validity=network.certificate_validity(directory),
+        previous_public_certificate_sha256=b["public_certificate_sha256"], previous_conditions_sha256=b["conditions_sha256"])
+    monkeypatch.setattr(network,"source",lambda:(m["head"],m["source_sha256"]))
+    monkeypatch.setattr(benchmark,"_compact_sample_pass",repair_real_gates[0])
+    monkeypatch.setattr(network,"_tls_pass",repair_real_gates[1])
+    return entries,m,ledger,directory,native_path,native
+
+
+def _repair_native_start(path, old, m):
+    entry = {k:m[k] for k in ("call","head","source_sha256","conditions_sha256","continuation_stage",
+                              "authorization_url","maximum_attempts","profile","phase")}
+    entry.update(completed=False,native_exit=None,started_utc="2026-10-19T00:00:00+00:00")
+    path.write_text(json.dumps({"entries":old+[entry]}),encoding="utf8")
+
+
+def _repair_software_result(m, *, model=True, goal=True):
+    """完整公开字段的合成软件原件；实际样本/TLS/CPU/18-16门禁均不mock。"""
+    from test_communication_batch import _s9_public_result
+    r=_s9_public_result()
+    target=m["maximum_attempts"]
+    r["cycles"]=r["cycles"][:target]
+    for c in r["cycles"]:
+        c["cycle_completed_ns"]=c["scheduled_start_ns"]+15000000
+        if c["global_step"] in range(399,target-1,400):c["phase_durations_ns"]={"maintenance":1}
+    if not goal:r["cycles"][-1]["cycle_completed_ns"]=r["cycles"][-1]["scheduled_start_ns"]+19000000
+    r.update(requested_steps=target,successful_steps=target,protocol_committed_count=target,physically_confirmed_count=target,
+        cycle_summary={"attempts":target,"misses":0},code_sha=m["head"],source_sha256=m["source_sha256"],
+        resource_counts={"products_consumed":30*target,"truncations_consumed":4*target},
+        wire_profile=network._COMPACT_PROFILE_V2,
+        steps=[{k:c[k] for k in ("global_step","status","session_id","round_id")} for c in r["cycles"]],
+        numeric_profile={"fractional_bits":32,"security_parameter":80,"period_s":.02,"modulus_bits":256,
+            "state_dimension":4,"input_dimension":2,"output_dimension":1},
+        material_comparison={"memory_guard_failed":False,"cleanup_failed":False,"producer_exited":True})
+    numeric=r.pop("worker_long_run")["numeric_contract"]|{"block_steps":19,"parameter_bits":40,"runtime_payload_bits":46}
+    r["stage_wait_diagnostic"]={"evidence_complete":True,"numeric_contract":numeric,
+        "roles":[{"role":p,"gc":{"normal_stop_ack_sent":True}} for p in ("P1","P2")]}
+    r["network_history"]={"finite_sample_pass":True,"representation_complete":True,"thread_registration_complete":True,
+        "numeric_contract":numeric,"roles":[{"role":role,"tables":{name:{"captured":target,"expanded":target}
+            for name in ("steps","cycles")}} for role in ("Client","P1","P2")]}
+    r["material_summary"].update(claimed=target,generated_received=target+16,encoding_profile=network._COMPACT_PROFILE_V2)
+    r["material_summary"]["worker"]["encoding_profile"]=network._COMPACT_PROFILE_V2
+    for p in r["party_outcomes"]:
+        p["steps"]=p["steps"][:target];p["wire_profile"]=network._COMPACT_PROFILE_V2
+    last=r["cycles"][-1]
+    r["last_commit_observation"].update({k:last[k] for k in ("round_id","global_step")})
+    r["last_commit_observation"]["step"]=target-1
+    for row,role in [(r,"Client"),*[(p,p["role"]) for p in r["party_outcomes"]]]:
+        row["network_tls"]={"restored":True,"links":[{"role":role,"peer_identity":f"{peer.lower()}.secure-control.test",
+            "peer_san":[["DNS",f"{peer.lower()}.secure-control.test"]],"version":"TLSv1.3","tcp_nodelay":1}
+            for peer in ("Client","P1","P2") if peer!=role]}
+    relay=_event_software_result(m,model=model)["network_relay"]
+    return network.assemble(r,profile="N2",phase=m["phase"],manifest=m,relay=relay)
+
+
+def test_repair_r1_q1_use_canonical_budget_native_start_and_recompute_predecessor(repair_context,monkeypatch):
+    entries,m,ledger,certs,npath,native = repair_context
+    assert network._repair_manifest_valid(m)
+    with pytest.raises(ValueError):  # 无native START，即使软件放行也不得占项。
+        network._next_compact_call(entries,"N2","candidate",m["head"],m["source_sha256"],m)
+    _repair_native_start(npath,native,m)
+    with network.RunBudget(ledger) as budget:
+        raw = ledger.parent/"R1.json"
+        assert budget.reserve("N2","candidate",m["head"],m["source_sha256"],raw,
+            conditions_sha256=m["conditions_sha256"],continuation=m)==1000
+        network.require_v2_candidate(m,network.role_configs(certs,network.V2_PORTS,"N2"))
+        result=_repair_software_result(m)
+        assert result["network_sample_pass"] and result["network_progress_goal_pass"]
+        raw.write_text(json.dumps(result),encoding="utf8")
+        budget.finish(result,network.hashlib.sha256(raw.read_bytes()).hexdigest())
+        r1 = copy.deepcopy(budget.entries[-1])
+    actual=json.loads(npath.read_text())["entries"]
+    actual[-1].update(completed=True,native_exit=0)
+    q=m|{"continuation_stage":"repair_qualification","call":10,"phase":"qualification","maximum_attempts":10000,
+         "eligible_for_candidate":False,"qualification_allowed":True,"predecessor_raw_sha256":r1["raw_sha256"]}
+    _repair_native_start(npath,actual,q)
+    good_raw=raw.read_bytes()
+    for fault in ("incomplete","commit","tls","model","cpu","goal"):
+        bad=json.loads(good_raw)
+        if fault=="incomplete":bad["cycles"].pop()
+        elif fault=="commit":bad["last_commit_observation"]["parties"]["P2"]["valid_ack_received"]=False
+        elif fault=="tls":bad["network_tls"]["links"]=[]
+        elif fault=="model":bad["network_relay"]["model_valid"]=False
+        elif fault=="cpu":bad["network_relay"]["wait_policy"]["last_wait_returned_ns"]=None
+        else:bad["cycles"][-1]["cycle_completed_ns"]=bad["cycles"][-1]["scheduled_start_ns"]+19000000
+        # 重新绑定真实被改原件hash，确保拒绝来自门禁重算，而非仅hash不同。
+        raw.write_text(json.dumps(bad),encoding="utf8")
+        changed=r1|{"raw_sha256":network.hashlib.sha256(raw.read_bytes()).hexdigest(),"sample_pass":True}
+        wrong=q|{"predecessor_raw_sha256":changed["raw_sha256"]}
+        with pytest.raises(ValueError):
+            network._next_compact_call(entries+[changed],"N2","qualification",wrong["head"],wrong["source_sha256"],wrong)
+    raw.write_bytes(good_raw)
+    for wrong in ({"head":"8"*40},{"conditions_sha256":"0"*64},{"predecessor_raw_sha256":"0"*64}):
+        w=q|wrong
+        with pytest.raises(ValueError):network._next_compact_call(entries+[r1],"N2","qualification",w["head"],w["source_sha256"],w)
+    with network.RunBudget(ledger) as budget:
+        assert budget.reserve("N2","qualification",q["head"],q["source_sha256"],ledger.parent/"Q1.json",
+            conditions_sha256=q["conditions_sha256"],continuation=q)==10000
+        network.require_v2_candidate(q)
+        assert budget.entries[:8]==entries
+        assert _repair_software_result(q)["network_dynamic_qualification_pass"]
+        budget.finish({"cycles":[],"network_sample_pass":False},"failure")
+        with pytest.raises(ValueError):
+            network._next_compact_call(budget.entries,"N2","qualification",q["head"],q["source_sha256"],q)
+    saved=json.loads(ledger.read_text())
+    assert saved["maximum_calls"]==10 and saved["maximum_attempts"]==19000
+
+
+def test_repair_wrong_permission_history_native_and_model_or_cpu_cannot_release(repair_context,monkeypatch):
+    entries,m,_ledger,_certs,npath,native=repair_context
+    for wrong in ({"authorization_url":network.EVENT_AUTHORIZATION},{"call":True},{"maximum_calls":9},
+                  {"continuation_stage":"repair_qualification"},{"closure_stage":"C"},
+                  {"closed_native_history_sha256":"0"*64},{"wait_strategy":"other"}):
+        assert not network._repair_manifest_valid(m|wrong)
+    _repair_native_start(npath,native,m)
+    assert network._next_compact_call(entries,"N2","candidate",m["head"],m["source_sha256"],m)==1000
+    for bad in ([],entries[:-1],entries+[entries[-1]], [entries[0]|{"head":"tampered"}]+entries[1:]):
+        with pytest.raises(ValueError): network._next_compact_call(bad,"N2","candidate",m["head"],m["source_sha256"],m)
+    rows=json.loads(npath.read_text())["entries"]
+    for changed in (rows[:-1],rows+[rows[-1]],rows[:-1]+[rows[-1]|{"completed":True}],
+                    [rows[0]|{"native_exit":0}]+rows[1:]):
+        npath.write_text(json.dumps({"entries":changed}),encoding="utf8")
+        with pytest.raises(ValueError):network._next_compact_call(entries,"N2","candidate",m["head"],m["source_sha256"],m)
+    npath.write_text(json.dumps({"entries":rows}),encoding="utf8")
+    for fields in ({"poll_episodes":1},{"last_wait_returned_ns":None},{"cpu_limit_percent":51}):
+        r=_repair_software_result(m);r["network_relay"]["wait_policy"].update(fields)
+        assert not network.assemble(r,profile="N2",phase="candidate",manifest=m,relay=r["network_relay"])["network_sample_pass"]
+    assert not _repair_software_result(m,model=False)["network_sample_pass"]
+    assert not _repair_software_result(m,goal=False)["network_progress_goal_pass"]
+
+
+def test_repair_actual_wrapper_native_strategy_shared_checks_and_failed_start_consumes(repair_context,monkeypatch):
+    entries,m,ledger,certs,npath,native=repair_context
+    m=m|{"environment":{"platform":network.platform.platform(),"python":sys.version.split()[0],
+                          "openssl":network.ssl.OPENSSL_VERSION}}
+    # 原有软件fixture已固定相同环境；若不同不可偷偷修改封闭历史。
+    assert m["environment"]==entries[-1]["environment"]
+    approval=ledger.parent/"repair-approval.json"
+    approval.write_text(json.dumps(m),encoding="utf8")
+    _repair_native_start(npath,native,m)
+    observed=[]
+    class Relay:
+        def __init__(self,profile,endpoints,*,wait_strategy):
+            assert profile=="N2" and len(endpoints)==3 and wait_strategy==network.EVENT_STRATEGY
+            self.report={"model_valid":False,"process_exited":True,"forced_termination":False}
+        def __enter__(self):return self
+        def __exit__(self,*args):return None
+    original=benchmark._run_continuous_observation
+    def observe(**kwargs):
+        observed.append(True)
+        return original(**kwargs)
+    def no_process(*args):raise RuntimeError("software boundary before role creation")
+    monkeypatch.setattr(network,"NetworkRelay",Relay)
+    monkeypatch.setattr(benchmark,"_run_continuous_observation",observe)
+    monkeypatch.setattr(benchmark.mp,"get_context",no_process)
+    r=network.run_network_benchmark(profile="N2",phase="candidate",certs=certs,ports=network.V2_PORTS,
+        ledger=ledger,approval=approval,output=ledger.parent/"R1.json",wire_profile=network._COMPACT_PROFILE_V2,
+        authorization=network.REPAIR_AUTHORIZATION)
+    assert observed==[True] and r["failure_category"]=="RuntimeError"
+    saved=json.loads(ledger.read_text())["entries"]
+    assert saved[:8]==entries and len(saved)==9 and saved[-1]["finished"] and saved[-1]["actual_attempts"]==0
+    with pytest.raises(ValueError):network.require_v2_candidate(m)
+    with pytest.raises(ValueError):
+        network.run_network_benchmark(profile="N2",phase="candidate",certs=certs,ports=network.V2_PORTS,
+            ledger=ledger,approval=approval,output=ledger.parent/"retry.json",wire_profile=network._COMPACT_PROFILE_V2,
+            authorization=network.REPAIR_AUTHORIZATION)
+
+
+def test_repair_certificate_exception_only_for_insufficient_original_and_exact_approval(repair_context,monkeypatch):
+    entries,m,ledger,certs,npath,native=repair_context
+    fresh=ledger.parent/"issue120-network-repair-certs"
+    subprocess.run([sys.executable,str(ROOT/"tests/fixtures/prepare_local_lan_certs.py"),"--output",str(fresh)],
+        check=True,capture_output=True)
+    hashes={name:network.hashlib.sha256((fresh/name).read_bytes()).hexdigest() for name in m["public_certificate_sha256"]}
+    changed=m|{"certificate_directory":str(fresh.resolve()),"public_certificate_sha256":hashes,
+        "public_certificate_validity":network.certificate_validity(fresh),
+        "certificate_change_reason":"insufficient_validity_before_R1","certificate_change_authorization_url":network.REPAIR_AUTHORIZATION}
+    changed["conditions_sha256"]=network.digest({k:changed[k] for k in ("ports","environment","public_certificate_sha256","seed")})
+    _repair_native_start(npath,native,changed)
+    assert network._next_compact_call(entries,"N2","candidate",changed["head"],changed["source_sha256"],changed)==1000
+    with pytest.raises(ValueError):network._require_repair_certificates(changed)
+    decode=network.ssl._ssl._test_decode_cert
+    def expired(path):
+        value=decode(path)
+        if network.Path(path).parent==certs:value["notAfter"]="Oct 17 00:00:00 2000 GMT"
+        return value
+    monkeypatch.setattr(network.ssl._ssl,"_test_decode_cert",expired)
+    network._require_repair_certificates(changed,network.role_configs(fresh,network.V2_PORTS,"N2"))
+    for wrong in ({"certificate_change_authorization_url":network.REPAIR_DESIGN},
+                  {"certificate_change_reason":"insufficient_validity_before_B"},{"public_certificate_validity":{}}):
+        with pytest.raises(ValueError):network._require_repair_certificates(changed|wrong)
+
+
 def test_event_B_C_exact_new_strategy_history_and_predecessor_goals(event_context):
     entries, b, ledger, certs = event_context
     assert network._closure_manifest_valid(b)
@@ -1983,6 +2213,12 @@ def test_network_cli_is_exclusive_and_does_not_accept_arbitrary_steps(tmp_path, 
         invalid[invalid.index(key)+1] = bad
         monkeypatch.setattr(sys, "argv", invalid)
         assert lan_runner._run() == 5 and len(calls) == 3
+    repair=[network.REPAIR_AUTHORIZATION if a==network.V2_AUTHORIZATION else a for a in v2]
+    for phase in ("candidate","qualification"):
+        current=list(repair);current[current.index("--network-phase")+1]=phase
+        monkeypatch.setattr(sys,"argv",current)
+        assert lan_runner._run()==0 and calls[-1]["authorization"]==network.REPAIR_AUTHORIZATION
+    assert len(calls)==5
 
 
 def test_startup_failure_is_exported_and_consumes_unique_discovery(tmp_path, monkeypatch):

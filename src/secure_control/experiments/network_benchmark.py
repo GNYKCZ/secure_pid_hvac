@@ -49,6 +49,134 @@ EVENT_AUTHORIZATION = "https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issu
 EVENT_HISTORY = "cc6b6a46b009fbebc32700e32ac65e348f3f10c474e6f219f2a39ecb0785c3b4"
 EVENT_STRATEGY = "win32-event-wait-v1"
 EVENT_FIELDS = ("wait_strategy", "wait_design_url", "wait_authorization_url", "closed_seven_history_sha256")
+REPAIR_DESIGN = "https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6251910122"
+REPAIR_AUTHORIZATION = "https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6251961861"
+REPAIR_HISTORY = "5e28dad8b899e1653f0c165ef5661027ac1f9d9fd684bc2ec2ac64a3ef3dc99c"
+REPAIR_NATIVE_HISTORY = "f429510fb22e70ea865b10dd084581e56199bf087cc81c44ed071ed7ebc6e120"
+
+
+def _repair_manifest_valid(m):
+    """第19批仅两个具体新阶段；旧B/C及布尔冒充整数均不能借用。"""
+    if not isinstance(m, dict):
+        return False
+    qualification = m.get("continuation_stage") == "repair_qualification"
+    legacy = {k:v for k,v in m.items() if k not in V2_CERTIFICATE_FIELDS}
+    legacy.update(authorization_url=V2_AUTHORIZATION,closed_history_sha256=V2_CLOSED_HISTORY,
+        phase="candidate",call=6,maximum_calls=6,maximum_attempts=1000,total_maximum_attempts=6000,
+        continuation_maximum_calls=1,continuation_maximum_attempts=1000,
+        eligible_for_candidate=True,qualification_allowed=False)
+    return (m.get("authorization_url") == REPAIR_AUTHORIZATION
+        and m.get("continuation_design_url") == REPAIR_DESIGN
+        and m.get("continuation_stage") in ("repair_recheck","repair_qualification")
+        and "closure_stage" not in m and m.get("closed_history_sha256") == REPAIR_HISTORY
+        and m.get("closed_native_history_sha256") == REPAIR_NATIVE_HISTORY
+        and m.get("wait_strategy") == EVENT_STRATEGY
+        and m.get("phase") == ("qualification" if qualification else "candidate")
+        and all(type(m.get(k)) is int and m[k] == v for k,v in {
+            "call":10 if qualification else 9,"maximum_calls":10,"total_maximum_attempts":19000,
+            "maximum_attempts":10000 if qualification else 1000,
+            "continuation_maximum_calls":2,"continuation_maximum_attempts":11000}.items())
+        and m.get("eligible_for_candidate") is (not qualification)
+        and m.get("qualification_allowed") is qualification
+        and m.get("software_pass") is True and m.get("readback_exact") is True
+        and m.get("native_ledger_path") == str((ROOT/".tmp/issue120-network-invocations.json").resolve())
+        and isinstance(m.get("certificate_directory"),str)
+        and m.get("certificate_directory") in {str((ROOT/".tmp"/name).resolve()) for name in
+            ("issue120-network-closure-certs","issue120-network-repair-certs")}
+        and isinstance(m.get("source_sha256"),dict)
+        and "src/secure_control/experiments/_network_wait_win32.py" in m["source_sha256"]
+        and _v2_candidate_manifest_valid(legacy))
+
+
+def _repair_native(entries, m):
+    """native只记实际CLI事实；canonical核固定历史及当前START，不赋予旁路许可。"""
+    rows = json.loads(Path(m["native_ledger_path"]).read_text(encoding="utf-8"))["entries"]
+    if (type(rows) is not list or len(rows) != len(entries)+1
+            or digest(rows[:8]) != REPAIR_NATIVE_HISTORY
+            or any(r.get("completed") is not True for r in rows[:-1])
+            or rows[-1].get("completed") is not False or rows[-1].get("native_exit") is not None
+            or not isinstance(rows[-1].get("started_utc"),str)
+            or any(rows[-1].get(k) != m.get(k) for k in ("call","head","source_sha256","conditions_sha256",
+                "continuation_stage","authorization_url","maximum_attempts","profile","phase"))):
+        raise ValueError("修复复验native历史/当前START或完成状态不符，不允许重跑。")
+    if len(entries) == 9 and (rows[8].get("native_exit") != 0
+            or any(rows[8].get(k) != entries[8].get(k) for k in ("call","head","source_sha256",
+                "conditions_sha256","continuation_stage","authorization_url","maximum_attempts","profile","phase"))):
+        raise ValueError("资格前件native必须是同一复验的实际成功退出。")
+
+
+def _next_repair_call(entries, profile, phase, head, sources, m):
+    """只追加call9复验/call10资格；原八项失败与未用步数保持封闭。"""
+    if (not _repair_manifest_valid(m) or type(entries) is not list or len(entries) not in (8,9)
+            or digest(entries[:8]) != REPAIR_HISTORY or any(e.get("finished") is not True for e in entries)
+            or m["call"] != len(entries)+1 or (profile,phase,head,sources) != (m["profile"],m["phase"],m["head"],m["source_sha256"])
+            or sum(e["maximum_attempts"] for e in entries)+m["maximum_attempts"] > 19000):
+        raise ValueError("修复复验许可/八项历史/来源/阶段或额度不符。")
+    previous = entries[-1]
+    if (m.get("predecessor_raw_sha256") != previous.get("raw_sha256")
+            or m.get("predecessor_readback_exact") is not True
+            or not isinstance(m.get("predecessor_review_url"),str)
+            or not COMMENT.fullmatch(m["predecessor_review_url"])):
+        raise ValueError("修复复验缺少精确前件原件和独立审计。")
+    _repair_native(entries,m)
+    goal = _closure_predecessor(previous)
+    if len(entries) == 8:
+        if (m["continuation_stage"] != "repair_recheck" or goal
+                or head == previous["head"] or sources == previous["source_sha256"]
+                or m.get("previous_conditions_sha256") != previous["conditions_sha256"]
+                or m.get("previous_public_certificate_sha256") != previous["public_certificate_sha256"]
+                or digest({"ports":m["ports"],"environment":m["environment"],
+                    "public_certificate_sha256":m["previous_public_certificate_sha256"],"seed":SEED}) != previous["conditions_sha256"]):
+            raise ValueError("R1必须绑定旧B失败及同一环境/端口/seed，使用新已审来源。")
+        same = all(m.get(k)==previous.get(k) for k in ("conditions_sha256","certificate_directory",
+            "public_certificate_sha256","public_certificate_validity"))
+        if not same and (m["certificate_directory"] != str((ROOT/".tmp/issue120-network-repair-certs").resolve())
+                or m.get("certificate_change_authorization_url") != REPAIR_AUTHORIZATION
+                or m.get("certificate_change_reason") != "insufficient_validity_before_R1"):
+            raise ValueError("R1只允许原条件或明确一次必要换证例外。")
+    elif (m["continuation_stage"] != "repair_qualification" or not goal
+            or not _repair_manifest_valid(previous) or previous.get("continuation_stage") != "repair_recheck"
+            or previous["head"] != head or previous["source_sha256"] != sources or previous["maximum_attempts"] != 1000
+            or any(m.get(k) != previous.get(k) for k in ("conditions_sha256","certificate_directory",
+                "public_certificate_sha256","public_certificate_validity",*V2_CERTIFICATE_FIELDS))):
+        raise ValueError("Q1只允许同源/同条件、完整且18/16通过并独立审计的R1。")
+    return m["maximum_attempts"]
+
+
+def _require_repair_certificates(m, configs=None):
+    """离线核证；仅R1前原证不足一小时可使用同规格新目录，Q1不得换套。"""
+    directory = Path(m["certificate_directory"])
+    if (certificate_validity(directory) != m.get("public_certificate_validity")
+            or any(hashlib.sha256((directory/name).read_bytes()).hexdigest() != sha
+                   for name,sha in m["public_certificate_sha256"].items())
+            or configs is not None and configs != role_configs(directory,V2_PORTS,"N2")):
+        raise ValueError("修复复验证书/有效期/角色配置与冻结不符。")
+    original = ROOT/".tmp/issue120-network-closure-certs"
+    if directory.resolve() != original.resolve():
+        now = datetime.now(UTC).timestamp()
+        if (m.get("certificate_change_authorization_url") != REPAIR_AUTHORIZATION
+                or m.get("certificate_change_reason") != "insufficient_validity_before_R1"
+                or not any(ssl.cert_time_to_seconds(ssl._ssl._test_decode_cert(str(original/name))['notAfter'])-now < 3600
+                           for name in m["public_certificate_sha256"])
+                or any(hashlib.sha256((original/name).read_bytes()).hexdigest() != sha
+                       for name,sha in m["previous_public_certificate_sha256"].items())):
+            raise ValueError("R1新证只能来自本批准的一次必要准备，旧证必须保持。")
+
+
+def _require_repair(m, configs=None):
+    """共享与实际循环复用唯一canonical占项和native事实，不靠外层wrapper放行。"""
+    head,sources = source()
+    ledger = Path(m["budget_path"])
+    entries = json.loads(ledger.read_text(encoding="utf-8"))["entries"]
+    lock = ledger.with_suffix(ledger.suffix+".lock")
+    if (head != m["head"] or sources != m["source_sha256"] or len(entries) != m["call"]
+            or not lock.is_file() or lock.read_text(encoding="utf-8").strip() != str(os.getpid())):
+        raise ValueError("修复复验共享入口缺当前来源/进程锁/占项。")
+    _next_repair_call(entries[:-1],m["profile"],m["phase"],head,sources,m)
+    if entries[-1].get("finished") is not False or any(entries[-1].get(k) != value for k,value in m.items()
+            if k not in ("command","started_utc","topology","models","scope")):
+        raise ValueError("修复复验在途占项与manifest不符。")
+    _require_repair_certificates(m,configs)
 
 
 def _event_manifest_valid(m):
@@ -138,7 +266,7 @@ def _closure_predecessor(entry):
         raise ValueError("闭环前置原件hash不符。")
     result = json.loads(data)
     manifest = result.get("network_manifest") or {}
-    if (manifest.get("authorization_url") != CLOSURE_AUTHORIZATION
+    if (manifest.get("authorization_url") not in (CLOSURE_AUTHORIZATION,REPAIR_AUTHORIZATION)
             or manifest.get("head") != entry["head"] or manifest.get("source_sha256") != entry["source_sha256"]
             or result.get("code_sha") != entry["head"] or result.get("source_sha256") != entry["source_sha256"]
             or manifest.get("conditions_sha256") != entry["conditions_sha256"]):
@@ -374,9 +502,9 @@ def validate_cli(args):
     if (wire is None and (authorization is not None or args.network_phase == "candidate")
             or wire is not None and (wire not in _COMPACT_PROFILES or args.network_profile != "N2"
                 or args.network_phase not in ({"candidate"} if wire == _COMPACT_PROFILE_V2
-                    and authorization != CLOSURE_AUTHORIZATION else {"candidate", "qualification"})
+                    and authorization not in (CLOSURE_AUTHORIZATION,REPAIR_AUTHORIZATION) else {"candidate", "qualification"})
                 or not isinstance(authorization, str) or not COMMENT.fullmatch(authorization)
-                or wire == _COMPACT_PROFILE_V2 and authorization not in (V2_AUTHORIZATION, CLOSURE_AUTHORIZATION))):
+                or wire == _COMPACT_PROFILE_V2 and authorization not in (V2_AUTHORIZATION, CLOSURE_AUTHORIZATION,REPAIR_AUTHORIZATION))):
         raise ValueError("紧凑候选须匹配批准和N2阶段；v2仅本次candidate。")
     try:
         ports = tuple(int(p) for p in args.network_ports.split(","))
@@ -457,6 +585,8 @@ def next_call(entries, profile, phase, head, sources, repair_note=None):
 
 def _next_compact_call(entries, profile, phase, head, sources, continuation):
     """在同一已停止账本追加一次人工续接；旧循环与失败记录不可重置。"""
+    if isinstance(continuation, dict) and continuation.get("authorization_url") == REPAIR_AUTHORIZATION:
+        return _next_repair_call(entries,profile,phase,head,sources,continuation)
     if isinstance(continuation, dict) and continuation.get("authorization_url") == CLOSURE_AUTHORIZATION:
         return _next_closure_call(entries, profile, phase, head, sources, continuation)
     if isinstance(continuation, dict) and continuation.get("wire_profile") == _COMPACT_PROFILE_V2:
@@ -508,6 +638,8 @@ def _v2_candidate_manifest_valid(manifest):
     """本次有限样本的公开来源/许可绑定；不是长期资格或新认证系统。"""
     if not isinstance(manifest, dict):
         return False
+    if manifest.get("authorization_url") == REPAIR_AUTHORIZATION:
+        return _repair_manifest_valid(manifest)
     if manifest.get("authorization_url") == CLOSURE_AUTHORIZATION:
         return _closure_manifest_valid(manifest)
     m = manifest
@@ -540,6 +672,9 @@ def require_v2_candidate(manifest, configs=None):
     """共享/实际循环都核对当前来源及获准的在途占项，不能私有入口旁路。"""
     if not _v2_candidate_manifest_valid(manifest):
         raise ValueError("v2缺少本次已审N2阶段/步数的完整绑定。")
+    if manifest.get("authorization_url") == REPAIR_AUTHORIZATION:
+        _require_repair(manifest,configs)
+        return
     if manifest.get("authorization_url") == CLOSURE_AUTHORIZATION:
         _require_closure(manifest, configs)
         return
@@ -608,9 +743,10 @@ class RunBudget:
     def _save(self):
         temporary = self.path.with_suffix(self.path.suffix+".writing")
         with temporary.open("x", encoding="utf-8") as stream:
+            repair = any(e.get("authorization_url") == REPAIR_AUTHORIZATION for e in self.entries)
             closure = any(e.get("authorization_url") == CLOSURE_AUTHORIZATION for e in self.entries)
-            json.dump({"schema": "network-call-budget-v1", "maximum_calls": 9 if closure else 6,
-                       "maximum_attempts": 18000 if closure else 15000,
+            json.dump({"schema": "network-call-budget-v1", "maximum_calls": 10 if repair else 9 if closure else 6,
+                       "maximum_attempts": 19000 if repair else 18000 if closure else 15000,
                        "entries": self.entries}, stream, ensure_ascii=False, indent=2, allow_nan=False)
             stream.flush()
             os.fsync(stream.fileno())
@@ -627,7 +763,7 @@ class RunBudget:
             "conditions_sha256": conditions_sha256})
         if continuation is not None:
             fields = continuation
-            if continuation.get("authorization_url") == CLOSURE_AUTHORIZATION:
+            if continuation.get("authorization_url") in (CLOSURE_AUTHORIZATION,REPAIR_AUTHORIZATION):
                 owned = {"output", "started_utc", "finished", "sample_pass", "actual_attempts", "raw_sha256",
                          "failure_category", "ended_utc", "repair_note"}
                 fields = {k: v for k, v in continuation.items() if k not in owned}
@@ -671,7 +807,8 @@ def assemble(result, *, profile, phase, manifest, relay):
     except (KeyError, TypeError, ValueError, IndexError):
         complete = False
     wire_profile = manifest.get("wire_profile")
-    closure = manifest.get("authorization_url") == CLOSURE_AUTHORIZATION
+    repair = manifest.get("authorization_url") == REPAIR_AUTHORIZATION
+    closure = manifest.get("authorization_url") in (CLOSURE_AUTHORIZATION,REPAIR_AUTHORIZATION)
     compact = wire_profile in _COMPACT_PROFILES
     material = result.get("material_summary") or {}
     wire_valid = (wire_profile is None and result.get("wire_profile") is None) or compact and (result.get("wire_profile") == wire_profile
@@ -686,7 +823,8 @@ def assemble(result, *, profile, phase, manifest, relay):
              and result.get("network_source_integrity_failed") is not True)
         and complete and wire_valid and (result.get("network_history") or {}).get("finite_sample_pass") is True and _tls_pass(result)
         and relay.get("model_valid") is True and relay.get("process_exited") is True
-        and not relay.get("forced_termination") and (not closure or _closure_cpu_pass(relay, native=_event_manifest_valid(manifest))))
+        and not relay.get("forced_termination") and (not closure or _closure_cpu_pass(relay,
+            native=_repair_manifest_valid(manifest) if repair else _event_manifest_valid(manifest))))
     result.update(network_sample_pass=bool(sample),
         network_dynamic_qualification_pass=bool(sample and (wire_profile != _COMPACT_PROFILE_V2 or closure)
                                                 and profile == "N2" and phase == "qualification"),
@@ -714,7 +852,8 @@ def run_network_benchmark(*, profile, phase, certs, ports, ledger, approval, out
             or not COMMENT.fullmatch(approval.get("review_url", ""))):
         raise ValueError("缺少当前head/源指纹对应的独立软件审查放行。")
     continuation = None
-    closure = wire_profile == _COMPACT_PROFILE_V2 and authorization == CLOSURE_AUTHORIZATION
+    repair = wire_profile == _COMPACT_PROFILE_V2 and authorization == REPAIR_AUTHORIZATION
+    closure = wire_profile == _COMPACT_PROFILE_V2 and authorization in (CLOSURE_AUTHORIZATION,REPAIR_AUTHORIZATION)
     if wire_profile is not None:
         if (wire_profile not in _COMPACT_PROFILES or approval.get("wire_profile") != wire_profile
                 or not isinstance(authorization, str) or not COMMENT.fullmatch(authorization)
@@ -724,7 +863,8 @@ def run_network_benchmark(*, profile, phase, certs, ports, ledger, approval, out
         continuation = {"wire_profile": wire_profile, "authorization_url": authorization,
                         "closed_history_sha256": approval["closed_history_sha256"]}
         if closure:
-            if (not _closure_manifest_valid(approval) or profile != approval["profile"] or phase != approval["phase"]
+            if (not (_repair_manifest_valid(approval) if repair else _closure_manifest_valid(approval))
+                    or profile != approval["profile"] or phase != approval["phase"]
                     or ports != V2_PORTS or str(Path(ledger).resolve()) != approval["budget_path"]
                     or str(Path(certs).resolve()) != approval["certificate_directory"]):
                 raise ValueError("缺少本次A/B/C的精确许可。")
@@ -750,8 +890,12 @@ def run_network_benchmark(*, profile, phase, certs, ports, ledger, approval, out
         if closure:
             if approval["conditions_sha256"] != conditions:
                 raise ValueError("闭环预声明条件摘要不符。")
-            _next_closure_call(budget.entries, profile, phase, head, fingerprints, approval)
-            _require_closure_certificates(approval)
+            if repair:
+                _next_repair_call(budget.entries,profile,phase,head,fingerprints,approval)
+                _require_repair_certificates(approval)
+            else:
+                _next_closure_call(budget.entries, profile, phase, head, fingerprints, approval)
+                _require_closure_certificates(approval)
         elif wire_profile == _COMPACT_PROFILE_V2:
             if approval.get("conditions_sha256") != conditions:
                 raise ValueError("v2预声明新条件摘要不匹配。")
@@ -810,7 +954,8 @@ def run_network_benchmark(*, profile, phase, certs, ports, ledger, approval, out
                 if manifest["public_certificate_sha256"] != approval.get("public_certificate_sha256"):
                     raise ValueError("公开证书指纹不符合预声明。")
                 relay = NetworkRelay(profile, tuple(("127.0.0.1", port, "127.0.0.2") for port in ports),
-                    **({"wait_strategy": EVENT_STRATEGY} if _event_manifest_valid(manifest) else {})) if profile != "N0" else None
+                    **({"wait_strategy": EVENT_STRATEGY} if _event_manifest_valid(manifest)
+                        or _repair_manifest_valid(manifest) else {})) if profile != "N0" else None
                 with relay if relay is not None else nullcontext():
                     result = benchmark.run_network_observation(configs=configs, steps=steps,
                         **({"wire_profile": wire_profile} if wire_profile is not None else {}),
