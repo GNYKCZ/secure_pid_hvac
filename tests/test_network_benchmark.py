@@ -337,7 +337,8 @@ def test_native_short_write_continuation_keeps_real_elapsed_and_requires_write_a
     direction.queued = 4
     ring = emulator.PublicRing()
     blocked = []
-    native = SimpleNamespace(write_blocked=blocked.append, writable_return=lambda _sock: None)
+    native = SimpleNamespace(write_blocked=blocked.append, writable_return=lambda _sock: None,
+                             write_progressed=lambda _sock: None)
     emulator._dispatch(direction, 100, None, ring, native)
     clock[0] = 1000101
     emulator._dispatch(direction, clock[0], None, ring, native)
@@ -355,7 +356,8 @@ def test_native_first_due_send_consumes_old_write_notification_before_short_cont
     def consume(_sock):
         value, pending[0] = pending[0], None
         return value
-    native = SimpleNamespace(writable_return=consume, write_blocked=lambda _sock: None)
+    native = SimpleNamespace(writable_return=consume, write_blocked=lambda _sock: None,
+                             write_progressed=lambda _sock: None)
     direction = emulator.Direction(None, SimpleNamespace(send=lambda _data: 2), "Client->P1", None)
     direction.queue.append(emulator.Block(b"abcd", 0, 0, 0, 0, 2000000))
     direction.queued = 4
@@ -366,6 +368,161 @@ def test_native_first_due_send_consumes_old_write_notification_before_short_cont
     emulator._dispatch(direction, clock[0], native.writable_return(direction.destination), ring, native)
     assert not direction.queue and direction.stats["max_unexplained_excess_ns"] == 100
     assert ring.rows()[-1][13] == -1  # 没有新FD_WRITE的继续发送，不能填入旧时刻。
+
+
+@pytest.mark.parametrize("failure", ["enum", "timer"])
+@pytest.mark.parametrize("previous_success", [False, True])
+def test_native_wait_failed_attempt_has_no_previous_return(monkeypatch, failure, previous_success):
+    """当前调用未返回必须明确为空；原异常传播与句柄回收保持。"""
+    from secure_control.experiments import _network_wait_win32 as native
+    api, clock = _WaitAPI(), [1000]
+    monkeypatch.setattr(native.time, "perf_counter_ns", lambda: clock[0])
+    with native.NativeWait(_api=api) as wait:
+        sock = SimpleNamespace(fileno=lambda: 101)
+        wait.register(sock, 1, ("stream", None, None))
+        if previous_success:
+            wait.wait_until(2000)
+            assert wait.report()["last_wait_returned_ns"] == 1000
+        clock[0] = 3000
+        api.fail = failure
+        with pytest.raises(OSError, match="native fixture failure"):
+            wait.wait_until(5000)
+        report = wait.report()
+        assert report["last_wait_started_ns"] == 3000 and report["last_wait_target_ns"] == 5000
+        assert report["last_wait_returned_ns"] is None
+        api.fail = None
+        clock[0] = 6000
+        wait.wait_until(7000)
+        assert wait.report()["last_wait_returned_ns"] == wait.report()["last_wait_started_ns"] == 6000
+    assert wait.report()["handles_open"] == 0 and not api.open
+
+
+@pytest.mark.parametrize("write_mode", ["drain", "backpressure", "short_write"])
+def test_native_relay_connect_transition_and_consecutive_due_heads_do_not_wait_for_resource_deadline(monkeypatch, write_mode):
+    """执行原relay全路径：连接转换、双向连续队头、无新WRITE与真实would-block。"""
+    from secure_control.experiments import _network_wait_win32 as native
+    clock, reports, waits, sent, bindings = [10000], [], [], [], []
+    backpressure = write_mode == "backpressure"
+    blocked, notified, stopped = [False], [False], [False]
+    waits_owner = []
+
+    class API(_WaitAPI):
+        def WSAEventSelect(self, fd, handle, mask):
+            result = super().WSAEventSelect(fd, handle, mask)
+            if mask:
+                bindings.append((fd, handle))
+                if mask & native.FD_ACCEPT:
+                    self.events[fd] = (native.FD_ACCEPT, {})
+                elif mask & native.FD_CONNECT:
+                    self.events[fd] = (native.FD_CONNECT | native.FD_WRITE, {})
+                elif mask & native.FD_READ:
+                    self.events[fd] = (native.FD_READ, {})
+            return result
+
+        def WaitForMultipleObjects(self, count, handles, all_events, timeout):
+            assert len(waits) < 15, "生产循环没有在有界功能序列内完成"
+            waits.append(self.due)
+            if blocked[0]:
+                clock[0] += 10000
+                blocked[0], notified[0] = False, True
+                self.events[303] = (native.FD_WRITE, {})
+                return 1
+            clock[0] += -self.due*100
+            return super().WaitForMultipleObjects(count, handles, all_events, timeout)
+
+    api = API()
+
+    class Socket:
+        def __init__(self, fd):
+            self.fd, self.reads = fd, 0
+
+        def fileno(self):
+            return self.fd
+
+        def setsockopt(self, *_args):
+            pass
+
+        def bind(self, *_args):
+            pass
+
+        def listen(self, *_args):
+            pass
+
+        def setblocking(self, *_args):
+            pass
+
+        def connect_ex(self, *_args):
+            return 0
+
+        def getsockopt(self, *_args):
+            return 0
+
+        def accept(self):
+            return front, None
+
+        def recv(self, _limit):
+            if self.reads == 2:
+                raise BlockingIOError()
+            self.reads += 1
+            if self.reads < 2:
+                api.events[self.fd] = (native.FD_READ, {})
+            return b"ab" if self.reads == 1 else b"cd"
+
+        def send(self, data):
+            if backpressure and self.fd == 303 and not notified[0]:
+                assert not blocked[0], "真实would-block后没有新FD_WRITE不得重试"
+                blocked[0] = True
+                raise BlockingIOError()
+            count = 1 if write_mode == "short_write" and self.fd == 202 and not any(fd == 202 for fd, *_ in sent) else len(data)
+            sent.append((self.fd, bytes(data[:count]), clock[0]))
+            if sum(len(payload) for _fd, payload, _when in sent) == 8:
+                stopped[0] = True
+            return count
+
+        def close(self):
+            self.fd = -1
+
+    listener, front, rear = Socket(101), Socket(202), Socket(303)
+    sockets = iter((listener, rear))
+    factory = native.NativeWait
+
+    def wait_factory():
+        wait = factory(_api=api)
+        waits_owner.append(wait)
+        return wait
+
+    monkeypatch.setattr(native, "NativeWait", wait_factory)
+    monkeypatch.setattr(emulator.socket, "socket", lambda *_args: next(sockets))
+
+    def now():
+        clock[0] += 1000
+        return clock[0]
+
+    monkeypatch.setattr(emulator.time, "perf_counter_ns", now)
+    monkeypatch.setattr(emulator.time, "process_time_ns", lambda: clock[0]//10)
+    monkeypatch.setattr(benchmark, "_process_memory", lambda: {"current_rss_bytes": 32*1024**2})
+    due = [None]
+
+    def schedule(self, arrival, size):
+        due[0] = due[0] or arrival+1000000
+        return 0, arrival, 0, due[0]
+
+    monkeypatch.setattr(emulator.Schedule, "enqueue", schedule)
+    emulator._relay_main("N2", [("127.0.0.1", 1, "127.0.0.2")],
+        SimpleNamespace(is_set=lambda: stopped[0]), SimpleNamespace(send=reports.append, close=lambda: None), native.STRATEGY)
+    report = reports[-1]
+    assert report["error_type"] is None and len(sent) == (5 if write_mode == "short_write" else 4)
+    for fd in (202, 303):
+        rows = [data for target, data, _when in sent if target == fd]
+        assert b"".join(rows) == b"abcd"
+    assert all(when >= due[0] for _fd, _data, when in sent)
+    assert all(x["unexplained_over_tolerance"] == 0 for x in report["directions"].values())
+    assert report["directions"]["Client->P1"]["backpressure_count"] == int(backpressure)
+    assert report["directions"]["P1->Client"]["short_writes"] == int(write_mode == "short_write")
+    assert notified[0] is backpressure
+    assert len({handle for fd, handle in bindings if fd == 303}) == 1  # connect转stream不丢原事件。
+    assert waits_owner[0].report()["handles_open"] == 0 and not api.open
+    assert report["wait_policy"]["poll_episodes"] == 0
 
 
 def test_native_initialization_failure_is_reported_without_fallback_or_fake_policy(monkeypatch):
@@ -1535,7 +1692,8 @@ def test_event_cpu_version_cannot_accept_poll_or_unknown_strategy(event_context)
     assert network._closure_cpu_pass(relay, native=True)
     assert not network._closure_cpu_pass(relay)
     for wrong in ({"strategy": "other"}, {"active_poll": True}, {"poll_wall_ns": 1},
-                  {"handle_high_water": 17}, {"handles_open": 1}, {"cpu_limit_percent": 51}, {"guard_ns": 500000}):
+                  {"handle_high_water": 17}, {"handles_open": 1}, {"cpu_limit_percent": 51}, {"guard_ns": 500000},
+                  {"last_wait_returned_ns": None}):
         altered = copy.deepcopy(relay)
         altered["wait_policy"].update(wrong)
         assert not network._closure_cpu_pass(altered, native=True)

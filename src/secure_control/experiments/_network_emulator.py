@@ -314,9 +314,13 @@ def _dispatch(direction, now, writable_at, ring, native=None):
         # 首次到期发送已使用此前的可写状态；旧通知不得留给将来的短写继续。
         native.writable_return(direction.destination)
     before = direction.stats["backpressure_count"]
+    queued_before = direction.queued
     _progress(direction, now, writable_at, ring, **({"known_writable": True} if native is not None else {}))
     if native is not None and direction.stats["backpressure_count"] != before:
         native.write_blocked(direction.destination)
+    elif native is not None and direction.queued < queued_before:
+        # 实际正数send也是写能力事实；短写继续沿原公平策略，直到真实would-block。
+        native.write_progressed(direction.destination)
 
 
 def _serve_due(directions, rotation, ring, native=None):
@@ -508,6 +512,9 @@ def _relay_main(profile, endpoints, stop, pipe, wait_strategy=None):
                     due = incoming.queue[0].due
                     if due <= now:
                         mask |= selectors.EVENT_WRITE
+                        if native is not None and incoming.queue[0].first_attempt is None:
+                            # 本遍公平服务后露出的新队头仍须首次尝试，不能等无关资源期限。
+                            next_due = min(next_due, due)
                     else:
                         next_due = min(next_due, due)
                         if incoming.queue[0].first_attempt is None:
@@ -553,7 +560,8 @@ def _relay_main(profile, endpoints, stop, pipe, wait_strategy=None):
                     connection = pending[index]
                     front, rear = connection["front"], connection["rear"]
                     result = (native.connection_error(rear) if native is not None else 0) or rear.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
-                    selector.unregister(rear)
+                    if result or native is None:
+                        selector.unregister(rear)
                     if result:
                         if result not in (errno.ECONNREFUSED, 10061):
                             raise OSError(result, "backend connect")
@@ -570,6 +578,10 @@ def _relay_main(profile, endpoints, stop, pipe, wait_strategy=None):
                         direction = Direction(source, destination, name, Schedule(link_models[name], name))
                         directions.append(direction)
                         outgoing_by_socket[source] = incoming_by_socket[destination] = direction
+                    if native is not None:
+                        # 原事件/真实可写状态属于同一socket；连接成功不注销再登记。
+                        selector.modify(rear, selectors.EVENT_READ,
+                            ("stream", outgoing_by_socket[rear], incoming_by_socket[rear]))
                     continue
                 _, outgoing, incoming = key.data
                 if mask & selectors.EVENT_READ:

@@ -202,6 +202,10 @@ class NativeWait:
         entry.writable = False
         entry.write_returned = None
 
+    def write_progressed(self, sock):
+        """实际正数send确认可继续尝试；不伪造FD_WRITE或新的取回时刻。"""
+        self._entry(sock).writable = True
+
     def writable_return(self, sock):
         """只消费真实FD_WRITE/CONNECT取回时刻；缓存可写状态返回None。"""
         entry = self._entry(sock)
@@ -230,7 +234,8 @@ class NativeWait:
         if self.closed or type(wake_at_ns) is not int or not 0 <= wake_at_ns < 2**63:
             raise ValueError("原生等待需要有效QPC整数期限。")
         start = self._now()
-        self.last_start, self.last_target = start, wake_at_ns
+        # 新调用在真正返回前没有返回事实；异常不得拼接前次 last_end。
+        self.last_start, self.last_target, self.last_end = start, wake_at_ns, None
         if wake_at_ns <= start:
             self.last_end = start
             return [], start, 6
@@ -262,7 +267,7 @@ class NativeWait:
         return self._ready(), returned, 6 if result == 0 else 5
 
     def report(self):
-        """固定标量摘要，关闭后的最后事实仍可读取。"""
+        """固定标量摘要；last_wait_returned_ns 为 None 表示本次调用未返回。"""
         return {"active_poll": False, "native_wait_calls": self.waits, "network_notifications": self.notifications,
             "handle_high_water": self.high_water,
             "handles_open": None if self.cleanup_uncertain else len(self.entries)+bool(self.timer),
