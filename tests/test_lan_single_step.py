@@ -91,6 +91,27 @@ def test_all_lan_tcp_links_enable_nodelay_and_close_failed_options(deployment, m
         server.close()
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_optional_wire_profile_is_strict_and_independent_of_transport(tmp_path):
+    import yaml
+    from lan_test_support import loopback_deployment
+
+    paths = loopback_deployment(tmp_path)
+    for role, path in paths.items():
+        assert load_lan_config(path, role).wire_profile == "control-batch-v1"
+        data = yaml.safe_load(path.read_text(encoding="utf8"))
+        data["wire_profile"] = "control-dynamic-compact-v2"
+        path.write_text(yaml.safe_dump(data), encoding="utf8")
+        config = load_lan_config(path, role)
+        assert config.wire_profile == data["wire_profile"] and config.transport == "insecure_tcp"
+        assert config.ca is config.certificate is config.private_key is None
+        for invalid in (False, [], None, "control-dynamic-compact-v1", "unknown"):
+            data["wire_profile"] = invalid
+            path.write_text(yaml.safe_dump(data), encoding="utf8")
+            with pytest.raises(ValueError, match="wire_profile"):
+                load_lan_config(path, role)
+
 NAMES = {
     "Client": "client.secure-control.test",
     "P1": "p1.secure-control.test",

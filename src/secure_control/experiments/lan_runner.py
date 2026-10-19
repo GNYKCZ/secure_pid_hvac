@@ -94,6 +94,8 @@ def cli() -> None:
 
 def run_client_continuous(config: LanConfig) -> dict[str, object]:
     """先预检 Client 场景，后建立单 session 多步 LAN，并一次性发布正式图。"""
+    if config.wire_profile != "control-batch-v1":
+        raise ValueError("compact-v2 仅支持专用动态持续 light 入口。")
     if config.experiment_config is None:
         raise ValueError("缺少 Client experiment profile。")
     experiment = load_prepared_lan_experiment(config.experiment_config)
@@ -118,12 +120,26 @@ class CompletedSegment:
     steps: tuple[ConfirmedStep, ...]
 
 
+def validate_segmented_mode(config, experiment, *, non_realtime=False,
+                            recording_mode=None, preload_steps=0):
+    """联网前拒绝新演示不支持的组合；旧 batch 留证与预送语义不变。"""
+    dynamic = experiment.spec.state_dimension != 0
+    mode = recording_mode if recording_mode is not None else "light" if dynamic else "full"
+    if type(non_realtime) is not bool:
+        raise ValueError("non_realtime 必须是布尔值。")
+    compact = config.wire_profile == _COMPACT_PROFILE_V2
+    if (non_realtime or compact) and (not dynamic or mode != "light" or preload_steps):
+        raise ValueError("compact-v2 / 非实时演示仅支持动态持续 light，不能预送或保存 full。")
+    return mode
+
+
 def run_client_segmented(config: LanConfig, *, segment_steps: int = 400,
                          control: RunControl,
                          on_step: Callable[[ConfirmedStep], None] | None = None,
                          on_segment: Callable[[CompletedSegment], None] | None = None,
                          phase: Callable[[str], None] | None = None,
-                         session=None, preload_steps=0, preload_execution="fused") -> dict[str, object]:
+                         session=None, preload_steps=0, preload_execution="fused",
+                         non_realtime=False) -> dict[str, object]:
     """运行到正常停止请求或故障；不将后端 stopped 冒充正式 artifact complete。"""
     # 队列与场景选择由装配层拥有；核心仅处理协议身份、双提交及确认前缀。
     from secure_control.scenarios.cart_pole.interactive import InteractiveSession
@@ -134,9 +150,11 @@ def run_client_segmented(config: LanConfig, *, segment_steps: int = 400,
     if not isinstance(session, InteractiveSession) or not isinstance(control, RunControl):
         raise TypeError("持续模式需要 RunControl 和 InteractiveSession。")
     experiment = load_segmented_experiment(config.experiment_config, segment_steps, session)
+    validate_segmented_mode(config, experiment, non_realtime=non_realtime, preload_steps=preload_steps)
     return _run_prepared_segmented(config, experiment, control=control, session=session,
                                    on_step=on_step, on_segment=on_segment, phase=phase,
-                                   preload_steps=preload_steps, preload_execution=preload_execution)
+                                   preload_steps=preload_steps, preload_execution=preload_execution,
+                                   non_realtime=non_realtime)
 
 
 def _run_prepared_segmented(config, experiment, *, control, session,
@@ -145,9 +163,19 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                             on_cycle=None, cycle_snapshot=None,
                             before_sample=None, preload_steps=0,
                             preload_execution="fused", on_segment_ready=None,
-                            _material_candidate=None, _wire_profile=None) -> dict[str, object]:
+                            _material_candidate=None, _wire_profile=None,
+                            non_realtime=False) -> dict[str, object]:
     """唯一持续循环接收已装配场景；保存/GUI 与 headless 不重复 parse 或创建 plant。"""
     control.bind_stop(session.reject_new)
+    wire_profile = _wire_profile if _wire_profile is not None else getattr(config, "wire_profile", "control-batch-v1")
+    # 旧实验显式参数仍归原实验 owner；普通角色配置的选择才装配演示 worker。
+    configured_compact = _wire_profile is None and wire_profile == _COMPACT_PROFILE_V2
+    if non_realtime or configured_compact:
+        validate_segmented_mode(config, experiment, non_realtime=non_realtime,
+                                preload_steps=preload_steps)
+        if realtime is True and non_realtime:
+            raise ValueError("非实时演示不能同时启用实时截止。")
+    material_candidate = "worker" if configured_compact else _material_candidate
     if preload_steps and material_slots != 16:
         raise ValueError("预送窗口与显式非默认material_slots互斥")
     runtime = None
@@ -158,6 +186,16 @@ def _run_prepared_segmented(config, experiment, *, control, session,
     cycle_count = misses = 0
     last_cycle = None
     startup_gc = None
+    sample_count = 0
+    previous_sample_ns = None
+    outcome = None
+    wall_started = perf_counter()
+
+    def summary():
+        """非实时没有周期截止证据；尝试数独立于 CycleTiming 的存在。"""
+        return {"attempts": sample_count if non_realtime else cycle_count,
+                "misses": None if non_realtime else misses,
+                "last_cycle": None if non_realtime else last_cycle}
 
     def emit_cycle(status, failure_phase=None):
         """成功和失败尝试走同一公开出口，失败不能丢掉首步/边界样本。"""
@@ -235,8 +273,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                     **experiment.scene.terminal_summary(),
                     "resource_counts": runtime.resource_counts,
                     "final_segment": asdict(segment), "transport": config.transport,
-                    "cycle_summary": {"attempts": cycle_count, "misses": misses,
-                                      "last_cycle": last_cycle},
+                    "cycle_summary": summary(),
                     "material_summary": getattr(runtime, "material_summary", runtime.cycle_queue_levels),
                     "startup_gc": startup_gc,
                     "last_commit_observation": getattr(runtime, "last_commit_observation", None),
@@ -288,30 +325,30 @@ def _run_prepared_segmented(config, experiment, *, control, session,
             segment_capacity=(experiment.segment_capacity
                               if experiment.spec.state_dimension else None),
             preload_steps=preload_steps, preload_execution=preload_execution,
-            **({"wire_profile": _wire_profile} if _wire_profile is not None else {}),
+            **({"wire_profile": wire_profile} if wire_profile != "control-batch-v1" else {}),
         )
         if on_start is not None:
             on_start(runtime.snapshot(), runtime.public_setup)
-        dynamic_realtime = experiment.spec.state_dimension != 0 if realtime is None else realtime
+        dynamic_realtime = (experiment.spec.state_dimension != 0 if realtime is None else realtime) and not non_realtime
         if preload_steps:
             progress("PRELOADING")
             runtime.enable_material_preload(cancelled=lambda: session.cancelled.is_set()
                                            or control.stop_requested)
-        if dynamic_realtime:
+        if dynamic_realtime or configured_compact:
             if material_slots and not preload_steps:
                 runtime.enable_material_preparation(slots=material_slots,
-                    **({"_candidate": _material_candidate} if _material_candidate else {}))
+                    **({"_candidate": material_candidate} if material_candidate else {}))
             # 所有固定验证、建连、writer 初始化与首池填充完成后才确定唯一 t0。
             # 收集初始化暂存垃圾；运行中的自动 GC/阈值保持原样，不转移周期内的工作。
             started = perf_counter_ns()
             collected = gc.collect(2)
             startup_gc = {"duration_ns": perf_counter_ns() - started, "collected": collected}
-            if _material_candidate:
+            if material_candidate:
                 runtime._begin_material_control()
             if session.cancelled.is_set():
                 raise RuntimeError("Client 运行已取消。")
             # 启动期间的正常停止仍关闭零步段，不再建立不需要的控制时钟。
-            if not control.stop_requested:
+            if dynamic_realtime and not control.stop_requested:
                 clock = AbsoluteCycleClock(experiment.scene.period)
         progress("RUNNING")
         while True:
@@ -320,9 +357,17 @@ def _run_prepared_segmented(config, experiment, *, control, session,
             if control.stop_requested or runtime.segment_full:
                 stopped = transition()
                 if stopped is not None:
-                    return stopped
+                    outcome = stopped
+                    return outcome
                 continue
             deadline_ns = None
+            if non_realtime and previous_sample_ns is not None:
+                # 只尽力保持模型节奏：从上次实际采样算剩余等待，慢轮不追赶或积压输入。
+                remaining = (previous_sample_ns + round(experiment.scene.period * 1e9) - perf_counter_ns()) / 1e9
+                if remaining > 0:
+                    session.cancelled.wait(remaining)
+                if session.cancelled.is_set() or control.stop_requested:
+                    continue
             if clock is not None:
                 scheduled, deadline_ns = clock.wait(runtime.confirmed_step_count)
                 lifecycle = runtime.snapshot()
@@ -338,6 +383,8 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                 before_sample()
             progress("INPUT")
             started = perf_counter_ns()
+            previous_sample_ns = started
+            sample_count += 1
             if attempt is not None:
                 attempt["sample"] = started
             value = experiment.scene.controller_input()
@@ -395,7 +442,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                 last_cycle["cycle_completed_ns"] = None
                 raise CycleDeadlineExceeded("CYCLE_OBSERVATION")
     except Exception as error:  # noqa: BLE001 - 生命周期出口不披露协议秘密或异常载荷
-        if (runtime is not None and _wire_profile == _COMPACT_PROFILE_V2
+        if (runtime is not None and wire_profile == _COMPACT_PROFILE_V2
                 and runtime.last_maintenance_operation == "advance"
                 and (runtime.phase == "CONNECTING_NEXT" or attempt is not None
                      and "maintenance_advance" in attempt["durations"]
@@ -417,7 +464,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
             except Exception as recording_error:  # noqa: BLE001 - 只保留公开类别
                 if last_cycle is not None:
                     last_cycle["recording_error"] = type(recording_error).__name__
-        return {
+        outcome = {
             "status": ("cancelled" if session.cancelled.is_set() else
                        "uncertain" if uncertain else "failed"),
             "category": type(error).__name__, "failure_phase": failure_phase,
@@ -432,21 +479,38 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                                  "truncations_consumed": lifecycle.truncations_consumed}
                                 if lifecycle else {}),
             "lifecycle": asdict(lifecycle) if lifecycle else None,
-            "cycle_summary": {"attempts": cycle_count, "misses": misses,
-                              "last_cycle": last_cycle},
+            "cycle_summary": summary(),
             "material_summary": getattr(runtime, "material_summary", runtime.cycle_queue_levels) if runtime is not None else {},
             "startup_gc": startup_gc,
             "last_commit_observation": getattr(runtime, "last_commit_observation", None),
             **({"last_sealed_segment": asdict(runtime.last_sealed_record)
                 if runtime.last_sealed_record is not None else None,
                 "known_segment_receipts": [asdict(r) for r in runtime.last_segment_receipts]}
-               if runtime is not None and _wire_profile == _COMPACT_PROFILE_V2 else {}),
+               if runtime is not None and wire_profile == _COMPACT_PROFILE_V2 else {}),
             "recording_error": getattr(error, "_public_recording_error", None),
         }
+        return outcome
     finally:
         session.stop_accepting()
         if runtime is not None:
-            runtime.close()
+            try:
+                runtime.close()
+            except Exception as error:
+                if not non_realtime or outcome is None:
+                    raise
+                outcome["cleanup_error_type"] = type(error).__name__
+                if outcome["status"] == "stopped":
+                    outcome.update(status="failed", category=type(error).__name__, failure_phase="CLEANUP")
+        if non_realtime and outcome is not None:
+            # close 后再取工人清退事实，不以构造 return 时的旧快照声称清理完成。
+            material = runtime.material_summary if runtime is not None else {}
+            outcome.update(transport=config.transport, wire_profile=wire_profile,
+                material_source="worker" if material_candidate == "worker" else "inline",
+                timing_mode="non_realtime_demo", model_period_s=experiment.scene.period,
+                wall_elapsed_s=perf_counter() - wall_started, material_summary=material)
+            if (material.get("cleanup_failed") or material.get("error_type")
+                    or (material.get("worker") or {}).get("memory_guard_failed")) and outcome["status"] == "stopped":
+                outcome.update(status="failed", category="MaterialWorkerFailure", failure_phase="CLEANUP")
 
 
 def _run_prepared_client(config: LanConfig, experiment: PreparedLanExperiment,
@@ -455,6 +519,8 @@ def _run_prepared_client(config: LanConfig, experiment: PreparedLanExperiment,
                          publication_guard: Callable[[], AbstractContextManager[None]]
                          | None = None) -> dict[str, object]:
     """通用会话/资源/正式发布只保留一份；交互入口仅换执行计划。"""
+    if config.wire_profile != "control-batch-v1":
+        raise ValueError("compact-v2 仅支持动态持续 light。")
     def check_cancelled() -> None:
         if cancelled is not None and cancelled.is_set():
             raise RuntimeError("Client 运行已取消。")
@@ -779,6 +845,8 @@ def _run() -> int:
     role = {"p1": "P1", "p2": "P2", "client": "Client"}[args.role]
     try:
         config = load_lan_config(args.config, role)
+        if role == "Client" and config.wire_profile != "control-batch-v1":
+            raise ValueError("compact-v2 Client 请使用倒立摆专用动态持续入口。")
         trial = (HvacScenario(config.controller_config).build_lan_single_step()
                  if role == "Client" and config.controller_config is not None else None)
         if role == "Client" and config.experiment_config is not None:
@@ -792,7 +860,7 @@ def _run() -> int:
             (run_client_continuous(config) if config.experiment_config is not None
              else run_client_single_step(config, trial))
             if role == "Client"
-            else run_party_single_step(config)
+            else run_party_single_step(config, wire_profile=config.wire_profile)
         )
     except LanConnectionError as error:
         return _failure(role, 3, "connection", error)

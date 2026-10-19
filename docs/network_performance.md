@@ -1,5 +1,10 @@
 # 安全动态平衡的本机网络模型实验
 
+> 后续已批准的[无证书两机非实时功能演示](https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6258914759)
+> 使用普通角色配置的compact-v2与倒立摆专用 `--non-realtime --recording light`，操作见
+> [演示指南](cart_pole_interactive.md#无证书两机非实时动态演示)。它不调用本页的TLS网络基准、历史许可或账本，
+> 不启用模拟中继/native等待，也没有20/40 ms性能指标。原20 ms资格及R1失败/Q1未解锁保持，不因软件演示变成PASS。
+
 本入口仅用于#120获批的单机网络阶段：真实Client/P1/P2及既有供料worker连接软件倒立摆，原TLS1.3双向认证、安全计算和20 ms绝对周期保持。不能把本机127或自己的192.168地址、逐应用帧sleep、模型通过称作真实Wi-Fi/三机或实体设备验收。具体设计与授权见[固定网络闭环](https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6208580212)。
 
 ## 固定条件与计时

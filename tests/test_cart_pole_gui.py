@@ -203,6 +203,18 @@ def test_dynamic_recording_windows_keep_light_frame_and_full_verified_reader(tmp
     window._run_worker()
     assert calls == ["verified-run"] and window._terminal == ("complete", verified)
 
+    window = gui.CartPoleWindow(tk_root, paths["Client"], non_realtime=True)
+    assert any("非实时仿真" in str(w.cget("text")) for w in tk_root.winfo_children() if isinstance(w, tk.Label))
+    def demo(config, **kwargs):
+        assert kwargs["non_realtime"] is True and kwargs["recording_mode"] == "light"
+        return {"recording_mode": "light", "status": "stopped", "confirmed_step_count": 3,
+                "observed_status": "recovering"}
+    monkeypatch.setattr(gui, "run_cart_pole_segmented", demo)
+    window._run_worker()
+    window._poll()
+    assert "recovering" in window.phase.get() and "已确认3步" in window.phase.get()
+    assert "未保存完整" in window.location.get()
+
 
 def test_headless_recording_selection_and_rejection_precede_network(tmp_path, monkeypatch):
     import runpy
@@ -240,6 +252,52 @@ def test_headless_recording_selection_and_rejection_precede_network(tmp_path, mo
     with pytest.raises(SystemExit) as exit:
         runpy.run_path(str(entry), run_name="__main__")
     assert exit.value.code == 2 and received == [None, "full"]
+
+
+def test_demo_script_options_reject_unsupported_routes_before_runner(tmp_path, monkeypatch):
+    import runpy
+
+    import yaml
+    from test_cart_pole_lan import ROOT, _observer_profile_for, _profile_for
+    from test_lan_continuous import _plain_deployment
+
+    from secure_control.experiments import cart_pole_segmented_evidence as evidence
+    from secure_control.scenarios.cart_pole import gui
+
+    paths = _plain_deployment(tmp_path)
+    _observer_profile_for(paths)
+    path = paths["Client"]
+    data = yaml.safe_load(path.read_text(encoding="utf8"))
+    data["wire_profile"] = "control-dynamic-compact-v2"
+    path.write_text(yaml.safe_dump(data), encoding="utf8")
+    calls = []
+    def run(config, **kwargs):
+        assert kwargs["non_realtime"] is True
+        calls.append(kwargs)
+        return {"status": "stopped"}
+    monkeypatch.setattr(evidence, "run_cart_pole_segmented", run)
+    monkeypatch.setattr(gui, "run_window", run)
+    entry = ROOT / "scripts/run_cart_pole_client.py"
+    for flags in (["--headless-continuous"], []):
+        monkeypatch.setattr(sys, "argv", [str(entry), str(path), "--non-realtime", *flags])
+        if flags:
+            with pytest.raises(SystemExit) as exit:
+                runpy.run_path(str(entry), run_name="__main__")
+            assert exit.value.code == 0
+        else:
+            runpy.run_path(str(entry), run_name="__main__")
+    assert len(calls) == 2
+    for flags in (["--finite"], ["--full-route", "secure"], ["--full-gui-route", "secure"],
+                  ["--headless-continuous", "--preload-steps", "1"], ["--recording", "full"]):
+        monkeypatch.setattr(sys, "argv", [str(entry), str(path), "--non-realtime", *flags])
+        with pytest.raises(SystemExit) as exit:
+            runpy.run_path(str(entry), run_name="__main__")
+        assert exit.value.code == 2
+    _profile_for(paths)
+    monkeypatch.setattr(sys, "argv", [str(entry), str(path), "--non-realtime"])
+    with pytest.raises(SystemExit) as exit:
+        runpy.run_path(str(entry), run_name="__main__")
+    assert exit.value.code == 2 and len(calls) == 2
 
 
 _CLOSE = r'''

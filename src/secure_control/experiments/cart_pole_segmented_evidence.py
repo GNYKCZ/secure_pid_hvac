@@ -2184,7 +2184,8 @@ class _LightRecording:
 def run_cart_pole_segmented(config, *, control: RunControl, session: InteractiveSession,
                            segment_steps=400, prepared: PreparedSegmentedExperiment | None = None,
                            on_step=None, phase=None, realtime=None,
-                           preload_steps=0, preload_execution="fused", recording_mode=None) -> dict:
+                           preload_steps=0, preload_execution="fused", recording_mode=None,
+                           non_realtime=False) -> dict:
     """Client 专用发布协调；安全循环只有一份，后端失败不会进入成功出版。"""
     if not isinstance(control, RunControl) or not isinstance(session, InteractiveSession):
         raise TypeError("持续发布需要原 RunControl/InteractiveSession。")
@@ -2200,6 +2201,9 @@ def run_cart_pole_segmented(config, *, control: RunControl, session: Interactive
                                       or recording_mode not in ("light", "full") or not dynamic):
         raise ValueError("recording_mode 仅支持动态持续模式的 light/full。")
     mode = recording_mode if recording_mode is not None else "light" if dynamic else "full"
+    from .lan_runner import validate_segmented_mode
+    validate_segmented_mode(config, prepared, non_realtime=non_realtime,
+                            recording_mode=mode, preload_steps=preload_steps)
     phase = phase if phase is not None else lambda _: None
     if mode == "light":
         recent = _LightRecording()
@@ -2207,6 +2211,7 @@ def run_cart_pole_segmented(config, *, control: RunControl, session: Interactive
             config, prepared, control=control, session=session, on_step=on_step,
             phase=phase, realtime=realtime, on_cycle=recent.record_cycle,
             preload_steps=preload_steps, preload_execution=preload_execution,
+            **({"non_realtime": True} if non_realtime else {}),
         )
         return {**stopped, "recording_mode": "light", "evidence_state": "not_recorded",
                 "run_dir": None, "prefix_dir": None, "durable_step_count": 0,

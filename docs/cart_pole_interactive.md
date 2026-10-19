@@ -1,5 +1,109 @@
 # 倒立摆动画 Client：三角色快速操作
 
+## 无证书两机非实时动态演示
+
+本入口保留原两测量observer、约5°初态、20 ms模型步长和秘密分享计算，只取消本次演示的采样周期截止要求。
+墙钟慢于20或40 ms不会单独导致失败，没有速度指标。每个已双提交并完成仿真确认的步骤才推进20 ms仿真时间。
+快机器尽力按相邻实际采样间隔至少20 ms展示；慢时不追赶、不跳步、不积压旧测量。
+启动、通信、空闲和关停仍有原秒级超时；材料短缺、非法消息、断连或缺提交回执仍停止，不重试未知轮。
+
+两台电脑使用同一版本代码和Python 3.11，各在仓库根目录执行 `uv sync --locked`。
+A运行Client、软件plant、动画及自动管理的材料worker；B运行P1/P2两个独立进程。
+无证书TCP没有身份认证或信道加密，能观察两份share的网络观察者可能恢复秘密；P1/P2同机也不提供独立服务器隔离。
+这里只用于可信隔离网络上的软件演示，不是论文安全部署或真实设备实时控制。
+
+两台的 `configs/local-deployment.example.yaml` 填入相同内容。下面IP **必须换成B的实际局域网IPv4**：
+
+```yaml
+version: 1
+identities:
+  Client: client.secure-control.test
+  P1: p1.secure-control.test
+  P2: p2.secure-control.test
+p1_client:
+  bind: 192.168.31.253
+  host: 192.168.31.253
+  port: 34401
+p2_client:
+  bind: 192.168.31.253
+  host: 192.168.31.253
+  port: 34402
+p1_peer:
+  bind: 127.0.0.1
+  host: 127.0.0.1
+  port: 34403
+```
+
+B允许A访问TCP 34401/34402；34403只供B本机P2连接P1，A无须监听。
+网络需允许设备互访，不用生成或分发证书。在B的 `configs/lab-p1.example.yaml` 使用：
+
+```yaml
+role: P1
+transport: insecure_tcp
+wire_profile: control-dynamic-compact-v2
+topology: local-deployment.example.yaml
+timeouts:
+  startup: 180
+  step: 30
+  shutdown: 5
+```
+
+B的 `configs/lab-p2.example.yaml` 内容相同，只把 `role` 改为 `P2`。
+A的 `configs/lab-client-cart-pole.example.yaml` 使用下面内容，**不要改水箱使用的lab-client-continuous配置**：
+
+```yaml
+role: Client
+transport: insecure_tcp
+wire_profile: control-dynamic-compact-v2
+topology: local-deployment.example.yaml
+experiment: cart_pole_observer_lan.example.yaml
+timeouts:
+  startup: 180
+  step: 30
+  idle: 30
+  shutdown: 5
+```
+
+timeout单位是秒，`step: 30`不是30 ms。三个角色wire必须一致，不能只改Client。
+transport与wire独立；省略wire仍是原 `control-batch-v1`，不会自动升级协议或关闭实时保护。
+本轮没有改旧示例默认；恢复旧演示时三角色都恢复原wire及所需场景。
+
+依次启动，每个命令占一个独立终端。B的终端一：
+
+```powershell
+uv run python scripts/run_continuous_p1.py configs/lab-p1.example.yaml
+```
+
+B的终端二：
+
+```powershell
+uv run python scripts/run_continuous_p2.py configs/lab-p2.example.yaml
+```
+
+A在180秒启动等待内运行：
+
+```powershell
+uv run python scripts/run_cart_pole_client.py configs/lab-client-cart-pole.example.yaml --non-realtime --recording light --segment-steps 400
+```
+
+窗口标注“非实时仿真，模型步长20 ms”，仿真时间、确认步数与墙钟时间分开。
+左右键/按钮仍施加±1 N、一个20 ms仿真区间的扰动（±0.02 N·s），观察恢复/稳定状态。
+400步是段容量而非总步数上限；满段维护后沿同一秘密observer状态继续，不重置x0。
+点击“停止”完成在途轮与双方停止确认；关窗是取消。正常停止可仍处于recovering，不保证末态stable。
+light不保存完整轨迹，不能正式回放或声称完整实验已保存。断连、失败或再次演示时重启三方，不恢复旧session/材料。
+
+无窗口时A使用同一后端，以Ctrl+C请求正常停止：
+
+```powershell
+uv run python scripts/run_cart_pole_client.py configs/lab-client-cart-pole.example.yaml --headless-continuous --non-realtime --recording light --segment-steps 400
+```
+
+非实时摘要写明transport、wire、material_source、timing_mode=`non_realtime_demo`、model_period_s、墙钟耗时和实际尝试/提交/物理确认数。
+没有CycleTiming时misses/last_cycle和近期分位为null，表示不适用，不是零超期或零耗时通过。
+当前compact-v2或`--non-realtime`只支持动态持续light；与静态、finite、预送、full记录及完整起摆组合均在联网前拒绝。
+旧batch/full和实时功能保持。`--full-non-realtime`属于另一完整路线，不替代本选项。
+本轮不接入relay/native等待、不复用旧R1/Q1预算。真实两机功能待用户设备验证，本机三进程不冒充跨机验收。
+
 默认窗口持续运行，点击“停止并保存”提交正常停止请求。段容量由
 `--segment-steps 400` 指定（允许 1…1000），总步数由实际停止时的双方确认前缀决定，
 不会在第 400 步自动结束。保留显式 `--finite` 的原 400 步有限窗口。

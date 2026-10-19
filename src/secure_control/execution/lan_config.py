@@ -72,6 +72,7 @@ class LanConfig:
     experiment_config: Path | None = None
     idle_timeout: float = 30.0
     transport: Literal["mutual_tls", "insecure_tcp"] = "mutual_tls"
+    wire_profile: str = "control-batch-v1"
 
 
 def load_lan_config(path: str | Path, role: Role) -> LanConfig:
@@ -82,6 +83,13 @@ def load_lan_config(path: str | Path, role: Role) -> LanConfig:
     if transport not in ("mutual_tls", "insecure_tcp"):
         raise ValueError("LAN transport 只能是 mutual_tls 或 insecure_tcp。")
     fields = {"role", "topology", "timeouts"}
+    wire_profile = data.get("wire_profile", "control-batch-v1")
+    if type(wire_profile) is not str or wire_profile not in (
+        "control-batch-v1", "control-dynamic-compact-v2",
+    ):
+        raise ValueError("wire_profile 只能是 control-batch-v1 或 control-dynamic-compact-v2。")
+    if "wire_profile" in data:
+        fields.add("wire_profile")
     if transport == "mutual_tls":
         fields.add("tls")
         if "transport" in data:
@@ -137,7 +145,7 @@ def load_lan_config(path: str | Path, role: Role) -> LanConfig:
         raise ValueError("Client experiment 配置不存在。")
     idle = _timeout(timeouts.get("idle", timeouts["step"]), "idle")
     return LanConfig(role, topology, ca, certificate, private_key, *seconds, controller,
-                     experiment, idle, transport)
+                     experiment, idle, transport, wire_profile)
 
 
 def _load_yaml(path: Path) -> dict[str, object]:

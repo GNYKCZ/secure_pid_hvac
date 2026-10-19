@@ -8,6 +8,7 @@ import tkinter as tk
 import webbrowser
 from collections import deque
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 from secure_control.execution.lan_config import load_lan_config
@@ -31,7 +32,7 @@ class CartPoleWindow:
 
     def __init__(self, root: tk.Tk, config_path: Path, *, segment_steps=400,
                  mode="segmented", preload_steps=0, preload_execution="fused",
-                 recording_mode=None) -> None:
+                 recording_mode=None, non_realtime=False) -> None:
         if mode not in ("segmented", "finite"):
             raise ValueError("窗口模式无效。")
         self.mode, self.segment_steps = mode, segment_steps
@@ -64,6 +65,13 @@ class CartPoleWindow:
                                           or recording_mode not in ("light", "full") or not dynamic):
             raise ValueError("recording_mode 仅支持动态持续窗口的 light/full。")
         self.recording_mode = recording_mode if recording_mode is not None else "light" if dynamic else "full"
+        from secure_control.experiments.lan_runner import validate_segmented_mode
+        if mode != "segmented" and (non_realtime or self.config.wire_profile != "control-batch-v1"):
+            raise ValueError("compact-v2 / 非实时演示仅支持动态持续light。")
+        validate_segmented_mode(self.config, self.prepared, non_realtime=non_realtime,
+                                recording_mode=self.recording_mode, preload_steps=preload_steps)
+        self.non_realtime = non_realtime
+        self._wall_started = None
         self._result: tuple[object, dict[str, object], Path] | None = None
         self._verified = None
         self._final_count = None
@@ -82,6 +90,8 @@ class CartPoleWindow:
                   f"θ={initial[2]:+.4f} rad / {math.degrees(initial[2]):+.2f}°"
         )
         self.detail = tk.StringVar(value="初态尚无控制区间 · 目标 p=0 m, θ=0 rad")
+        if non_realtime:
+            tk.Label(root, text=f"非实时仿真，模型步长 {self.prepared.scene.period * 1000:g} ms；无周期性能指标").pack()
         tk.Label(root, textvariable=self.phase, font=("Arial", 15, "bold")).pack(pady=8)
         self.canvas = tk.Canvas(root, width=820, height=340, bg="white")
         self.canvas.pack()
@@ -273,6 +283,7 @@ class CartPoleWindow:
                     on_step=self._confirmed_frame,
                     preload_steps=self.preload_steps, preload_execution=self.preload_execution,
                     recording_mode=self.recording_mode if self.prepared.spec.state_dimension else None,
+                    **({"non_realtime": True} if self.non_realtime else {}),
                 )
                 if result.get("recording_mode") == "light":
                     self._notify("light_stopped", result)
@@ -309,6 +320,8 @@ class CartPoleWindow:
         })
 
     def start(self) -> None:
+        """工作线程拥有控制，界面墙钟仅供操作参考。"""
+        self._wall_started = perf_counter()
         self._worker = threading.Thread(target=self._run_worker, name="cart-pole-client")
         self._worker.start()
         self.root.after(40, self._poll)
@@ -328,6 +341,8 @@ class CartPoleWindow:
                 f"p={frame['state'][0]:+.4f} m · θ={frame['state'][2]:+.4f} rad / "
                 f"{math.degrees(frame['state'][2]):+.2f}° · {frame['status']}"
             )
+            if self.non_realtime and self._wall_started is not None:
+                self.values.set(self.values.get() + f" · 墙钟 {perf_counter() - self._wall_started:.2f} s")
             self.detail.set(
                 f"上一控制区间 applied={frame['applied_force_n']:+.3f} N · "
                 f"外力={frame['disturbance_force_n']:+.1f} N · 目标 0"
@@ -366,7 +381,7 @@ class CartPoleWindow:
                 reason = ("预送库存耗尽" if value.get("stop_reason") == "preload_exhausted"
                           else "用户停止" if value["status"] == "stopped"
                           else f"{value['status']} / {value.get('category', '失败')}")
-                self.phase.set(f"{reason}；已确认{self._final_count}步")
+                self.phase.set(f"{reason}；已确认{self._final_count}步；停止时 {value.get('observed_status', '未记录')}")
                 self.location.set("未保存完整实验轨迹；不能正式回放")
             elif kind == "complete" and not self._closing:
                 if self.mode == "segmented":
@@ -417,13 +432,14 @@ class CartPoleWindow:
 
 
 def run_window(config_path: Path, *, segment_steps=400, mode="segmented",
-               preload_steps=0, preload_execution="fused", recording_mode=None) -> None:
+               preload_steps=0, preload_execution="fused", recording_mode=None,
+               non_realtime=False) -> None:
     """配置和 Tk 创建均在拨号前完成；没有窗口时直接失败。"""
     root = tk.Tk()
     try:
         window = CartPoleWindow(root, config_path, segment_steps=segment_steps, mode=mode,
                                preload_steps=preload_steps, preload_execution=preload_execution,
-                               recording_mode=recording_mode)
+                               recording_mode=recording_mode, non_realtime=non_realtime)
     except Exception:
         root.destroy()
         raise

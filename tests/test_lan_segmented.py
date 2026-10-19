@@ -858,6 +858,77 @@ def test_dynamic_v2_keeps_secret_state_in_one_session_across_segments(tmp_path):
         reap_processes(parties)
 
 
+@pytest.mark.parametrize("delay_ns", [0, 55_000_000])
+@pytest.mark.parametrize("non_realtime", [True, False])
+def test_demo_paces_actual_samples_and_slow_steps_do_not_refresh_realtime_deadline(
+    tmp_path, monkeypatch, delay_ns, non_realtime,
+):
+    from secure_control.execution.cycle_timing import AbsoluteCycleClock, check_deadline
+    from secure_control.experiments import lan_runner as runner
+
+    paths = _plain_deployment(tmp_path)
+    from test_cart_pole_lan import _observer_profile_for
+    _observer_profile_for(paths)
+    config = load_lan_config(paths["Client"], "Client")
+    control, session = RunControl(), InteractiveSession()
+    prepared = load_segmented_experiment(config.experiment_config, 3, session)
+    now, samples, deadlines, initialized = [1_000_000_000], [], [], []
+    class Runtime:
+        def __init__(self, *args, **kwargs):
+            self.phase = "RUNNING"
+            self.run_id = "r"
+            self.confirmed_step_count = self.protocol_committed_count = 0
+            self.cycle_phase_ns = self.cycle_queue_levels = self.material_summary = {}
+            self.resource_counts = {}
+        @property
+        def segment_full(self):
+            return False
+        def enable_material_preparation(self, **kwargs):
+            initialized.append(kwargs)
+        def snapshot(self):
+            n = self.confirmed_step_count
+            return lan_runtime.LanLifecycleSnapshot(self.phase, "r", "s", "e", 0, 0,
+                n, f"round-{n}", self.protocol_committed_count, n, 0, 0, 0)
+        def step(self, value, **kwargs):
+            deadlines.append(kwargs.get("deadline_ns"))
+            now[0] += delay_ns
+            self.protocol_committed_count += 1
+            return SimpleNamespace(global_step=self.confirmed_step_count, raw_control=(0.,), round_id="r")
+        def confirm_applied(self, identity):
+            self.confirmed_step_count += 1
+            if self.confirmed_step_count == 3:
+                control.request_stop()
+        def end_segment(self):
+            self.phase = "STOPPED"
+            return lan_runtime.SegmentRecord(None, "s", (), (), None, 0., None, None, None)
+        def close(self):
+            pass
+    def sample():
+        samples.append(now[0])
+        return [0., 0.]
+    def wait(seconds):
+        now[0] += round(seconds * 1e9)
+    scene = SimpleNamespace(period=.02, controller_input=sample, advance=lambda *a, **k: {}, terminal_summary=dict)
+    monkeypatch.setattr(runner, "LanSegmentedRuntime", Runtime)
+    monkeypatch.setattr(runner, "perf_counter_ns", lambda: now[0])
+    monkeypatch.setattr(session.cancelled, "wait", wait)
+    monkeypatch.setattr(runner, "check_deadline", lambda d, p: check_deadline(d, p, now=lambda: now[0]))
+    monkeypatch.setattr(runner, "AbsoluteCycleClock", lambda p: AbsoluteCycleClock(p, now=lambda: now[0], sleep=wait))
+    result = runner._run_prepared_segmented(config, replace(prepared, scene=scene),
+        control=control, session=session, non_realtime=non_realtime)
+    if delay_ns and not non_realtime:
+        assert result["status"] == "failed" and len(samples) == 1
+        assert result["cycle_summary"]["misses"] == 1
+        assert result["confirmed_step_count"] == 0
+    else:
+        assert result["status"] == "stopped" and result["confirmed_step_count"] == 3
+        assert samples == [1_000_000_000 + i * max(20_000_000, delay_ns) for i in range(3)]
+        if non_realtime:
+            assert deadlines == [None] * 3 and not initialized
+            assert result["cycle_summary"] == {"attempts": 3, "misses": None, "last_cycle": None}
+            assert result["model_period_s"] == .02 and result["timing_mode"] == "non_realtime_demo"
+
+
 @pytest.mark.parametrize("misuse", ["copy", "duplicate", "close"])
 @pytest.mark.integration
 def test_unconfirmed_and_invalid_capabilities_cannot_end_or_restart(generic_runtime, misuse):
