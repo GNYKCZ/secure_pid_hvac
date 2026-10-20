@@ -130,3 +130,10 @@ party、session、round、step、公开计划 canonical SHA256 和资源数量�
 正常轮为11个应用帧（peer3帧），继承 v2 advance 后满段含额外4帧。setup/STOP单列，
 应用帧不是网络包或 RTT。局部领取即不可复用；失败封闭当前 run，重启须新 session/材料。
 这依赖既有可信 Client、半诚实不串通双方及安全信道，不提供故障下的分布式原子提交保证。
+
+授权策略的既有 orchestrator/单方 endpoint 只在本轮 owner 内复用 canonical 公开计划摘要。
+首次绑定核实确切 `StepResourcePlan/ResourceMetadata/ControllerScaleLedger` 及严格原子值、
+tuple 构成的深层不可变图；之后仅同一对象命中。兼容的可变嵌套或非标准类型沿原即时摘要路径，
+不转换或复制出第二份权威计划。owner 至多持有一项，换对象重新计算，提交/废弃释放缓存。
+摘要函数和 wire 不改，所有收据、授权和动态资源状态仍逐次验证；可发送授权仍在双收据、
+输出和截止检查后创建。首次构建成本留在原控制周期内，旧 peer_barriers 不增加缓存负担。

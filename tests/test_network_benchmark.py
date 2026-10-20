@@ -1099,6 +1099,96 @@ def staged_context(v2_candidate_context, monkeypatch):
     return history, manifest, ledger, native, native_path
 
 
+@pytest.fixture
+def local_context(staged_context, monkeypatch):
+    """封存旧T2退出5，新的U1/U2只追加，不重写失败。"""
+    history, old, ledger, native, native_path = staged_context
+    for i in range(2):
+        entry = old | {"comparison_stage": f"T{i+1}", "call": 10+i,
+                       "finished": True, "sample_pass": i == 0, "actual_attempts": 1000}
+        history.append(entry)
+        native.append(entry | {"completed": True, "native_exit": 0 if i == 0 else 5})
+    monkeypatch.setattr(network, "LOCAL_HISTORY", network.digest(history))
+    monkeypatch.setattr(network, "LOCAL_NATIVE_HISTORY", network.digest(native))
+    m = {k: v for k, v in old.items() if k not in network.V2_CERTIFICATE_FIELDS}
+    m.update(authorization_url=network.LOCAL_DESIGN, comparison_design_url=network.LOCAL_DESIGN,
+        comparison_stage="U1", closed_history_sha256=network.LOCAL_HISTORY,
+        closed_native_history_sha256=network.LOCAL_NATIVE_HISTORY, call=12, maximum_calls=13,
+        total_maximum_attempts=13000, batch_maximum_calls=2, batch_maximum_attempts=2000,
+        public_certificate_validity=old["public_certificate_validity"])
+    m.update(head="e"*40, source_sha256={"src": "f"*64})
+    monkeypatch.setattr(network, "source", lambda: (m["head"], m["source_sha256"]))
+    ledger.write_text(json.dumps({"schema": "network-call-budget-v1", "entries": history}), encoding="utf-8")
+    def start(current):
+        native_path.write_text(json.dumps({"entries": native+[current | {
+            "completed": False, "native_exit": None, "started_utc": "start"}]}), encoding="utf-8")
+    start(m)
+    return history, m, ledger, native, start
+
+
+@pytest.mark.parametrize("change", [{"call": 13}, {"comparison_stage": "T3"},
+    {"profile": "N2"}, {"maximum_calls": 14}, {"maximum_attempts": 10000}, {"maximum_attempts": True},
+    {"authorization_url": network.STAGED_AUTHORIZATION}, {"closed_history_sha256": "0"*64},
+    {"certificate_change_reason": "renew"}, {"phase": "qualification"}])
+def test_local_comparison_scope_and_old_batch_stay_closed(local_context, change):
+    history, m, _, _, _ = local_context
+    assert network._local_manifest_valid(m)
+    assert not network._staged_manifest_valid(m)
+    with pytest.raises(ValueError):
+        network._next_local_call(history, "N0", "candidate", m["head"], m["source_sha256"], m | change)
+    with pytest.raises(ValueError):
+        network._next_staged_call(history, "N0", "candidate", m["head"], m["source_sha256"], m)
+
+
+@pytest.mark.parametrize("failed_u1", [False, True])
+def test_local_comparison_appends_preserved_eleven_and_requires_real_u1(local_context, monkeypatch, failed_u1):
+    history, m, ledger, native, start = local_context
+    monkeypatch.setattr(network, "_require_local_certificates", lambda *_: None)
+    # 用真实旧门禁验证完整前件；不运行控制或忽略TLS/材料/端点检查。
+    result = _repair_software_result(m)
+    result.update(status="stopped", failure_category=None, failed_phase=None)
+    for i, row in enumerate(result["steps"]):
+        row["sent"] = {"Client": {"frames": 4}}
+        result["cycles"][i]["public_frame_counts"] = {"Client": 4+2*int(i in (399,799))}
+        for p, party in enumerate(result["party_outcomes"]):
+            party["steps"][i]["sent"] = {"Party": {"frames": 5+p+int(i in (400,800))}}
+    result = network.assemble(result, profile="N0", phase="candidate", manifest=m, relay=result["network_relay"])
+    assert result["network_sample_pass"]
+    if failed_u1:
+        result["cycles"][0]["cycle_completed_ns"] = None
+    raw = ledger.parent/"U1.json"
+    with network.RunBudget(ledger) as budget:
+        assert budget.reserve("N0", "candidate", m["head"], m["source_sha256"], raw,
+            conditions_sha256=m["conditions_sha256"], continuation=m) == 1000
+        network.require_network_candidate(m, m["wire_profile"])
+        raw.write_text(json.dumps(result), encoding="utf-8")
+        budget.finish(result, network.hashlib.sha256(raw.read_bytes()).hexdigest())
+        assert budget.entries[:11] == history
+        previous = copy.deepcopy(budget.entries[-1])
+    native.append(previous | {"completed": True, "native_exit": 0})
+    second = m | {"call": 13, "comparison_stage": "U2", "wire_profile": network._COMPACT_PROFILE_V3}
+    start(second)
+    entries = history+[previous]
+    if failed_u1:
+        with pytest.raises(ValueError):
+            network._next_local_call(entries, "N0", "candidate", second["head"], second["source_sha256"], second)
+    else:
+        assert network._next_local_call(entries, "N0", "candidate", second["head"], second["source_sha256"], second) == 1000
+        for changed in ({"head": "8"*40}, {"public_certificate_validity": {}}, {"conditions_sha256": "0"*64}):
+            if changed == {"public_certificate_validity": {}}:
+                changed = {"public_certificate_validity": {"changed": True}}
+            wrong = second | changed
+            with pytest.raises(ValueError):
+                network._next_local_call(entries, "N0", "candidate", wrong["head"], wrong["source_sha256"], wrong)
+        with network.RunBudget(ledger) as budget:
+            budget.reserve("N0", "candidate", second["head"], second["source_sha256"], ledger.parent/"U2.json",
+                conditions_sha256=second["conditions_sha256"], continuation=second)
+            network.require_local_candidate(second)
+            budget.finish({"cycles": [], "network_sample_pass": False}, "failed")
+            with pytest.raises(ValueError):
+                network._next_local_call(budget.entries, "N0", "candidate", second["head"], second["source_sha256"], second)
+
+
 @pytest.mark.parametrize("change", [
     {"maximum_attempts": 10000}, {"maximum_attempts": True}, {"call": 11},
     {"maximum_calls": 13}, {"batch_maximum_calls": 4}, {"batch_maximum_attempts": 4000},
@@ -2368,6 +2458,14 @@ def test_network_cli_is_exclusive_and_does_not_accept_arbitrary_steps(tmp_path, 
         monkeypatch.setattr(sys,"argv",current)
         assert lan_runner._run()==0 and calls[-1]["authorization"]==network.REPAIR_AUTHORIZATION
     assert len(calls)==5
+    local=[network.LOCAL_DESIGN if a==network.V2_AUTHORIZATION else "N0" if a=="N2" else a for a in v2]
+    monkeypatch.setattr(sys, "argv", local)
+    assert lan_runner._run() == 0 and calls[-1]["authorization"] == network.LOCAL_DESIGN
+    for key, bad in (("--network-profile", "N2"), ("--network-phase", "qualification")):
+        invalid = list(local)
+        invalid[invalid.index(key)+1] = bad
+        monkeypatch.setattr(sys, "argv", invalid)
+        assert lan_runner._run() == 5 and len(calls) == 6
 
 
 def test_startup_failure_is_exported_and_consumes_unique_discovery(tmp_path, monkeypatch):

@@ -428,6 +428,23 @@ _PUBLIC_PLAN_JSON_FIELDS = {kind: tuple(item.name for item in fields(kind))
                             for kind in (StepResourcePlan, ResourceMetadata, ControllerScaleLedger)}
 
 
+def _deeply_immutable_public_plan(plan: StepResourcePlan) -> bool:
+    """只证明确切 canonical 类型图的不可变性；兼容可变输入仍走原即时摘要。"""
+    def immutable(value):
+        kind = type(value)
+        if kind in (str, int, type(None)):
+            return True
+        if kind is tuple:
+            return all(immutable(item) for item in value)
+        names = _PUBLIC_PLAN_JSON_FIELDS.get(kind)
+        return names is not None and all(immutable(getattr(value, name)) for name in names)
+    try:
+        return type(plan) is StepResourcePlan and immutable(plan)
+    except RecursionError:
+        # 不缓存非法循环；由未修改的 canonical 函数保持原失败类别。
+        return False
+
+
 def _public_plan_json_fields(value):
     """按标准JSON需求逐个投影公开记录，不预先复制整棵计划；只缓存有限类型的字段名。"""
     names = _PUBLIC_PLAN_JSON_FIELDS.get(type(value))

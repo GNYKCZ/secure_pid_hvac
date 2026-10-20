@@ -61,6 +61,96 @@ STAGED_HISTORY = "08805f3aa8e0149771f05d7519c51f8801345e9c47f24a86d9848eb447a148
 STAGED_NATIVE_HISTORY = "61dcefa48b1314ca1d86e9ab039dc3f214ab0c746ced453090557d26c3b079be"
 STAGED_STAGES = (("T1", "N0", _COMPACT_PROFILE_V2), ("T2", "N0", _COMPACT_PROFILE_V3),
                  ("T3", "N2", _COMPACT_PROFILE_V3))
+LOCAL_DESIGN = "https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6289274852"
+LOCAL_HISTORY = "b9a468b68413d80e2c1daaa4ac9ce6700d555bb9c7717fee00563c951909d2d7"
+LOCAL_NATIVE_HISTORY = "61f4826e58ff45d91417fb72024dd8c43f5a6d51bed7d7829650306f62705cb7"
+LOCAL_STAGES = (("U1", "N0", _COMPACT_PROFILE_V2), ("U2", "N0", _COMPACT_PROFILE_V3))
+
+
+def _local_manifest_valid(m):
+    """仅本次局部摘要优化的两个直连阶段，不恢复旧 T3 或换证许可。"""
+    if not isinstance(m, dict):
+        return False
+    index = next((i for i, row in enumerate(LOCAL_STAGES) if row == (
+        m.get("comparison_stage"), m.get("profile"), m.get("wire_profile"))), None)
+    if index is None:
+        return False
+    common = m | {"authorization_url": STAGED_AUTHORIZATION, "comparison_design_url": STAGED_DESIGN,
+        "closed_history_sha256": STAGED_HISTORY, "closed_native_history_sha256": STAGED_NATIVE_HISTORY,
+        "comparison_stage": "T1" if index == 0 else "T2", "call": 10+index,
+        "maximum_calls": 12, "total_maximum_attempts": 12000,
+        "batch_maximum_calls": 3, "batch_maximum_attempts": 3000}
+    return (m.get("authorization_url") == LOCAL_DESIGN and m.get("comparison_design_url") == LOCAL_DESIGN
+        and m.get("closed_history_sha256") == LOCAL_HISTORY
+        and m.get("closed_native_history_sha256") == LOCAL_NATIVE_HISTORY
+        and all(type(m.get(k)) is int and m[k] == v for k, v in {
+            "call": 12+index, "maximum_calls": 13, "total_maximum_attempts": 13000,
+            "batch_maximum_calls": 2, "batch_maximum_attempts": 2000}.items())
+        and not any(k in m for k in (*[key for key in V2_CERTIFICATE_FIELDS if key != "public_certificate_validity"],
+                                    "comparison_review_url", "comparison_raw_sha256"))
+        and isinstance(m.get("public_certificate_validity"), dict)
+        and _staged_manifest_valid(common))
+
+
+def _next_local_call(entries, profile, phase, head, sources, m):
+    """保留旧十一对象及 exit5；只要求本批 U1 成功成为 U2 前件。"""
+    if (not _local_manifest_valid(m) or type(entries) is not list or len(entries) not in (11, 12)
+            or digest(entries[:11]) != LOCAL_HISTORY or m["call"] != len(entries)+1
+            or (profile, phase, head, sources) != (m["profile"], m["phase"], m["head"], m["source_sha256"])
+            or any(entry.get("finished") is not True for entry in entries)
+            or [(e.get("comparison_stage"), e.get("profile"), e.get("wire_profile"))
+                for e in entries[11:]] != list(LOCAL_STAGES[:len(entries)-11])):
+        raise ValueError("局部比较许可/十一项历史/顺序/来源或额度不符。")
+    rows = json.loads(Path(m["native_ledger_path"]).read_text(encoding="utf-8"))["entries"]
+    keys = ("call", "head", "source_sha256", "conditions_sha256", "comparison_stage",
+            "authorization_url", "maximum_attempts", "profile", "phase", "wire_profile")
+    if (type(rows) is not list or len(rows) != len(entries)+1 or digest(rows[:11]) != LOCAL_NATIVE_HISTORY
+            or any(row.get("completed") is not True for row in rows[:-1])
+            or rows[-1].get("completed") is not False or rows[-1].get("native_exit") is not None
+            or not isinstance(rows[-1].get("started_utc"), str)
+            or any(rows[-1].get(k) != m.get(k) for k in keys)):
+        raise ValueError("局部比较 native 历史/当前 START 不符。")
+    fixed = ("certificate_directory", "public_certificate_sha256", "public_certificate_validity", "conditions_sha256")
+    if any(m.get(k) != entries[10].get(k) for k in fixed):
+        raise ValueError("局部比较必须复用已存在的同套证书/环境条件，不含换证授权。")
+    if len(entries) == 11 and (head == entries[10].get("head") or sources == entries[10].get("source_sha256")):
+        raise ValueError("U1必须使用局部优化后新审查的来源，不能重跑旧T1/T2。")
+    if len(entries) == 12:
+        previous, native = entries[-1], rows[-2]
+        if (not _local_manifest_valid(previous) or native.get("native_exit") != 0
+                or any(native.get(k) != previous.get(k) for k in keys)
+                or any(previous.get(k) != m.get(k) for k in (*fixed, "head", "source_sha256"))):
+            raise ValueError("U2必须与已正常退出的U1同源同条件。")
+        _comparison_result(previous, _local_manifest_valid)
+    return 1000
+
+
+def _require_local_certificates(m, configs=None):
+    """只读现有公开证书预检，不产生、替换或借用上一批换证例外。"""
+    directory = Path(m["certificate_directory"])
+    if (certificate_validity(directory) != m["public_certificate_validity"]
+            or any(hashlib.sha256((directory/name).read_bytes()).hexdigest() != sha
+                   for name, sha in m["public_certificate_sha256"].items())
+            or configs is not None and configs != role_configs(directory, V2_PORTS, "N0")):
+        raise ValueError("局部比较证书/有效期/固定直连拓扑不匹配；不得自动换证。")
+
+
+def require_local_candidate(m, configs=None):
+    """CLI/共享/实际循环共同核对新的有限占项，未占项不能旁路运行。"""
+    if not _local_manifest_valid(m):
+        raise ValueError("缺少局部比较 U1/U2 的精确许可。")
+    head, sources = source()
+    ledger = Path(m["budget_path"])
+    entries = json.loads(ledger.read_text(encoding="utf-8"))["entries"]
+    lock = ledger.with_suffix(ledger.suffix+".lock")
+    if (head != m["head"] or sources != m["source_sha256"] or len(entries) != m["call"]
+            or not lock.is_file() or lock.read_text(encoding="utf-8").strip() != str(os.getpid())):
+        raise ValueError("局部比较缺少当前来源/进程锁/占项。")
+    _next_local_call(entries[:-1], m["profile"], m["phase"], head, sources, m)
+    if entries[-1].get("finished") is not False or any(entries[-1].get(k) != v for k, v in m.items()
+            if k not in ("command", "started_utc", "topology", "models", "scope")):
+        raise ValueError("局部比较在途占项与 manifest 不符。")
+    _require_local_certificates(m, configs)
 
 
 def _staged_manifest_valid(m):
@@ -97,12 +187,17 @@ def _staged_manifest_valid(m):
 
 def _staged_result(entry):
     """读取完整原件并重算全部旧门禁；不信任账本预填的通过标志。"""
+    return _comparison_result(entry, _staged_manifest_valid)
+
+
+def _comparison_result(entry, valid_manifest):
+    """同一完整原件读取/门禁算法；由具体批次决定许可，不复制证据真相。"""
     data = Path(entry["output"]).read_bytes()
     if hashlib.sha256(data).hexdigest() != entry.get("raw_sha256"):
         raise ValueError("比较阶段前件原件摘要不匹配。")
     result = json.loads(data)
     manifest = result.get("network_manifest") or {}
-    if (not _staged_manifest_valid(manifest) or any(manifest.get(k) != entry.get(k) for k in (
+    if (not valid_manifest(manifest) or any(manifest.get(k) != entry.get(k) for k in (
             "comparison_stage", "head", "source_sha256", "conditions_sha256", "call"))
             or result.get("code_sha") != entry["head"]
             or result.get("source_sha256") != entry["source_sha256"]):
@@ -244,6 +339,11 @@ def require_staged_candidate(m, configs=None):
 
 def require_network_candidate(m, wire_profile, configs=None):
     """只按明确批次路由许可；不能把 v3 放入旧 R1/Q1 的能力集合。"""
+    if isinstance(m, dict) and m.get("authorization_url") == LOCAL_DESIGN:
+        if m.get("wire_profile") != wire_profile:
+            raise ValueError("局部比较编码与实际入口不匹配。")
+        require_local_candidate(m, configs)
+        return
     if wire_profile == _COMPACT_PROFILE_V3 or isinstance(m, dict) and m.get("authorization_url") == STAGED_AUTHORIZATION:
         if not isinstance(m, dict) or m.get("wire_profile") != wire_profile:
             raise ValueError("比较阶段编码与实际入口不符。")
@@ -696,7 +796,10 @@ def validate_cli(args):
         raise ValueError("网络实验参数必须独占、固定场景/阶段/正常GC/原动态资源；不能设置任意steps。")
     wire = getattr(args, "network_wire_profile", None)
     authorization = getattr(args, "network_authorization", None)
-    staged = authorization == STAGED_AUTHORIZATION
+    local = authorization == LOCAL_DESIGN
+    staged = authorization == STAGED_AUTHORIZATION or local
+    if local and args.network_profile != "N0":
+        raise ValueError("局部比较仅允许 N0 直连。")
     if staged and (wire not in (_COMPACT_PROFILE_V2, _COMPACT_PROFILE_V3)
             or args.network_profile not in ("N0", "N2") or args.network_phase != "candidate"):
         raise ValueError("本批比较仅开放 N0/N2 的有限 candidate。")
@@ -787,6 +890,8 @@ def next_call(entries, profile, phase, head, sources, repair_note=None):
 
 def _next_compact_call(entries, profile, phase, head, sources, continuation):
     """在同一已停止账本追加一次人工续接；旧循环与失败记录不可重置。"""
+    if isinstance(continuation, dict) and continuation.get("authorization_url") == LOCAL_DESIGN:
+        return _next_local_call(entries, profile, phase, head, sources, continuation)
     if isinstance(continuation, dict) and continuation.get("authorization_url") == STAGED_AUTHORIZATION:
         return _next_staged_call(entries, profile, phase, head, sources, continuation)
     if isinstance(continuation, dict) and continuation.get("authorization_url") == REPAIR_AUTHORIZATION:
@@ -950,8 +1055,9 @@ class RunBudget:
             repair = any(e.get("authorization_url") == REPAIR_AUTHORIZATION for e in self.entries)
             closure = any(e.get("authorization_url") == CLOSURE_AUTHORIZATION for e in self.entries)
             staged = any(e.get("authorization_url") == STAGED_AUTHORIZATION for e in self.entries)
-            json.dump({"schema": "network-call-budget-v1", "maximum_calls": 12 if staged else 10 if repair else 9 if closure else 6,
-                       "maximum_attempts": 12000 if staged else 19000 if repair else 18000 if closure else 15000,
+            local = any(e.get("authorization_url") == LOCAL_DESIGN for e in self.entries)
+            json.dump({"schema": "network-call-budget-v1", "maximum_calls": 13 if local else 12 if staged else 10 if repair else 9 if closure else 6,
+                       "maximum_attempts": 13000 if local else 12000 if staged else 19000 if repair else 18000 if closure else 15000,
                        "entries": self.entries}, stream, ensure_ascii=False, indent=2, allow_nan=False)
             stream.flush()
             os.fsync(stream.fileno())
@@ -968,7 +1074,7 @@ class RunBudget:
             "conditions_sha256": conditions_sha256})
         if continuation is not None:
             fields = continuation
-            if continuation.get("authorization_url") in (CLOSURE_AUTHORIZATION,REPAIR_AUTHORIZATION,STAGED_AUTHORIZATION):
+            if continuation.get("authorization_url") in (CLOSURE_AUTHORIZATION,REPAIR_AUTHORIZATION,STAGED_AUTHORIZATION,LOCAL_DESIGN):
                 owned = {"output", "started_utc", "finished", "sample_pass", "actual_attempts", "raw_sha256",
                          "failure_category", "ended_utc", "repair_note"}
                 fields = {k: v for k, v in continuation.items() if k not in owned}
@@ -1015,7 +1121,8 @@ def assemble(result, *, profile, phase, manifest, relay):
     repair = manifest.get("authorization_url") == REPAIR_AUTHORIZATION
     closure = manifest.get("authorization_url") in (CLOSURE_AUTHORIZATION,REPAIR_AUTHORIZATION)
     compact = wire_profile in _COMPACT_PROFILES
-    staged = manifest.get("authorization_url") == STAGED_AUTHORIZATION
+    local = manifest.get("authorization_url") == LOCAL_DESIGN
+    staged = manifest.get("authorization_url") == STAGED_AUTHORIZATION or local
     material = result.get("material_summary") or {}
     wire_valid = (wire_profile is None and result.get("wire_profile") is None) or compact and (result.get("wire_profile") == wire_profile
         and material.get("encoding_profile") == wire_profile
@@ -1023,7 +1130,8 @@ def assemble(result, *, profile, phase, manifest, relay):
         and len(result.get("party_outcomes", [])) == 2
         and all(row.get("wire_profile") == wire_profile for row in result["party_outcomes"]))
     sample = (result.get("status") == "stopped" and result.get("requested_steps") == target
-        and ((_staged_manifest_valid(manifest) and (profile, phase) == (manifest["profile"], manifest["phase"])
+        and (((_local_manifest_valid(manifest) if local else _staged_manifest_valid(manifest))
+              and (profile, phase) == (manifest["profile"], manifest["phase"])
               and result.get("code_sha") == manifest["head"]
               and result.get("source_sha256") == manifest["source_sha256"]
               and result.get("network_source_integrity_failed") is not True) if staged else
@@ -1069,7 +1177,8 @@ def run_network_benchmark(*, profile, phase, certs, ports, ledger, approval, out
     continuation = None
     repair = wire_profile == _COMPACT_PROFILE_V2 and authorization == REPAIR_AUTHORIZATION
     closure = wire_profile == _COMPACT_PROFILE_V2 and authorization in (CLOSURE_AUTHORIZATION,REPAIR_AUTHORIZATION)
-    staged = authorization == STAGED_AUTHORIZATION
+    local = authorization == LOCAL_DESIGN
+    staged = authorization == STAGED_AUTHORIZATION or local
     if wire_profile is not None:
         if (wire_profile not in _COMPACT_PROFILES or approval.get("wire_profile") != wire_profile
                 or not isinstance(authorization, str) or not COMMENT.fullmatch(authorization)
@@ -1079,7 +1188,8 @@ def run_network_benchmark(*, profile, phase, certs, ports, ledger, approval, out
         continuation = {"wire_profile": wire_profile, "authorization_url": authorization,
                         "closed_history_sha256": approval["closed_history_sha256"]}
         if staged:
-            if (not _staged_manifest_valid(approval) or (profile, phase) != (approval["profile"], approval["phase"])
+            if (not (_local_manifest_valid(approval) if local else _staged_manifest_valid(approval))
+                    or (profile, phase) != (approval["profile"], approval["phase"])
                     or ports != V2_PORTS or str(Path(ledger).resolve()) != approval["budget_path"]
                     or str(Path(certs).resolve()) != approval["certificate_directory"]):
                 raise ValueError("缺少本批比较阶段的精确许可。")
@@ -1114,8 +1224,12 @@ def run_network_benchmark(*, profile, phase, certs, ports, ledger, approval, out
         if staged:
             if approval["conditions_sha256"] != conditions:
                 raise ValueError("比较阶段条件摘要不符。")
-            _next_staged_call(budget.entries, profile, phase, head, fingerprints, approval)
-            _require_staged_certificates(approval)
+            if local:
+                _next_local_call(budget.entries, profile, phase, head, fingerprints, approval)
+                _require_local_certificates(approval)
+            else:
+                _next_staged_call(budget.entries, profile, phase, head, fingerprints, approval)
+                _require_staged_certificates(approval)
         elif closure:
             if approval["conditions_sha256"] != conditions:
                 raise ValueError("闭环预声明条件摘要不符。")
@@ -1207,9 +1321,10 @@ def run_network_benchmark(*, profile, phase, certs, ports, ledger, approval, out
                 "forced_termination": False, "scope": "N0 direct TLS, no relay process or injected delay"}
             result.update(code_sha=head, source_sha256=fingerprints)
             result = assemble(result, profile=profile, phase=phase, manifest=manifest, relay=relay_report or {})
-            if staged and manifest["comparison_stage"] == "T2":
+            if staged and manifest["comparison_stage"] in ("T2", "U2"):
                 result["network_progress_goal_pass"] = bool(result["network_sample_pass"]
-                    and _staged_gain(_staged_result(budget.entries[9]), result))
+                    and _staged_gain(_comparison_result(budget.entries[11], _local_manifest_valid)
+                        if local else _staged_result(budget.entries[9]), result))
                 if result["network_sample_pass"] and not result["network_progress_goal_pass"]:
                     result["comparison_stop_reason"] = "wall_clock_gain_insufficient"
             result.update(network_budget={"call": budget.entries[-1]["call"], "reserved_attempts": steps,

@@ -248,8 +248,24 @@ def test_peer_rejects_removed_phases_early_truncation_and_round_replay(local_rou
 @pytest.mark.parametrize("fault", [None, "output", "lost_ack", "short_p1", "short_p2", "late"])
 def test_actual_client_and_peer_frames_keep_double_ack_owner(local_round, monkeypatch, fault):
     """真实 socket 编解码计数；任何提交不确定都不能签发控制结果。"""
+    from collections import Counter
+    from threading import get_ident, main_thread
+
     import secure_control.execution._localhost_peer as peer_module
     import secure_control.execution._localhost_workers as workers
+    from secure_control.protocol import coordinator
+    digest_calls = Counter()
+    authorization_objects = Counter()
+    canonical_digest = coordinator.public_step_plan_sha256
+    def counted_digest(plan):
+        digest_calls[get_ident()] += 1
+        return canonical_digest(plan)
+    monkeypatch.setattr(coordinator, "public_step_plan_sha256", counted_digest)
+    original_init = Protocol3CommitAuthorization.__post_init__
+    def counted_authorization(self):
+        authorization_objects[get_ident()] += 1
+        original_init(self)
+    monkeypatch.setattr(Protocol3CommitAuthorization, "__post_init__", counted_authorization)
     client, _roles, rounds, local, peers, outputs = local_round
     connections = [socket.socketpair(), socket.socketpair()]
     endpoints = [_ClientPartyEndpoint(pair[0], i, local[i].plan, 1, 8*1024*1024, 5.,
@@ -327,6 +343,151 @@ def test_actual_client_and_peer_frames_keep_double_ack_owner(local_round, monkey
         assert not errors and len(frames) == 11
         assert sum(sender != "Client" and recipient != "Client" for sender, recipient, _ in frames) == 3
         assert all(item.resources.consumed_count > 0 for item in rounds)
+        assert digest_calls[main_thread().ident] == 1
+        assert sorted(digest_calls.values()) == [1, 1, 1]
+        assert authorization_objects[main_thread().ident] == 1
+        assert sorted(authorization_objects.values()) == [1, 1, 1]  # 发送1份，两方分别decode；无期望对象。
+        assert all(endpoint._authorization_cache is None for endpoint in local)
+
+
+def _receipts(plan):
+    from secure_control.protocol.messages import public_step_plan_sha256
+    return tuple(Protocol3LocalStageReceipt(i, plan.session_id, plan.round_id, plan.step,
+        plan.triple_count, plan.truncation_count, public_step_plan_sha256(plan)) for i in (0, 1))
+
+
+def test_authorization_digest_reuses_only_same_deeply_immutable_plan(local_round, monkeypatch):
+    from secure_control.protocol import coordinator
+    from secure_control.protocol.messages import public_step_plan_sha256
+    plan = local_round[3][0].plan
+    owner = Protocol3Orchestrator(completion_strategy="client_authorized")
+    calls = []
+    canonical = coordinator.public_step_plan_sha256
+    def counted(item):
+        calls.append(item)
+        return canonical(item)
+    monkeypatch.setattr(coordinator, "public_step_plan_sha256", counted)
+    assert owner.authorize(_receipts(plan), plan).plan_sha256 == public_step_plan_sha256(plan)
+    assert owner.authorize(_receipts(plan), plan).plan_sha256 == public_step_plan_sha256(plan)
+    assert len(calls) == 1
+    # 身份相同也不能把不同布局、资源次序/ID、尺度对象当作同一项。
+    changed = [replace(plan), replace(plan, round_id="new-round"),
+        replace(plan, state_shape=(3,)), replace(plan, product_resources=plan.product_resources[::-1]),
+        replace(plan, product_resources=(replace(plan.product_resources[0], resource_id="new-id"),
+                                        *plan.product_resources[1:])),
+        replace(plan, scale_ledger=replace(plan.scale_ledger, C=0, D=0, output_accumulator=8, output=8))]
+    for item in changed:
+        prior = len(calls)
+        assert owner.authorize(_receipts(item), item).plan_sha256 == public_step_plan_sha256(item)
+        owner.authorize(_receipts(item), item)
+        assert len(calls) == prior+1
+    owner.authorize(_receipts(plan), plan)
+    assert len(calls) == len(changed)+2  # 单项缓存不保留旧轮集合。
+
+
+def test_cached_plan_does_not_cache_receipt_success_or_change_canonical_bytes(local_round):
+    import json
+    from dataclasses import asdict
+    from hashlib import sha256
+    plan = local_round[3][0].plan
+    owner = Protocol3Orchestrator(completion_strategy="client_authorized")
+    receipts = _receipts(plan)
+    authorized = owner.authorize(receipts, plan)
+    reference = json.dumps(asdict(plan), sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                           allow_nan=False).encode("utf-8")
+    assert authorized.plan_sha256 == sha256(b"control-batch-v1-plan\0"+reference).hexdigest()
+    for edits in ({"party": 0}, {"plan_sha256": "0"*64}, {"step": 1},
+                  {"products": plan.triple_count+1}, {"round_id": "other"}):
+        with pytest.raises(ValueError):
+            owner.authorize((receipts[0], replace(receipts[1], **edits)), plan)
+    assert owner.authorize(receipts, plan) == authorized
+    local_round[3][0].abort()
+    assert local_round[3][0]._authorization_cache is None
+
+
+def test_canonical_dynamic_30_4_plan_qualifies_without_changing_digest(monkeypatch):
+    """正式数值配置的纯材料/计划功能检查；不建连、不执行周期或计时。"""
+    from pathlib import Path
+
+    from secure_control.experiments.lan_continuous_profile import load_segmented_experiment
+    from secure_control.protocol import Client, coordinator
+    from secure_control.protocol.messages import (
+        _deeply_immutable_public_plan,
+        public_step_plan_sha256,
+    )
+    from secure_control.scenarios.cart_pole.interactive import InteractiveSession
+    prepared = load_segmented_experiment(Path(__file__).resolve().parents[1]/"configs/cart_pole_observer_lan.example.yaml",
+                                         400, InteractiveSession())
+    from secure_control.crypto import TwoPartySharing
+    client = Client(prepared.context, TwoPartySharing(prepared.context.modulus),
+                    security_parameter=prepared.security_parameter, modulus_evidence=prepared.evidence)
+    distribution = client.distribute_controller(prepared.spec, prepared.contract, rng=random.Random(10))
+    current = client.prepare_online(distribution, [0., 0.], step=0, rng=random.Random(20))
+    plan = current.p1_resources.plan
+    assert (plan.triple_count, plan.truncation_count) == (30, 4)
+    assert _deeply_immutable_public_plan(plan)
+    calls = []
+    def digest(item):
+        calls.append(item)
+        return public_step_plan_sha256(item)
+    monkeypatch.setattr(coordinator, "public_step_plan_sha256", digest)
+    owner = Protocol3Orchestrator(completion_strategy="client_authorized")
+    for _ in range(2):
+        assert owner.authorize(_receipts(plan), plan).plan_sha256 == public_step_plan_sha256(plan)
+    assert len(calls) == 1
+    client.abort_round(current)
+
+
+@pytest.mark.parametrize("nested", ["resources", "shape", "index", "ledger_subclass", "plan_subclass"])
+def test_mutable_or_noncanonical_plan_never_returns_stale_digest(local_round, monkeypatch, nested):
+    from secure_control.protocol import coordinator
+    from secure_control.protocol.messages import (
+        ControllerScaleLedger,
+        StepResourcePlan,
+        public_step_plan_sha256,
+    )
+    original = local_round[3][0].plan
+    if nested == "resources":
+        mutable = list(original.product_resources)
+        plan = replace(original, product_resources=mutable)
+        mutate = lambda: mutable.reverse()
+    elif nested == "shape":
+        mutable = [2]
+        plan = replace(original, state_shape=mutable)
+        mutate = lambda: mutable.append(3)
+    elif nested == "index":
+        mutable = list(original.product_resources[0].index)
+        plan = replace(original, product_resources=(replace(original.product_resources[0], index=mutable),
+                                                   *original.product_resources[1:]))
+        mutate = lambda: mutable.append(2)
+    elif nested == "ledger_subclass":
+        class Ledger(ControllerScaleLedger):
+            pass
+        ledger = Ledger(**{name: getattr(original.scale_ledger, name)
+                           for name in original.scale_ledger.__dataclass_fields__})
+        plan = replace(original, scale_ledger=ledger)
+        mutate = lambda: None
+    else:
+        class Plan(StepResourcePlan):
+            pass
+        plan = Plan(**{name: getattr(original, name) for name in original.__dataclass_fields__})
+        mutate = lambda: None
+    calls = []
+    def counted(item):
+        calls.append(item)
+        return public_step_plan_sha256(item)
+    monkeypatch.setattr(coordinator, "public_step_plan_sha256", counted)
+    owner = Protocol3Orchestrator(completion_strategy="client_authorized")
+    first = owner.authorize(_receipts(plan), plan)
+    owner.authorize(_receipts(plan), plan)
+    assert len(calls) >= 2  # 兼容域仍即时摘要，绝不把浅冻结当作缓存许可。
+    mutate()
+    second = owner.authorize(_receipts(plan), plan)
+    assert second.plan_sha256 == public_step_plan_sha256(plan)
+    if nested in ("resources", "shape", "index"):
+        assert second.plan_sha256 != first.plan_sha256
+        with pytest.raises(ValueError):
+            owner.authorize(tuple(replace(item, plan_sha256=first.plan_sha256) for item in _receipts(plan)), plan)
 
 
 def test_new_wire_types_round_trip_and_old_receipt_cannot_authorize():

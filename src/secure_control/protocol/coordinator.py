@@ -47,10 +47,24 @@ from .messages import (
     StepResourcePlan,
     TruncationMaskPayload,
     TruncationResourceMaterial,
+    _deeply_immutable_public_plan,
     _ResourceLifecycle,
     public_step_plan_sha256,
 )
 from .roles import P1, P2, _Server, _vector_from_scalars
+
+
+def _authorization_plan_digest(owner, plan: StepResourcePlan) -> str:
+    """仅在单轮 owner 内复用本地公开派生值；不缓存任何消息校验或动态状态。"""
+    cached = getattr(owner, "_authorization_cache", None)
+    if cached is not None and cached[0] is plan:
+        return cached[1]
+    owner._authorization_cache = None
+    immutable = _deeply_immutable_public_plan(plan)
+    digest = public_step_plan_sha256(plan)
+    if immutable:
+        owner._authorization_cache = (plan, digest)
+    return digest
 
 
 @runtime_checkable
@@ -157,7 +171,7 @@ class Protocol3Orchestrator:
         if len(receipts) != 2 or any(type(item) is not receipt_type for item in receipts):
             raise ValueError("Protocol 3 暂存回执类型与完成策略不匹配。")
         if receipt_type is Protocol3LocalStageReceipt and any(
-                item.plan_sha256 != public_step_plan_sha256(plan) for item in receipts):
+                item.plan_sha256 != _authorization_plan_digest(self, plan) for item in receipts):
             raise ValueError("Protocol 3 局部暂存计划摘要不匹配。")
         expected = (
             plan.session_id,
@@ -185,7 +199,7 @@ class Protocol3Orchestrator:
         if self.completion_strategy != "client_authorized":
             raise ValueError("旧完成策略不签发 Client 授权。")
         self._validate_receipts(receipts, plan)
-        return Protocol3CommitAuthorization(public_step_plan_sha256(plan), (0, 1),
+        return Protocol3CommitAuthorization(_authorization_plan_digest(self, plan), (0, 1),
                                             plan.triple_count, plan.truncation_count)
 
     def commit(self, p1: Protocol3PartyEndpoint, p2: Protocol3PartyEndpoint) -> None:
@@ -197,20 +211,26 @@ class Protocol3Orchestrator:
                      p2: Protocol3BatchPartyEndpoint, plan: StepResourcePlan,
                      authorization: Protocol3CommitAuthorization | None = None) -> None:
         """同一 Client 先发送两方原请求；仍需两份有效 ACK 才能返回。"""
-        self._validate_endpoints(p1, p2, plan)
-        if self.completion_strategy == "client_authorized":
-            if authorization != Protocol3CommitAuthorization(public_step_plan_sha256(plan), (0, 1),
-                                                             plan.triple_count, plan.truncation_count):
-                raise ValueError("提交授权与本轮计划不匹配。")
-            p1.start_commit(authorization)
-            p2.start_commit(authorization)
-        else:
-            if authorization is not None:
-                raise ValueError("旧完成策略拒绝 Client 授权。")
-            p1.start_commit()
-            p2.start_commit()
-        p1.finish_commit()
-        p2.finish_commit()
+        try:
+            self._validate_endpoints(p1, p2, plan)
+            if self.completion_strategy == "client_authorized":
+                if (type(authorization) is not Protocol3CommitAuthorization
+                        or (authorization.plan_sha256, authorization.prepared_parties,
+                            authorization.products, authorization.truncations) != (
+                            _authorization_plan_digest(self, plan), (0, 1), plan.triple_count, plan.truncation_count)):
+                    raise ValueError("提交授权与本轮计划不匹配。")
+                p1.start_commit(authorization)
+                p2.start_commit(authorization)
+            else:
+                if authorization is not None:
+                    raise ValueError("旧完成策略拒绝 Client 授权。")
+                p1.start_commit()
+                p2.start_commit()
+            p1.finish_commit()
+            p2.finish_commit()
+        finally:
+            if self.completion_strategy == "client_authorized":
+                self._authorization_cache = None
 
     @staticmethod
     def _validate_endpoints(
@@ -743,7 +763,7 @@ class LocalProtocol3PartyEndpoint:
             return Protocol3LocalStageReceipt(
                 self.party, self._plan.session_id, self._plan.round_id, self._plan.step,
                 self._plan.triple_count, self._plan.truncation_count,
-                public_step_plan_sha256(self._plan))
+                _authorization_plan_digest(self, self._plan))
         return Protocol3StageReceipt(
             self.party,
             self._plan.session_id,
@@ -769,11 +789,12 @@ class LocalProtocol3PartyEndpoint:
             raise
 
     def _accept_authorization(self, authorization: Protocol3CommitAuthorization) -> None:
-        expected = Protocol3CommitAuthorization(public_step_plan_sha256(self._plan), (0, 1),
-                                                self._plan.triple_count, self._plan.truncation_count)
         if (self.completion_strategy != "client_authorized" or self._closed
                 or not self._staged or type(authorization) is not Protocol3CommitAuthorization
-                or authorization != expected):
+                or (authorization.plan_sha256, authorization.prepared_parties,
+                    authorization.products, authorization.truncations) != (
+                    _authorization_plan_digest(self, self._plan), (0, 1),
+                    self._plan.triple_count, self._plan.truncation_count)):
             raise ValueError("授权与当前完整局部暂存状态不匹配。")
         for resource in self._products.values():
             resource.triple._lifecycle.attest_peer_finish(self.party)
@@ -790,6 +811,8 @@ class LocalProtocol3PartyEndpoint:
         self._role.commit_state(self._next_state)
         self._staged = False
         self._closed = True
+        if self.completion_strategy == "client_authorized":
+            self._authorization_cache = None
 
     def abort(self) -> None:
         """废弃本 endpoint 尚未完成的 protocol 资源，不提交 state。"""
@@ -798,6 +821,8 @@ class LocalProtocol3PartyEndpoint:
         self._staged = False
         self._closed = True
         self._next_state = None
+        if self.completion_strategy == "client_authorized":
+            self._authorization_cache = None
 
     def _product_resource(self, metadata: ResourceMetadata) -> ProductResourceShare:
         if self._closed:
