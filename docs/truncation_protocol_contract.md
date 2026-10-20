@@ -97,3 +97,10 @@ P2 没有任何接收 P1 消息的 API。重构输出允许与 `paper_round_divi
 素数报告中的 `verified` 仅表示本地验证器检查通过 MR64 或 Pocklington 定理前提；它不证明参数
 生成过程、随机源、模数位长、协议部署或整个控制系统达到生产安全等级。#15 仍须独立选择并证明
 适合各 precision 点的 `q/kappa/k/ell/lambda`，本契约不预选该参数。
+
+局部暂存候选的协议 owner 可在首次使用前明确设置单方观察范围。P2 发送本方
+masked 消息后，复用原 `finish_p2` 算式完成本方输出，无需等待 P1；此时
+`p1_reconstructed` 仍为 false，`finished_parties` 仅含本方，资源尚未全局消费。
+P1 只有实际收到并验证 P2 消息后才记录发送事实、重构 masked 值并完成本方输出。
+可信 Client 汇总两方完整局部回执后，以单独的 `client_attested_parties` 确认远端完成；
+不会把远端重构冒充本地观察。默认共享生命周期仍要求原两方遮蔽/P1重构顺序。

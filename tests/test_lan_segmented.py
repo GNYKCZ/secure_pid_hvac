@@ -35,8 +35,8 @@ from secure_control.protocol import ControllerRangeContract
 from secure_control.scenarios.cart_pole.interactive import InteractiveSession
 
 
-@pytest.fixture
-def compact_advance(monkeypatch):
+@pytest.fixture(params=("control-dynamic-compact-v2", "control-dynamic-compact-v3"))
+def compact_advance(monkeypatch, request):
     """400个已双提交且确认的公开条目；所有网络操作可逐项注入失败。"""
     from secure_control.execution import localhost_codec as codec
 
@@ -49,7 +49,7 @@ def compact_advance(monkeypatch):
         _products=12000, _truncations=1600, setup=None, scale_ledger=None,
         range_verification=None, modulus_verification=None, _material_pool=None,
         last_commit_observation=None, _last_phase_ns={}, close=lambda: closed.append(True))
-    runtime.__dict__.update(_v2=True, _full_v3=False, _wire_profile=codec._COMPACT_PROFILE_V2,
+    runtime.__dict__.update(_v2=True, _full_v3=False, _wire_profile=request.param,
         config=SimpleNamespace(shutdown_timeout=1.), control=RunControl(), _segment=segment,
         _pending=None, phase="RUNNING", run_id="run", controller_epoch="e"*64,
         segment_capacity=400, segment_index=0, global_start=0, confirmed_step_count=400,

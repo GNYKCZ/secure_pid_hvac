@@ -17,6 +17,7 @@ from secure_control.protocol.messages import (
 )
 
 from .localhost_codec import (
+    _COMPACT_PROFILE_V3,
     _COMPACT_PROFILES,
     SCHEMA_VERSION,
     BatchHelloPayload,
@@ -91,14 +92,24 @@ class LocalhostProtocol3PeerPort:
             raise ValueError("peer 未协商批量能力或 session 不匹配")
         if type(modulus) is not int or modulus < 3:
             raise ValueError("批量 peer 模数无效")
+        if self._wire_profile == _COMPACT_PROFILE_V3 and (
+                not plan.truncation_count or getattr(self, "_v3_last_step", -1)+1 != plan.step
+                or getattr(self, "_v3_phase", "truncated") != "truncated"):
+            raise ValueError("局部暂存 peer 需要连续新鲜且前轮完整的动态截断轮次。")
         self._batch_context = (deepcopy(plan), run_id, epoch_id or plan.session_id,
                                physical_step, modulus)
         # 独立快照保留每次调用的变化检测；摘要仅计算一次，不信任调用者的对象 identity。
         self._batch_digest = public_step_plan_sha256(plan)
+        if self._wire_profile == _COMPACT_PROFILE_V3:
+            self._v3_last_step = plan.step
+            self._v3_phase = "prepared"
 
     def exchange_products(
         self, plan: StepResourcePlan, masks: tuple[ProductMaskPayload, ...],
     ) -> tuple[ProductMaskPayload, ...]:
+        self._check_v3_phase("prepared")
+        if self._wire_profile == _COMPACT_PROFILE_V3:
+            self._v3_phase = "in_flight"
         ids = tuple(item.resource_id for item in plan.product_resources)
         self._check_batch_values(masks, len(ids), "product", sender=self._role)
         if self._wire_profile in _COMPACT_PROFILES:
@@ -110,6 +121,8 @@ class LocalhostProtocol3PeerPort:
             incoming = self._receive_batch(plan, "product", ids).products
             self._send_batch(plan, "product", ids, products=masks)
         self._check_batch_values(incoming, len(ids), "product", sender=self._peer)
+        if self._wire_profile == _COMPACT_PROFILE_V3:
+            self._v3_phase = "products"
         return incoming
 
     def product_complete(self, plan: StepResourcePlan) -> None:
@@ -121,16 +134,26 @@ class LocalhostProtocol3PeerPort:
     ) -> None:
         if self._role != "P2":
             raise ValueError("只有 P2 能发送截断批次")
+        self._check_v3_phase("products")
+        if self._wire_profile == _COMPACT_PROFILE_V3:
+            self._v3_phase = "in_flight"
         ids = tuple(item.resource_id for item in plan.state_truncation_resources)
         self._check_batch_values(values, len(ids), "truncation")
         self._send_batch(plan, "truncation", ids, truncations=values)
+        if self._wire_profile == _COMPACT_PROFILE_V3:
+            self._v3_phase = "truncated"
 
     def receive_truncations(self, plan: StepResourcePlan) -> tuple[P2TruncationPayload, ...]:
         if self._role != "P1":
             raise ValueError("只有 P1 能接收截断批次")
+        self._check_v3_phase("products")
+        if self._wire_profile == _COMPACT_PROFILE_V3:
+            self._v3_phase = "in_flight"
         ids = tuple(item.resource_id for item in plan.state_truncation_resources)
         values = self._receive_batch(plan, "truncation", ids).truncations
         self._check_batch_values(values, len(ids), "truncation")
+        if self._wire_profile == _COMPACT_PROFILE_V3:
+            self._v3_phase = "truncated"
         return values
 
     def state_complete(self, plan: StepResourcePlan) -> None:
@@ -138,6 +161,8 @@ class LocalhostProtocol3PeerPort:
                       tuple(item.resource_id for item in plan.state_truncation_resources))
 
     def _barrier(self, plan: StepResourcePlan, phase: str, ids: tuple[str, ...]) -> None:
+        if self._wire_profile == _COMPACT_PROFILE_V3:
+            raise ValueError("局部暂存 peer 拒绝完成屏障。")
         if self._wire_profile in _COMPACT_PROFILES:
             self._exchange_batch(plan, phase, ids)
         elif self._role == "P1":
@@ -146,6 +171,12 @@ class LocalhostProtocol3PeerPort:
         else:
             self._receive_batch(plan, phase, ids)
             self._send_batch(plan, phase, ids)
+
+    def _check_v3_phase(self, expected: str) -> None:
+        """严格保留实际传输次序，跳过的语义索引不允许重新进入。"""
+        if (self._wire_profile == _COMPACT_PROFILE_V3
+                and getattr(self, "_v3_phase", None) != expected):
+            raise ValueError("局部暂存 peer 阶段重复或提前。")
 
     def _batch_identity(self, plan: StepResourcePlan) -> tuple[str | None, str, int | None, int]:
         if not self._batch_enabled or self._session_id != plan.session_id:

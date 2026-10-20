@@ -42,6 +42,7 @@ from secure_control.protocol.messages import (
     PreloadReceipt,
     ProductResourceMaterial,
     Protocol3EndpointCommand,
+    Protocol3LocalStageReceipt,
     Protocol3StageReceipt,
     TruncationResourceMaterial,
     _EncodedInputRound,
@@ -63,8 +64,9 @@ from .cycle_timing import check_deadline, network_deadline
 from .lan_config import LanConfig, Role
 from .lan_transport import accept_role, connect_role, listener
 from .localhost_codec import (
+    _COMPACT_ADVANCE_PROFILES,
     _COMPACT_PROFILE,
-    _COMPACT_PROFILE_V2,
+    _COMPACT_PROFILE_V3,
     _COMPACT_PROFILES,
     SCHEMA_VERSION,
     BatchHelloPayload,
@@ -484,6 +486,10 @@ class LanContinuousRuntime:
         ):
             raise ValueError("紧凑动态候选仅允许显式批量 v2 且不预送")
         self._wire_profile = wire_profile
+        if wire_profile == _COMPACT_PROFILE_V3 and not (
+                spec.state_dimension and (spec.scale_metadata.A if spec.scale_metadata is not None
+                                          else fixed_point.fractional_bits) > 0):
+            raise ValueError("compact-v3 仅支持动态聚合行截断。")
         if v2:
             if (range_contract.reachability_block_steps is None
                     or range_contract.horizon_steps is not None
@@ -779,6 +785,8 @@ class LanContinuousRuntime:
                     self.config.step_timeout, deadline,
                     activation=(request, encoded) if fused else None,
                     on_send=lambda: setattr(self, "_round_started", True),
+                    completion_strategy=("client_authorized" if self._wire_profile == _COMPACT_PROFILE_V3
+                                         else "peer_barriers"),
                 ))
             if not fused:
                 for sock, request in zip(self._sockets, pending, strict=True):
@@ -1249,7 +1257,7 @@ class LanSegmentedRuntime:
             if action == "continue" and not self.segment_full:
                 raise RuntimeError("只有满段才能继续。")
             self.phase = "STOPPING" if action == "stop" else "ENDING_SEGMENT"
-            advance = self._wire_profile == _COMPACT_PROFILE_V2 and action == "continue"
+            advance = self._wire_profile in _COMPACT_ADVANCE_PROFILES and action == "continue"
             self.last_maintenance_operation = "advance" if advance else "end"
         completed = False
         self.last_segment_receipts = ()
@@ -1299,7 +1307,7 @@ class LanSegmentedRuntime:
             self._last_end_round_id = end.last_round_id
             self._last_closed_segment_count = self.confirmed_step_count
             # 双方密封是独立事实；周期出口超期也不能丢掉刚收到的真实回执。
-            if self._full_v3 or self._wire_profile == _COMPACT_PROFILE_V2:
+            if self._full_v3 or self._wire_profile in _COMPACT_ADVANCE_PROFILES:
                 self.last_sealed_record = record
             self._advance_begin = begin
             self.phase = ("SWITCHED" if action == "switch" else
@@ -1325,7 +1333,7 @@ class LanSegmentedRuntime:
                 self.controller_epoch, self._last_end_round_id,
             )
             try:
-                if self._wire_profile == _COMPACT_PROFILE_V2:
+                if self._wire_profile in _COMPACT_ADVANCE_PROFILES:
                     if self._advance_begin != begin:
                         raise RuntimeError("复合维护未完整确认，禁止激活下一段")
                     check_deadline(deadline_ns, "SEGMENT_ADVANCE_LOCAL")
@@ -1370,7 +1378,7 @@ class LanSegmentedRuntime:
 
     def abort_segment_transition(self) -> None:
         """维护已发出后，本地回调或原周期出口失败只能异常关闭。"""
-        if self._wire_profile != _COMPACT_PROFILE_V2 or self.last_maintenance_operation != "advance":
+        if self._wire_profile not in _COMPACT_ADVANCE_PROFILES or self.last_maintenance_operation != "advance":
             raise RuntimeError("当前没有 compact-v2 复合维护")
         self.phase = "UNCERTAIN"
         self.close()
@@ -1685,13 +1693,13 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
             if segmented and online_request.operation in {"segment_end", "segment_advance"}:
                 advance = online_request.operation == "segment_advance"
                 _check_request(online_request, role, sequence, online_request.operation, session)
-                if advance and (expected_wire_profile != _COMPACT_PROFILE_V2
+                if advance and (expected_wire_profile not in _COMPACT_ADVANCE_PROFILES
                                 or not isinstance(online_request.payload, SegmentAdvancePayload)):
                     raise ValueError("复合维护必须精确协商 compact-v2")
                 end = online_request.payload.end if advance else online_request.payload
                 if not isinstance(end, SegmentEndPayload):
                     raise TypeError("段结束请求类型错误。")
-                if (expected_wire_profile == _COMPACT_PROFILE_V2 and end.action == "continue"
+                if (expected_wire_profile in _COMPACT_ADVANCE_PROFILES and end.action == "continue"
                         and not advance):
                     raise ValueError("compact-v2 满段 continue 必须使用复合维护")
                 if end.action == "switch" and hello.mode != "lan-full-v3":
@@ -1769,6 +1777,8 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
             endpoint = LocalProtocol3PartyEndpoint(
                 role_object, online,
                 lambda message, collected=staged: _capture_stage_share(message, collected),
+                completion_strategy=("client_authorized" if expected_wire_profile == _COMPACT_PROFILE_V3
+                                     else "peer_barriers"),
             )
             if (endpoint.plan.round_id, endpoint.plan.step) != (
                 online_request.round_id, expected_step
@@ -1788,9 +1798,12 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                 )
             direct = DirectProtocol3PartyEndpoint(endpoint, peer_port)
             activation_result = None
+            receipt_type = (Protocol3LocalStageReceipt if expected_wire_profile == _COMPACT_PROFILE_V3
+                            else Protocol3StageReceipt)
+            commit_operation = "commit_staged" if expected_wire_profile == _COMPACT_PROFILE_V3 else "commit"
             if fused:
                 receipt = stage_protocol3_batch(endpoint, peer_port)
-                if not isinstance(receipt, Protocol3StageReceipt) or len(staged) != 1:
+                if type(receipt) is not receipt_type or len(staged) != 1:
                     raise ValueError("融合暂存回执与输出份额不完整")
                 activation_result = PartyStageResult(receipt, staged[0])
             _party_reply(client_socket, online_request, activation_result, config.step_timeout,
@@ -1807,16 +1820,20 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                     raise ValueError("endpoint command 与当前 round 不匹配。")
                 try:
                     command = command_request.payload.operation
-                    if fused and command != "commit":
+                    if fused and command != commit_operation:
                         raise ValueError("融合激活后只允许原双提交命令")
                     if batch and command == "stage_batch":
                         result = stage_protocol3_batch(endpoint, peer_port)
-                    elif (batch and command != "commit") or (not batch and command == "stage_batch"):
+                    elif command == "commit_staged" and expected_wire_profile == _COMPACT_PROFILE_V3:
+                        if command_request.resource_id is not None:
+                            raise ValueError("提交授权不能绑定其他资源。")
+                        result = endpoint.commit_staged(command_request.payload.authorization)
+                    elif (batch and command != commit_operation) or (not batch and command == "stage_batch"):
                         raise ValueError("endpoint 操作与协商的批量能力不匹配")
                     else:
                         result = dispatch_direct_protocol3_command(direct, command_request.payload)
                     if command in {"stage_output", "stage_batch"}:
-                        if not isinstance(result, Protocol3StageReceipt) or len(staged) != 1:
+                        if type(result) is not receipt_type or len(staged) != 1:
                             raise ValueError("暂存回执与输出份额不完整。")
                         result = PartyStageResult(result, staged[0])
                     _party_reply(client_socket, command_request, result,
@@ -1825,7 +1842,7 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                     _party_error(client_socket, command_request, error, config.step_timeout)
                     raise
                 sequence += 1
-                if command == "commit":
+                if command == commit_operation:
                     if preload_store is not None:
                         preload_store.commit(endpoint.plan)
                     committed += 1

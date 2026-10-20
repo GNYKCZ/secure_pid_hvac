@@ -43,7 +43,9 @@ from secure_control.protocol.messages import (
     ProductMaskPayload,
     ProductResourceMaterial,
     Protocol3BatchPayload,
+    Protocol3CommitAuthorization,
     Protocol3EndpointCommand,
+    Protocol3LocalStageReceipt,
     Protocol3StageReceipt,
     ResourceMetadata,
     StepResourcePlan,
@@ -54,7 +56,9 @@ from secure_control.protocol.messages import (
 SCHEMA_VERSION = 3
 _COMPACT_PROFILE = "control-dynamic-compact-v1"
 _COMPACT_PROFILE_V2 = "control-dynamic-compact-v2"
-_COMPACT_PROFILES = (_COMPACT_PROFILE, _COMPACT_PROFILE_V2)
+_COMPACT_PROFILE_V3 = "control-dynamic-compact-v3"
+_COMPACT_PROFILES = (_COMPACT_PROFILE, _COMPACT_PROFILE_V2, _COMPACT_PROFILE_V3)
+_COMPACT_ADVANCE_PROFILES = (_COMPACT_PROFILE_V2, _COMPACT_PROFILE_V3)
 _COMPACT_MAX_VALUES = 512 * 1024
 _ROLES = {"Supervisor", "Client", "P1", "P2"}
 _KINDS = {"hello", "ready", "request", "reply", "error", "shutdown"}
@@ -254,6 +258,8 @@ class _CompactBatchPayload:
             raise LocalhostCodecError("紧凑数值块版本不匹配")
         if self.phase not in {"product", "product_complete", "truncation", "state_complete"}:
             raise LocalhostCodecError("紧凑 peer 阶段无效")
+        if self.version == _COMPACT_PROFILE_V3 and self.phase not in {"product", "truncation"}:
+            raise LocalhostCodecError("compact-v3 不接受完成屏障。")
         if type(self.batch_index) is not int or self.batch_index != {
             "product": 0, "product_complete": 1, "truncation": 2, "state_complete": 3}[self.phase]:
             raise LocalhostCodecError("紧凑 peer 批次索引无效")
@@ -519,11 +525,11 @@ class ClientStepResult:
 class PartyStageResult:
     """仅在 Client 私有通道返回的单方暂存回执和输出 share。"""
 
-    receipt: Protocol3StageReceipt
+    receipt: Protocol3StageReceipt | Protocol3LocalStageReceipt
     share: ControlShareMessage
 
     def __post_init__(self) -> None:
-        if not isinstance(self.receipt, Protocol3StageReceipt) or not isinstance(
+        if type(self.receipt) not in (Protocol3StageReceipt, Protocol3LocalStageReceipt) or not isinstance(
             self.share, ControlShareMessage
         ):
             raise TypeError("暂存结果必须包含回执与控制份额。")
@@ -543,6 +549,8 @@ WirePayload = (
     | np.ndarray[Any, Any]
     | StepResourcePlan
     | Protocol3EndpointCommand
+    | Protocol3LocalStageReceipt
+    | Protocol3CommitAuthorization
     | ProductMaskPayload
     | Protocol3BatchPayload
     | TruncationMaskPayload
@@ -1111,6 +1119,15 @@ def _encode_value(value: object) -> object:
         }
     if isinstance(value, P2TruncationPayload):
         return {"type": "p2_truncation", "value": _encode_value(value.value)}
+    if isinstance(value, Protocol3CommitAuthorization):
+        return {"type": "commit_authorization", "plan_sha256": value.plan_sha256,
+                "prepared_parties": list(value.prepared_parties), "products": value.products,
+                "truncations": value.truncations}
+    if isinstance(value, Protocol3LocalStageReceipt):
+        return {"type": "local_stage_receipt", "party": value.party,
+                "session_id": value.session_id, "round_id": value.round_id, "step": value.step,
+                "products": value.products, "truncations": value.truncations,
+                "plan_sha256": value.plan_sha256, "scope": value.scope}
     if isinstance(value, Protocol3StageReceipt):
         return {
             "type": "stage_receipt",
@@ -1122,6 +1139,15 @@ def _encode_value(value: object) -> object:
             "truncations": value.truncations,
         }
     if isinstance(value, Protocol3EndpointCommand):
+        if value.operation == "commit_staged":
+            if (type(value.authorization) is not Protocol3CommitAuthorization
+                    or any(getattr(value, name) is not None for name in (
+                        "metadata", "product_mask", "truncation_mask", "p2_truncation"))):
+                raise ValueError("commit_staged 只允许完整提交授权。")
+            return {"type": "endpoint_command", "operation": "commit_staged",
+                    "authorization": _encode_value(value.authorization)}
+        if value.authorization is not None:
+            raise ValueError("旧 endpoint 命令不允许提交授权。")
         return {
             "type": "endpoint_command",
             "operation": value.operation,
@@ -1391,7 +1417,7 @@ def _decode_value(value: object) -> object:
     if kind == "party_stage_result":
         _exact_fields(mapping, {"type", "receipt", "share"}, kind)
         return PartyStageResult(
-            _typed(mapping["receipt"], Protocol3StageReceipt),
+            _decode_value(mapping["receipt"]),
             _typed(mapping["share"], ControlShareMessage),
         )
     if kind == "float_array":
@@ -1605,6 +1631,16 @@ def _decode_value(value: object) -> object:
     if kind == "p2_truncation":
         _exact_fields(mapping, {"type", "value"}, kind)
         return P2TruncationPayload(_typed(mapping["value"], AdditiveShare))
+    if kind == "commit_authorization":
+        _exact_fields(mapping, {"type", "plan_sha256", "prepared_parties", "products", "truncations"}, kind)
+        if type(mapping["prepared_parties"]) is not list:
+            raise LocalhostCodecError("prepared_parties 必须为列表。")
+        return Protocol3CommitAuthorization(mapping["plan_sha256"], tuple(mapping["prepared_parties"]),
+                                            mapping["products"], mapping["truncations"])
+    if kind == "local_stage_receipt":
+        _exact_fields(mapping, {"type", "party", "session_id", "round_id", "step", "products",
+                                "truncations", "plan_sha256", "scope"}, kind)
+        return Protocol3LocalStageReceipt(**{key: item for key, item in mapping.items() if key != "type"})
     if kind == "stage_receipt":
         _exact_fields(
             mapping,
@@ -1620,6 +1656,10 @@ def _decode_value(value: object) -> object:
             _nonnegative(mapping["truncations"], "truncations"),
         )
     if kind == "endpoint_command":
+        if mapping.get("operation") == "commit_staged":
+            _exact_fields(mapping, {"type", "operation", "authorization"}, kind)
+            return Protocol3EndpointCommand("commit_staged",
+                authorization=_typed(mapping["authorization"], Protocol3CommitAuthorization))
         _exact_fields(
             mapping,
             {"type", "operation", "metadata", "product_mask", "truncation_mask", "p2_truncation"},

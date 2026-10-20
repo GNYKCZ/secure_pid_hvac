@@ -109,3 +109,24 @@ RNG。原有 `execute()` 与 `reconstruct_control()` 接口和默认行为保持
 sanitized evidence 只含 residue、centered integer、fractional bits、decode 结果、资源 ID hash 与已验证
 状态方程。两份 raw share 仅能在显式授权的本地组合诊断对象中同时出现，不能由公共包入口导出，也不
 进入公开 manifest。详见[安全执行证据与增强中文报告](secure_execution_evidence.md)。
+
+## 显式 Client 授权的局部暂存候选
+
+协议内核通过 `completion_strategy="client_authorized"` 接受局部观察策略；默认
+`peer_barriers` 的共享生命周期及原回执保持。执行层仅在协商
+`control-dynamic-compact-v3` 的动态分段实验中选择新策略。
+
+乘法与聚合行 Trunc 仍使用原数学函数、材料和旧状态输出次序。新路径不发送
+`product_complete/state_complete`，每个角色只登记本方算术完成，返回
+`Protocol3LocalStageReceipt(scope="local_staged")` 与本方控制份额。回执精确绑定
+party、session、round、step、公开计划 canonical SHA256 和资源数量，不能代替双方完成。
+
+唯一 Client owner 收齐并验证两份回执、成功重构输出并通过原检查后，生成
+`Protocol3CommitAuthorization`，经当前轮信封发送 `commit_staged`。角色验证摘要、
+两方集合和计数后登记 `client_attested`、消费资源并提交 state；本地实际观察集合不冒充
+远端完成。v3 拒绝裸 `commit`，旧版本拒绝授权提交或新回执。只有双方有效 ACK 后才可
+交付控制；单方已提交但 ACK 不确定时停止，不回滚、不重试、不复用材料。
+
+正常轮为11个应用帧（peer3帧），继承 v2 advance 后满段含额外4帧。setup/STOP单列，
+应用帧不是网络包或 RTT。局部领取即不可复用；失败封闭当前 run，重启须新 session/材料。
+这依赖既有可信 Client、半诚实不串通双方及安全信道，不提供故障下的分布式原子提交保证。
