@@ -31,7 +31,9 @@ import numpy as np
 from secure_control.execution.lan_config import LanConfig, LanEndpoint, LanTopology, load_lan_config
 from secure_control.execution.lan_runtime import LanContinuousRuntime, run_party_single_step
 from secure_control.execution.lan_scalar_runtime import LanScalarRuntime
-from secure_control.execution.localhost_codec import _COMPACT_PROFILE_V2
+from secure_control.execution.localhost_codec import (
+    _COMPACT_ADVANCE_PROFILES,
+)
 
 _ROOT = Path(__file__).resolve().parents[3]
 
@@ -154,7 +156,7 @@ class _CompactHistory:
 
     @classmethod
     def schemas(cls, role, steps, *, qualification=False, wire_profile=None):
-        if wire_profile not in (None, _COMPACT_PROFILE_V2):
+        if wire_profile not in (None, *_COMPACT_ADVANCE_PROFILES):
             raise ValueError("非法维护历史版本")
         phases = (*cls.PHASES, "maintenance_advance") if wire_profile else cls.PHASES
         if (role not in ("Client", "P1", "P2") or type(steps) is not int or type(qualification) is not bool
@@ -1925,7 +1927,7 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
         (LocalProtocol3PartyEndpoint, (
             "mask_product", "finish_product", "complete_product", "finish_products",
             "mask_truncation", "p2_truncation_message_direct", "finish_truncation_p1_direct",
-            "finish_truncation_p2", "complete_truncation", "stage_output", "commit",
+            "finish_truncation_p2", "complete_truncation", "stage_output", "commit", "commit_staged",
         ), "local_arithmetic_ms"),
         (LocalhostProtocol3PeerPort, (
             "exchange_products", "product_complete", "send_truncations",
@@ -1977,7 +1979,7 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
             nonlocal previous, previous_counts
             value = reply(sock, request, *args, **kwargs)
             if (request.operation == "endpoint"
-                    and getattr(request.payload, "operation", None) == "commit"):
+                    and getattr(request.payload, "operation", None) in {"commit", "commit_staged"}):
                 if compact_history is not None:
                     compact_history.party_step(request, activity, previous, counts, previous_counts)
                 else:
@@ -1986,7 +1988,7 @@ def _meter(role: str, ports: tuple[int, int, int], delay_ms: float, role_steps=N
                                    "sent": {k: {field: v[field] - previous_counts.get(k, {}).get(field, 0)
                                                 for field in v} for k, v in counts.items()}})
             if request.operation in {"offline", "preload_seal"} or (request.operation == "endpoint"
-                    and getattr(request.payload, "operation", None) == "commit"):
+                    and getattr(request.payload, "operation", None) in {"commit", "commit_staged"}):
                 previous = dict(activity)
                 previous_counts = {k: dict(v) for k, v in counts.items()}
             return value
@@ -2024,7 +2026,7 @@ def _party_job(
         try:
             history = _CompactHistory(config.role, compact_history_steps,
                 **({"qualification": True} if compact_history_qualification else {}),
-                **({"wire_profile": wire_profile} if wire_profile == _COMPACT_PROFILE_V2 else {}))
+                **({"wire_profile": wire_profile} if wire_profile in _COMPACT_ADVANCE_PROFILES else {}))
         except Exception as error:  # noqa: BLE001 - 启动失败不建角色，不隐去缺失记录
             queue.put({"role": config.role, "status": "failed", "error_type": type(error).__name__,
                        "steps": [], "directions": {}, "activity_ms": {},
@@ -2310,9 +2312,9 @@ def _observe_diagnostic(diagnostic, *, recording=True):
         with diagnostic.scope(f"p{self.party + 1}_commit"):
             return original_commit(self)
 
-    def start_commit(self):
+    def start_commit(self, *args):
         with diagnostic.scope(f"p{self.party + 1}_commit_send"):
-            return original_start(self)
+            return original_start(self, *args)
 
     def finish_commit(self):
         with diagnostic.scope(f"p{self.party + 1}_commit_ack_wait"):
@@ -3218,8 +3220,8 @@ def _run_material_comparison(options, candidate, *, target_steps=1000):
             if compact_candidate:
                 history = _CompactHistory("Client", target_steps if qpc_candidate or qpc_qualification or network else 4000,
                     **({"qualification": True} if large_history else {}),
-                    **({"wire_profile": _COMPACT_PROFILE_V2}
-                       if options.get("network_wire_profile") == _COMPACT_PROFILE_V2 else {}))
+                    **({"wire_profile": options["network_wire_profile"]}
+                       if options.get("network_wire_profile") in _COMPACT_ADVANCE_PROFILES else {}))
             cleanup.enter_context(patch.object(lan_runtime.LanContinuousRuntime, "close", close))
             if history is not None:
                 cleanup.enter_context(patch.object(lan_runtime._MaterialWorkerPool, "__init__", initialized))
@@ -3355,7 +3357,7 @@ def run_network_observation(*, configs, steps, wire_profile=None, candidate_mani
     from secure_control.execution.localhost_codec import _COMPACT_PROFILES
 
     if (wire_profile not in (None, *_COMPACT_PROFILES)
-            or wire_profile != _COMPACT_PROFILE_V2 and candidate_manifest is not None
+            or wire_profile not in _COMPACT_ADVANCE_PROFILES and candidate_manifest is not None
             or type(configs) is not tuple or len(configs) != 3 or type(steps) is not int or steps not in (1000, 10000)
             or tuple(getattr(c, "role", None) for c in configs) != ("Client", "P1", "P2")
             or not all(isinstance(c, LanConfig) and c.transport == "mutual_tls" for c in configs)
@@ -3367,9 +3369,9 @@ def run_network_observation(*, configs, steps, wire_profile=None, candidate_mani
             or not gc.isenabled() or gc.get_threshold() != (700, 10, 10)
             or gc.get_freeze_count() or gc.get_debug() or gc.callbacks):
         raise ValueError("网络实验只允许原配置、正常GC、三角色TLS及固定1000/10000。")
-    if wire_profile == _COMPACT_PROFILE_V2:
-        from .network_benchmark import require_v2_candidate
-        require_v2_candidate(candidate_manifest, configs)
+    if wire_profile in _COMPACT_ADVANCE_PROFILES:
+        from .network_benchmark import require_network_candidate
+        require_network_candidate(candidate_manifest, wire_profile, configs)
         if steps != candidate_manifest["maximum_attempts"]:
             raise ValueError("实际步数必须等于本次已占许可。")
     topology = configs[0].topology
@@ -3383,7 +3385,7 @@ def run_network_observation(*, configs, steps, wire_profile=None, candidate_mani
         "material_slots": 16, "role_config": None, "preload_steps": 0, "preload_execution": "fused", "diagnostic": False,
         "recording_mode": "light", "tcp_nodelay": None, "commit_policy": "default", "timeout_trace": False,
         "network_configs": configs, **({"network_wire_profile": wire_profile} if wire_profile is not None else {}),
-        **({"network_candidate_manifest": candidate_manifest} if wire_profile == _COMPACT_PROFILE_V2 else {})},
+        **({"network_candidate_manifest": candidate_manifest} if wire_profile in _COMPACT_ADVANCE_PROFILES else {})},
         "worker", target_steps=steps)
 
 
@@ -3414,8 +3416,8 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
             or network_configs is None or material_candidate != "worker" or not optimized
             or preload_steps or material_slots != 16 or recording_mode != "light"):
         raise ValueError("紧凑动态 profile 只允许显式原网络工人实验入口")
-    if network_wire_profile == _COMPACT_PROFILE_V2:
-        from .network_benchmark import require_v2_candidate
+    if network_wire_profile in _COMPACT_ADVANCE_PROFILES:
+        from .network_benchmark import require_network_candidate
         if (type(steps) is not int or steps not in (1000, 10000) or delay_ms != 0 or segment_steps != 400 or role_config is not None
                 or tcp_nodelay is not None or commit_policy != "default" or _gc_trial is not None
                 or any((diagnostic, timeout_trace, worker_timeout_diagnostic, worker_wait_diagnostic,
@@ -3425,7 +3427,7 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
                 or not gc.isenabled() or gc.get_threshold() != (700, 10, 10)
                 or gc.get_freeze_count() or gc.get_debug()):
             raise ValueError("v2仅允许已批准1000或10000、段400和正常GC的原网络入口")
-        require_v2_candidate(network_candidate_manifest, network_configs)
+        require_network_candidate(network_candidate_manifest, network_wire_profile, network_configs)
         if steps != network_candidate_manifest["maximum_attempts"]:
             raise ValueError("实际步数必须等于本次已占许可。")
     elif network_candidate_manifest is not None:

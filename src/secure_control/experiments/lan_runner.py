@@ -36,7 +36,12 @@ from secure_control.execution.lan_transport import (
     LanIdentityError,
     LanTimeoutError,
 )
-from secure_control.execution.localhost_codec import _COMPACT_PROFILE_V2, LocalhostCodecError
+from secure_control.execution.localhost_codec import (
+    _COMPACT_ADVANCE_PROFILES,
+    _COMPACT_PROFILE_V2,
+    _COMPACT_PROFILE_V3,
+    LocalhostCodecError,
+)
 from secure_control.execution.localhost_transport import (
     LocalhostTransportDisconnected,
     LocalhostTransportTimeout,
@@ -395,7 +400,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                 last_cycle["cycle_completed_ns"] = None
                 raise CycleDeadlineExceeded("CYCLE_OBSERVATION")
     except Exception as error:  # noqa: BLE001 - 生命周期出口不披露协议秘密或异常载荷
-        if (runtime is not None and _wire_profile == _COMPACT_PROFILE_V2
+        if (runtime is not None and _wire_profile in _COMPACT_ADVANCE_PROFILES
                 and runtime.last_maintenance_operation == "advance"
                 and (runtime.phase == "CONNECTING_NEXT" or attempt is not None
                      and "maintenance_advance" in attempt["durations"]
@@ -440,7 +445,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
             **({"last_sealed_segment": asdict(runtime.last_sealed_record)
                 if runtime.last_sealed_record is not None else None,
                 "known_segment_receipts": [asdict(r) for r in runtime.last_segment_receipts]}
-               if runtime is not None and _wire_profile == _COMPACT_PROFILE_V2 else {}),
+               if runtime is not None and _wire_profile in _COMPACT_ADVANCE_PROFILES else {}),
             "recording_error": getattr(error, "_public_recording_error", None),
         }
     finally:
@@ -637,7 +642,7 @@ def _run() -> int:
     benchmark.add_argument("--network-ledger", type=Path)
     benchmark.add_argument("--network-approval", type=Path)
     benchmark.add_argument("--network-repair-note")
-    benchmark.add_argument("--network-wire-profile", choices=("control-dynamic-compact-v1", _COMPACT_PROFILE_V2))
+    benchmark.add_argument("--network-wire-profile", choices=("control-dynamic-compact-v1", _COMPACT_PROFILE_V2, _COMPACT_PROFILE_V3))
     benchmark.add_argument("--network-authorization", help="当前 Issue 的直接用户批准登记评论 URL")
     benchmark.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
@@ -659,10 +664,14 @@ def _run() -> int:
                 return _failure("Client", 5, "network_benchmark", error)
             print(json.dumps({"status": report["status"], "profile": args.network_profile, "phase": args.network_phase,
                 "network_sample_pass": report["network_sample_pass"],
+                **({"network_progress_goal_pass": report.get("network_progress_goal_pass")}
+                   if (report.get("network_manifest") or {}).get("comparison_stage") else {}),
                 "network_dynamic_qualification_pass": report["network_dynamic_qualification_pass"],
                 "attempts": len(report.get("cycles", [])), "history_export_ns": report["network_export_ns"],
                 "report": str(args.output)}, ensure_ascii=False, sort_keys=True))
-            return 0 if report["network_sample_pass"] else 5
+            comparison = (report.get("network_manifest") or {}).get("comparison_stage")
+            return 0 if (report["network_sample_pass"] and (comparison not in ("T2", "T3", "U2", "V1", "W1", "W2")
+                           or report.get("network_progress_goal_pass") is True)) else 5
         if args.steps is None:
             parser.error("benchmark requires --steps outside the fixed network profiles")
         if args.segment_steps is None:

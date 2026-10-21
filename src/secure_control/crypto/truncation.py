@@ -21,12 +21,24 @@ class _MaskLifecycle:
 
     # 只减少实例字典，不复用随机量或状态，也不改变 GC 跟踪及弱引用能力。
     __slots__ = (
-        "__weakref__", "consumed", "finished_parties", "masked_parties",
-        "owner", "p1_reconstructed", "p2_sent",
+        "__weakref__",
+        "client_attested_parties",
+        "consumed",
+        "finished_parties",
+        "masked_parties",
+        "observation_party",
+        "owner",
+        "p1_reconstructed",
+        "p2_sent",
     )
 
-    def __init__(self, owner: object) -> None:
+    def __init__(self, owner: object, *, observation_party: int | None = None) -> None:
+        if observation_party is not None and (
+                type(observation_party) is not int or observation_party not in (0, 1)):
+            raise ValueError("截断单方观察范围必须是 P1/P2。")
         self.owner = owner
+        self.observation_party = observation_party
+        self.client_attested_parties: set[int] = set()
         self.masked_parties: set[int] = set()
         self.p2_sent = False
         self.p1_reconstructed = False
@@ -35,13 +47,22 @@ class _MaskLifecycle:
 
     def claim_mask(self, party: int) -> None:
         """记录一方使用辅助随机量生成一次遮蔽份额。"""
-        if self.consumed or party in self.masked_parties:
+        if (self.consumed or party in self.masked_parties
+                or self.observation_party is not None and party != self.observation_party):
             raise ValueError("截断随机量已经用于遮蔽，不能复用。")
         self.masked_parties.add(party)
 
+    def observe_as(self, party: int) -> None:
+        """协议 owner 在首次领取前限定本地观察范围；不能改变已用材料的语义。"""
+        if (type(party) is not int or party not in (0, 1) or self.masked_parties
+                or self.p2_sent or self.consumed or self.observation_party is not None):
+            raise ValueError("截断观察范围只能在未使用时设置一次。")
+        self.observation_party = party
+
     def claim_p2_send(self) -> None:
-        """仅允许 P2 在两方均完成遮蔽后发送一次本地份额。"""
-        if self.consumed or self.p2_sent or self.masked_parties != {0, 1}:
+        """共享模式要求两方遮蔽；P2 单方观察只依据本方遮蔽发送一次。"""
+        expected = {1} if self.observation_party == 1 else {0, 1}
+        if self.consumed or self.p2_sent or self.masked_parties != expected:
             raise ValueError("P2 必须在两方各遮蔽一次后才能发送一次消息。")
         self.p2_sent = True
 
@@ -53,13 +74,31 @@ class _MaskLifecycle:
 
     def claim_finish(self, party: int) -> bool:
         """两方各完成一次输出后，将该随机量标记为已消费。"""
-        if self.consumed or not self.p1_reconstructed or party in self.finished_parties:
+        ready = (self.p2_sent if self.observation_party == 1 and party == 1
+                 else self.p1_reconstructed)
+        if (self.consumed or not ready or party in self.finished_parties
+                or self.observation_party is not None and party != self.observation_party):
             raise ValueError("截断随机量已经完成或不处于可完成状态。")
         self.finished_parties.add(party)
         if self.finished_parties == {0, 1}:
             self.consumed = True
             return True
         return False
+
+    def receive_p2_message(self) -> None:
+        """P1 实际收到合法 P2 payload 后记录发送事实；不声称 P2 完成。"""
+        if (self.observation_party != 0 or self.consumed or self.p2_sent
+                or self.masked_parties != {0}):
+            raise ValueError("P1 不处于可接收 P2 截断消息的状态。")
+        self.p2_sent = True
+
+    def attest_peer_finish(self, party: int) -> None:
+        """记录 Client 的双方完成确认，远端重构和完成观察字段保持原义。"""
+        if (self.observation_party != party or self.consumed
+                or self.finished_parties != {party}):
+            raise ValueError("截断本方尚未完成或已确认。")
+        self.client_attested_parties.add(1 - party)
+        self.consumed = True
 
 
 @dataclass(frozen=True)

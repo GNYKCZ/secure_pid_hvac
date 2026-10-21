@@ -428,6 +428,23 @@ _PUBLIC_PLAN_JSON_FIELDS = {kind: tuple(item.name for item in fields(kind))
                             for kind in (StepResourcePlan, ResourceMetadata, ControllerScaleLedger)}
 
 
+def _deeply_immutable_public_plan(plan: StepResourcePlan) -> bool:
+    """只证明确切 canonical 类型图的不可变性；兼容可变输入仍走原即时摘要。"""
+    def immutable(value):
+        kind = type(value)
+        if kind in (str, int, type(None)):
+            return True
+        if kind is tuple:
+            return all(immutable(item) for item in value)
+        names = _PUBLIC_PLAN_JSON_FIELDS.get(kind)
+        return names is not None and all(immutable(getattr(value, name)) for name in names)
+    try:
+        return type(plan) is StepResourcePlan and immutable(plan)
+    except RecursionError:
+        # 不缓存非法循环；由未修改的 canonical 函数保持原失败类别。
+        return False
+
+
 def _public_plan_json_fields(value):
     """按标准JSON需求逐个投影公开记录，不预先复制整棵计划；只缓存有限类型的字段名。"""
     names = _PUBLIC_PLAN_JSON_FIELDS.get(type(value))
@@ -500,11 +517,12 @@ class _ResourceLifecycle:
     """绑定同一逻辑资源的两份局部材料，阻止跨会话、跨轮次或失败后的重放。"""
 
     # 每个逻辑资源仍拥有独立状态；固定字段只省实例字典，保留弱引用。
-    __slots__ = ("__weakref__", "claimed_by", "status")
+    __slots__ = ("__weakref__", "claimed_by", "client_attested", "status")
 
     def __init__(self) -> None:
         self.claimed_by: set[int] = set()
         self.status = "prepared"
+        self.client_attested = False
 
     def claim(self, party: PartyIndex) -> None:
         """登记某一角色开始使用资源；每轮仅允许 P1/P2 各一次。"""
@@ -522,6 +540,13 @@ class _ResourceLifecycle:
         """废弃未完成资源，使失败 round 无法拼接或重试。"""
         if self.status == "prepared":
             self.status = "aborted"
+
+    def attest_completion(self, party: PartyIndex) -> None:
+        """可信 Client 确认双方暂存；保留本地实际领取集合，不伪造对端观察。"""
+        if self.status != "prepared" or self.claimed_by != {party}:
+            raise ValueError("仅单方已领取且未废弃的资源可以接受 Client 确认。")
+        self.client_attested = True
+        self.status = "consumed"
 
     def export(self) -> None:
         """移交到单方预送缓存；已导出并不代表实际计算已消费。"""
@@ -881,6 +906,54 @@ class Protocol3StageReceipt:
     truncations: int
 
 
+def _validate_stage_counts(plan_sha256: str, products: int, truncations: int) -> None:
+    if (not isinstance(plan_sha256, str) or len(plan_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in plan_sha256)):
+        raise ValueError("暂存计划摘要必须是 canonical SHA256。")
+    if any(type(value) is not int or value < 0 for value in (products, truncations)):
+        raise ValueError("暂存资源计数必须为严格非负整数。")
+
+
+@dataclass(frozen=True, slots=True)
+class Protocol3LocalStageReceipt:
+    """仅证明本方算术与暂存完成；不声称对端完成或 state 已提交。"""
+
+    party: PartyIndex
+    session_id: str
+    round_id: str
+    step: int
+    products: int
+    truncations: int
+    plan_sha256: str
+    scope: Literal["local_staged"] = "local_staged"
+
+    def __post_init__(self) -> None:
+        if type(self.party) is not int or self.party not in (0, 1):
+            raise ValueError("局部暂存角色必须是严格 int 0/1。")
+        if any(not isinstance(value, str) or not value for value in (
+                self.session_id, self.round_id)):
+            raise ValueError("局部暂存身份不能为空。")
+        if type(self.step) is not int or self.step < 0 or self.scope != "local_staged":
+            raise ValueError("局部暂存 step 或 scope 不合法。")
+        _validate_stage_counts(self.plan_sha256, self.products, self.truncations)
+
+
+@dataclass(frozen=True, slots=True)
+class Protocol3CommitAuthorization:
+    """Client 验证两份局部回执及输出后签发的本轮提交授权。"""
+
+    plan_sha256: str
+    prepared_parties: tuple[PartyIndex, PartyIndex]
+    products: int
+    truncations: int
+
+    def __post_init__(self) -> None:
+        _validate_stage_counts(self.plan_sha256, self.products, self.truncations)
+        if (type(self.prepared_parties) is not tuple or self.prepared_parties != (0, 1)
+                or any(type(value) is not int for value in self.prepared_parties)):
+            raise ValueError("提交授权必须确认严格的 P1/P2 两方。")
+
+
 Protocol3Operation = Literal[
     "stage_batch",
     "mask_product",
@@ -895,6 +968,7 @@ Protocol3Operation = Literal[
     "complete_truncation",
     "stage_output",
     "commit",
+    "commit_staged",
 ]
 
 
@@ -907,6 +981,7 @@ class Protocol3EndpointCommand:
     product_mask: ProductMaskPayload | None = None
     truncation_mask: TruncationMaskPayload | None = None
     p2_truncation: P2TruncationPayload | None = None
+    authorization: Protocol3CommitAuthorization | None = None
 
 
 @dataclass(frozen=True, slots=True)

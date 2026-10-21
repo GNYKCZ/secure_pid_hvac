@@ -3,15 +3,52 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import selectors
 import sys
+import threading
 import time
+from array import array
 from ctypes import wintypes as w
 from dataclasses import dataclass
 
 STRATEGY = "win32-event-wait-v1"
 FD_READ, FD_WRITE, FD_ACCEPT, FD_CONNECT, FD_CLOSE = 1, 2, 8, 16, 32
 MAX_HANDLES = 16
+
+
+class WaitEvidence:
+    """仅W1显式启用的8次等待整数环；时点是Python可观察FFI边界而非内核signal。"""
+
+    FIELDS = ("wait_id", "pid", "native_tid", "wait_started_ns", "target_ns", "calc_ns", "relative_100ns",
+              "set_enter_ns", "set_leave_ns", "handles_ready_ns", "wait_enter_ns", "wait_leave_ns",
+              "collect_end_ns", "relay_return_ns", "return_kind", "completed")
+    CAPACITY = 8
+
+    def __init__(self):
+        self.rows = array("q", [-1]) * (self.CAPACITY*len(self.FIELDS))
+        self.current = array("q", [-1]) * len(self.FIELDS)
+        self.count = 0
+
+    def begin(self):
+        self.count += 1
+        for i in range(len(self.current)):
+            self.current[i] = -1
+        self.current[0], self.current[1], self.current[2] = self.count, os.getpid(), threading.get_native_id()
+
+    def finish(self):
+        start = (self.count-1) % self.CAPACITY * len(self.FIELDS)
+        for i, value in enumerate(self.current):
+            self.rows[start+i] = value
+
+    def report(self):
+        """退出后才构建列表；-1明确表示没有执行/没有返回。"""
+        width = len(self.FIELDS)
+        return {"version": 1, "clock": "perf_counter_ns/QPC", "fields": self.FIELDS,
+                "capacity": self.CAPACITY, "waits_seen": self.count,
+                "scope": "Python-visible FFI boundaries; no kernel timer signal timestamp",
+                "rows": [list(self.rows[(i % self.CAPACITY)*width:(i % self.CAPACITY+1)*width])
+                         for i in range(max(0, self.count-self.CAPACITY), self.count)]}
 
 
 class _Events(ctypes.Structure):
@@ -33,6 +70,8 @@ class _API:
             (kernel, "CancelWaitableTimer", [w.HANDLE], w.BOOL),
             (kernel, "WaitForMultipleObjects", [w.DWORD, ctypes.POINTER(w.HANDLE), w.BOOL, w.DWORD], w.DWORD),
             (kernel, "CloseHandle", [w.HANDLE], w.BOOL),
+            (kernel, "QueryPerformanceCounter", [ctypes.POINTER(ctypes.c_longlong)], w.BOOL),
+            (kernel, "QueryPerformanceFrequency", [ctypes.POINTER(ctypes.c_longlong)], w.BOOL),
             (winsock, "WSACreateEvent", [], w.HANDLE),
             (winsock, "WSACloseEvent", [w.HANDLE], w.BOOL),
             (winsock, "WSAEventSelect", [ctypes.c_size_t, w.HANDLE, ctypes.c_long], ctypes.c_int),
@@ -64,8 +103,22 @@ class _SocketEvent:
 class NativeWait:
     """单relay持有≤16句柄；缓存FD_WRITE边沿的状态，不伪造新可写通知。"""
 
-    def __init__(self, *, _api=None):
+    def __init__(self, *, _api=None, observe_wait=False):
+        if type(observe_wait) is not bool:
+            raise ValueError("等待观察开关必须是bool。")
+        self.evidence = WaitEvidence() if observe_wait else None
         self.api = _API() if _api is None else _api
+        self.clock_mapping = None
+        if observe_wait and _api is None:
+            raw, frequency = ctypes.c_longlong(), ctypes.c_longlong()
+            before = time.perf_counter_ns()
+            if not self.api.QueryPerformanceCounter(ctypes.byref(raw)):
+                raise self.api.error()
+            after = time.perf_counter_ns()
+            if not self.api.QueryPerformanceFrequency(ctypes.byref(frequency)):
+                raise self.api.error()
+            self.clock_mapping = {"qpc_raw":raw.value,"frequency_hz":frequency.value,
+                                  "perf_before_ns":before,"perf_after_ns":after}
         self.entries = {}
         self.closed = False
         self.cleanup_uncertain = False
@@ -230,10 +283,25 @@ class NativeWait:
         return ready
 
     def wait_until(self, wake_at_ns):
+        """保持原等待算法，只在显式W1模式记录有界时间事实。"""
+        evidence = self.evidence
+        if evidence is None:
+            return self._wait_until(wake_at_ns)
+        evidence.begin()
+        try:
+            result = self._wait_until(wake_at_ns)
+            evidence.current[14], evidence.current[15] = result[2], 1
+            return result
+        finally:
+            evidence.finish()
+
+    def _wait_until(self, wake_at_ns):
         """一次有界收集＋一次原生等待；QPC绝对期限转负相对100ns，绝不主动轮询。"""
         if self.closed or type(wake_at_ns) is not int or not 0 <= wake_at_ns < 2**63:
             raise ValueError("原生等待需要有效QPC整数期限。")
         start = self._now()
+        if self.evidence is not None:
+            self.evidence.current[3], self.evidence.current[4] = start, wake_at_ns
         # 新调用在真正返回前没有返回事实；异常不得拼接前次 last_end。
         self.last_start, self.last_target, self.last_end = start, wake_at_ns, None
         if wake_at_ns <= start:
@@ -243,27 +311,45 @@ class NativeWait:
             self._collect(entry, start)
         ready = self._ready()
         if ready:
+            if self.evidence is not None:
+                self.evidence.current[12] = self._now()
             self.last_end = self._now()
             return ready, self.last_end, 5
         now = self._now()
         remaining = wake_at_ns-now
+        if self.evidence is not None:
+            self.evidence.current[5] = now
         if remaining <= 0:
             self.last_end = now
             return [], now, 6
         # 相对计时向上取整，timer唤醒后仍由外层QPC判due，绝不提前发送。
         due = ctypes.c_longlong(-((remaining+99)//100))
-        if not self.api.SetWaitableTimerEx(self.timer, ctypes.byref(due), 0, None, None, None, 0):
-            raise self.api.error()
+        if self.evidence is not None:
+            self.evidence.current[6], self.evidence.current[7] = due.value, self._now()
+        timer_set = self.api.SetWaitableTimerEx(self.timer, ctypes.byref(due), 0, None, None, None, 0)
+        timer_error = self.api.error() if not timer_set else None
+        if self.evidence is not None:
+            self.evidence.current[8] = self._now()
+        if not timer_set:
+            raise timer_error
         handles = (w.HANDLE * (len(self.entries)+1))(self.timer, *(e.handle for e in self.entries.values()))
+        if self.evidence is not None:
+            self.evidence.current[9] = self._now()
         self.waits += 1
+        if self.evidence is not None:
+            self.evidence.current[10] = self._now()
         result = self.api.WaitForMultipleObjects(len(handles), handles, False, 0xFFFFFFFF)
         returned = self._now()
+        if self.evidence is not None:
+            self.evidence.current[11] = returned
         self.last_end = returned
         if not 0 <= result < len(handles):
             raise self.api.error() if result == 0xFFFFFFFF else OSError("原生等待返回异常状态。")
         # 枚举全部socket通知，避免最小句柄索引偏置；timer永远不合成FD_WRITE。
         for entry in self.entries.values():
             self._collect(entry, returned)
+        if self.evidence is not None:
+            self.evidence.current[12] = self._now()
         return self._ready(), returned, 6 if result == 0 else 5
 
     def report(self):

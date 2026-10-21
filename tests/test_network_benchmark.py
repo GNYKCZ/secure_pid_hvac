@@ -1023,6 +1023,175 @@ def test_relay_cpu_failure_exports_full_bounded_ring_and_preserves_first_error(m
     assert len(json.dumps(report, separators=(",", ":")).encode()) <= 64*1024
 
 
+@pytest.mark.parametrize("mode", ["timer", "ready", "expired", "timer_error", "wait_error", "enum_error"])
+def test_wait_diagnostic_boundaries_missing_values_and_fixed_ring(monkeypatch, mode):
+    """FFI前后为本地Python时点；异常/ready路径不继承上一次timer事实。"""
+    from secure_control.experiments import _network_wait_win32 as native
+    clock, api = [1000], _WaitAPI()
+    monkeypatch.setattr(native.time,"perf_counter_ns",lambda:clock[0])
+    original_set, original_wait = api.SetWaitableTimerEx, api.WaitForMultipleObjects
+    def set_timer(*args):
+        clock[0] += 50000
+        return original_set(*args)
+    def kernel_wait(*args):
+        clock[0] += 2000000
+        return original_wait(*args)
+    api.SetWaitableTimerEx,api.WaitForMultipleObjects = set_timer,kernel_wait
+    with native.NativeWait(_api=api,observe_wait=True) as wait:
+        sock=SimpleNamespace(fileno=lambda:101)
+        wait.register(sock,1,("stream",None,None))
+        for _ in range(10):
+            wait.wait_until(clock[0]+1001)
+        assert len(wait.evidence.report()["rows"])==8
+        before=clock[0]
+        if mode=="ready": api.events[101]=(native.FD_READ,{})
+        elif mode.endswith("error"): api.fail=mode.split('_')[0].replace('enum','enum')
+        if mode.endswith("error"):
+            with pytest.raises(OSError): wait.wait_until(clock[0]+1001)
+        else: wait.wait_until(clock[0] if mode=="expired" else clock[0]+1001)
+        row=dict(zip(native.WaitEvidence.FIELDS,wait.evidence.report()["rows"][-1]))
+        assert row["wait_id"]==11 and row["pid"]==os.getpid() and row["native_tid"]>0
+        if mode in ("ready","expired","enum_error"):
+            assert all(row[k]==-1 for k in ("relative_100ns","set_enter_ns","wait_enter_ns","wait_leave_ns"))
+        elif mode=="timer_error":
+            assert row["set_leave_ns"]-row["set_enter_ns"]==50000 and row["wait_enter_ns"]==-1
+        else:
+            assert row["relative_100ns"]==-11
+            assert row["set_leave_ns"]-row["set_enter_ns"]==50000
+            assert row["wait_leave_ns"]-row["wait_enter_ns"]==2000000
+        assert row["completed"]==(-1 if mode.endswith("error") else 1)
+        assert row["wait_started_ns"]==before
+        api.fail=None
+    assert not api.open
+    with native.NativeWait(_api=api) as default:
+        assert default.evidence is None
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_model_first_stop_preserves_send_and_first_snapshot(monkeypatch, blocked):
+    from secure_control.experiments import _network_wait_win32 as native
+    clock=[2000001]
+    monkeypatch.setattr(emulator.time,"perf_counter_ns",lambda:clock[0])
+    evidence=native.WaitEvidence();evidence.begin()
+    evidence.current[4]=0;evidence.current[11]=evidence.current[13]=2000000
+    evidence.current[14:16]=native.array('q',[6,1]);evidence.finish()
+    owner=SimpleNamespace(evidence=evidence,writable_return=lambda *_:None,
+                          write_progressed=lambda *_:None,write_blocked=lambda *_:None)
+    def send(data):
+        if blocked: raise BlockingIOError()
+        return len(data)
+    d=emulator.Direction(None,SimpleNamespace(send=send),"Client->P1",None)
+    d.queue.append(emulator.Block(b'ab',0,0,0,0,0));d.queued=2
+    ring=emulator.PublicRing(fail_first=True,native=owner)
+    with pytest.raises(emulator.RelayModelError):emulator._dispatch(d,clock[0],None,ring,owner)
+    assert ring.first_anomaly is not None and ring.wait_report()["associated_wait_id"]==1
+    assert d.stats['sent_bytes']==(0 if blocked else 2) and d.queued==(2 if blocked else 0)
+    assert d.stats['unexplained_over_tolerance']==1
+    evidence.current[4]=3;evidence.finish()
+    assert ring.wait_report()['rows'][-1][4]==0  # 首异常快照不被后续覆盖。
+
+
+def test_wpr_fixed_profile_owner_no_takeover_and_stop_failure(tmp_path,monkeypatch):
+    monkeypatch.setattr(network,'ROOT',tmp_path);(tmp_path/'.tmp').mkdir()
+    keywords=''.join(f'<Keyword Value="{k}"/>' for k in sorted(network.W_TRACE_KEYWORDS))
+    path=tmp_path/'.tmp/issue120-w1.wprp'
+    path.write_text(f'<WindowsPerformanceRecorder><Profiles><SystemCollector><BufferSize Value="256"/>'
+        f'<Buffers Value="128"/></SystemCollector><SystemProvider><Keywords>{keywords}</Keywords></SystemProvider>'
+        '<Profile Name="Issue120W1" LoggingMode="Memory"/></Profiles></WindowsPerformanceRecorder>')
+    m={'trace_profile_sha256':network.hashlib.sha256(path.read_bytes()).hexdigest(),
+       'trace_instance':network.W_TRACE_INSTANCE,'trace_max_seconds':90}
+    commands=[];active=[False];stop_fail=[False]
+    def run(args,**kwargs):
+        commands.append(args)
+        assert kwargs['timeout']<=20
+        if '-status' in args:return SimpleNamespace(returncode=0,stdout='busy' if active[0] else 'WPR is not recording')
+        if '-stop' in args:
+            if stop_fail[0]:return SimpleNamespace(returncode=1,stdout='failure')
+            (tmp_path/'.tmp/issue120-w1.etl').write_bytes(b'local system metadata')
+        assert args[-2:]==['-instancename',network.W_TRACE_INSTANCE]
+        return SimpleNamespace(returncode=0,stdout='')
+    monkeypatch.setattr(network.subprocess,'run',run)
+    active[0]=True
+    with pytest.raises(RuntimeError),network._WaitTrace(m):pass
+    assert len(commands)==1
+    active[0]=False;stop_fail[0]=True
+    trace=network._WaitTrace(m)
+    with pytest.raises(RuntimeError),trace:pass
+    assert trace.report['started'] and not trace.report['saved'] and trace.report['stop_error_type']=='RuntimeError'
+    assert not trace.owned and sum('-start' in c for c in commands)==1
+
+
+@pytest.mark.parametrize('failure',['stop_error','stop_timeout','start_timeout','save_error_after_stop'])
+def test_rv009_trace_failure_confirms_owned_session_stopped(tmp_path,monkeypatch,failure):
+    """有状态WPR假实现：错误可能发生在会话仍活动、或已停但未保存之后。"""
+    monkeypatch.setattr(network,'ROOT',tmp_path);(tmp_path/'.tmp').mkdir()
+    monkeypatch.setattr(network._WaitTrace,'validate_profile',staticmethod(lambda _:tmp_path/'profile.wprp'))
+    active=[False];commands=[];foreign=[True]
+    def run(args,**kwargs):
+        commands.append(args)
+        if '-status' in args:
+            if '-instancename' not in args:return SimpleNamespace(returncode=0,stdout='WPR is not recording')
+            return SimpleNamespace(returncode=0,stdout='Issue120W1 active' if active[0] else 'WPR is not recording')
+        assert args[-2:]==['-instancename',network.W_TRACE_INSTANCE]
+        if '-start' in args:
+            active[0]=True
+            if failure=='start_timeout':raise subprocess.TimeoutExpired(args,kwargs['timeout'])
+        elif '-stop' in args:
+            if failure=='save_error_after_stop':active[0]=False
+            if failure=='stop_timeout':raise subprocess.TimeoutExpired(args,kwargs['timeout'])
+            return SimpleNamespace(returncode=1,stdout='failed')
+        elif '-cancel' in args:active[0]=False
+        return SimpleNamespace(returncode=0,stdout='')
+    monkeypatch.setattr(network.subprocess,'run',run)
+    trace=network._WaitTrace({'head':'a'*40,'call':15,'trace_profile_sha256':'b'*64})
+    with pytest.raises((RuntimeError,subprocess.TimeoutExpired)),trace:pass
+    assert not active[0] and not trace.owned and trace.report['stopped_confirmed'] is True
+    assert not trace.report['saved'] and foreign[0] and sum('-start' in a for a in commands)==1
+    assert sum('-cancel' in a for a in commands)==(0 if failure=='save_error_after_stop' else 1)
+
+
+@pytest.mark.parametrize('cli_exit',[0,5,124])
+def test_rv009_native_finalizer_cleans_claim_on_every_exit(tmp_path,monkeypatch,cli_exit):
+    """外层正常失败5和超时同样收尾；无claim时绝不操作其他会话。"""
+    monkeypatch.setattr(network,'ROOT',tmp_path);(tmp_path/'.tmp').mkdir()
+    manifest={'head':'a'*40,'call':15,'trace_profile_sha256':'b'*64}
+    active=[True];commands=[]
+    def run(args,**_):
+        commands.append(args)
+        assert args[-2:]==['-instancename',network.W_TRACE_INSTANCE]
+        if '-cancel' in args:active[0]=False
+        return SimpleNamespace(returncode=0,stdout='active' if active[0] else 'WPR is not recording')
+    monkeypatch.setattr(network.subprocess,'run',run)
+    assert network._WaitTrace.recover_owned(manifest)['not_started'] and not commands
+    claim=manifest|{'instance':network.W_TRACE_INSTANCE,'owner_pid':123,'claim_qpc_ns':time.perf_counter_ns()}
+    (tmp_path/'.tmp/issue120-w1-trace-claim.json').write_text(json.dumps(claim))
+    result=network._WaitTrace.recover_owned(manifest)
+    assert cli_exit in (0,5,124) and result['stopped_confirmed'] and not active[0]
+    assert sum('-cancel' in a for a in commands)==1 and not any('-start' in a for a in commands)
+
+
+def test_rv009_unconfirmed_cleanup_retains_claim_and_foreign_is_not_touched(tmp_path,monkeypatch):
+    monkeypatch.setattr(network,'ROOT',tmp_path);(tmp_path/'.tmp').mkdir()
+    m={'head':'a'*40,'call':15,'trace_profile_sha256':'b'*64}
+    path=tmp_path/'.tmp/issue120-w1-trace-claim.json'
+    claim=m|{'instance':network.W_TRACE_INSTANCE,'owner_pid':123,'claim_qpc_ns':time.perf_counter_ns()}
+    path.write_text(json.dumps(claim))
+    commands=[]
+    def run(args,**kwargs):
+        commands.append(args)
+        assert kwargs['timeout']<=5 and args[-2:]==['-instancename',network.W_TRACE_INSTANCE]
+        return SimpleNamespace(returncode=1 if '-cancel' in args else 0,stdout='active')
+    monkeypatch.setattr(network.subprocess,'run',run)
+    result=network._WaitTrace.recover_owned(m)
+    assert result['stopped_confirmed'] is False and result['ownership_released'] is False
+    assert result['recovery_error_type']=='RuntimeError' and path.exists()
+    before=len(commands)
+    with pytest.raises(ValueError):network._WaitTrace.recover_owned(m|{'head':'c'*40})
+    assert len(commands)==before
+    path.unlink()
+    assert network._WaitTrace.recover_owned(m)['not_started'] and len(commands)==before
+
+
 def _entry(profile, *, passed=True, head="a", sources=None, phase="discovery"):
     return {"profile": profile, "phase": phase, "head": head, "source_sha256": sources or {"src": "a"},
             "maximum_attempts": 10000 if phase == "qualification" else 1000, "finished": True, "sample_pass": passed}
@@ -1066,6 +1235,561 @@ def v2_candidate_context(tmp_path, monkeypatch):
         "review_url": "https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-1",
         "budget_path": str(ledger.resolve())}
     return history, manifest, ledger, certs
+
+
+@pytest.fixture
+def staged_context(v2_candidate_context, monkeypatch):
+    """新批次独立的九项封闭夹具，绝不读取本机真实性能额度。"""
+    old, legacy, ledger, _ = v2_candidate_context
+    history = copy.deepcopy(old)
+    for call in range(6, 10):
+        history.append(dict(history[-1], call=call, public_certificate_sha256=legacy["public_certificate_sha256"]))
+    native = [{"completed": True, "native_exit": 5} for _ in history]
+    monkeypatch.setattr(network, "STAGED_HISTORY", network.digest(history))
+    monkeypatch.setattr(network, "STAGED_NATIVE_HISTORY", network.digest(native))
+    native_path = ledger.parent/"issue120-network-invocations.json"
+    manifest = legacy | {
+        "authorization_url": network.STAGED_AUTHORIZATION,
+        "comparison_design_url": network.STAGED_DESIGN,
+        "comparison_stage": "T1", "profile": "N0", "phase": "candidate", "call": 10,
+        "closed_history_sha256": network.STAGED_HISTORY,
+        "closed_native_history_sha256": network.STAGED_NATIVE_HISTORY,
+        "maximum_calls": 12, "maximum_attempts": 1000, "total_maximum_attempts": 12000,
+        "batch_maximum_calls": 3, "batch_maximum_attempts": 3000,
+        "wait_strategy": network.EVENT_STRATEGY, "software_pass": True, "readback_exact": True,
+        "native_ledger_path": str(native_path.resolve()),
+        "certificate_directory": str((ledger.parent/"issue120-stage-authorized-certs").resolve()),
+        "previous_public_certificate_sha256": legacy["public_certificate_sha256"],
+        "public_certificate_validity": {},
+    }
+    ledger.write_text(json.dumps({"schema": "network-call-budget-v1", "entries": history}), encoding="utf-8")
+    native_path.write_text(json.dumps({"entries": native+[manifest | {
+        "completed": False, "native_exit": None, "started_utc": "start"}]}), encoding="utf-8")
+    return history, manifest, ledger, native, native_path
+
+
+@pytest.fixture
+def local_context(staged_context, monkeypatch):
+    """封存旧T2退出5，新的U1/U2只追加，不重写失败。"""
+    history, old, ledger, native, native_path = staged_context
+    for i in range(2):
+        entry = old | {"comparison_stage": f"T{i+1}", "call": 10+i,
+                       "finished": True, "sample_pass": i == 0, "actual_attempts": 1000}
+        history.append(entry)
+        native.append(entry | {"completed": True, "native_exit": 0 if i == 0 else 5})
+    monkeypatch.setattr(network, "LOCAL_HISTORY", network.digest(history))
+    monkeypatch.setattr(network, "LOCAL_NATIVE_HISTORY", network.digest(native))
+    m = {k: v for k, v in old.items() if k not in network.V2_CERTIFICATE_FIELDS}
+    m.update(authorization_url=network.LOCAL_DESIGN, comparison_design_url=network.LOCAL_DESIGN,
+        comparison_stage="U1", closed_history_sha256=network.LOCAL_HISTORY,
+        closed_native_history_sha256=network.LOCAL_NATIVE_HISTORY, call=12, maximum_calls=13,
+        total_maximum_attempts=13000, batch_maximum_calls=2, batch_maximum_attempts=2000,
+        public_certificate_validity=old["public_certificate_validity"])
+    m.update(head="e"*40, source_sha256={"src": "f"*64})
+    monkeypatch.setattr(network, "source", lambda: (m["head"], m["source_sha256"]))
+    ledger.write_text(json.dumps({"schema": "network-call-budget-v1", "entries": history}), encoding="utf-8")
+    def start(current):
+        native_path.write_text(json.dumps({"entries": native+[current | {
+            "completed": False, "native_exit": None, "started_utc": "start"}]}), encoding="utf-8")
+    start(m)
+    return history, m, ledger, native, start
+
+
+@pytest.mark.parametrize("change", [{"call": 13}, {"comparison_stage": "T3"},
+    {"profile": "N2"}, {"maximum_calls": 14}, {"maximum_attempts": 10000}, {"maximum_attempts": True},
+    {"authorization_url": network.STAGED_AUTHORIZATION}, {"closed_history_sha256": "0"*64},
+    {"certificate_change_reason": "renew"}, {"phase": "qualification"}])
+def test_local_comparison_scope_and_old_batch_stay_closed(local_context, change):
+    history, m, _, _, _ = local_context
+    assert network._local_manifest_valid(m)
+    assert not network._staged_manifest_valid(m)
+    with pytest.raises(ValueError):
+        network._next_local_call(history, "N0", "candidate", m["head"], m["source_sha256"], m | change)
+    with pytest.raises(ValueError):
+        network._next_staged_call(history, "N0", "candidate", m["head"], m["source_sha256"], m)
+
+
+@pytest.mark.parametrize("failed_u1", [False, True])
+def test_local_comparison_appends_preserved_eleven_and_requires_real_u1(local_context, monkeypatch, failed_u1):
+    history, m, ledger, native, start = local_context
+    monkeypatch.setattr(network, "_require_local_certificates", lambda *_: None)
+    # 用真实旧门禁验证完整前件；不运行控制或忽略TLS/材料/端点检查。
+    result = _repair_software_result(m)
+    result.update(status="stopped", failure_category=None, failed_phase=None)
+    for i, row in enumerate(result["steps"]):
+        row["sent"] = {"Client": {"frames": 4}}
+        result["cycles"][i]["public_frame_counts"] = {"Client": 4+2*int(i in (399,799))}
+        for p, party in enumerate(result["party_outcomes"]):
+            party["steps"][i]["sent"] = {"Party": {"frames": 5+p+int(i in (400,800))}}
+    result = network.assemble(result, profile="N0", phase="candidate", manifest=m, relay=result["network_relay"])
+    assert result["network_sample_pass"]
+    if failed_u1:
+        result["cycles"][0]["cycle_completed_ns"] = None
+    raw = ledger.parent/"U1.json"
+    with network.RunBudget(ledger) as budget:
+        assert budget.reserve("N0", "candidate", m["head"], m["source_sha256"], raw,
+            conditions_sha256=m["conditions_sha256"], continuation=m) == 1000
+        network.require_network_candidate(m, m["wire_profile"])
+        raw.write_text(json.dumps(result), encoding="utf-8")
+        budget.finish(result, network.hashlib.sha256(raw.read_bytes()).hexdigest())
+        assert budget.entries[:11] == history
+        previous = copy.deepcopy(budget.entries[-1])
+    native.append(previous | {"completed": True, "native_exit": 0})
+    second = m | {"call": 13, "comparison_stage": "U2", "wire_profile": network._COMPACT_PROFILE_V3}
+    start(second)
+    entries = history+[previous]
+    if failed_u1:
+        with pytest.raises(ValueError):
+            network._next_local_call(entries, "N0", "candidate", second["head"], second["source_sha256"], second)
+    else:
+        assert network._next_local_call(entries, "N0", "candidate", second["head"], second["source_sha256"], second) == 1000
+        for changed in ({"head": "8"*40}, {"public_certificate_validity": {}}, {"conditions_sha256": "0"*64}):
+            if changed == {"public_certificate_validity": {}}:
+                changed = {"public_certificate_validity": {"changed": True}}
+            wrong = second | changed
+            with pytest.raises(ValueError):
+                network._next_local_call(entries, "N0", "candidate", wrong["head"], wrong["source_sha256"], wrong)
+        with network.RunBudget(ledger) as budget:
+            budget.reserve("N0", "candidate", second["head"], second["source_sha256"], ledger.parent/"U2.json",
+                conditions_sha256=second["conditions_sha256"], continuation=second)
+            network.require_local_candidate(second)
+            budget.finish({"cycles": [], "network_sample_pass": False}, "failed")
+            with pytest.raises(ValueError):
+                network._next_local_call(budget.entries, "N0", "candidate", second["head"], second["source_sha256"], second)
+
+
+def _comparison_software_result(m, duration=15000000):
+    """复用完整公开夹具，补实际帧口径；不启动控制或替换证据门禁。"""
+    r = _repair_software_result(m)
+    wire = m["wire_profile"]
+    r.update(status="stopped", failure_category=None, failed_phase=None, wire_profile=wire)
+    r["material_summary"]["encoding_profile"] = wire
+    r["material_summary"]["worker"]["encoding_profile"] = wire
+    for i, row in enumerate(r["steps"]):
+        row["sent"] = {"Client": {"frames": 4}}
+        r["cycles"][i].update(cycle_completed_ns=r["cycles"][i]["scheduled_start_ns"]+duration,
+                             public_frame_counts={"Client": 4+2*int(i in (399,799))})
+        for p, party in enumerate(r["party_outcomes"]):
+            party["wire_profile"] = wire
+            party["steps"][i]["sent"] = {"Party": {
+                "frames": (3 if wire == network._COMPACT_PROFILE_V3 else 5)+p+int(i in (400,800))}}
+    return r
+
+
+@pytest.fixture
+def v1_context(local_context, monkeypatch):
+    """两份真实门禁重算的软件前件和13项历史，绝不读取本机额度。"""
+    history, old, ledger, native, _ = local_context
+    old = old | {"source_sha256": old["source_sha256"] | {network.V1_SOURCE_FILES[0]: "a"*64}}
+    hashes = []
+    for i, wire in enumerate((network._COMPACT_PROFILE_V2, network._COMPACT_PROFILE_V3)):
+        m = old | {"comparison_stage": f"U{i+1}", "call": 12+i, "wire_profile": wire}
+        r = _comparison_software_result(m, 15000000 if i == 0 else 12000000)
+        r = network.assemble(r, profile="N0", phase="candidate", manifest=m, relay=r["network_relay"])
+        assert r["network_sample_pass"]
+        raw = ledger.parent/f"U{i+1}.json"
+        raw.write_text(json.dumps(r), encoding="utf8")
+        hashes.append(network.hashlib.sha256(raw.read_bytes()).hexdigest())
+        entry = m | {"output": str(raw), "raw_sha256": hashes[-1], "finished": True, "actual_attempts": 1000}
+        history.append(entry)
+        native.append(entry | {"completed": True, "native_exit": 0})
+    monkeypatch.setattr(network, "V1_HISTORY", network.digest(history))
+    monkeypatch.setattr(network, "V1_NATIVE_HISTORY", network.digest(native))
+    monkeypatch.setattr(network, "V1_CONTROL_HEAD", old["head"])
+    monkeypatch.setattr(network, "V1_RAW_SHA256", hashes)
+    m = old | {"authorization_url": network.V1_DESIGN, "comparison_design_url": network.V1_DESIGN,
+        "comparison_stage": "V1", "profile": "N2", "wire_profile": network._COMPACT_PROFILE_V3,
+        "call": 14, "maximum_calls": 14,
+        "total_maximum_attempts": 14000, "batch_maximum_calls": 1, "batch_maximum_attempts": 1000,
+        "closed_history_sha256": network.V1_HISTORY, "closed_native_history_sha256": network.V1_NATIVE_HISTORY,
+        "head": "9"*40, "source_sha256": old["source_sha256"] | {network.V1_SOURCE_FILES[0]: "b"*64},
+        "control_head": old["head"], "comparison_review_url": network.V1_REVIEW,
+        "comparison_raw_sha256": hashes,
+        "models": {k: network.asdict(v) for k, v in network.models("N2").items()},
+        "topology": network.asdict(network.role_configs(old["certificate_directory"], network.V2_PORTS, "N2")[0].topology)}
+    ledger.write_text(json.dumps({"schema": "network-call-budget-v1", "entries": history}), encoding="utf8")
+    npath = network.Path(m["native_ledger_path"])
+    def start(current=m):
+        npath.write_text(json.dumps({"entries": native+[current | {
+            "completed": False, "native_exit": None, "started_utc": "start"}]}), encoding="utf8")
+    start()
+    monkeypatch.setattr(network, "source", lambda: (m["head"], m["source_sha256"]))
+    return history, m, ledger, native, start
+
+
+@pytest.mark.parametrize("change", [
+    {"call": 15}, {"maximum_attempts": True}, {"maximum_calls": 15}, {"batch_maximum_calls": 2},
+    {"total_maximum_attempts": 15000}, {"batch_maximum_attempts": 2000}, {"maximum_attempts": 10000},
+    {"comparison_stage": "T3"}, {"comparison_stage": "U2"}, {"profile": "N0"}, {"profile": "N3"},
+    {"phase": "qualification"}, {"wire_profile": network._COMPACT_PROFILE_V2},
+    {"authorization_url": network.LOCAL_DESIGN}, {"comparison_review_url": network.LOCAL_DESIGN},
+    {"comparison_raw_sha256": []}, {"control_head": "0"*40}, {"models": {}}, {"topology": {}},
+    {"seed": True}, {"qualification_allowed": True}, {"certificate_change_reason": "renew"},
+])
+def test_v1_exact_permission_and_model_binding(v1_context, change):
+    history, m, _, _, _ = v1_context
+    assert network._v1_manifest_valid(m)
+    assert network._next_v1_call(history, "N2", "candidate", m["head"], m["source_sha256"], m) == 1000
+    with pytest.raises(ValueError):
+        wrong = m | change
+        network._next_compact_call(history, wrong["profile"], wrong["phase"], wrong["head"], wrong["source_sha256"], wrong)
+
+
+@pytest.mark.parametrize("fault", ["history", "missing_start", "wrong_start", "missing_native", "unfinished",
+    "control_source", "raw", "endpoint", "unreserved", "wrong_pid", "n0_configs"])
+def test_v1_predecessor_history_source_start_and_lock_fail_closed(v1_context, monkeypatch, fault):
+    history, m, ledger, native, start = v1_context
+    certificate_check = network._require_v1_certificates
+    monkeypatch.setattr(network, "_require_v1_certificates", lambda *_: None)
+    npath = network.Path(m["native_ledger_path"])
+    if fault == "history": history[0]["call"] = 99
+    elif fault == "unfinished": history[-1]["finished"] = False
+    elif fault == "missing_start": npath.write_text(json.dumps({"entries": native}), encoding="utf8")
+    elif fault == "missing_native": npath.write_text(json.dumps({"entries": native[:-1]}), encoding="utf8")
+    elif fault == "wrong_start": start(m | {"wire_profile": network._COMPACT_PROFILE_V2})
+    elif fault == "control_source": m["source_sha256"]["src"] = "0"*64; start()
+    elif fault in ("raw", "endpoint"):
+        path = network.Path(history[-1]["output"])
+        r = json.loads(path.read_text())
+        if fault == "endpoint": r["cycles"][0]["cycle_completed_ns"] = None
+        path.write_text(json.dumps(r)+" ", encoding="utf8")
+        if fault == "endpoint":
+            # 即使重新填写摘要，固定前件及原门禁也不能被假true绕过。
+            history[-1]["raw_sha256"] = network.hashlib.sha256(path.read_bytes()).hexdigest()
+    if fault in ("unreserved", "wrong_pid", "n0_configs"):
+        if fault == "unreserved":
+            with pytest.raises(ValueError): network.require_v1_candidate(m)
+            return
+        with network.RunBudget(ledger) as budget:
+            budget.reserve("N2", "candidate", m["head"], m["source_sha256"], ledger.parent/"V1.json",
+                           conditions_sha256=m["conditions_sha256"], continuation=m)
+            if fault == "wrong_pid": budget.lock.write_text("-1")
+            else: monkeypatch.setattr(network, "_require_v1_certificates", certificate_check)
+            with pytest.raises(ValueError):
+                network.require_v1_candidate(m, network.role_configs(m["certificate_directory"], network.V2_PORTS, "N0"))
+        return
+    with pytest.raises(ValueError):
+        network._next_v1_call(history, "N2", "candidate", m["head"], m["source_sha256"], m)
+
+
+def test_v1_one_reservation_preserves_thirteen_and_startup_failure_consumes(v1_context, monkeypatch):
+    history, m, ledger, _, _ = v1_context
+    monkeypatch.setattr(network, "_require_v1_certificates", lambda *_: None)
+    with network.RunBudget(ledger) as budget:
+        budget.reserve("N2", "candidate", m["head"], m["source_sha256"], ledger.parent/"V1.json",
+                       conditions_sha256=m["conditions_sha256"], continuation=m | {"finished": True})
+        assert budget.entries[:13] == history and budget.entries[-1]["finished"] is False
+        network.require_network_candidate(m, network._COMPACT_PROFILE_V3)
+        budget.finish({"cycles": [], "network_sample_pass": False}, "failed")
+    stored = json.loads(ledger.read_text())
+    assert stored["maximum_calls"] == 14 and stored["maximum_attempts"] == 14000
+    with network.RunBudget(ledger) as budget, pytest.raises(ValueError):
+        budget.reserve("N2", "candidate", m["head"], m["source_sha256"], ledger.parent/"retry.json", continuation=m)
+
+
+def test_v1_wrapper_routes_original_n2_and_exports_startup_failure_once(v1_context, monkeypatch):
+    _, m, ledger, _, _ = v1_context
+    calls = []
+    monkeypatch.setattr(network, "_require_v1_certificates", lambda *_: None)
+    class Relay:
+        def __init__(self, profile, endpoints, *, wait_strategy):
+            calls.append((profile, endpoints, wait_strategy))
+            self.report = {"model_valid": False, "process_exited": True, "forced_termination": False}
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+    monkeypatch.setattr(network, "NetworkRelay", Relay)
+    def failed(**kwargs):
+        network.require_network_candidate(kwargs["candidate_manifest"], kwargs["wire_profile"], kwargs["configs"])
+        assert kwargs["configs"] == network.role_configs(m["certificate_directory"], network.V2_PORTS, "N2")
+        raise RuntimeError("software startup witness; no role or relay process")
+    monkeypatch.setattr(benchmark, "run_network_observation", failed)
+    directory = network.Path(m["certificate_directory"])
+    directory.mkdir()
+    for name in m["public_certificate_sha256"]: (directory/name).write_bytes(name.encode())
+    approval = ledger.parent/"approval.json"
+    approval.write_text(json.dumps(m), encoding="utf8")
+    options = {"profile": "N2", "phase": "candidate", "certs": directory, "ports": network.V2_PORTS,
+               "ledger": ledger, "approval": approval, "wire_profile": network._COMPACT_PROFILE_V3,
+               "authorization": network.V1_DESIGN}
+    r = network.run_network_benchmark(**options, output=ledger.parent/"V1.json")
+    assert calls == [("N2", tuple(("127.0.0.1", p, "127.0.0.2") for p in network.V2_PORTS), network.EVENT_STRATEGY)]
+    assert r["failure_category"] == "RuntimeError" and r["cycles"] == []
+    assert not r["network_sample_pass"] and not r["network_progress_goal_pass"]
+    stored = json.loads(ledger.read_text())
+    assert len(stored["entries"]) == 14 and stored["entries"][-1]["finished"]
+    with pytest.raises(ValueError): network.run_network_benchmark(**options, output=ledger.parent/"retry.json")
+
+
+@pytest.mark.parametrize("goal", [False, True])
+def test_v1_cli_preserves_failure_exit_for_margin_and_rejects_other_profiles(tmp_path, monkeypatch, goal):
+    from secure_control.experiments import lan_runner
+    calls = []
+    def completed(**kwargs):
+        calls.append(kwargs)
+        return {"status": "stopped", "network_sample_pass": True, "network_progress_goal_pass": goal,
+                "network_dynamic_qualification_pass": False, "cycles": [], "network_export_ns": 1,
+                "network_manifest": {"comparison_stage": "V1"}}
+    monkeypatch.setattr(network, "run_network_benchmark", completed)
+    argv = ["secure-control", "benchmark", "--case", "cycle", "--network-profile", "N2",
+        "--network-phase", "candidate", "--network-certs", str(tmp_path), "--network-ports", "55121,55122,55123",
+        "--network-ledger", str(tmp_path/"calls.json"), "--network-approval", str(tmp_path/"approval.json"),
+        "--network-wire-profile", network._COMPACT_PROFILE_V3, "--network-authorization", network.V1_DESIGN,
+        "--output", str(tmp_path/"raw.json")]
+    monkeypatch.setattr(sys, "argv", argv)
+    assert lan_runner._run() == (0 if goal else 5) and len(calls) == 1
+    for key, bad in (("--network-profile", "N0"), ("--network-profile", "N3"),
+                     ("--network-phase", "qualification"), ("--network-wire-profile", network._COMPACT_PROFILE_V2)):
+        invalid = list(argv)
+        invalid[invalid.index(key)+1] = bad
+        monkeypatch.setattr(sys, "argv", invalid)
+        assert lan_runner._run() == 5 and len(calls) == 1
+
+
+@pytest.mark.parametrize("fault", [None, "missing_model", "n0_relay", "seed", "cpu", "error", "cycle", "null",
+    "frame", "ack", "margin"])
+def test_v1_reuses_sample_model_frames_and_separate_margin_gates(v1_context, fault):
+    _, m, _, _, _ = v1_context
+    r = _comparison_software_result(m)
+    relay = r["network_relay"]
+    relay.update(profile="N2", seed=network.SEED,
+                 directions={name: {"received_bytes": 1, "sent_bytes": 1} for name in network.models("N2")},
+                 read_block_limit=4096, queue_limit_per_direction=1048576, model_tolerance_ns=1000000)
+    if fault == "missing_model": relay["directions"] = {}
+    elif fault == "n0_relay": relay.update(profile="N0", directions={})
+    elif fault == "seed": relay["seed"] += 1
+    elif fault == "cpu": relay["wait_policy"]["peak_cpu_window"]["cpu_delta_ns"] += 1
+    elif fault == "error": relay["model_valid"] = False
+    elif fault == "cycle": r["cycles"].pop()
+    elif fault == "null": r["cycles"][0]["cycle_completed_ns"] = None
+    elif fault == "frame": r["steps"][0]["sent"]["Client"]["frames"] += 1
+    elif fault == "ack": r["last_commit_observation"]["parties"]["P2"]["valid_ack_received"] = False
+    elif fault == "margin": r["cycles"][-1]["cycle_completed_ns"] = r["cycles"][-1]["scheduled_start_ns"]+19000000
+    checked = network.assemble(r, profile="N2", phase="candidate", manifest=m, relay=relay)
+    assert checked["network_sample_pass"] is (fault in (None, "margin"))
+    assert checked["network_progress_goal_pass"] is (fault is None)
+    assert checked["network_dynamic_qualification_pass"] is False
+
+
+@pytest.fixture
+def w_context(v1_context,monkeypatch):
+    """封存14个测试对象，隔离真实账本；W1/W2必须有真实在途与前件结构。"""
+    history,old,ledger,native,_=v1_context
+    old=old|{'source_sha256':old['source_sha256']|{p:'c'*64 for p in network.W_SOURCE_FILES[2:]}}
+    raw=ledger.parent/'V1.json';raw.write_text(json.dumps(_comparison_software_result(old)),encoding='utf8')
+    entry=old|{'output':str(raw),'raw_sha256':network.hashlib.sha256(raw.read_bytes()).hexdigest(),
+               'finished':True,'actual_attempts':1000}
+    history.append(entry);native.append(entry|{'completed':True,'native_exit':5})
+    monkeypatch.setattr(network,'W_HISTORY',network.digest(history))
+    monkeypatch.setattr(network,'W_NATIVE_HISTORY',network.digest(native))
+    monkeypatch.setattr(network,'W_BASE_HEAD',old['head'])
+    m=old|{'head':'b'*40,'source_sha256':old['source_sha256']|{p:'d'*64 for p in network.W_SOURCE_FILES if p in old['source_sha256']},
+       'authorization_url':network.W_DESIGN,'comparison_design_url':network.W_DESIGN,
+       'closed_history_sha256':network.W_HISTORY,'closed_native_history_sha256':network.W_NATIVE_HISTORY,
+       'comparison_stage':'W1','call':15,'maximum_calls':16,'total_maximum_attempts':16000,
+       'batch_maximum_calls':2,'batch_maximum_attempts':2000,'wait_diagnostic':True,'system_trace':True,
+       'first_model_failure_stop':True}
+    ledger.write_text(json.dumps({'schema':'network-call-budget-v1','entries':history}),encoding='utf8')
+    def start(current=m):
+        network.Path(m['native_ledger_path']).write_text(json.dumps({'entries':native+[current|{
+            'completed':False,'native_exit':None,'started_utc':'start'}]}),encoding='utf8')
+    start();monkeypatch.setattr(network,'source',lambda:(m['head'],m['source_sha256']))
+    return history,m,ledger,native,start
+
+
+@pytest.mark.parametrize('change',[{'call':16},{'call':True},{'maximum_calls':17},{'maximum_attempts':10000},
+    {'profile':'N0'},{'phase':'qualification'},{'comparison_stage':'V1'},{'authorization_url':network.V1_DESIGN},
+    {'wait_diagnostic':False},{'system_trace':False},{'first_model_failure_stop':False},
+    {'closed_history_sha256':'0'*64},{'control_head':'0'*40}])
+def test_w_precise_scope_old_history_and_unique_native_start(w_context,change):
+    history,m,_,_,_=w_context
+    assert network._w_manifest_valid(m)
+    assert network._next_w_call(history,'N2','candidate',m['head'],m['source_sha256'],m)==1000
+    wrong=m|change
+    with pytest.raises(ValueError):
+        network._next_compact_call(history,wrong['profile'],wrong['phase'],wrong['head'],wrong['source_sha256'],wrong)
+
+
+def test_w1_consumed_and_w2_requires_original_cause_review_and_new_source(w_context,monkeypatch):
+    history,m,ledger,native,start=w_context
+    monkeypatch.setattr(network,'_require_w_certificates',lambda *_:None)
+    with network.RunBudget(ledger) as budget:
+        raw=ledger.parent/'W1.json'
+        budget.reserve('N2','candidate',m['head'],m['source_sha256'],raw,continuation=m,
+                       conditions_sha256=m['conditions_sha256'])
+        network.require_network_candidate(m,network._COMPACT_PROFILE_V3)
+        r={'network_manifest':m,'network_relay':{'wait_diagnostic':{'first_anomaly':{'rows':[[1]]}}},
+           'system_trace':{'saved':True,'etl_sha256':'a'*64},'cycles':[]}
+        raw.write_text(json.dumps(r),encoding='utf8')
+        budget.finish(r,network.hashlib.sha256(raw.read_bytes()).hexdigest())
+        first=copy.deepcopy(budget.entries[-1])
+    native.append(first|{'completed':True,'native_exit':5})
+    cause=ledger.parent/'cause.json'
+    cause.write_text(json.dumps({'version':1,'branch':'relative_preparation','raw_sha256':first['raw_sha256'],
+        'head':m['head'],'review_url':m['review_url'],'start_ns':100,'end_ns':2000200,
+        'trace_lost_events':0,'clock_mapping_verified':True,'etl_sha256':'a'*64,'excerpt_sha256':'b'*64}),encoding='utf8')
+    second=m|{'comparison_stage':'W2','call':16,'head':'8'*40,'wait_diagnostic':False,'system_trace':False,
+        'source_sha256':m['source_sha256']|{network.W_SOURCE_FILES[2]:'8'*64},
+        'diagnosis_review_url':m['review_url'],'fix_evidence_url':m['review_url'],
+        'cause_path':str(cause),'cause_sha256':network.hashlib.sha256(cause.read_bytes()).hexdigest(),
+        'predecessor_raw_sha256':first['raw_sha256']}
+    start(second)
+    assert network._next_w_call(history+[first],'N2','candidate',second['head'],second['source_sha256'],second)==1000
+    for fault in ({'branch':'system_ready'},{'trace_lost_events':1},{'clock_mapping_verified':False},{'end_ns':101}):
+        original=json.loads(cause.read_text());cause.write_text(json.dumps(original|fault),encoding='utf8')
+        wrong=second|{'cause_sha256':network.hashlib.sha256(cause.read_bytes()).hexdigest()}
+        start(wrong)
+        with pytest.raises(ValueError):
+            network._next_w_call(history+[first],'N2','candidate',wrong['head'],wrong['source_sha256'],wrong)
+        cause.write_text(json.dumps(original),encoding='utf8')
+    assert json.loads(ledger.read_text())['maximum_calls']==16
+
+
+def test_w1_trace_is_started_only_after_reservation_and_no_real_recording(w_context,monkeypatch):
+    _,m,ledger,_,_=w_context
+    m['trace_profile_sha256']='0'*64
+    monkeypatch.setattr(network,'_require_w_certificates',lambda *_:None)
+    monkeypatch.setattr(network._WaitTrace,'validate_profile',lambda *_:None)
+    order=[]
+    class Trace:
+        validate_profile=staticmethod(lambda *_:None)
+        def __init__(self,_):self.report={'saved':False}
+        def __enter__(self):
+            assert len(json.loads(ledger.read_text())['entries'])==15
+            order.append('trace');return self
+        def __exit__(self,*_):self.report['saved']=True;order.append('save')
+    class Relay:
+        def __init__(self,*args,**kwargs):
+            assert kwargs['wait_diagnostic'] and kwargs['fail_first_model']
+            self.report={'model_valid':False}
+        def __enter__(self):order.append('relay');return self
+        def __exit__(self,*_):order.append('close')
+    monkeypatch.setattr(network,'_WaitTrace',Trace);monkeypatch.setattr(network,'NetworkRelay',Relay)
+    monkeypatch.setattr(benchmark,'run_network_observation',lambda **_:(_ for _ in ()).throw(RuntimeError('fixture')))
+    directory=network.Path(m['certificate_directory']);directory.mkdir()
+    for name in m['public_certificate_sha256']:(directory/name).write_bytes(name.encode())
+    p=ledger.parent/'approval.json';p.write_text(json.dumps(m),encoding='utf8')
+    r=network.run_network_benchmark(profile='N2',phase='candidate',certs=directory,ports=network.V2_PORTS,
+        ledger=ledger,approval=p,output=ledger.parent/'W1.json',wire_profile=network._COMPACT_PROFILE_V3,authorization=network.W_DESIGN)
+    assert order==['trace','relay','close','save'] and r['system_trace']['saved']
+    assert not r['network_sample_pass']
+
+
+@pytest.mark.parametrize("change", [
+    {"maximum_attempts": 10000}, {"maximum_attempts": True}, {"call": 11},
+    {"maximum_calls": 13}, {"batch_maximum_calls": 4}, {"batch_maximum_attempts": 4000},
+    {"profile": "N2"}, {"phase": "qualification"}, {"comparison_stage": "T3"},
+    {"wire_profile": network._COMPACT_PROFILE_V3}, {"software_pass": False},
+    {"authorization_url": network.REPAIR_AUTHORIZATION}, {"closed_history_sha256": "0"*64},
+    {"qualification_allowed": True}, {"readback_exact": False},
+    {"closure_stage": "B"}, {"continuation_stage": "repair_qualification"},
+])
+def test_staged_batch_rejects_scope_budget_and_legacy_borrowing(staged_context, change):
+    history, manifest, _, _, _ = staged_context
+    assert network._staged_manifest_valid(manifest)
+    with pytest.raises(ValueError):
+        network._next_compact_call(history, "N0", "candidate", manifest["head"], manifest["source_sha256"], manifest | change)
+
+
+def test_staged_reservation_preserves_nine_and_startup_failure_seals_batch(staged_context, monkeypatch):
+    history, manifest, ledger, native, native_path = staged_context
+    monkeypatch.setattr(network, "_require_staged_certificates", lambda *_: None)
+    with network.RunBudget(ledger) as budget:
+        assert budget.reserve("N0", "candidate", manifest["head"], manifest["source_sha256"],
+            ledger.parent/"T1.json", conditions_sha256=manifest["conditions_sha256"], continuation=manifest) == 1000
+        network.require_staged_candidate(manifest)
+        assert budget.entries[:9] == history and len(budget.entries) == 10
+        budget.finish({"cycles": [], "network_sample_pass": False}, "raw")
+    saved = json.loads(ledger.read_text(encoding="utf-8"))["entries"]
+    assert saved[:9] == history and saved[-1]["actual_attempts"] == 0
+    next_manifest = manifest | {"comparison_stage": "T2", "wire_profile": network._COMPACT_PROFILE_V3, "call": 11}
+    native_path.write_text(json.dumps({"entries": native+[saved[-1] | {
+        "completed": True, "native_exit": 5}, next_manifest | {
+        "completed": False, "native_exit": None, "started_utc": "next"}]}), encoding="utf-8")
+    for entries, m in ((history, manifest), (saved, next_manifest)):
+        with pytest.raises(ValueError):
+            network._next_staged_call(entries, m["profile"], "candidate", m["head"], m["source_sha256"], m)
+    # 历史不完整、原对象变化以及额外在途都不能重新开始。
+    for entries in ([], history[:-1], [dict(item, call=99) if i == 0 else item for i, item in enumerate(history)]):
+        with pytest.raises(ValueError):
+            network._next_staged_call(entries, "N0", "candidate", manifest["head"], manifest["source_sha256"], manifest)
+
+
+@pytest.mark.parametrize("median,p99,maximum,expected", [
+    (9_000_000, 11_000_000, 19_000_000, True),
+    (9_000_001, 11_000_000, 19_000_000, False),
+    (9_000_000, 12_000_001, 19_000_000, False),
+    (9_000_000, 11_000_000, 20_000_001, False),
+])
+def test_staged_gain_uses_all_integer_endpoints_including_first_and_boundaries(median, p99, maximum, expected):
+    def result(mid, tail, last):
+        values = [mid]*980+[tail]*19+[last]
+        return {"cycles": [{"scheduled_start_ns": i*20_000_000, "cycle_completed_ns": i*20_000_000+value}
+                            for i, value in enumerate(values)]}
+    baseline = result(10_000_000, 12_000_000, 19_000_000)
+    assert network._staged_gain(baseline, result(median, p99, maximum)) is expected
+    with pytest.raises(ValueError):
+        network._staged_gain(baseline, {"cycles": baseline["cycles"][1:]})
+
+
+def test_staged_t1_t2_t3_require_same_source_full_raw_gain_and_independent_audit(staged_context, monkeypatch):
+    """合成完整原件复用真实门禁；只隔离磁盘根及证书读取，不运行性能。"""
+    history, first, ledger, native, native_path = staged_context
+    monkeypatch.setattr(network, "_require_staged_certificates", lambda *_: None)
+    manifests, entries = [], copy.deepcopy(history)
+    for stage, (label, profile, wire) in enumerate(network.STAGED_STAGES):
+        m = first | {"comparison_stage": label, "profile": profile, "wire_profile": wire, "call": 10+stage}
+        if stage == 2:
+            m.update(comparison_raw_sha256=[e["raw_sha256"] for e in entries[9:]],
+                     comparison_review_url=first["review_url"])
+        start = m | {"completed": False, "native_exit": None, "started_utc": "start"}
+        native_path.write_text(json.dumps({"entries": native+[start]}), encoding="utf-8")
+        with network.RunBudget(ledger) as budget:
+            if stage:
+                for wrong in ({"head": "f"*40}, {"conditions_sha256": "0"*64}):
+                    invalid = m | wrong
+                    with pytest.raises(ValueError):
+                        network._next_staged_call(budget.entries, profile, "candidate", invalid["head"], invalid["source_sha256"], invalid)
+            if stage == 2:
+                for wrong in ({"comparison_review_url": None}, {"comparison_raw_sha256": []}):
+                    with pytest.raises((ValueError, TypeError)):
+                        network._next_staged_call(budget.entries, profile, "candidate", m["head"], m["source_sha256"], m | wrong)
+            raw = ledger.parent/f"{label}.json"
+            assert budget.reserve(profile, "candidate", m["head"], m["source_sha256"], raw,
+                conditions_sha256=m["conditions_sha256"], continuation=m) == 1000
+            network.require_staged_candidate(m)
+            result = _repair_software_result(m)
+            result.update(status="stopped", wire_profile=wire, failure_category=None, failed_phase=None)
+            result["material_summary"]["encoding_profile"] = wire
+            result["material_summary"]["worker"]["encoding_profile"] = wire
+            for step, row in enumerate(result["steps"]):
+                row["sent"] = {"Client->P1": {"frames": 2}, "Client->P2": {"frames": 2}}
+                cycle = result["cycles"][step]
+                cycle["cycle_completed_ns"] = cycle["scheduled_start_ns"]+(15_000_000 if stage == 0 else 13_000_000)
+                cycle["public_frame_counts"] = {"Client->P1": 2+int(step in (399, 799)),
+                                                  "Client->P2": 2+int(step in (399, 799))}
+                for i, party in enumerate(result["party_outcomes"]):
+                    party["wire_profile"] = wire
+                    party["steps"][step]["sent"] = {"test": {"frames": (3+i if stage else 5+i)
+                        +int(step in (400, 800))}}
+            result = network.assemble(result, profile=profile, phase="candidate", manifest=m,
+                                      relay=result["network_relay"])
+            assert result["network_sample_pass"], (label,
+                network._staged_manifest_valid(m), network._staged_frames_pass(result, wire),
+                benchmark._compact_sample_pass(result, result["material_comparison"], result["network_history"], target_steps=1000),
+                network._tls_pass(result))
+            assert not result["network_dynamic_qualification_pass"]
+            broken = copy.deepcopy(result)
+            broken["party_outcomes"][0]["steps"][400]["sent"]["test"]["frames"] += 1
+            assert not network.assemble(broken, profile=profile, phase="candidate", manifest=m,
+                                        relay=result["network_relay"])["network_sample_pass"]
+            raw.write_text(json.dumps(result), encoding="utf-8")
+            budget.finish(result, network.hashlib.sha256(raw.read_bytes()).hexdigest())
+            entries = copy.deepcopy(budget.entries)
+        native.append(start | {"completed": True, "native_exit": 0})
+        manifests.append(m)
+    assert entries[:9] == history and len(entries) == 12
+    with pytest.raises(ValueError):
+        network._next_staged_call(entries, "N2", "candidate", first["head"], first["source_sha256"], manifests[-1])
 
 
 def test_v2_candidate_reserves_original_sixth_once_and_never_qualification(v2_candidate_context):
@@ -2219,6 +2943,14 @@ def test_network_cli_is_exclusive_and_does_not_accept_arbitrary_steps(tmp_path, 
         monkeypatch.setattr(sys,"argv",current)
         assert lan_runner._run()==0 and calls[-1]["authorization"]==network.REPAIR_AUTHORIZATION
     assert len(calls)==5
+    local=[network.LOCAL_DESIGN if a==network.V2_AUTHORIZATION else "N0" if a=="N2" else a for a in v2]
+    monkeypatch.setattr(sys, "argv", local)
+    assert lan_runner._run() == 0 and calls[-1]["authorization"] == network.LOCAL_DESIGN
+    for key, bad in (("--network-profile", "N2"), ("--network-phase", "qualification")):
+        invalid = list(local)
+        invalid[invalid.index(key)+1] = bad
+        monkeypatch.setattr(sys, "argv", invalid)
+        assert lan_runner._run() == 5 and len(calls) == 6
 
 
 def test_startup_failure_is_exported_and_consumes_unique_discovery(tmp_path, monkeypatch):
@@ -2342,7 +3074,9 @@ def _tls_protocol_party_fixture(config, ports, queue, wire_profile):
 @pytest.mark.parametrize("wire_profile,expected_frames,fault", (
     (None, 19, None), (network._COMPACT_PROFILE, 15, None),
     ("control-dynamic-compact-v2", 15, None), ("control-dynamic-compact-v2", 15, "bad_epoch"),
-    ("control-dynamic-compact-v2", 15, "bad_global"), ("control-dynamic-compact-v2", 15, "duplicate")))
+    ("control-dynamic-compact-v2", 15, "bad_global"), ("control-dynamic-compact-v2", 15, "duplicate"),
+    ("control-dynamic-compact-v3", 11, None), ("control-dynamic-compact-v3", 11, "bad_epoch"),
+    ("control-dynamic-compact-v3", 11, "bad_global"), ("control-dynamic-compact-v3", 11, "duplicate")))
 def test_tls_protocol_fixture_preserves_fused_frames_worker_cleanup_segments_and_stop(
         tmp_path, monkeypatch, wire_profile, expected_frames, fault):
     """仅五轮协议功能夹具，无 plant、20ms周期或性能资格入口。"""
@@ -2428,13 +3162,14 @@ def test_tls_protocol_fixture_preserves_fused_frames_worker_cleanup_segments_and
         assert all(outcome["status"] == "closed" for outcome in outcomes), outcomes
         party_frames = sum(sum(row["frames"] for row in outcome["steps"][0]["sent"].values())
                            for outcome in outcomes)
-        assert boundaries == ([2, 2] if wire_profile == "control-dynamic-compact-v2" else [4, 4])
-        if wire_profile == "control-dynamic-compact-v2":
+        advances = wire_profile in (network._COMPACT_PROFILE_V2, network._COMPACT_PROFILE_V3)
+        assert boundaries == ([2, 2] if advances else [4, 4])
+        if advances:
             assert operations.count("segment_advance") == 4 and "segment_begin" not in operations
             replies = [o["fixture_sent_operations"].count("segment_advance") for o in outcomes]
             assert replies == [2, 2]  # 每段双方各一个实际回复，额外四帧。
             assert all("segment_begin" not in o["fixture_sent_operations"] for o in outcomes)
-            assert client_frames + party_frames + boundaries[0] + sum(replies)//2 == 19
+            assert client_frames + party_frames + boundaries[0] + sum(replies)//2 == expected_frames+4
         assert client_frames + party_frames == expected_frames
         assert client_frames == (4 if wire_profile else 6)
         if wire_profile:

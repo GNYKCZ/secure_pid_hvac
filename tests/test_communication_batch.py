@@ -1530,12 +1530,13 @@ def test_compact_and_original_kernel_exact_shares_across_two_400_boundaries(monk
     from secure_control.execution.localhost_codec import (
         _COMPACT_PROFILE,
         _COMPACT_PROFILE_V2,
+        _COMPACT_PROFILE_V3,
         _decode_preloaded_values,
         _encode_preloaded_values,
     )
 
     client, _, _, _, distribution = make_stack()
-    profiles = ("control-batch-v1", _COMPACT_PROFILE, _COMPACT_PROFILE_V2)
+    profiles = ("control-batch-v1", _COMPACT_PROFILE, _COMPACT_PROFILE_V2, _COMPACT_PROFILE_V3)
     roles = [[role_type(rehydrate_offline_material(PartyOfflineMaterial.from_message(material),
                 distribution.range_contract)) for role_type, material in ((P1, distribution.p1), (P2, distribution.p2))]
              for _ in profiles]
@@ -1570,17 +1571,20 @@ def test_compact_and_original_kernel_exact_shares_across_two_400_boundaries(monk
                 inp, plan, client.fixed_point.modulus) for inp, resources in (
                     (current.p1_input, current.p1_resources), (current.p2_input, current.p2_resources))]
             results = []
-            for index, materials in enumerate((original, compact, compact)):
+            for index, materials in enumerate((original, compact, compact, compact)):
                 outputs = [[], []]
                 local = [rehydrate_online_material(m, modulus=client.fixed_point.modulus, security_parameter=8)
                          for m in materials]
-                endpoints = [LocalProtocol3PartyEndpoint(roles[index][i], local[i], outputs[i].append)
+                strategy = "client_authorized" if profiles[index] == _COMPACT_PROFILE_V3 else "peer_barriers"
+                endpoints = [LocalProtocol3PartyEndpoint(roles[index][i], local[i], outputs[i].append,
+                                                        completion_strategy=strategy)
                              for i in (0, 1)]
+                receipts = [None, None]
                 for port in peers[index]:
                     port.set_batch_round(plan, modulus=client.fixed_point.modulus, run_id="run", epoch_id="epoch")
-                def stage(i, endpoints=endpoints, pair=peers[index]):
+                def stage(i, endpoints=endpoints, pair=peers[index], receipts=receipts):
                     try:
-                        stage_protocol3_batch(endpoints[i], pair[i])
+                        receipts[i] = stage_protocol3_batch(endpoints[i], pair[i])
                     except BaseException as error:  # noqa: BLE001 - 保留线程原始失败供断言。
                         errors.append(error)
                 threads = [Thread(target=stage, args=(i,)) for i in (0, 1)]
@@ -1589,19 +1593,27 @@ def test_compact_and_original_kernel_exact_shares_across_two_400_boundaries(monk
                 for thread in threads:
                     thread.join(12.)
                 assert not any(t.is_alive() for t in threads) and not errors, errors
-                Protocol3Orchestrator().commit(*endpoints)
+                if strategy == "client_authorized":
+                    assert all(r.resources.consumed_count == 0 for r in local)
+                    authorization = Protocol3Orchestrator(completion_strategy=strategy).authorize(tuple(receipts), plan)
+                    for endpoint in endpoints:
+                        endpoint.commit_staged(authorization)
+                else:
+                    Protocol3Orchestrator().commit(*endpoints)
                 results.append([outputs[i][0].value.value for i in (0, 1)])
                 assert all(r.resources.consumed_count == plan.triple_count+plan.truncation_count for r in local)
             for i in (0, 1):
-                for index in (1, 2):
+                for index in (1, 2, 3):
                     assert np.array_equal(results[0][i], results[index][i])
                     assert np.array_equal(roles[0][i].state_share.value, roles[index][i].state_share.value)
             client.abort_round(current)
         for profile in profiles:
-            assert len(frames[profile]) == 801*7
+            authorized = profile == _COMPACT_PROFILE_V3
+            assert len(frames[profile]) == 801*(3 if authorized else 7)
             assert {phase: sum(p == phase for p, _ in frames[profile]) for phase in (
                 "product", "product_complete", "truncation", "state_complete")} == {
-                    "product": 1602, "product_complete": 1602, "truncation": 801, "state_complete": 1602}
+                    "product": 1602, "product_complete": 0 if authorized else 1602,
+                    "truncation": 801, "state_complete": 0 if authorized else 1602}
     finally:
         for pair in peers:
             for port in pair:
@@ -2862,8 +2874,10 @@ def test_large_legal_peer_batch_with_small_socket_buffers_does_not_deadlock():
             peer.close()
 
 
-@pytest.mark.parametrize("fault", ("bad_last_member", "lost_product_barrier"))
-def test_dynamic_batch_fault_burns_all_resources_without_stage_or_state_change(fault):
+@pytest.mark.parametrize("strategy,fault", (("peer_barriers", "bad_last_member"),
+    ("peer_barriers", "lost_product_barrier"), ("client_authorized", "bad_last_member"),
+    ("client_authorized", "lost_truncation")))
+def test_dynamic_batch_fault_burns_all_resources_without_stage_or_state_change(strategy, fault):
     from test_two_party_protocol import make_stack
 
     client, _, _, _, distribution = make_stack()
@@ -2877,7 +2891,7 @@ def test_dynamic_batch_fault_burns_all_resources_without_stage_or_state_change(f
         )), modulus=client.fixed_point.modulus, security_parameter=8,
     )
     shares = []
-    endpoint = LocalProtocol3PartyEndpoint(role, local, shares.append)
+    endpoint = LocalProtocol3PartyEndpoint(role, local, shares.append, completion_strategy=strategy)
     prior_state = role.state_share
 
     class FaultPeer:
@@ -2890,6 +2904,9 @@ def test_dynamic_batch_fault_burns_all_resources_without_stage_or_state_change(f
 
         def product_complete(self, plan):
             raise TimeoutError("lost product barrier")
+
+        def receive_truncations(self, plan):
+            raise TimeoutError("lost truncation")
 
     with pytest.raises((ValueError, TimeoutError)):
         stage_protocol3_batch(endpoint, FaultPeer())
