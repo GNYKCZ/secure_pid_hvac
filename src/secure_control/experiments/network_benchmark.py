@@ -204,11 +204,12 @@ def require_w_candidate(m, configs=None):
 
 
 class _WaitTrace:
-    """仅W1一次任务具名WPR会话；占项后启动，finally只停止自己成功启动的实例。"""
+    """仅W1一次任务具名WPR会话；启动不确定也保留claim，核实终止后释放归属。"""
 
     def __init__(self, manifest):
         self.manifest = manifest
         self.owned = False
+        self.deadline_ns = time.perf_counter_ns()+85000000000
         self.report = {"version":1,"instance":W_TRACE_INSTANCE,"started":False,"saved":False,"commands":[]}
 
     @staticmethod
@@ -232,42 +233,113 @@ class _WaitTrace:
 
     def _command(self, args, timeout):
         start = time.perf_counter_ns()
-        result = subprocess.run(["wpr",*args],capture_output=True,text=True,timeout=timeout,check=False)
-        self.report["commands"].append({"command":["wpr",*args],"native_exit":result.returncode,
-            "start_qpc_ns":start,"end_qpc_ns":time.perf_counter_ns()})
+        remaining = (self.deadline_ns-start)/1000000000
+        if remaining <= 0:
+            raise TimeoutError("WPR本任务清理总时限已到，停止自动推进。")
+        fact = {"command":["wpr",*args],"native_exit":None,"start_qpc_ns":start}
+        try:
+            result = subprocess.run(["wpr",*args],capture_output=True,text=True,
+                                    timeout=min(timeout,remaining),check=False)
+            fact["native_exit"] = result.returncode
+        except BaseException as error:
+            fact["error_type"] = type(error).__name__
+            raise
+        finally:
+            fact["end_qpc_ns"] = time.perf_counter_ns()
+            self.report["commands"].append(fact)
         if result.returncode:
             raise RuntimeError("本任务WPR命令失败；不重采。")
         return result.stdout
+
+    def _confirm_stopped(self):
+        """只核本任务具名会话；保存失败后最多一次cancel，确认停止才释放归属。"""
+        try:
+            status = self._command(["-status","-instancename",W_TRACE_INSTANCE],3)
+            if "WPR is not recording" not in status:
+                self.report["cancel_attempted"] = True
+                self._command(["-cancel","-instancename",W_TRACE_INSTANCE],5)
+                status = self._command(["-status","-instancename",W_TRACE_INSTANCE],3)
+            if "WPR is not recording" not in status:
+                raise RuntimeError("任务WPR尚在记录，禁止继续。")
+            self.owned = False
+            self.report["stopped_confirmed"] = True
+        except BaseException as error:
+            self.report.update(stopped_confirmed=False,cleanup_error_type=type(error).__name__)
+            raise
+
+    @classmethod
+    def recover_owned(cls, manifest, *, deadline_ns=None):
+        """原生外层所有退出都核持久claim；无本任务claim则不碰任何会话。"""
+        path = ROOT/".tmp/issue120-w1-trace-claim.json"
+        if not path.exists():
+            return {"not_started":True,"stopped_confirmed":True}
+        claim = json.loads(path.read_text(encoding="utf8"))
+        if (claim.get("instance") != W_TRACE_INSTANCE or any(claim.get(k) != manifest.get(k)
+                for k in ("head","call","trace_profile_sha256"))
+                or type(claim.get("owner_pid")) is not int or type(claim.get("claim_qpc_ns")) is not int):
+            raise ValueError("本任务跟踪归属凭据不匹配，不接管未知会话。")
+        owner = cls(manifest)
+        owner.deadline_ns = min(owner.deadline_ns,claim["claim_qpc_ns"]+85000000000,
+                                deadline_ns if deadline_ns is not None else owner.deadline_ns)
+        owner.owned = True
+        try:
+            owner._confirm_stopped()
+        except BaseException as error:  # noqa: BLE001 - 保留未释放归属及明确失败，原生退出不被覆盖。
+            owner.report["recovery_error_type"] = type(error).__name__
+        finally:
+            owner.report["ownership_released"] = not owner.owned
+        return owner.report
 
     def __enter__(self):
         path = self.validate_profile(self.manifest)
         if (ROOT/".tmp/issue120-w1.etl").exists():
             raise ValueError("任务ETL已存在，禁止启动第二次记录。")
-        if "WPR is not recording" not in self._command(["-status"],10):
+        if "WPR is not recording" not in self._command(["-status"],3):
             raise RuntimeError("存在非本任务WPR会话，不接管或cancel。")
-        self._command(["-start",str(path)+"!"+W_TRACE_INSTANCE,"-instancename",W_TRACE_INSTANCE],10)
+        if "WPR is not recording" not in self._command(["-status","-instancename",W_TRACE_INSTANCE],3):
+            raise RuntimeError("同名任务实例已存在，不接管。")
+        # 两次只读确认无会话后，先独占登记这一次start尝试。超时也保留明确归属供外层收尾。
+        claim = {k:self.manifest.get(k) for k in ("head","call","trace_profile_sha256")}
+        claim.update(instance=W_TRACE_INSTANCE,owner_pid=os.getpid(),claim_qpc_ns=time.perf_counter_ns())
+        with (ROOT/".tmp/issue120-w1-trace-claim.json").open("x",encoding="utf8") as stream:
+            json.dump(claim,stream);stream.flush();os.fsync(stream.fileno())
         self.owned = True
-        self.report["started"] = True
+        self.report["start_attempted"] = True
+        try:
+            self._command(["-start",str(path)+"!"+W_TRACE_INSTANCE,"-instancename",W_TRACE_INSTANCE],10)
+            self.report["started"] = True
+        except BaseException as error:
+            self.report["start_error_type"] = type(error).__name__
+            try:
+                self._confirm_stopped()
+            except BaseException as cleanup_error:  # noqa: BLE001 - 不覆盖首start错误，保留尚未释放归属。
+                self.report["start_cleanup_error_type"] = type(cleanup_error).__name__
+            raise
         return self
 
     def __exit__(self, *_):
         if self.owned:
-            self.owned = False
-            path = ROOT/".tmp/issue120-w1.etl"
-            if path.exists():
-                # 即使外部异常创建同名文件，也停止自己的会话，绝不覆盖原件或泄漏记录。
-                path = ROOT/f".tmp/issue120-w1-conflict-{os.getpid()}.etl"
-                self.report["stop_path_conflict"] = True
-                if path.exists():
-                    self.report["stop_error_type"] = "ExistingETL"
-                    raise RuntimeError("任务ETL及冲突保存路径均已存在，需报告会话状态。")
+            first_error = None
             try:
-                self._command(["-stop",str(path),"-skipPdbGen","-instancename",W_TRACE_INSTANCE],20)
+                path = ROOT/".tmp/issue120-w1.etl"
+                if path.exists():
+                    path = ROOT/f".tmp/issue120-w1-conflict-{os.getpid()}.etl"
+                    self.report["stop_path_conflict"] = True
+                    if path.exists():
+                        raise RuntimeError("任务ETL及冲突保存路径均已存在。")
+                self._command(["-stop",str(path),"-skipPdbGen","-instancename",W_TRACE_INSTANCE],10)
                 self.report.update(saved=True,etl_path=str(path),etl_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
                                    etl_bytes=path.stat().st_size)
-            except Exception as error:
+            except BaseException as error:  # noqa: BLE001 - 清理阶段保留首错，仍尝试确认本任务停止。
                 self.report["stop_error_type"] = type(error).__name__
-                raise
+                first_error = error
+            try:
+                self._confirm_stopped()
+            except BaseException as error:  # noqa: BLE001 - 状态不确定不能释放归属或覆盖首保存错误。
+                first_error = first_error or error
+            self.report["ownership_released"] = not self.owned
+            if first_error is not None:
+                raise first_error
 
 
 def _v1_manifest_valid(m):

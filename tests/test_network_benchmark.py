@@ -1121,6 +1121,77 @@ def test_wpr_fixed_profile_owner_no_takeover_and_stop_failure(tmp_path,monkeypat
     assert not trace.owned and sum('-start' in c for c in commands)==1
 
 
+@pytest.mark.parametrize('failure',['stop_error','stop_timeout','start_timeout','save_error_after_stop'])
+def test_rv009_trace_failure_confirms_owned_session_stopped(tmp_path,monkeypatch,failure):
+    """有状态WPR假实现：错误可能发生在会话仍活动、或已停但未保存之后。"""
+    monkeypatch.setattr(network,'ROOT',tmp_path);(tmp_path/'.tmp').mkdir()
+    monkeypatch.setattr(network._WaitTrace,'validate_profile',staticmethod(lambda _:tmp_path/'profile.wprp'))
+    active=[False];commands=[];foreign=[True]
+    def run(args,**kwargs):
+        commands.append(args)
+        if '-status' in args:
+            if '-instancename' not in args:return SimpleNamespace(returncode=0,stdout='WPR is not recording')
+            return SimpleNamespace(returncode=0,stdout='Issue120W1 active' if active[0] else 'WPR is not recording')
+        assert args[-2:]==['-instancename',network.W_TRACE_INSTANCE]
+        if '-start' in args:
+            active[0]=True
+            if failure=='start_timeout':raise subprocess.TimeoutExpired(args,kwargs['timeout'])
+        elif '-stop' in args:
+            if failure=='save_error_after_stop':active[0]=False
+            if failure=='stop_timeout':raise subprocess.TimeoutExpired(args,kwargs['timeout'])
+            return SimpleNamespace(returncode=1,stdout='failed')
+        elif '-cancel' in args:active[0]=False
+        return SimpleNamespace(returncode=0,stdout='')
+    monkeypatch.setattr(network.subprocess,'run',run)
+    trace=network._WaitTrace({'head':'a'*40,'call':15,'trace_profile_sha256':'b'*64})
+    with pytest.raises((RuntimeError,subprocess.TimeoutExpired)),trace:pass
+    assert not active[0] and not trace.owned and trace.report['stopped_confirmed'] is True
+    assert not trace.report['saved'] and foreign[0] and sum('-start' in a for a in commands)==1
+    assert sum('-cancel' in a for a in commands)==(0 if failure=='save_error_after_stop' else 1)
+
+
+@pytest.mark.parametrize('cli_exit',[0,5,124])
+def test_rv009_native_finalizer_cleans_claim_on_every_exit(tmp_path,monkeypatch,cli_exit):
+    """外层正常失败5和超时同样收尾；无claim时绝不操作其他会话。"""
+    monkeypatch.setattr(network,'ROOT',tmp_path);(tmp_path/'.tmp').mkdir()
+    manifest={'head':'a'*40,'call':15,'trace_profile_sha256':'b'*64}
+    active=[True];commands=[]
+    def run(args,**_):
+        commands.append(args)
+        assert args[-2:]==['-instancename',network.W_TRACE_INSTANCE]
+        if '-cancel' in args:active[0]=False
+        return SimpleNamespace(returncode=0,stdout='active' if active[0] else 'WPR is not recording')
+    monkeypatch.setattr(network.subprocess,'run',run)
+    assert network._WaitTrace.recover_owned(manifest)['not_started'] and not commands
+    claim=manifest|{'instance':network.W_TRACE_INSTANCE,'owner_pid':123,'claim_qpc_ns':time.perf_counter_ns()}
+    (tmp_path/'.tmp/issue120-w1-trace-claim.json').write_text(json.dumps(claim))
+    result=network._WaitTrace.recover_owned(manifest)
+    assert cli_exit in (0,5,124) and result['stopped_confirmed'] and not active[0]
+    assert sum('-cancel' in a for a in commands)==1 and not any('-start' in a for a in commands)
+
+
+def test_rv009_unconfirmed_cleanup_retains_claim_and_foreign_is_not_touched(tmp_path,monkeypatch):
+    monkeypatch.setattr(network,'ROOT',tmp_path);(tmp_path/'.tmp').mkdir()
+    m={'head':'a'*40,'call':15,'trace_profile_sha256':'b'*64}
+    path=tmp_path/'.tmp/issue120-w1-trace-claim.json'
+    claim=m|{'instance':network.W_TRACE_INSTANCE,'owner_pid':123,'claim_qpc_ns':time.perf_counter_ns()}
+    path.write_text(json.dumps(claim))
+    commands=[]
+    def run(args,**kwargs):
+        commands.append(args)
+        assert kwargs['timeout']<=5 and args[-2:]==['-instancename',network.W_TRACE_INSTANCE]
+        return SimpleNamespace(returncode=1 if '-cancel' in args else 0,stdout='active')
+    monkeypatch.setattr(network.subprocess,'run',run)
+    result=network._WaitTrace.recover_owned(m)
+    assert result['stopped_confirmed'] is False and result['ownership_released'] is False
+    assert result['recovery_error_type']=='RuntimeError' and path.exists()
+    before=len(commands)
+    with pytest.raises(ValueError):network._WaitTrace.recover_owned(m|{'head':'c'*40})
+    assert len(commands)==before
+    path.unlink()
+    assert network._WaitTrace.recover_owned(m)['not_started'] and len(commands)==before
+
+
 def _entry(profile, *, passed=True, head="a", sources=None, phase="discovery"):
     return {"profile": profile, "phase": phase, "head": head, "source_sha256": sources or {"src": "a"},
             "maximum_attempts": 10000 if phase == "qualification" else 1000, "finished": True, "sample_pass": passed}
