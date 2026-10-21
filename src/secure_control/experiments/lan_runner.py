@@ -670,7 +670,7 @@ def _run() -> int:
                 "attempts": len(report.get("cycles", [])), "history_export_ns": report["network_export_ns"],
                 "report": str(args.output)}, ensure_ascii=False, sort_keys=True))
             comparison = (report.get("network_manifest") or {}).get("comparison_stage")
-            return 0 if (report["network_sample_pass"] and (comparison not in ("T2", "T3", "U2")
+            return 0 if (report["network_sample_pass"] and (comparison not in ("T2", "T3", "U2", "V1")
                            or report.get("network_progress_goal_pass") is True)) else 5
         if args.steps is None:
             parser.error("benchmark requires --steps outside the fixed network profiles")
