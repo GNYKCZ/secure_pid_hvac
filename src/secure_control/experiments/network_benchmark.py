@@ -17,6 +17,7 @@ from contextlib import nullcontext
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from xml.etree import ElementTree
 
 from secure_control.execution.lan_config import LanEndpoint, LanTopology
 from secure_control.execution.localhost_codec import (
@@ -74,6 +75,199 @@ V1_RAW_SHA256 = ["7bf31dcc9ec8b703edee022f6414c8dd7b6be212fd330b4c35024d7f89f097
                  "9d5007dfa94652a4367533f02b66dce2a81c508d303fec0fefea650536968c5a"]
 V1_SOURCE_FILES = ("src/secure_control/experiments/network_benchmark.py",
                    "src/secure_control/experiments/lan_runner.py")
+W_DESIGN = "https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6308806798"
+W_HISTORY = "55b2fda1991b4ba65cd67fb7ec87addc0b865bb8f14289b10c71eb49cc403902"
+W_NATIVE_HISTORY = "08374e2f98cc0381ff855bb5b3ac0dd3a03aa0a46508b366efd6b898fe686b93"
+W_BASE_HEAD = "45a60abe5e2547326ac152d9280cd133b662b72d"
+W_SOURCE_FILES = (*V1_SOURCE_FILES, "src/secure_control/experiments/_network_emulator.py",
+                  "src/secure_control/experiments/_network_wait_win32.py")
+W_TRACE_INSTANCE = "Issue120W1"
+W_TRACE_KEYWORDS = {"ProcessThread", "CSwitch", "ReadyThread", "ThreadPriority", "CpuConfig", "Interrupt", "DPC"}
+
+
+def _w_manifest_valid(m):
+    """本批W1诊断/W2有证据修复复核，不复活旧许可或另开跟踪。"""
+    if not isinstance(m, dict) or m.get("comparison_stage") not in ("W1", "W2"):
+        return False
+    second = m["comparison_stage"] == "W2"
+    common = {k: v for k, v in m.items() if k not in V2_CERTIFICATE_FIELDS}
+    common.update(authorization_url=V1_DESIGN, comparison_design_url=V1_DESIGN,
+        closed_history_sha256=V1_HISTORY, closed_native_history_sha256=V1_NATIVE_HISTORY,
+        comparison_stage="V1", call=14, maximum_calls=14, total_maximum_attempts=14000,
+        batch_maximum_calls=1, batch_maximum_attempts=1000,
+        certificate_directory=str((ROOT/".tmp/issue120-stage-authorized-certs").resolve()),
+        public_certificate_validity={}, comparison_review_url=V1_REVIEW, comparison_raw_sha256=V1_RAW_SHA256)
+    return (m.get("authorization_url") == W_DESIGN and m.get("comparison_design_url") == W_DESIGN
+        and m.get("closed_history_sha256") == W_HISTORY and m.get("closed_native_history_sha256") == W_NATIVE_HISTORY
+        and m.get("wait_diagnostic") is (not second) and m.get("system_trace") is (not second)
+        and m.get("first_model_failure_stop") is True
+        and all(type(m.get(k)) is int and m[k] == v for k,v in {
+            "call": 16 if second else 15, "maximum_calls": 16, "total_maximum_attempts": 16000,
+            "batch_maximum_calls": 2, "batch_maximum_attempts": 2000}.items())
+        and m.get("certificate_directory") in {str((ROOT/".tmp"/name).resolve())
+                for name in ("issue120-stage-authorized-certs", "issue120-wait-diagnostic-certs")}
+        and isinstance(m.get("public_certificate_validity"), dict)
+        and not any(k in m for k in V2_CERTIFICATE_FIELDS if k != "public_certificate_validity")
+        and _v1_manifest_valid(common))
+
+
+def _next_w_call(entries, profile, phase, head, sources, m):
+    """保留14项含失败的历史；W2额外要求原件/可复核区间/修复与独审。"""
+    if (not _w_manifest_valid(m) or type(entries) is not list or len(entries) not in (14,15)
+            or digest(entries[:14]) != W_HISTORY or m["call"] != len(entries)+1
+            or any(e.get("finished") is not True for e in entries)
+            or (profile,phase,head,sources) != (m["profile"],m["phase"],m["head"],m["source_sha256"])):
+        raise ValueError("W批次许可/14项历史/来源/顺序或额度不符。")
+    rows = json.loads(Path(m["native_ledger_path"]).read_text(encoding="utf8"))["entries"]
+    keys = ("call","head","source_sha256","conditions_sha256","comparison_stage","authorization_url",
+            "maximum_attempts","profile","phase","wire_profile")
+    if (type(rows) is not list or len(rows) != len(entries)+1 or digest(rows[:14]) != W_NATIVE_HISTORY
+            or any(r.get("completed") is not True for r in rows[:-1])
+            or rows[-1].get("completed") is not False or rows[-1].get("native_exit") is not None
+            or not isinstance(rows[-1].get("started_utc"),str)
+            or any(rows[-1].get(k) != m.get(k) for k in keys)):
+        raise ValueError("W批次原生历史/当前START不符。")
+    previous = entries[13]
+    frozen = previous["source_sha256"]
+    if (previous["head"] != W_BASE_HEAD or head == W_BASE_HEAD or set(sources) != set(frozen)
+            or any(sources[k] != value for k,value in frozen.items() if k not in W_SOURCE_FILES)):
+        raise ValueError("W批次控制/材料/transport来源必须冻结。")
+    # 换证只在W1前一次，旧公开指纹/条件必须可追溯，不读取私钥。
+    if m.get("certificate_directory") == previous.get("certificate_directory"):
+        if any(m.get(k) != previous.get(k) for k in ("public_certificate_sha256","public_certificate_validity","conditions_sha256")):
+            raise ValueError("复用原证必须保持原指纹/条件。")
+    elif (m.get("certificate_preparation_url") != W_DESIGN
+            or m.get("certificate_preparation_reason") != "insufficient_validity_before_W1"
+            or m.get("prior_public_certificate_sha256") != previous.get("public_certificate_sha256")
+            or m.get("prior_conditions_sha256") != previous.get("conditions_sha256")
+            or digest({"ports":m["ports"],"environment":m["environment"],
+                "public_certificate_sha256":m["prior_public_certificate_sha256"],"seed":SEED}) != previous["conditions_sha256"]):
+        raise ValueError("W1一次证书准备依据不符。")
+    if len(entries) == 15:
+        first = entries[-1]
+        if (not _w_manifest_valid(first) or first["comparison_stage"] != "W1"
+                or any(first.get(k) != m.get(k) for k in ("certificate_directory","public_certificate_sha256",
+                    "public_certificate_validity","conditions_sha256")) or head == first["head"]
+                or all(sources.get(k) == first.get("source_sha256",{}).get(k) for k in W_SOURCE_FILES[2:])
+                or any(rows[-2].get(k) != first.get(k) for k in keys)
+                or type(rows[-2].get("native_exit")) is not int
+                or not COMMENT.fullmatch(m.get("diagnosis_review_url",""))
+                or not COMMENT.fullmatch(m.get("fix_evidence_url",""))):
+            raise ValueError("W2需要同链W1、真实退出、新修复head和独审。")
+        raw = Path(first["output"]).read_bytes()
+        cause = Path(m["cause_path"]).read_bytes()
+        if (hashlib.sha256(raw).hexdigest() != first.get("raw_sha256")
+                or m.get("predecessor_raw_sha256") != first.get("raw_sha256")
+                or hashlib.sha256(cause).hexdigest() != m.get("cause_sha256")):
+            raise ValueError("W2缺少精确原件/原因证据。")
+        evidence = json.loads(cause)
+        r = json.loads(raw)
+        if (evidence.get("version") != 1 or evidence.get("branch") not in ("relative_preparation","handle_preparation","dispatch_work")
+                or evidence.get("raw_sha256") != first["raw_sha256"] or evidence.get("head") != first["head"]
+                or evidence.get("review_url") != m["diagnosis_review_url"]
+                or type(evidence.get("start_ns")) is not int or type(evidence.get("end_ns")) is not int
+                or evidence["end_ns"]-evidence["start_ns"] <= 1000000
+                or evidence.get("trace_lost_events") != 0 or evidence.get("clock_mapping_verified") is not True
+                or any(r.get("network_manifest",{}).get(k) != first.get(k) for k in keys)
+                or (r.get("system_trace") or {}).get("saved") is not True
+                or evidence.get("etl_sha256") != (r.get("system_trace") or {}).get("etl_sha256")
+                or not isinstance(evidence.get("etl_sha256"),str)
+                or not re.fullmatch(r"[0-9a-f]{64}",evidence["etl_sha256"])
+                or not isinstance(evidence.get("excerpt_sha256"),str)
+                or not re.fullmatch(r"[0-9a-f]{64}",evidence["excerpt_sha256"])
+                or not (r.get("network_relay") or {}).get("wait_diagnostic",{}).get("first_anomaly")):
+            raise ValueError("W2未有可复核内部原因区间/映射/独审，不接受root_cause布尔。")
+    return 1000
+
+
+def _require_w_certificates(m, configs=None):
+    """只读当前同链公开证书及原N2拓扑；不在owner内生成证书。"""
+    _require_v1_certificates(m, configs)
+
+
+def require_w_candidate(m, configs=None):
+    """正式/共享/实际循环共用本批锁、唯一START和原子占项。"""
+    if not _w_manifest_valid(m):
+        raise ValueError("缺少W批次精确许可。")
+    head,sources = source()
+    ledger = Path(m["budget_path"])
+    entries = json.loads(ledger.read_text(encoding="utf8"))["entries"]
+    lock = ledger.with_suffix(ledger.suffix+".lock")
+    if (head != m["head"] or sources != m["source_sha256"] or len(entries) != m["call"]
+            or not lock.is_file() or lock.read_text(encoding="utf8").strip() != str(os.getpid())):
+        raise ValueError("W批次当前来源/锁/占项不符。")
+    _next_w_call(entries[:-1],m["profile"],m["phase"],head,sources,m)
+    if entries[-1].get("finished") is not False or any(entries[-1].get(k) != value for k,value in m.items()
+            if k not in ("command","started_utc","scope")):
+        raise ValueError("W批次在途记录不符。")
+    _require_w_certificates(m,configs)
+
+
+class _WaitTrace:
+    """仅W1一次任务具名WPR会话；占项后启动，finally只停止自己成功启动的实例。"""
+
+    def __init__(self, manifest):
+        self.manifest = manifest
+        self.owned = False
+        self.report = {"version":1,"instance":W_TRACE_INSTANCE,"started":False,"saved":False,"commands":[]}
+
+    @staticmethod
+    def validate_profile(m):
+        """只读校验32MiB内存环与最小事件集，禁止stack/sample/网络等宽泛配置。"""
+        path = ROOT/".tmp/issue120-w1.wprp"
+        data = path.read_bytes()
+        if hashlib.sha256(data).hexdigest() != m.get("trace_profile_sha256"):
+            raise ValueError("WPR任务profile摘要不符。")
+        root = ElementTree.fromstring(data)
+        profiles = root.findall("./Profiles/Profile")
+        if (len(profiles) != 1 or profiles[0].get("LoggingMode") != "Memory"
+                or profiles[0].get("Name") != W_TRACE_INSTANCE
+                or [x.attrib for x in root.findall("./Profiles/SystemCollector/BufferSize")] != [{"Value":"256"}]
+                or [x.attrib for x in root.findall("./Profiles/SystemCollector/Buffers")] != [{"Value":"128"}]
+                or {x.get("Value") for x in root.findall("./Profiles/SystemProvider/Keywords/Keyword")} != W_TRACE_KEYWORDS
+                or root.findall(".//Stacks") or root.findall(".//EventProvider")
+                or m.get("trace_instance") != W_TRACE_INSTANCE or m.get("trace_max_seconds") != 90):
+            raise ValueError("WPR必须为本任务固定32MiB及最小系统事件，禁止重型记录。")
+        return path
+
+    def _command(self, args, timeout):
+        start = time.perf_counter_ns()
+        result = subprocess.run(["wpr",*args],capture_output=True,text=True,timeout=timeout,check=False)
+        self.report["commands"].append({"command":["wpr",*args],"native_exit":result.returncode,
+            "start_qpc_ns":start,"end_qpc_ns":time.perf_counter_ns()})
+        if result.returncode:
+            raise RuntimeError("本任务WPR命令失败；不重采。")
+        return result.stdout
+
+    def __enter__(self):
+        path = self.validate_profile(self.manifest)
+        if (ROOT/".tmp/issue120-w1.etl").exists():
+            raise ValueError("任务ETL已存在，禁止启动第二次记录。")
+        if "WPR is not recording" not in self._command(["-status"],10):
+            raise RuntimeError("存在非本任务WPR会话，不接管或cancel。")
+        self._command(["-start",str(path)+"!"+W_TRACE_INSTANCE,"-instancename",W_TRACE_INSTANCE],10)
+        self.owned = True
+        self.report["started"] = True
+        return self
+
+    def __exit__(self, *_):
+        if self.owned:
+            self.owned = False
+            path = ROOT/".tmp/issue120-w1.etl"
+            if path.exists():
+                # 即使外部异常创建同名文件，也停止自己的会话，绝不覆盖原件或泄漏记录。
+                path = ROOT/f".tmp/issue120-w1-conflict-{os.getpid()}.etl"
+                self.report["stop_path_conflict"] = True
+                if path.exists():
+                    self.report["stop_error_type"] = "ExistingETL"
+                    raise RuntimeError("任务ETL及冲突保存路径均已存在，需报告会话状态。")
+            try:
+                self._command(["-stop",str(path),"-skipPdbGen","-instancename",W_TRACE_INSTANCE],20)
+                self.report.update(saved=True,etl_path=str(path),etl_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                                   etl_bytes=path.stat().st_size)
+            except Exception as error:
+                self.report["stop_error_type"] = type(error).__name__
+                raise
 
 
 def _v1_manifest_valid(m):
@@ -445,6 +639,11 @@ def require_staged_candidate(m, configs=None):
 
 def require_network_candidate(m, wire_profile, configs=None):
     """只按明确批次路由许可；不能把 v3 放入旧 R1/Q1 的能力集合。"""
+    if isinstance(m, dict) and m.get("authorization_url") == W_DESIGN:
+        if m.get("wire_profile") != wire_profile:
+            raise ValueError("W批次编码与实际入口不符。")
+        require_w_candidate(m,configs)
+        return
     if isinstance(m, dict) and m.get("authorization_url") == V1_DESIGN:
         if m.get("wire_profile") != wire_profile:
             raise ValueError("V1编码与实际入口不匹配。")
@@ -908,7 +1107,8 @@ def validate_cli(args):
     wire = getattr(args, "network_wire_profile", None)
     authorization = getattr(args, "network_authorization", None)
     local = authorization == LOCAL_DESIGN
-    v1 = authorization == V1_DESIGN
+    w_batch = authorization == W_DESIGN
+    v1 = authorization == V1_DESIGN or w_batch
     staged = authorization == STAGED_AUTHORIZATION or local or v1
     if v1 and (args.network_profile != "N2" or wire != _COMPACT_PROFILE_V3):
         raise ValueError("V1仅允许N2/compact-v3。")
@@ -1004,6 +1204,8 @@ def next_call(entries, profile, phase, head, sources, repair_note=None):
 
 def _next_compact_call(entries, profile, phase, head, sources, continuation):
     """在同一已停止账本追加一次人工续接；旧循环与失败记录不可重置。"""
+    if isinstance(continuation, dict) and continuation.get("authorization_url") == W_DESIGN:
+        return _next_w_call(entries,profile,phase,head,sources,continuation)
     if isinstance(continuation, dict) and continuation.get("authorization_url") == V1_DESIGN:
         return _next_v1_call(entries, profile, phase, head, sources, continuation)
     if isinstance(continuation, dict) and continuation.get("authorization_url") == LOCAL_DESIGN:
@@ -1173,8 +1375,9 @@ class RunBudget:
             staged = any(e.get("authorization_url") == STAGED_AUTHORIZATION for e in self.entries)
             local = any(e.get("authorization_url") == LOCAL_DESIGN for e in self.entries)
             v1 = any(e.get("authorization_url") == V1_DESIGN for e in self.entries)
-            json.dump({"schema": "network-call-budget-v1", "maximum_calls": 14 if v1 else 13 if local else 12 if staged else 10 if repair else 9 if closure else 6,
-                       "maximum_attempts": 14000 if v1 else 13000 if local else 12000 if staged else 19000 if repair else 18000 if closure else 15000,
+            w_batch = any(e.get("authorization_url") == W_DESIGN for e in self.entries)
+            json.dump({"schema": "network-call-budget-v1", "maximum_calls": 16 if w_batch else 14 if v1 else 13 if local else 12 if staged else 10 if repair else 9 if closure else 6,
+                       "maximum_attempts": 16000 if w_batch else 14000 if v1 else 13000 if local else 12000 if staged else 19000 if repair else 18000 if closure else 15000,
                        "entries": self.entries}, stream, ensure_ascii=False, indent=2, allow_nan=False)
             stream.flush()
             os.fsync(stream.fileno())
@@ -1191,7 +1394,7 @@ class RunBudget:
             "conditions_sha256": conditions_sha256})
         if continuation is not None:
             fields = continuation
-            if continuation.get("authorization_url") in (CLOSURE_AUTHORIZATION,REPAIR_AUTHORIZATION,STAGED_AUTHORIZATION,LOCAL_DESIGN,V1_DESIGN):
+            if continuation.get("authorization_url") in (CLOSURE_AUTHORIZATION,REPAIR_AUTHORIZATION,STAGED_AUTHORIZATION,LOCAL_DESIGN,V1_DESIGN,W_DESIGN):
                 owned = {"output", "started_utc", "finished", "sample_pass", "actual_attempts", "raw_sha256",
                          "failure_category", "ended_utc", "repair_note"}
                 fields = {k: v for k, v in continuation.items() if k not in owned}
@@ -1239,7 +1442,8 @@ def assemble(result, *, profile, phase, manifest, relay):
     closure = manifest.get("authorization_url") in (CLOSURE_AUTHORIZATION,REPAIR_AUTHORIZATION)
     compact = wire_profile in _COMPACT_PROFILES
     local = manifest.get("authorization_url") == LOCAL_DESIGN
-    v1 = manifest.get("authorization_url") == V1_DESIGN
+    w_batch = manifest.get("authorization_url") == W_DESIGN
+    v1 = manifest.get("authorization_url") == V1_DESIGN or w_batch
     staged = manifest.get("authorization_url") == STAGED_AUTHORIZATION or local or v1
     material = result.get("material_summary") or {}
     wire_valid = (wire_profile is None and result.get("wire_profile") is None) or compact and (result.get("wire_profile") == wire_profile
@@ -1248,7 +1452,7 @@ def assemble(result, *, profile, phase, manifest, relay):
         and len(result.get("party_outcomes", [])) == 2
         and all(row.get("wire_profile") == wire_profile for row in result["party_outcomes"]))
     sample = (result.get("status") == "stopped" and result.get("requested_steps") == target
-        and (((_v1_manifest_valid(manifest) if v1 else _local_manifest_valid(manifest) if local else _staged_manifest_valid(manifest))
+        and (((_w_manifest_valid(manifest) if w_batch else _v1_manifest_valid(manifest) if v1 else _local_manifest_valid(manifest) if local else _staged_manifest_valid(manifest))
               and (profile, phase) == (manifest["profile"], manifest["phase"])
               and result.get("code_sha") == manifest["head"]
               and result.get("source_sha256") == manifest["source_sha256"]
@@ -1260,6 +1464,8 @@ def assemble(result, *, profile, phase, manifest, relay):
         and complete and wire_valid and (result.get("network_history") or {}).get("finite_sample_pass") is True and _tls_pass(result)
         and relay.get("model_valid") is True and relay.get("process_exited") is True
         and (not v1 or _v1_relay_pass(relay))
+        and (not w_batch or relay.get("first_model_failure_stop") is True
+             and (manifest["comparison_stage"] != "W1" or (result.get("system_trace") or {}).get("saved") is True))
         and not relay.get("forced_termination") and (not closure or _closure_cpu_pass(relay,
             native=_repair_manifest_valid(manifest) if repair else _event_manifest_valid(manifest)))
         and (not staged or _staged_frames_pass(result, wire_profile)
@@ -1276,7 +1482,7 @@ def assemble(result, *, profile, phase, manifest, relay):
         result["network_progress_goal_pass"] = bool(sample and _closure_goal(result))
     if staged:
         result["network_progress_goal_pass"] = (bool(sample and _closure_goal(result))
-            if manifest["comparison_stage"] in ("T3", "V1") else None)
+            if manifest["comparison_stage"] in ("T3", "V1", "W1", "W2") else None)
     if not sample and result.get("status") == "stopped":
         result.update(status="failed", failure_category="NetworkEvidenceOrModel", failed_phase="NETWORK_REPORT")
     return result
@@ -1297,7 +1503,8 @@ def run_network_benchmark(*, profile, phase, certs, ports, ledger, approval, out
     repair = wire_profile == _COMPACT_PROFILE_V2 and authorization == REPAIR_AUTHORIZATION
     closure = wire_profile == _COMPACT_PROFILE_V2 and authorization in (CLOSURE_AUTHORIZATION,REPAIR_AUTHORIZATION)
     local = authorization == LOCAL_DESIGN
-    v1 = authorization == V1_DESIGN
+    w_batch = authorization == W_DESIGN
+    v1 = authorization == V1_DESIGN or w_batch
     staged = authorization == STAGED_AUTHORIZATION or local or v1
     if wire_profile is not None:
         if (wire_profile not in _COMPACT_PROFILES or approval.get("wire_profile") != wire_profile
@@ -1308,7 +1515,7 @@ def run_network_benchmark(*, profile, phase, certs, ports, ledger, approval, out
         continuation = {"wire_profile": wire_profile, "authorization_url": authorization,
                         "closed_history_sha256": approval["closed_history_sha256"]}
         if staged:
-            if (not (_v1_manifest_valid(approval) if v1 else _local_manifest_valid(approval) if local else _staged_manifest_valid(approval))
+            if (not (_w_manifest_valid(approval) if w_batch else _v1_manifest_valid(approval) if v1 else _local_manifest_valid(approval) if local else _staged_manifest_valid(approval))
                     or (profile, phase) != (approval["profile"], approval["phase"])
                     or ports != V2_PORTS or str(Path(ledger).resolve()) != approval["budget_path"]
                     or str(Path(certs).resolve()) != approval["certificate_directory"]):
@@ -1344,7 +1551,12 @@ def run_network_benchmark(*, profile, phase, certs, ports, ledger, approval, out
         if staged:
             if approval["conditions_sha256"] != conditions:
                 raise ValueError("比较阶段条件摘要不符。")
-            if v1:
+            if w_batch:
+                _next_w_call(budget.entries,profile,phase,head,fingerprints,approval)
+                _require_w_certificates(approval)
+                if approval["system_trace"]:
+                    _WaitTrace.validate_profile(approval)
+            elif v1:
                 _next_v1_call(budget.entries, profile, phase, head, fingerprints, approval)
                 _require_v1_certificates(approval)
             elif local:
@@ -1390,7 +1602,7 @@ def run_network_benchmark(*, profile, phase, certs, ports, ledger, approval, out
                 raise ValueError("当前候选的N2原件已变化。")
         steps = budget.reserve(profile, phase, head, fingerprints, output, repair_note, conditions,
                                continuation=continuation)
-        result, relay = {}, None
+        result, relay, trace = {}, None, None
         manifest = {"profile": profile, "phase": phase, "head": head, "source_sha256": fingerprints,
             "command": list(sys.argv), "seed": SEED, "maximum_attempts": steps,
             "call": budget.entries[-1]["call"], "maximum_calls": 6, "total_maximum_attempts": 15000,
@@ -1419,10 +1631,12 @@ def run_network_benchmark(*, profile, phase, certs, ports, ledger, approval, out
                     for name in ("ca.pem", "client.pem", "p1.pem", "p2.pem")}
                 if manifest["public_certificate_sha256"] != approval.get("public_certificate_sha256"):
                     raise ValueError("公开证书指纹不符合预声明。")
+                trace = _WaitTrace(manifest) if w_batch and manifest["system_trace"] else None
                 relay = NetworkRelay(profile, tuple(("127.0.0.1", port, "127.0.0.2") for port in ports),
                     **({"wait_strategy": EVENT_STRATEGY} if _event_manifest_valid(manifest)
-                        or _repair_manifest_valid(manifest) or staged else {})) if profile != "N0" else None
-                with relay if relay is not None else nullcontext():
+                        or _repair_manifest_valid(manifest) or staged else {}),
+                    **({"wait_diagnostic":manifest["wait_diagnostic"],"fail_first_model":True} if w_batch else {})) if profile != "N0" else None
+                with (trace if trace is not None else nullcontext()), (relay if relay is not None else nullcontext()):
                     result = benchmark.run_network_observation(configs=configs, steps=steps,
                         **({"wire_profile": wire_profile} if wire_profile is not None else {}),
                         **({"candidate_manifest": manifest} if wire_profile in (_COMPACT_PROFILE_V2, _COMPACT_PROFILE_V3) else {}))
@@ -1442,6 +1656,8 @@ def run_network_benchmark(*, profile, phase, certs, ports, ledger, approval, out
                               "cycle_timing": benchmark._timing([]), "requested_steps": steps}
             relay_report = relay.report if relay is not None else {"model_valid": True, "process_exited": True,
                 "forced_termination": False, "scope": "N0 direct TLS, no relay process or injected delay"}
+            if trace is not None:
+                result["system_trace"] = trace.report
             result.update(code_sha=head, source_sha256=fingerprints)
             result = assemble(result, profile=profile, phase=phase, manifest=manifest, relay=relay_report or {})
             if staged and manifest["comparison_stage"] in ("T2", "U2"):

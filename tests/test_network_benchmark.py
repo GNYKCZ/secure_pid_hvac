@@ -1023,6 +1023,104 @@ def test_relay_cpu_failure_exports_full_bounded_ring_and_preserves_first_error(m
     assert len(json.dumps(report, separators=(",", ":")).encode()) <= 64*1024
 
 
+@pytest.mark.parametrize("mode", ["timer", "ready", "expired", "timer_error", "wait_error", "enum_error"])
+def test_wait_diagnostic_boundaries_missing_values_and_fixed_ring(monkeypatch, mode):
+    """FFI前后为本地Python时点；异常/ready路径不继承上一次timer事实。"""
+    from secure_control.experiments import _network_wait_win32 as native
+    clock, api = [1000], _WaitAPI()
+    monkeypatch.setattr(native.time,"perf_counter_ns",lambda:clock[0])
+    original_set, original_wait = api.SetWaitableTimerEx, api.WaitForMultipleObjects
+    def set_timer(*args):
+        clock[0] += 50000
+        return original_set(*args)
+    def kernel_wait(*args):
+        clock[0] += 2000000
+        return original_wait(*args)
+    api.SetWaitableTimerEx,api.WaitForMultipleObjects = set_timer,kernel_wait
+    with native.NativeWait(_api=api,observe_wait=True) as wait:
+        sock=SimpleNamespace(fileno=lambda:101)
+        wait.register(sock,1,("stream",None,None))
+        for _ in range(10):
+            wait.wait_until(clock[0]+1001)
+        assert len(wait.evidence.report()["rows"])==8
+        before=clock[0]
+        if mode=="ready": api.events[101]=(native.FD_READ,{})
+        elif mode.endswith("error"): api.fail=mode.split('_')[0].replace('enum','enum')
+        if mode.endswith("error"):
+            with pytest.raises(OSError): wait.wait_until(clock[0]+1001)
+        else: wait.wait_until(clock[0] if mode=="expired" else clock[0]+1001)
+        row=dict(zip(native.WaitEvidence.FIELDS,wait.evidence.report()["rows"][-1]))
+        assert row["wait_id"]==11 and row["pid"]==os.getpid() and row["native_tid"]>0
+        if mode in ("ready","expired","enum_error"):
+            assert all(row[k]==-1 for k in ("relative_100ns","set_enter_ns","wait_enter_ns","wait_leave_ns"))
+        elif mode=="timer_error":
+            assert row["set_leave_ns"]-row["set_enter_ns"]==50000 and row["wait_enter_ns"]==-1
+        else:
+            assert row["relative_100ns"]==-11
+            assert row["set_leave_ns"]-row["set_enter_ns"]==50000
+            assert row["wait_leave_ns"]-row["wait_enter_ns"]==2000000
+        assert row["completed"]==(-1 if mode.endswith("error") else 1)
+        assert row["wait_started_ns"]==before
+        api.fail=None
+    assert not api.open
+    with native.NativeWait(_api=api) as default:
+        assert default.evidence is None
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_model_first_stop_preserves_send_and_first_snapshot(monkeypatch, blocked):
+    from secure_control.experiments import _network_wait_win32 as native
+    clock=[2000001]
+    monkeypatch.setattr(emulator.time,"perf_counter_ns",lambda:clock[0])
+    evidence=native.WaitEvidence();evidence.begin()
+    evidence.current[4]=0;evidence.current[11]=evidence.current[13]=2000000
+    evidence.current[14:16]=native.array('q',[6,1]);evidence.finish()
+    owner=SimpleNamespace(evidence=evidence,writable_return=lambda *_:None,
+                          write_progressed=lambda *_:None,write_blocked=lambda *_:None)
+    def send(data):
+        if blocked: raise BlockingIOError()
+        return len(data)
+    d=emulator.Direction(None,SimpleNamespace(send=send),"Client->P1",None)
+    d.queue.append(emulator.Block(b'ab',0,0,0,0,0));d.queued=2
+    ring=emulator.PublicRing(fail_first=True,native=owner)
+    with pytest.raises(emulator.RelayModelError):emulator._dispatch(d,clock[0],None,ring,owner)
+    assert ring.first_anomaly is not None and ring.wait_report()["associated_wait_id"]==1
+    assert d.stats['sent_bytes']==(0 if blocked else 2) and d.queued==(2 if blocked else 0)
+    assert d.stats['unexplained_over_tolerance']==1
+    evidence.current[4]=3;evidence.finish()
+    assert ring.wait_report()['rows'][-1][4]==0  # 首异常快照不被后续覆盖。
+
+
+def test_wpr_fixed_profile_owner_no_takeover_and_stop_failure(tmp_path,monkeypatch):
+    monkeypatch.setattr(network,'ROOT',tmp_path);(tmp_path/'.tmp').mkdir()
+    keywords=''.join(f'<Keyword Value="{k}"/>' for k in sorted(network.W_TRACE_KEYWORDS))
+    path=tmp_path/'.tmp/issue120-w1.wprp'
+    path.write_text(f'<WindowsPerformanceRecorder><Profiles><SystemCollector><BufferSize Value="256"/>'
+        f'<Buffers Value="128"/></SystemCollector><SystemProvider><Keywords>{keywords}</Keywords></SystemProvider>'
+        '<Profile Name="Issue120W1" LoggingMode="Memory"/></Profiles></WindowsPerformanceRecorder>')
+    m={'trace_profile_sha256':network.hashlib.sha256(path.read_bytes()).hexdigest(),
+       'trace_instance':network.W_TRACE_INSTANCE,'trace_max_seconds':90}
+    commands=[];active=[False];stop_fail=[False]
+    def run(args,**kwargs):
+        commands.append(args)
+        assert kwargs['timeout']<=20
+        if '-status' in args:return SimpleNamespace(returncode=0,stdout='busy' if active[0] else 'WPR is not recording')
+        if '-stop' in args:
+            if stop_fail[0]:return SimpleNamespace(returncode=1,stdout='failure')
+            (tmp_path/'.tmp/issue120-w1.etl').write_bytes(b'local system metadata')
+        assert args[-2:]==['-instancename',network.W_TRACE_INSTANCE]
+        return SimpleNamespace(returncode=0,stdout='')
+    monkeypatch.setattr(network.subprocess,'run',run)
+    active[0]=True
+    with pytest.raises(RuntimeError),network._WaitTrace(m):pass
+    assert len(commands)==1
+    active[0]=False;stop_fail[0]=True
+    trace=network._WaitTrace(m)
+    with pytest.raises(RuntimeError),trace:pass
+    assert trace.report['started'] and not trace.report['saved'] and trace.report['stop_error_type']=='RuntimeError'
+    assert not trace.owned and sum('-start' in c for c in commands)==1
+
+
 def _entry(profile, *, passed=True, head="a", sources=None, phase="discovery"):
     return {"profile": profile, "phase": phase, "head": head, "source_sha256": sources or {"src": "a"},
             "maximum_attempts": 10000 if phase == "qualification" else 1000, "finished": True, "sample_pass": passed}
@@ -1399,6 +1497,110 @@ def test_v1_reuses_sample_model_frames_and_separate_margin_gates(v1_context, fau
     assert checked["network_sample_pass"] is (fault in (None, "margin"))
     assert checked["network_progress_goal_pass"] is (fault is None)
     assert checked["network_dynamic_qualification_pass"] is False
+
+
+@pytest.fixture
+def w_context(v1_context,monkeypatch):
+    """封存14个测试对象，隔离真实账本；W1/W2必须有真实在途与前件结构。"""
+    history,old,ledger,native,_=v1_context
+    old=old|{'source_sha256':old['source_sha256']|{p:'c'*64 for p in network.W_SOURCE_FILES[2:]}}
+    raw=ledger.parent/'V1.json';raw.write_text(json.dumps(_comparison_software_result(old)),encoding='utf8')
+    entry=old|{'output':str(raw),'raw_sha256':network.hashlib.sha256(raw.read_bytes()).hexdigest(),
+               'finished':True,'actual_attempts':1000}
+    history.append(entry);native.append(entry|{'completed':True,'native_exit':5})
+    monkeypatch.setattr(network,'W_HISTORY',network.digest(history))
+    monkeypatch.setattr(network,'W_NATIVE_HISTORY',network.digest(native))
+    monkeypatch.setattr(network,'W_BASE_HEAD',old['head'])
+    m=old|{'head':'b'*40,'source_sha256':old['source_sha256']|{p:'d'*64 for p in network.W_SOURCE_FILES if p in old['source_sha256']},
+       'authorization_url':network.W_DESIGN,'comparison_design_url':network.W_DESIGN,
+       'closed_history_sha256':network.W_HISTORY,'closed_native_history_sha256':network.W_NATIVE_HISTORY,
+       'comparison_stage':'W1','call':15,'maximum_calls':16,'total_maximum_attempts':16000,
+       'batch_maximum_calls':2,'batch_maximum_attempts':2000,'wait_diagnostic':True,'system_trace':True,
+       'first_model_failure_stop':True}
+    ledger.write_text(json.dumps({'schema':'network-call-budget-v1','entries':history}),encoding='utf8')
+    def start(current=m):
+        network.Path(m['native_ledger_path']).write_text(json.dumps({'entries':native+[current|{
+            'completed':False,'native_exit':None,'started_utc':'start'}]}),encoding='utf8')
+    start();monkeypatch.setattr(network,'source',lambda:(m['head'],m['source_sha256']))
+    return history,m,ledger,native,start
+
+
+@pytest.mark.parametrize('change',[{'call':16},{'call':True},{'maximum_calls':17},{'maximum_attempts':10000},
+    {'profile':'N0'},{'phase':'qualification'},{'comparison_stage':'V1'},{'authorization_url':network.V1_DESIGN},
+    {'wait_diagnostic':False},{'system_trace':False},{'first_model_failure_stop':False},
+    {'closed_history_sha256':'0'*64},{'control_head':'0'*40}])
+def test_w_precise_scope_old_history_and_unique_native_start(w_context,change):
+    history,m,_,_,_=w_context
+    assert network._w_manifest_valid(m)
+    assert network._next_w_call(history,'N2','candidate',m['head'],m['source_sha256'],m)==1000
+    wrong=m|change
+    with pytest.raises(ValueError):
+        network._next_compact_call(history,wrong['profile'],wrong['phase'],wrong['head'],wrong['source_sha256'],wrong)
+
+
+def test_w1_consumed_and_w2_requires_original_cause_review_and_new_source(w_context,monkeypatch):
+    history,m,ledger,native,start=w_context
+    monkeypatch.setattr(network,'_require_w_certificates',lambda *_:None)
+    with network.RunBudget(ledger) as budget:
+        raw=ledger.parent/'W1.json'
+        budget.reserve('N2','candidate',m['head'],m['source_sha256'],raw,continuation=m,
+                       conditions_sha256=m['conditions_sha256'])
+        network.require_network_candidate(m,network._COMPACT_PROFILE_V3)
+        r={'network_manifest':m,'network_relay':{'wait_diagnostic':{'first_anomaly':{'rows':[[1]]}}},
+           'system_trace':{'saved':True,'etl_sha256':'a'*64},'cycles':[]}
+        raw.write_text(json.dumps(r),encoding='utf8')
+        budget.finish(r,network.hashlib.sha256(raw.read_bytes()).hexdigest())
+        first=copy.deepcopy(budget.entries[-1])
+    native.append(first|{'completed':True,'native_exit':5})
+    cause=ledger.parent/'cause.json'
+    cause.write_text(json.dumps({'version':1,'branch':'relative_preparation','raw_sha256':first['raw_sha256'],
+        'head':m['head'],'review_url':m['review_url'],'start_ns':100,'end_ns':2000200,
+        'trace_lost_events':0,'clock_mapping_verified':True,'etl_sha256':'a'*64,'excerpt_sha256':'b'*64}),encoding='utf8')
+    second=m|{'comparison_stage':'W2','call':16,'head':'8'*40,'wait_diagnostic':False,'system_trace':False,
+        'source_sha256':m['source_sha256']|{network.W_SOURCE_FILES[2]:'8'*64},
+        'diagnosis_review_url':m['review_url'],'fix_evidence_url':m['review_url'],
+        'cause_path':str(cause),'cause_sha256':network.hashlib.sha256(cause.read_bytes()).hexdigest(),
+        'predecessor_raw_sha256':first['raw_sha256']}
+    start(second)
+    assert network._next_w_call(history+[first],'N2','candidate',second['head'],second['source_sha256'],second)==1000
+    for fault in ({'branch':'system_ready'},{'trace_lost_events':1},{'clock_mapping_verified':False},{'end_ns':101}):
+        original=json.loads(cause.read_text());cause.write_text(json.dumps(original|fault),encoding='utf8')
+        wrong=second|{'cause_sha256':network.hashlib.sha256(cause.read_bytes()).hexdigest()}
+        start(wrong)
+        with pytest.raises(ValueError):
+            network._next_w_call(history+[first],'N2','candidate',wrong['head'],wrong['source_sha256'],wrong)
+        cause.write_text(json.dumps(original),encoding='utf8')
+    assert json.loads(ledger.read_text())['maximum_calls']==16
+
+
+def test_w1_trace_is_started_only_after_reservation_and_no_real_recording(w_context,monkeypatch):
+    _,m,ledger,_,_=w_context
+    m['trace_profile_sha256']='0'*64
+    monkeypatch.setattr(network,'_require_w_certificates',lambda *_:None)
+    monkeypatch.setattr(network._WaitTrace,'validate_profile',lambda *_:None)
+    order=[]
+    class Trace:
+        validate_profile=staticmethod(lambda *_:None)
+        def __init__(self,_):self.report={'saved':False}
+        def __enter__(self):
+            assert len(json.loads(ledger.read_text())['entries'])==15
+            order.append('trace');return self
+        def __exit__(self,*_):self.report['saved']=True;order.append('save')
+    class Relay:
+        def __init__(self,*args,**kwargs):
+            assert kwargs['wait_diagnostic'] and kwargs['fail_first_model']
+            self.report={'model_valid':False}
+        def __enter__(self):order.append('relay');return self
+        def __exit__(self,*_):order.append('close')
+    monkeypatch.setattr(network,'_WaitTrace',Trace);monkeypatch.setattr(network,'NetworkRelay',Relay)
+    monkeypatch.setattr(benchmark,'run_network_observation',lambda **_:(_ for _ in ()).throw(RuntimeError('fixture')))
+    directory=network.Path(m['certificate_directory']);directory.mkdir()
+    for name in m['public_certificate_sha256']:(directory/name).write_bytes(name.encode())
+    p=ledger.parent/'approval.json';p.write_text(json.dumps(m),encoding='utf8')
+    r=network.run_network_benchmark(profile='N2',phase='candidate',certs=directory,ports=network.V2_PORTS,
+        ledger=ledger,approval=p,output=ledger.parent/'W1.json',wire_profile=network._COMPACT_PROFILE_V3,authorization=network.W_DESIGN)
+    assert order==['trace','relay','close','save'] and r['system_trace']['saved']
+    assert not r['network_sample_pass']
 
 
 @pytest.mark.parametrize("change", [
