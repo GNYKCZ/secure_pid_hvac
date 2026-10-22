@@ -34,6 +34,10 @@ from secure_control.protocol.messages import (
     ControllerShare,
     ControlShareMessage,
     InputShareMessage,
+    MatrixCommitAuthorization,
+    MatrixLocalStageReceipt,
+    MatrixProductMaterial,
+    MatrixStepResourcePlan,
     P2TruncationPayload,
     PartyOfflineMaterial,
     PartyOnlineMaterial,
@@ -57,8 +61,10 @@ SCHEMA_VERSION = 3
 _COMPACT_PROFILE = "control-dynamic-compact-v1"
 _COMPACT_PROFILE_V2 = "control-dynamic-compact-v2"
 _COMPACT_PROFILE_V3 = "control-dynamic-compact-v3"
-_COMPACT_PROFILES = (_COMPACT_PROFILE, _COMPACT_PROFILE_V2, _COMPACT_PROFILE_V3)
-_COMPACT_ADVANCE_PROFILES = (_COMPACT_PROFILE_V2, _COMPACT_PROFILE_V3)
+_MATRIX_PROFILE = "control-dynamic-matrix-v1"
+_CLIENT_AUTH_PROFILES = (_COMPACT_PROFILE_V3, _MATRIX_PROFILE)
+_COMPACT_PROFILES = (_COMPACT_PROFILE, _COMPACT_PROFILE_V2, *_CLIENT_AUTH_PROFILES)
+_COMPACT_ADVANCE_PROFILES = (_COMPACT_PROFILE_V2, *_CLIENT_AUTH_PROFILES)
 _COMPACT_MAX_VALUES = 512 * 1024
 _ROLES = {"Supervisor", "Client", "P1", "P2"}
 _KINDS = {"hello", "ready", "request", "reply", "error", "shutdown"}
@@ -258,7 +264,7 @@ class _CompactBatchPayload:
             raise LocalhostCodecError("紧凑数值块版本不匹配")
         if self.phase not in {"product", "product_complete", "truncation", "state_complete"}:
             raise LocalhostCodecError("紧凑 peer 阶段无效")
-        if self.version == _COMPACT_PROFILE_V3 and self.phase not in {"product", "truncation"}:
+        if self.version in _CLIENT_AUTH_PROFILES and self.phase not in {"product", "truncation"}:
             raise LocalhostCodecError("compact-v3 不接受完成屏障。")
         if type(self.batch_index) is not int or self.batch_index != {
             "product": 0, "product_complete": 1, "truncation": 2, "state_complete": 3}[self.phase]:
@@ -529,7 +535,7 @@ class PartyStageResult:
     share: ControlShareMessage
 
     def __post_init__(self) -> None:
-        if type(self.receipt) not in (Protocol3StageReceipt, Protocol3LocalStageReceipt) or not isinstance(
+        if type(self.receipt) not in (Protocol3StageReceipt, Protocol3LocalStageReceipt, MatrixLocalStageReceipt) or not isinstance(
             self.share, ControlShareMessage
         ):
             raise TypeError("暂存结果必须包含回执与控制份额。")
@@ -753,9 +759,12 @@ def decode_wire_value(payload: bytes) -> object:
 
 def _preloaded_values_size(plan: StepResourcePlan, modulus: int) -> int:
     """固定公开计划的无损数值长度；分配和生成之前即可计算。"""
-    if not isinstance(plan, StepResourcePlan) or type(modulus) is not int or modulus < 3:
+    if (not isinstance(plan, StepResourcePlan) and type(plan) is not MatrixStepResourcePlan
+            or type(modulus) is not int or modulus < 3):
         raise ValueError("预送计划或模数无效")
-    size = ((modulus.bit_length() + 7) // 8) * (3 * plan.triple_count + 2 * plan.truncation_count)
+    count = (plan.multiplication_material_elements if type(plan) is MatrixStepResourcePlan
+             else 3 * plan.triple_count) + 2 * plan.truncation_count
+    size = ((modulus.bit_length() + 7) // 8) * count
     if not 0 < size <= 512 * 1024:
         raise ValueError("单轮预送数值超出编码预算")
     return size
@@ -776,7 +785,14 @@ def _encode_preloaded_values(resources: PartyResources, modulus: int) -> bytes:
     for item in resources.product_resources:
         if type(item.owner) is not int or item.owner != resources.recipient:
             raise ValueError("预送资源角色不匹配")
-        values.extend((item.triple.a, item.triple.b, item.triple.c))
+        if type(plan) is MatrixStepResourcePlan:
+            from secure_control.crypto.matrix_beaver import matrix_values
+            meta = plan.product_resources[0]
+            for share, shape in zip((item.triple.u, item.triple.v, item.triple.w),
+                                   ((meta.rows,meta.inner),(meta.inner,1),(meta.rows,1)), strict=True):
+                values.extend(AdditiveShare(int(v)) for v in matrix_values(share,shape,modulus).flat)
+        else:
+            values.extend((item.triple.a, item.triple.b, item.triple.c))
     for item in resources.state_truncation_resources:
         if type(item.owner) is not int or item.owner != resources.recipient:
             raise ValueError("预送资源角色不匹配")
@@ -829,6 +845,18 @@ def _decode_preloaded_values(data: bytes, inp: InputShareMessage,
         raise ValueError("预送数值长度错误")
     if not isinstance(inp, InputShareMessage) or type(inp.recipient) is not int or inp.recipient not in (0, 1):
         raise ValueError("预送输入角色无效")
+    if type(plan) is MatrixStepResourcePlan:
+        count = plan.multiplication_material_elements + 2*plan.truncation_count
+        values = iter(_decode_residues(data, count, modulus))
+        meta = plan.product_resources[0]
+        def array(shape):
+            return AdditiveShare(np.array([next(values).value for _ in range(prod(shape))],
+                                         dtype=object).reshape(shape))
+        material = MatrixProductMaterial(inp.recipient, meta, array((meta.rows,meta.inner)),
+                                         array((meta.inner,1)), array((meta.rows,1)))
+        return PartyOnlineMaterial(inp, plan, (material,),
+            tuple(TruncationResourceMaterial(inp.recipient, item, next(values), next(values))
+                  for item in plan.state_truncation_resources))
     values = _decode_residues(data, 3 * plan.triple_count + 2 * plan.truncation_count, modulus)
     iterator = iter(values)
     return PartyOnlineMaterial(
@@ -841,6 +869,9 @@ def _decode_preloaded_values(data: bytes, inp: InputShareMessage,
 
 
 def _encode_value(value: object) -> object:
+    if type(value) in (MatrixLocalStageReceipt, MatrixCommitAuthorization):
+        return {"type": "matrix_local_stage_receipt" if type(value) is MatrixLocalStageReceipt
+                else "matrix_commit_authorization", **asdict(value)}
     if isinstance(value, _CompactHelloPayload):
         return {"type": "compact_hello", "base": _encode_value(value.base), "version": value.version}
     if isinstance(value, (_CompactOnlinePayload, _CompactBatchPayload)):
@@ -1140,7 +1171,7 @@ def _encode_value(value: object) -> object:
         }
     if isinstance(value, Protocol3EndpointCommand):
         if value.operation == "commit_staged":
-            if (type(value.authorization) is not Protocol3CommitAuthorization
+            if (type(value.authorization) not in (Protocol3CommitAuthorization, MatrixCommitAuthorization)
                     or any(getattr(value, name) is not None for name in (
                         "metadata", "product_mask", "truncation_mask", "p2_truncation"))):
                 raise ValueError("commit_staged 只允许完整提交授权。")
@@ -1226,9 +1257,25 @@ def _decode_prime_evidence(value: object) -> PrimeModulusEvidence | None:
     )
 
 
+def _typed_union(value, classes):
+    result = _decode_value(value)
+    if type(result) not in classes:
+        raise LocalhostCodecError("提交授权类型不匹配")
+    return result
+
+
 def _decode_value(value: object) -> object:
     mapping = _mapping(value, "wire value")
     kind = mapping.get("type")
+    if kind in ("matrix_local_stage_receipt", "matrix_commit_authorization"):
+        cls = MatrixLocalStageReceipt if kind == "matrix_local_stage_receipt" else MatrixCommitAuthorization
+        _exact_fields(mapping, {"type", *cls.__dataclass_fields__}, kind)
+        args = {k:v for k,v in mapping.items() if k != "type"}
+        if cls is MatrixCommitAuthorization:
+            if type(args["prepared_parties"]) is not list:
+                raise LocalhostCodecError("矩阵授权参与方必须为数组")
+            args["prepared_parties"] = tuple(args["prepared_parties"])
+        return cls(**args)
     if not isinstance(kind, str):
         raise LocalhostCodecError("wire value 缺少字符串 type。")
     if kind == "compact_hello":
@@ -1659,7 +1706,7 @@ def _decode_value(value: object) -> object:
         if mapping.get("operation") == "commit_staged":
             _exact_fields(mapping, {"type", "operation", "authorization"}, kind)
             return Protocol3EndpointCommand("commit_staged",
-                authorization=_typed(mapping["authorization"], Protocol3CommitAuthorization))
+                authorization=_typed_union(mapping["authorization"], (Protocol3CommitAuthorization, MatrixCommitAuthorization)))
         _exact_fields(
             mapping,
             {"type", "operation", "metadata", "product_mask", "truncation_mask", "p2_truncation"},

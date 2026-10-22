@@ -1,0 +1,356 @@
+"""矩阵向量原语的独立整数oracle与一次性/形状边界。"""
+
+import random
+from dataclasses import replace
+
+import numpy as np
+import pytest
+
+from secure_control.crypto import AdditiveShare, TwoPartySharing
+from secure_control.crypto.matrix_beaver import MatrixBeaverMultiplier
+
+
+@pytest.mark.parametrize('rows,inner', [(1, 1), (2, 3), (5, 6)])
+def test_matrix_product_independent_integer_oracle_and_one_public_cross_term(rows, inner):
+    q = 2**127 - 1
+    sharing = TwoPartySharing(q)
+    multiplier = MatrixBeaverMultiplier(sharing)
+    rng = random.Random(128)
+    x = [[(q - 1 if (i+j) % 2 else 0) for j in range(inner)] for i in range(rows)]
+    y = [[q-2 if j % 2 else j+1] for j in range(inner)]
+    expected = [[sum(x[i][j]*y[j][0] for j in range(inner)) % q] for i in range(rows)]
+    a, b = sharing.share(np.array(x, dtype=object), rng=rng), sharing.share(np.array(y, dtype=object), rng=rng)
+    triples = multiplier.create_triple(rows, inner, rng=rng)
+    masks = [multiplier.mask_inputs(a[i], b[i], triples[i]) for i in (0, 1)]
+    public = multiplier.open_masked_differences(*masks)
+    results = [multiplier.finish(t, public) for t in triples]
+    assert sharing.reconstruct(*results).tolist() == expected
+    # 漏掉/重复公开交叉项均改变结果，不能由新实现给自己构造期望值。
+    cross = [[sum(int(public.e[i,j])*int(public.f[j,0]) for j in range(inner)) % q]
+             for i in range(rows)]
+    assert any(v[0] for v in cross)
+    assert ((sharing.reconstruct(*results)-np.array(cross,dtype=object)) % q).tolist() != expected
+    for i in (0, 1):
+        with pytest.raises(ValueError):
+            multiplier.mask_inputs(a[i], b[i], triples[i])
+        with pytest.raises(ValueError):
+            multiplier.finish(triples[i], public)
+
+
+def test_matrix_rejects_wrong_owner_shape_and_noncanonical_values_before_claim():
+    sharing = TwoPartySharing(257)
+    owner = MatrixBeaverMultiplier(sharing)
+    triple = owner.create_triple(2, 3, rng=random.Random(3))[0]
+    good = AdditiveShare(np.ones((3, 1), dtype=object))
+    for bad in (np.ones((2, 2), dtype=object), np.ones((6,), dtype=object),
+                np.full((2,3), True, dtype=object), np.full((2,3), .5, dtype=object),
+                np.full((2,3), -1, dtype=object), np.full((2,3), 257, dtype=object)):
+        with pytest.raises((TypeError, ValueError)):
+            owner.mask_inputs(AdditiveShare(bad), good, triple)
+        assert triple._lifecycle.masked_parties == set()
+    with pytest.raises(ValueError):
+        MatrixBeaverMultiplier(sharing).mask_inputs(AdditiveShare(np.ones((2,3),dtype=object)), good, triple)
+    with pytest.raises(ValueError):
+        owner.create_triple(True, 3)
+    with pytest.raises(ValueError):
+        owner.create_triple(1000000, 1000000)
+    with pytest.raises(ValueError):
+        owner._validate(replace(triple, party_index=True))
+
+
+def test_distinct_matrix_operations_cannot_mix_masks():
+    sharing = TwoPartySharing(257)
+    owner = MatrixBeaverMultiplier(sharing)
+    a, b = owner.create_triple(1, 1), owner.create_triple(1, 1)
+    x = AdditiveShare(np.array([[1]], dtype=object))
+    first = owner.mask_inputs(x, x, a[0])
+    other = owner.mask_inputs(x, x, b[1])
+    with pytest.raises(ValueError):
+        owner.open_masked_differences(first, other)
+
+
+def test_matrix_256bit_oracle_fresh_random_draws_and_exact_mask_shapes():
+    class CountingRandom(random.Random):
+        calls = 0
+        def randrange(self, *args, **kwargs):
+            self.calls += 1
+            return super().randrange(*args, **kwargs)
+    q = 2**256-189
+    sharing = TwoPartySharing(q)
+    owner = MatrixBeaverMultiplier(sharing)
+    rng = CountingRandom(19)
+    first = owner.create_triple(2, 3, rng=rng)
+    draws = rng.calls
+    second = owner.create_triple(2, 3, rng=rng)
+    # 每次确实调用原随机源，不以偶然的“不相等”作为新鲜性证明。
+    assert draws == (6+3)+(6+3+2) and rng.calls == 2*draws
+    assert first[0]._lifecycle is not second[0]._lifecycle
+    x = sharing.share(np.array([[q-1, 2, q-3], [4, 0, 6]], dtype=object), rng=rng)
+    y = sharing.share(np.array([[7], [q-8], [9]], dtype=object), rng=rng)
+    masks = [owner.mask_inputs(x[p], y[p], first[p]) for p in (0,1)]
+    for bad in (replace(masks[1], e=AdditiveShare(np.zeros((1,3),dtype=object))),
+                replace(masks[1], f=AdditiveShare(np.zeros(3,dtype=object))),
+                replace(masks[1], f=AdditiveShare(np.full((3,1),True,dtype=object)))):
+        with pytest.raises((TypeError, ValueError)):
+            owner.open_masked_differences(masks[0],bad)
+        assert not first[0]._lifecycle.opened
+    opened = owner.open_masked_differences(*masks)
+    outputs = [owner.finish(first[p],opened) for p in (0,1)]
+    assert sharing.reconstruct(*outputs).tolist() == [[(-7-16-27) % q], [(28+54) % q]]
+    assert first[0]._lifecycle.consumed
+    assert not second[0]._lifecycle.consumed
+
+
+def test_matrix_plan_codec_material_identity_and_legacy_mixing_fail_closed():
+    import socket
+
+    from test_two_party_protocol import make_stack
+
+    from secure_control.execution._localhost_peer import LocalhostProtocol3PeerPort
+    from secure_control.execution.localhost_codec import (
+        _decode_preloaded_values,
+        _encode_preloaded_values,
+    )
+    from secure_control.protocol import Client
+    from secure_control.protocol.coordinator import rehydrate_online_material
+    from secure_control.protocol.messages import (
+        PartyOnlineMaterial,
+        PartyOnlineRound,
+        public_step_plan_sha256,
+    )
+
+    client, _, _, _, distribution = make_stack()
+    prepared = client._material_owner(distribution).create(0, encoding_profile='control-dynamic-matrix-v1')
+    current = client.bind_online_input(distribution,prepared,[.25],step=0)
+    plan = current.p1_resources.plan
+    legacy = Client._resource_plan(distribution.p1.layout, plan.session_id, plan.round_id, plan.step)
+    assert public_step_plan_sha256(plan) != public_step_plan_sha256(legacy)
+    assert public_step_plan_sha256(replace(plan, round_id='next',
+        product_resources=(replace(plan.product_resources[0],round_id='next',resource_id='next:matrix'),),
+        state_truncation_resources=tuple(replace(t,round_id='next',resource_id=t.resource_id.replace(plan.round_id,'next'))
+                                         for t in plan.state_truncation_resources))) != public_step_plan_sha256(plan)
+    for change in ({'version':'old'}, {'state_shape':(True,)}, {'order':'column-major'},
+                   {'product_resources':(replace(plan.product_resources[0],resource_id='other'),)},
+                   {'state_truncation_resources':(replace(plan.state_truncation_resources[0],index=(False,)),
+                                                   *plan.state_truncation_resources[1:])}):
+        with pytest.raises((TypeError,ValueError)):
+            replace(plan,**change)
+    for changes in ({'rows':True},{'step':False},{'inner':0}):
+        with pytest.raises(ValueError):
+            replace(plan.product_resources[0],**changes)
+    encoded = _encode_preloaded_values(current.p1_resources,client.fixed_point.modulus)
+    item = current.p1_resources.product_resources[0]
+    for value in (np.zeros((1,9),dtype=object),np.full((3,3),True,dtype=object),
+                  np.full((3,3),1.5,dtype=object)):
+        bad=replace(current.p1_resources,product_resources=(replace(item,triple=replace(item.triple,u=AdditiveShare(value))),))
+        with pytest.raises((TypeError,ValueError)):
+            _encode_preloaded_values(bad,client.fixed_point.modulus)
+    for data in (encoded[:-1],encoded+b'\0',b'\xff'*4+encoded[4:]):
+        with pytest.raises((TypeError,ValueError)):
+            _decode_preloaded_values(data,current.p1_input,plan,client.fixed_point.modulus)
+    material = PartyOnlineMaterial.from_round(PartyOnlineRound(current.p1_input,current.p1_resources))
+    item = material.product_resources[0]
+    for bad in (replace(material,input_message=replace(material.input_message,step=1)),
+                replace(material,product_resources=(replace(item,owner=1),)),
+                replace(material,product_resources=(replace(item,u=AdditiveShare(np.zeros((1,1),dtype=object))),))):
+        with pytest.raises((TypeError,ValueError)):
+            rehydrate_online_material(bad,modulus=client.fixed_point.modulus,security_parameter=8)
+    for wire, wrong in (('control-dynamic-compact-v3',plan),('control-dynamic-matrix-v1',legacy)):
+        a,b=socket.socketpair()
+        peer=LocalhostProtocol3PeerPort(a,'P1',8*1024*1024,1.,batch_enabled=True,wire_profile=wire)
+        try:
+            peer.bind(plan.session_id)
+            with pytest.raises(ValueError):
+                peer.set_batch_round(wrong,modulus=client.fixed_point.modulus)
+        finally:
+            peer.close();b.close()
+
+
+def test_local_cost_math_and_codec_with_fake_clock(monkeypatch):
+    """只验证局部成本函数算术与字段；假时钟无性能样本、不调用P0入口。"""
+    from types import SimpleNamespace
+
+    from secure_control.crypto import FixedPointContext
+    from secure_control.experiments import network_benchmark as network
+    monkeypatch.setattr(network.time,'perf_counter_ns',lambda:0)
+    monkeypatch.setattr(network.time,'process_time_ns',lambda:0)
+    prepared=SimpleNamespace(context=FixedPointContext(2**61-1,32,8),security_parameter=8,evidence=None,
+        spec=SimpleNamespace(A=np.eye(4)*.5,B=np.zeros((4,2)),C=np.ones((1,4)),D=np.zeros((1,2)),
+                             x0=np.array([.25,-.5,0.,.75])))
+    for kind,elements in (('scalar',98),('matrix',49)):
+        result=network._matrix_primitive_sample(kind,prepared)
+        assert result['functional_pass'] and result['material_elements_per_party']==elements
+        assert result['material_bytes_both_parties']==elements*8*2
+        assert result['total_wall_ns']==result['total_cpu_ns']==0
+
+
+def test_matrix_round_codec_real_peer_old_state_output_and_commit():
+    """真实socket peer交换、单方恢复与原Trunc/授权；不运行性能循环。"""
+    import socket
+    from threading import Thread
+
+    from test_two_party_protocol import make_stack
+
+    from secure_control.execution._localhost_peer import LocalhostProtocol3PeerPort
+    from secure_control.execution.localhost_codec import (
+        _decode_preloaded_values,
+        _encode_preloaded_values,
+        decode_wire_value,
+        encode_wire_value,
+    )
+    from secure_control.protocol import P1, P2
+    from secure_control.protocol.coordinator import (
+        LocalProtocol3PartyEndpoint,
+        Protocol3Orchestrator,
+        rehydrate_online_material,
+        stage_protocol3_batch,
+    )
+    from secure_control.protocol.messages import MatrixStepResourcePlan, product_operation_count
+
+    client, _, _, _, distribution = make_stack()
+    prepared = client._material_owner(distribution).create(0, rng=random.Random(82),
+                                             encoding_profile='control-dynamic-matrix-v1')
+    current = client.bind_online_input(distribution, prepared, [.25], step=0, rng=random.Random(71))
+    plan = current.p1_resources.plan
+    assert type(plan) is MatrixStepResourcePlan and product_operation_count(plan) == 1
+    assert plan.scalar_equivalent_products == 9
+    assert not hasattr(plan, 'triple_count')
+    endpoints, outputs = [], [[], []]
+    for i, role in enumerate((P1(distribution.p1), P2(distribution.p2))):
+        resources = (current.p1_resources, current.p2_resources)[i]
+        encoded = _encode_preloaded_values(resources, client.fixed_point.modulus)
+        assert len(encoded) == (9+3+3+4)*4
+        inp = (current.p1_input, current.p2_input)[i]
+        material = _decode_preloaded_values(encoded, inp, plan, client.fixed_point.modulus)
+        online = rehydrate_online_material(material, modulus=client.fixed_point.modulus, security_parameter=8)
+        endpoints.append(LocalProtocol3PartyEndpoint(role, online, outputs[i].append,
+                                                     completion_strategy='client_authorized'))
+    peers = [LocalhostProtocol3PeerPort(s, f'P{i+1}', 8*1024*1024, 3., batch_enabled=True,
+                                       wire_profile='control-dynamic-matrix-v1')
+             for i,s in enumerate(socket.socketpair())]
+    receipts, errors = [None,None], []
+    for peer in peers:
+        peer.bind(plan.session_id)
+        peer.set_batch_round(plan, modulus=client.fixed_point.modulus, run_id='run',epoch_id='epoch')
+    def stage(i):
+        try:
+            receipts[i] = stage_protocol3_batch(endpoints[i], peers[i])
+        except BaseException as e:  # noqa: BLE001
+            errors.append(e)
+    threads = [Thread(target=stage,args=(i,)) for i in (0,1)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
+        assert not any(t.is_alive() for t in threads)
+        assert not errors, errors
+        assert client.reconstruct_control(outputs[0][0], outputs[1][0]).tolist() == [.625]
+        orchestrator = Protocol3Orchestrator(completion_strategy='client_authorized')
+        auth = orchestrator.authorize(tuple(receipts),plan)
+        assert decode_wire_value(encode_wire_value(auth)) == auth
+        assert all(decode_wire_value(encode_wire_value(r)) == r for r in receipts)
+        for ep in endpoints:
+            ep.commit_staged(auth)
+        q=client.fixed_point.modulus
+        state=(endpoints[0]._role.state_share.value+endpoints[1]._role.state_share.value)%q
+        state=[int(v) if v<q//2 else int(v)-q for v in state]
+        assert all(abs(a-b)<=1 for a,b in zip(state,[80,-16],strict=True))
+        for ep in endpoints:
+            with pytest.raises(ValueError):
+                ep.commit_staged(auth)
+    finally:
+        for peer in peers:
+            peer.close()
+        for ep in endpoints:
+            ep.abort()
+
+
+@pytest.mark.parametrize('fault', [None, 'worker_exit', 'commit_ack', 'advance_ack'])
+def test_matrix_spawn_worker_segments_and_uncertain_failures(monkeypatch, fault):
+    """真实角色/供料进程短功能联调；无控制性能预热或长测。"""
+    import multiprocessing as mp
+
+    from secure_control.execution import lan_runtime
+    from secure_control.execution._localhost_workers import _ClientPartyEndpoint
+    from secure_control.experiments.communication_benchmark import _config, _party_job, _ports
+    from secure_control.experiments.lan_continuous_profile import load_segmented_experiment
+    from secure_control.scenarios.cart_pole.interactive import InteractiveSession
+
+    profile = 'control-dynamic-matrix-v1'
+    ports = _ports()
+    context = mp.get_context('spawn')
+    queue = context.Queue()
+    parties = [context.Process(target=_party_job, args=(_config(r, ports), ports, 0, True, queue),
+                               kwargs={'wire_profile':profile}) for r in ('P1','P2')]
+    runtime = None
+    try:
+        prepared = load_segmented_experiment(_config('Client',ports).experiment_config,2,InteractiveSession())
+        for party in parties:
+            party.start()
+        runtime = lan_runtime.LanSegmentedRuntime(_config('Client',ports),prepared.spec,prepared.context,
+            prepared.contract,prepared.security_parameter,prepared.evidence,
+            control=lan_runtime.RunControl(),segment_capacity=2,wire_profile=profile)
+        runtime.enable_material_preparation(slots=4,_candidate='worker')
+        pool=runtime._segment._material_pool
+        worker_pid=pool._process.pid
+        if fault == 'worker_exit':
+            pool._process.terminate();pool._process.join(5)
+            with pool._condition:
+                assert pool._condition.wait_for(lambda:pool._error is not None,timeout=5)
+        if fault == 'commit_ack':
+            original=_ClientPartyEndpoint.finish_commit
+            def fail_ack(endpoint):
+                if endpoint.party==1:
+                    raise OSError('test missing commit ACK')
+                return original(endpoint)
+            monkeypatch.setattr(_ClientPartyEndpoint,'finish_commit',fail_ack)
+        if fault in ('worker_exit','commit_ack'):
+            with pytest.raises((OSError,RuntimeError)):
+                runtime.step(np.zeros(2))
+            assert runtime.confirmed_step_count==0
+            with pytest.raises(RuntimeError):
+                runtime.step(np.zeros(2))
+        else:
+            state=np.array(prepared.spec.x0,dtype=float)
+            for step in range(5):
+                if runtime.segment_full:
+                    if fault=='advance_ack':
+                        original=lan_runtime._validate_party_reply
+                        def fail_advance(response,request,original=original):
+                            if request.operation=='segment_advance':
+                                raise OSError('test missing advance ACK')
+                            return original(response,request)
+                        monkeypatch.setattr(lan_runtime,'_validate_party_reply',fail_advance)
+                        with pytest.raises(OSError):
+                            runtime.end_segment()
+                        assert runtime.confirmed_step_count==2
+                        break
+                    runtime.end_segment();runtime.next_segment()
+                    assert pool._process.pid==worker_pid
+                identity=runtime.step(np.zeros(2))
+                np.testing.assert_allclose(identity.raw_control,np.asarray(prepared.spec.C)@state,atol=1e-5,rtol=0)
+                state=np.asarray(prepared.spec.A)@state
+                runtime.confirm_applied(identity)
+                with pool._condition:
+                    assert pool._condition.wait_for(lambda:len(pool._queue)==4 or pool._error,timeout=10)
+                    assert not pool._error
+            if fault is None:
+                runtime.control.request_stop();runtime.end_segment()
+                assert runtime.resource_counts=={'matrix_products_consumed':5,
+                    'scalar_equivalent_products':150,'multiplication_material_elements':205,
+                    'truncations_consumed':20}
+                assert runtime.confirmed_step_count==5
+        runtime.close()
+        assert not pool._process.is_alive()
+        stats=runtime.material_summary
+        assert stats['worker_exited'] and stats['receiver_exited'] and stats['credit_thread_exited']
+    finally:
+        if runtime is not None:
+            runtime.close()
+        for p in parties:
+            if p.pid:
+                p.join(6)
+                if p.is_alive():
+                    p.terminate();p.join(5)
+        queue.close();queue.join_thread()

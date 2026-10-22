@@ -19,6 +19,7 @@ from secure_control.protocol.roles import Client, _create_resource_pair
 
 from .localhost_codec import (
     _COMPACT_PROFILES,
+    _MATRIX_PROFILE,
     _canonical_json,
     _encode_online_fragment,
     _encode_preloaded_values,
@@ -57,12 +58,21 @@ def _check_spec(spec):
                    for v in (spec.run_id, spec.session_id, spec.epoch))):
         raise ValueError("本地供料规格无效")
     n, m, p = spec.layout.state_dimension, spec.layout.input_dimension, spec.layout.output_dimension
+    if spec.encoding_profile == _MATRIX_PROFILE:
+        from secure_control.crypto.matrix_beaver import matrix_shape
+        if any(type(v) is not int or v < 1 for v in (n,m,p)):
+            raise ValueError("矩阵供料需要非零动态维度")
+        matrix_shape(n+p, n+m, spec.modulus)
+        # 生成或分配之前验证完整新布局，不在工人进程启动后才发现尺度不支持。
+        Client._resource_plan(spec.layout, spec.session_id, "preflight", spec.start,
+                              encoding_profile=spec.encoding_profile)
     products = n * n + n * m + p * n + p * m
     truncations = n if spec.layout.scale_ledger.state_truncation_bits else 0
     digits = spec.modulus.bit_length() * 30103 // 100000 + 1
     bound = products * (4096 + 12 * digits) + truncations * (4096 + 8 * digits) + 4096 + 512 * m
     if spec.encoding_profile in _COMPACT_PROFILES:
-        row = (3 * products + 2 * truncations) * ((spec.modulus.bit_length() + 7) // 8)
+        elements = ((n+p)*(n+m) + n+m + n+p if spec.encoding_profile == _MATRIX_PROFILE else 3*products)
+        row = (elements + 2 * truncations) * ((spec.modulus.bit_length() + 7) // 8)
         # 三份 IPC 临时包均计入原槽上限；生成资源前就排除最大合法头的最坏尺寸。
         bound = 3 * (2 * row + _HEADER_LIMIT + 5)
     else:
@@ -138,7 +148,7 @@ def _unpack(spec, packet, step):
             or type(head["sha256"]) is not list or len(head["sha256"]) != 2
             or sum(head["lengths"]) + 5 + size != len(packet)):
         raise ValueError("材料包公开身份/尺寸/计数不匹配")
-    plan = Client._resource_plan(spec.layout, spec.session_id, head["round"], step)
+    plan = Client._resource_plan(spec.layout, spec.session_id, head["round"], step, encoding_profile=spec.encoding_profile)
     if head["plan"] != public_step_plan_sha256(plan):
         raise ValueError("材料包与父进程公开计划摘要不匹配")
     if spec.encoding_profile in _COMPACT_PROFILES and head["lengths"] != [
@@ -197,7 +207,7 @@ def _worker_main(spec, credit, output):
             if spec.horizon is not None and next_step >= spec.horizon:
                 raise ValueError("工人越过已证明范围")
             started, cpu = time.perf_counter_ns(), time.process_time_ns()
-            plan = Client._resource_plan(spec.layout, spec.session_id, "round-" + secrets.token_hex(16), next_step)
+            plan = Client._resource_plan(spec.layout, spec.session_id, "round-" + secrets.token_hex(16), next_step, encoding_profile=spec.encoding_profile)
             resources = _create_resource_pair(plan, multiplier, truncation)
             encoder = _encode_preloaded_values if spec.encoding_profile in _COMPACT_PROFILES else _encode_online_fragment
             fragments = tuple(encoder(v, spec.modulus) for v in resources)
