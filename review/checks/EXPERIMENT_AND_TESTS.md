@@ -36,6 +36,10 @@
 - negative/edge cases 是否覆盖最关键的边界（时间切换、负数 modulo、Trunc、reset 等）。
 
 ## Test tampering / false green
+对关键数学/协议行为，记录 expected value 的来源：论文推导、可手算边界、独立参考模型或经过说明的不变量。不能把 production helper 的输出直接作为其自身 expected。差分比较的两端若共享实现，也不能单独证明正确性。
+
+对于 bug 修复，优先检查回归用例能否区分旧错行为与目标行为；不能安全执行旧版时，写明未执行及已有代码证据，不伪造“旧版失败”。只读 Reviewer 不新增测试；缺少有效 oracle 或反例时交给 Work 补充。无需为纯文档改动添加镜像实现的测试。
+
 在 Diff Mode 特别检查：
 - 删除/弱化 assertion；
 - 无依据扩大 tolerance；

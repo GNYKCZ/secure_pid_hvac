@@ -106,6 +106,8 @@
 
 ### Phase E — Full Validation
 
+纯 Markdown 文档改动（含 AI 工作流/review 提示词）且不改变运行配置、依赖、生成逻辑或可执行代码时，验证路径/链接、命令真实性、规则一致性和 `git diff --check`；不要求为了文档改动重跑完整数值实验。记录代码测试为“不适用：仅文档”。若 Issue 明确要求执行某项验证，仍须执行。本例外同样适用于第 16、17 节和文档工作流中的完整验证要求。
+
 完成实现后至少执行：
 
 ```powershell
@@ -592,8 +594,8 @@ git diff -- <modified-file>
 推荐：
 
 ```python
-# 将实数按 2^ell 缩放并取整，使其能够在 Z_q 上进行秘密分享。
-encoded = round(value * scale)
+# 采用论文的 floor(x + 1/2)，而非 ties-to-even；正式编码使用现有定点入口。
+encoded = math.floor(value * scale + 0.5)
 ```
 
 不推荐：
@@ -936,6 +938,8 @@ plotting 应优先读取已保存的实验结果，不要为了画图重新执�
 每个功能 Issue 必须同时提交相应测试，除非 Issue 明确只涉及文档。
 
 测试应验证行为和数学 invariant，而不是仅覆盖代码行。
+
+关键 expected value 应来自独立的契约、推导或参考模型，不能调用被测实现生成自己的正确答案。设计阶段先明确验收与 oracle，再实现代码；修复时检查回归用例能否区分旧错行为，未执行旧版验证时如实说明。参考依据与适用限制见 `docs/ai_review_evidence.md`。
 
 典型 invariant：
 
@@ -1397,6 +1401,7 @@ consumer <- interface/contract <- provider
 而不是：
 
 consumer -> 某个具体 provider 的内部细节
+```
 
 当调用方只需要“能够提供某种数据/行为”时，不应要求调用方理解提供者的全部实现或身份。
 

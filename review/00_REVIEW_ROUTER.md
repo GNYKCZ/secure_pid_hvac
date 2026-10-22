@@ -30,6 +30,8 @@ Diff Mode 开始时记录 Issue、设计评论（若有）、PR URL、base 与�
 完整 Target Review 至少覆盖：主仿真入口、plant/controller、fixed-point/protocol arithmetic、实验循环、metric/plot、相关 tests/config。
 
 ## 3. 两阶段审查
+先依据 Issue/契约记录预期行为与验收条件；再从 diff、调用路径和数据消费者独立概括改动实际改变的行为，比较二者是否一致。不要直接复述实现者的修复理由当作验证。这里借鉴双向核对思路，不声称复现论文中的盲审实验。
+
 ### Pass A — Candidate discovery
 使用五个专项 checks 找候选问题：
 - `checks/AI_CODING_FAILURES.md`

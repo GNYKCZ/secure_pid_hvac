@@ -6,6 +6,8 @@
 - Completeness: COMPLETE / PARTIAL
 - Reviewed: 按 `core/VERIFICATION_AND_COVERAGE.md` 给 coverage ledger
 - Not verified: 关键不可访问/不可执行项
+- Contract alignment: 预期行为与从 diff/数据流读出的实际行为是否一致
+- Evidence matrix: 验收项、契约来源、oracle、证据版本/环境、PASS / FAIL / NOT RUN / NOT APPLICABLE
 
 ## Findings
 按 P0 -> P3，只列 confidence >= 0.80 且通过 adversarial verification 的问题。
@@ -79,5 +81,6 @@
 - `INCONCLUSIVE`：关键路径或验证无法覆盖，现有证据不足以判断可否合并。列出缺少的证据。
 
 Merge recommendation 只针对报告记录的 head SHA；PR 出现新提交后需 re-review。
+发布前重新核对 head 与 base；记录工作区未提交差异是否参与验证。必要验证为 NOT RUN 时不得 APPROVE。主观 Confidence 不替代此门槛。
 
 最后明确：当前证据最多支持到哪种 claim（例如 float simulation / fixed-point numerical comparison / local two-party protocol emulation），不要自动升级到真实部署安全性。
