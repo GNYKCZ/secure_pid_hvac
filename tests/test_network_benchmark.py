@@ -25,6 +25,164 @@ from secure_control.experiments import communication_benchmark as benchmark
 from secure_control.experiments import network_benchmark as network
 
 
+@pytest.fixture
+def matrix_context(tmp_path, monkeypatch):
+    """仅本地合成许可/公开证据，不读取实际#128额度或启动性能调用。"""
+    monkeypatch.setattr(network,"ROOT",tmp_path)
+    folder=tmp_path/".tmp"
+    folder.mkdir()
+    a={"head":"a"*40,"source_sha256":{"common":"f"*64,network.MATRIX_MODULE:None}}
+    b={"head":"b"*40,"source_sha256":{"common":"f"*64,network.MATRIX_MODULE:"e"*64}}
+    manifest={"scope":network.MATRIX_SCOPE,"authorization_url":network.MATRIX_AUTHORIZATION,
+        "comparison_design_url":network.MATRIX_DESIGN,"comparison_stage":"M128-P0",
+        "matrix_versions":{"A":a,"B":b},"head":b["head"],"source_sha256":b["source_sha256"],
+        "review_heads":[a["head"],b["head"]],"review_url":"https://github.com/GNYKCZ/secure_pid_hvac/issues/128#issuecomment-1",
+        "software_pass":True,"readback_exact":True,"profile":"N0","phase":"candidate","wire_profile":network.MATRIX_WIRE,
+        "call":1,"maximum_calls":3,"total_maximum_attempts":2000,"maximum_attempts":0,"ports":list(network.V2_PORTS),
+        "budget_path":str((folder/"issue128-performance-budget.json").resolve()),
+        "native_ledger_path":str((folder/"issue128-native-invocations.json").resolve()),
+        "certificate_directory":str((folder/"issue128-matrix-certs").resolve()),"public_certificate_validity":{},
+        "public_certificate_sha256":{},"output":str((folder/"P0.json").resolve()),
+        "environment":{"platform":network.platform.platform(),"python":sys.version.split()[0],"openssl":network.ssl.OPENSSL_VERSION}}
+    return manifest
+
+
+def _matrix_test_manifest(m, stage):
+    index=("M128-P0","M128-A","M128-B").index(stage)
+    version=m["matrix_versions"]["A" if stage=="M128-A" else "B"]
+    return m|version|{"comparison_stage":stage,"call":index+1,"maximum_attempts":0 if index==0 else 1000,
+        "wire_profile":network._COMPACT_PROFILE_V3 if index==1 else network.MATRIX_WIRE,
+        "output":str(network.Path(m["output"]).with_name(stage+".json"))}
+
+
+def _matrix_test_p0():
+    phases={k:1 for k in ("prepare_random_share","encode_numeric_material","restore_numeric_material","multiply","truncate_and_oracle")}
+    pairs=[]
+    for i in range(18):
+        order=["scalar","matrix"] if i%2==0 else ["matrix","scalar"]
+        pairs.append({"index":i,"warmup":i<2,"order":order,"samples":[{"kind":kind,"functional_pass":True,
+            "wall_ns":dict(phases),"cpu_ns":dict(phases),"total_wall_ns":5,"total_cpu_ns":5,
+            "material_elements_per_party":49 if kind=="matrix" else 98,
+            "material_bytes_both_parties":(49 if kind=="matrix" else 98)*64,
+            "mask_elements_per_direction":36 if kind=="matrix" else 60} for kind in order]})
+    return {"schema":"matrix-primitive-cost-v1","status":"stopped","functional_pass":True,"pairs":pairs}
+
+
+def _matrix_test_result(m):
+    # 使用已存在的完整公开软件fixture；不把这些合成时间当实测成绩。
+    result=_comparison_software_result(m)
+    matrix=m["comparison_stage"]=="M128-B"
+    result.update(status="stopped",failure_category=None,failed_phase=None,
+        schema="matrix-dynamic-evidence-v1" if matrix else "cycle-qualification-v1")
+    binding={"head":m["head"],"source_sha256_digest":network.digest(m["source_sha256"])}
+    result["material_summary"]["worker"]["source_binding"]=binding
+    for p,party in enumerate(result["party_outcomes"]):
+        party["source_binding"]=binding
+        for i,step in enumerate(party["steps"]):
+            step["sent"]={"Party":{"frames":3+p+int(i in (400,800))}}
+    if matrix:
+        result["resource_counts"]={"matrix_products_consumed":1000,"scalar_equivalent_products":30000,
+            "multiplication_material_elements":41000,"truncations_consumed":4000}
+    return result
+
+
+@pytest.mark.parametrize("change",[{"maximum_attempts":10000},{"call":True},{"scope":"issue120"},
+    {"profile":"N2"},{"software_pass":False},{"wire_profile":network._COMPACT_PROFILE_V2},
+    {"budget_path":"old.json"},{"review_heads":[]}])
+def test_matrix_scope_rejects_legacy_or_expanded_permission(matrix_context,change):
+    assert network._matrix_manifest_valid(matrix_context)
+    assert not network._matrix_manifest_valid(matrix_context|change)
+
+
+@pytest.mark.parametrize("stage",["M128-A","M128-B"])
+def test_matrix_independent_evidence_and_failure_counts(matrix_context,stage):
+    m=_matrix_test_manifest(matrix_context,stage)
+    result=_matrix_test_result(m)
+    assert network._assemble_matrix(result,m)["network_sample_pass"]
+    for fault in ("counts","null","miss","worker_source","party_source","tls","schema","history"):
+        bad=copy.deepcopy(_matrix_test_result(m))
+        if fault=="counts":bad["resource_counts"]={"products_consumed":30000,"truncations_consumed":4000} if stage=="M128-B" else {}
+        elif fault=="null":bad["cycles"][-1]["cycle_completed_ns"]=None
+        elif fault=="miss":bad["cycle_summary"]["misses"]=1
+        elif fault=="worker_source":bad["material_summary"]["worker"]["source_binding"]={}
+        elif fault=="party_source":bad["party_outcomes"][0].pop("source_binding")
+        elif fault=="tls":bad["network_tls"]["links"][0]["version"]="TLSv1.2"
+        elif fault=="schema":bad["schema"]="unknown"
+        elif fault=="history":bad["network_history"]["representation_complete"]=False
+        assert not network._assemble_matrix(bad,m)["network_sample_pass"],fault
+
+
+def test_matrix_p0_all_pairs_no_local_speed_threshold(matrix_context):
+    result=_matrix_test_p0()
+    assert network._matrix_cost_pass(result)
+    result["pairs"][-1]["samples"][-1]["total_wall_ns"]=10**12
+    assert network._matrix_cost_pass(result)  # 延迟慢不能替代A/B准入决策。
+    for fault in ("missing","order","null","count"):
+        bad=copy.deepcopy(result)
+        if fault=="missing":bad["pairs"].pop()
+        elif fault=="order":bad["pairs"][3]["order"].reverse()
+        elif fault=="null":bad["pairs"][0]["samples"][0]["wall_ns"]["multiply"]=None
+        else:bad["pairs"][0]["samples"][1]["material_elements_per_party"]=98
+        assert not network._matrix_cost_pass(bad)
+
+
+def test_matrix_three_scope_native_start_failed_a_and_no_restart(matrix_context,monkeypatch):
+    m=matrix_context
+    monkeypatch.setattr(network,"_require_matrix_versions",lambda _m:None)
+    entries,native=[],[]
+    def start(current):
+        network.Path(current["native_ledger_path"]).write_text(json.dumps({"entries":native+[current|{
+            "completed":False,"native_exit":None,"started_utc":"test"}]}),encoding="utf-8")
+    with pytest.raises(FileNotFoundError):
+        network._next_matrix_call(entries,"N0","candidate",m["head"],m["source_sha256"],m)
+    for stage in ("M128-P0","M128-A","M128-B"):
+        current=_matrix_test_manifest(m,stage)
+        start(current)
+        assert network._next_matrix_call(entries,"N0","candidate",current["head"],current["source_sha256"],current)==current["maximum_attempts"]
+        if stage=="M128-B":
+            bad=copy.deepcopy(entries)
+            bad[1]["sample_pass"]=False
+            with pytest.raises(ValueError):
+                network._next_matrix_call(bad,"N0","candidate",current["head"],current["source_sha256"],current)
+            native[1]["native_exit"]=5
+            start(current)
+            with pytest.raises(ValueError):
+                network._next_matrix_call(entries,"N0","candidate",current["head"],current["source_sha256"],current)
+            native[1]["native_exit"]=0
+            start(current)
+        result=_matrix_test_p0() if stage=="M128-P0" else network._assemble_matrix(_matrix_test_result(current),current)
+        path=network.Path(current["output"])
+        path.write_text(json.dumps(result),encoding="utf-8")
+        entry=current|{"finished":True,"sample_pass":True,"raw_sha256":network.hashlib.sha256(path.read_bytes()).hexdigest()}
+        entries.append(entry)
+        native.append(current|{"completed":True,"native_exit":0,"started_utc":"test","raw_sha256":entry["raw_sha256"]})
+    with pytest.raises(ValueError):
+        network._next_matrix_call(entries,"N0","candidate",m["head"],m["source_sha256"],m)
+    with network.RunBudget(m["budget_path"]) as budget:
+        budget.entries=entries
+        budget._save()
+    saved=json.loads(network.Path(m["budget_path"]).read_text(encoding="utf-8"))
+    assert saved["maximum_calls"]==3 and saved["maximum_attempts"]==2000
+
+
+def test_matrix_worker_binding_records_own_source_without_changing_material(matrix_context,monkeypatch):
+    m=matrix_context
+    monkeypatch.setattr(network,"ROOT",ROOT)
+    monkeypatch.setattr(network,"matrix_source",lambda:(m["head"],m["source_sha256"]))
+    packets=[]
+    class Output:
+        send_bytes=staticmethod(packets.append)
+        close=staticmethod(lambda:None)
+    wrapped=network._MatrixBoundOutput(Output(),m)
+    wrapped.send_bytes(b"Msecret-material")
+    wrapped.send_bytes(b'R{"pid":1,"error_type":null}')
+    assert packets[0]==b"Msecret-material"
+    assert json.loads(packets[1][1:])["source_binding"]["head"]==m["head"]
+    monkeypatch.setattr(network,"matrix_source",lambda:("c"*40,m["source_sha256"]))
+    wrapped.send_bytes(b'R{"pid":1,"error_type":null}')
+    assert json.loads(packets[-1][1:])["error_type"]=="ValueError"
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows原生事件ABI功能检查")
 def test_native_wait_socket_read_pause_halfclose_and_reused_timer():
     """只有本机socket字节/句柄功能，没有控制循环或性能分位测量。"""
