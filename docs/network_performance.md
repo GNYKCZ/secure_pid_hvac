@@ -461,3 +461,25 @@ start命令超时也保留归属。stop失败/超时与已停止但保存失败�
 处理。无claim或claim不符不碰任何会话；无法确认停止时保留未释放事实、阻断后续，不重采。
 原CLI70秒、只清理任务进程树≤5秒，剩余时限内具名status≤3秒/cancel≤5秒/确认≤3秒，
 总采集上限90秒不扩大。此处cancel是终结已失败的本次记录，不是第二次采集或重跑。
+
+## SC完整周期两版本比较（N0/TLS）
+
+[SC-E2E设计与用户批准](https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6333274397)
+只允许SC-A/SC-B各一次最多1000周期。A从main767c2a14只加共同实验支持H，B从已审
+SC提交2b1c40a4加相同H；两完整版本只允许secret_sharing.py四行及其测试不同。
+新增来源明确包含secret_sharing.py，旧记录的来源键/摘要不回填。SC manifest绑定两head、
+两source映射和实际独审报告，两版本共同H及其余生产文件通过Git内容核验；所有角色和
+worker在同一冻结checkout上正常spawn，不使用进程内算法替换。
+
+原15项budget/native摘要分别固定为
+e1e6ebdc02516f43624ec5c82a3de1db30a5873a6ea686b6e65843a2866fec56 /
+b0f927d5e368a97a8e16b3de4d9eb7898ad6e3edb413f56a40ab020876b43a0d。
+SC独立scope只追加call16/17，总占项上限17000，不挪旧PS/W2；锁、START、准备失败
+消费及唯一原件保持。A须全部1000完整零失败/超期、原生0、原TLS/帧数/材料/退出门禁
+和原件hash通过才B。复用W1原链，每次START至少余1小时；无续证或无证书降级许可。
+
+两次N0直连TLS、v3、20ms完整周期、400步维护、observer/初态、worker16/8MiB、light
+和正常GC一致，无relay/WPR。SC-B复用_staged_gain的10%中位改善、p99不升及max≤20ms；
+控制样本通过与收益门槛单列，收益不足仍真实exit5，禁止重跑找通过。原N2/资格门禁不改。
+软件独审通过及完整精确预声明先于运行；结果无论好坏均公开全部失败/维护与原生退出，
+交同版本独立结果核对后停止。不自动合并/关Issue，不代表真实Wi-Fi/三机或硬件资格。

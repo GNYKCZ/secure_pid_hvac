@@ -1417,6 +1417,149 @@ def v1_context(local_context, monkeypatch):
     return history, m, ledger, native, start
 
 
+@pytest.fixture
+def sc_context(local_context, monkeypatch):
+    history, old, ledger, native, _ = local_context
+    for i in range(11, 15):
+        entry = old | {"call": i+1, "finished": True, "sample_pass": False}
+        history.append(entry)
+        native.append(entry | {"completed": True, "native_exit": 5})
+    directory = str((ledger.parent/"issue120-wait-diagnostic-certs").resolve())
+    history[14]["certificate_directory"] = directory
+    monkeypatch.setattr(network, "SC_HISTORY", network.digest(history))
+    monkeypatch.setattr(network, "SC_NATIVE_HISTORY", network.digest(native))
+    a = {"head": "a"*40, "source_sha256": old["source_sha256"] | {network.SC_SCALAR: "a"*64}}
+    b = {"head": "b"*40, "source_sha256": old["source_sha256"] | {network.SC_SCALAR: "b"*64}}
+    m = old | {"authorization_url": network.SC_DESIGN, "comparison_design_url": network.SC_DESIGN,
+        "closed_history_sha256": network.SC_HISTORY, "closed_native_history_sha256": network.SC_NATIVE_HISTORY,
+        "comparison_stage": "SC-A", "call": 16, "maximum_calls": 17, "total_maximum_attempts": 17000,
+        "wire_profile": network._COMPACT_PROFILE_V3, "certificate_directory": directory,
+        "sc_versions": {"SC-A": a, "SC-B": b}, "sc_review_heads": [a["head"], b["head"]], **a}
+    ledger.write_text(json.dumps({"schema": "network-call-budget-v1", "entries": history}), encoding="utf8")
+    def start(current=m):
+        network.Path(m["native_ledger_path"]).write_text(json.dumps({"entries": native+[current | {
+            "completed": False, "native_exit": None, "started_utc": "start"}]}), encoding="utf8")
+    start()
+    monkeypatch.setattr(network, "_require_sc_versions", lambda _: None)
+    monkeypatch.setattr(network, "sc_source", lambda: (m["head"], m["source_sha256"]))
+    return history, m, ledger, native, start
+
+
+@pytest.mark.parametrize("change", [
+    {"call": 17}, {"maximum_attempts": True}, {"maximum_attempts": 10000}, {"maximum_calls": 18},
+    {"total_maximum_attempts": 18000}, {"batch_maximum_calls": 3}, {"batch_maximum_attempts": 3000},
+    {"profile": "N2"}, {"phase": "qualification"}, {"wire_profile": network._COMPACT_PROFILE_V2},
+    {"authorization_url": network.W_DESIGN}, {"comparison_stage": "W2"}, {"comparison_stage": "SC-B"},
+    {"software_pass": False}, {"sc_review_heads": []}, {"closed_history_sha256": "0"*64},
+    {"certificate_directory": "new-certs"}, {"system_trace": True}, {"qualification_allowed": True},
+])
+def test_sc_exact_scope_versions_and_legacy_permissions(sc_context, change):
+    entries, m, _, _, _ = sc_context
+    assert network._sc_manifest_valid(m)
+    assert not network._w_manifest_valid(m) and not network._local_manifest_valid(m)
+    assert network._next_compact_call(entries, "N0", "candidate", m["head"], m["source_sha256"], m) == 1000
+    wrong = m | change
+    with pytest.raises(ValueError):
+        network._next_compact_call(entries, wrong["profile"], wrong["phase"], wrong["head"], wrong["source_sha256"], wrong)
+
+
+@pytest.mark.parametrize("fault", ["missing_scalar", "other_source", "head", "history", "unfinished", "native", "certificate", "unreserved"])
+def test_sc_sources_start_history_and_current_claim_fail_closed(sc_context, fault, monkeypatch):
+    entries, m, _, _, _ = sc_context
+    m = copy.deepcopy(m)
+    if fault == "missing_scalar":
+        for version in m["sc_versions"].values(): version["source_sha256"].pop(network.SC_SCALAR)
+    elif fault == "other_source": m["sc_versions"]["SC-B"]["source_sha256"]["src"] = "0"*64
+    elif fault == "head": m["head"] = "f"*40
+    elif fault == "history": entries[0]["call"] = 90
+    elif fault == "unfinished": entries[0]["finished"] = False
+    elif fault == "native": network.Path(m["native_ledger_path"]).write_text('{"entries":[]}', encoding="utf8")
+    elif fault == "certificate": m["conditions_sha256"] = "0"*64
+    elif fault == "unreserved":
+        monkeypatch.setattr(network, "_require_sc_certificates", lambda *_: None)
+        with pytest.raises(ValueError): network.require_sc_candidate(m)
+        return
+    with pytest.raises(ValueError): network._next_sc_call(entries, "N0", "candidate", m["head"], m["source_sha256"], m)
+
+
+@pytest.mark.parametrize("fault", [None, "partial", "native5", "raw", "source", "no_tls", "no_frames"])
+def test_sc_two_calls_append_native_zero_and_full_evidence_required(sc_context, monkeypatch, fault):
+    entries, m, ledger, native, start = sc_context
+    result = _comparison_software_result(m)
+    result = network.assemble(result, profile="N0", phase="candidate", manifest=m, relay=result["network_relay"])
+    assert result["network_sample_pass"]
+    if fault == "partial": result["cycles"][0]["cycle_completed_ns"] = None
+    elif fault == "no_tls": result["network_tls"] = {}
+    elif fault == "no_frames": result["steps"][0]["sent"] = {}
+    raw = ledger.parent/"SC-A.json"
+    monkeypatch.setattr(network, "_require_sc_certificates", lambda *_: None)
+    with network.RunBudget(ledger) as budget:
+        budget.reserve("N0", "candidate", m["head"], m["source_sha256"], raw,
+                       conditions_sha256=m["conditions_sha256"], continuation=m)
+        network.require_sc_candidate(m)
+        raw.write_text(json.dumps(result), encoding="utf8")
+        budget.finish(result, network.hashlib.sha256(raw.read_bytes()).hexdigest())
+        assert budget.entries[:15] == entries
+        first = copy.deepcopy(budget.entries[-1])
+    native.append(first | {"completed": True, "native_exit": 5 if fault == "native5" else 0})
+    second = m | {"call": 17, "comparison_stage": "SC-B", **m["sc_versions"]["SC-B"]}
+    start(second)
+    if fault == "raw": raw.write_text('{}', encoding="utf8")
+    if fault == "source": second["source_sha256"] = {}
+    if fault:
+        with pytest.raises(ValueError): network._next_sc_call(entries+[first], "N0", "candidate", second["head"], second["source_sha256"], second)
+    else:
+        assert network._next_sc_call(entries+[first], "N0", "candidate", second["head"], second["source_sha256"], second) == 1000
+        with pytest.raises(ValueError): network._next_sc_call(entries+[first,first], "N0", "candidate", second["head"], second["source_sha256"], second)
+        value = json.loads(ledger.read_text(encoding="utf8"))
+        assert value["maximum_calls"] == 17 and value["maximum_attempts"] == 17000
+
+
+def test_sc_extended_source_does_not_backfill_legacy(v2_candidate_context):
+    (network.ROOT/network.SC_SCALAR).parent.mkdir(parents=True)
+    (network.ROOT/network.SC_SCALAR).write_text('source', encoding="utf8")
+    head, original = network.source()
+    current, sources = network.sc_source()
+    assert current == head and network.SC_SCALAR not in original
+    assert sources == original | {network.SC_SCALAR: network.hashlib.sha256(b'source').hexdigest()}
+
+
+@pytest.mark.parametrize("fault", [None, "other_file", "different_h", "wrong_scalar"])
+def test_sc_complete_git_pair_checks_do_not_trust_manifest_boolean(local_context, monkeypatch, fault):
+    # 独立git对象响应：同tree比较、变量内容、共同H都必须核，不切换真实checkout。
+    _, old, _, _, _ = local_context
+    a, b = "a"*40, "b"*40
+    versions = {"SC-A": {"head":a,"source_sha256":old["source_sha256"]|{network.SC_SCALAR:"a"*64}},
+                "SC-B": {"head":b,"source_sha256":old["source_sha256"]|{network.SC_SCALAR:"b"*64}}}
+    monkeypatch.setattr(network, "_sc_manifest_valid", lambda _: True)
+    def git(args, **kwargs):
+        if args[1] == "diff":
+            first, last = args[-2:]
+            if (first,last) == (a,b):
+                return ('\n'.join((*network.SC_VARIABLE_FILES,*(("other.py",) if fault=="other_file" else ())))+'\n').encode()
+            return (network.SC_SUPPORT_FILES[0]+'\n').encode()
+        ref, path = args[-1].split(':',1)
+        if path in network.SC_VARIABLE_FILES:
+            if fault=="wrong_scalar" and ref==a:return b'foreign'
+            return b'old' if ref in (network.SC_MAIN,a) else b'new'
+        return b'different' if fault=="different_h" and ref==a else b'common-H'
+    monkeypatch.setattr(network.subprocess,"check_output",git)
+    if fault:
+        with pytest.raises(ValueError): network._require_sc_versions({"sc_versions":versions})
+    else: network._require_sc_versions({"sc_versions":versions})
+
+
+def test_sc_certificate_precheck_does_not_reuse_old_validity(sc_context, monkeypatch):
+    _, m, _, _, _ = sc_context
+    called=[]
+    def expired(directory):
+        called.append(directory)
+        raise ValueError("expired or less than one hour")
+    monkeypatch.setattr(network,"certificate_validity",expired)
+    with pytest.raises(ValueError,match="one hour"):network._require_sc_certificates(m)
+    assert len(called)==1
+
+
 @pytest.mark.parametrize("change", [
     {"call": 15}, {"maximum_attempts": True}, {"maximum_calls": 15}, {"batch_maximum_calls": 2},
     {"total_maximum_attempts": 15000}, {"batch_maximum_attempts": 2000}, {"maximum_attempts": 10000},
