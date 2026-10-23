@@ -13,7 +13,7 @@ from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from threading import Event
-from time import perf_counter, perf_counter_ns
+from time import perf_counter, perf_counter_ns, sleep
 
 from secure_control.execution.cycle_timing import (
     AbsoluteCycleClock,
@@ -161,6 +161,23 @@ def run_client_segmented(config: LanConfig, *, segment_steps: int = 400,
                                    on_step=on_step, on_segment=on_segment, phase=phase,
                                    preload_steps=preload_steps, preload_execution=preload_execution,
                                    non_realtime=non_realtime)
+
+
+def _wait_nonrealtime(target_ns, cancelled, control):
+    """以同一实际采样目标分片休眠；5ms是请求上限，不是系统唤醒保证。"""
+    started = perf_counter_ns()
+    requested = max(0, target_ns - started)
+    waited = False
+    while True:
+        if cancelled.is_set() or control.stop_requested:
+            return requested if waited else 0, perf_counter_ns() - started if waited else 0, None
+        remaining = target_ns - perf_counter_ns()
+        if remaining <= 0:
+            elapsed = perf_counter_ns() - started if waited else 0
+            return requested if waited else 0, elapsed, max(0, elapsed - requested) if waited else 0
+        # time.sleep走标准库节拍休眠路径；每次醒来重新核对同一目标，不忙等或追赶。
+        waited = True
+        sleep(min(remaining, 5_000_000) / 1e9)
 
 
 def _run_prepared_segmented(config, experiment, *, control, session,
@@ -419,14 +436,9 @@ def _run_prepared_segmented(config, experiment, *, control, session,
             pacing_requested = pacing_elapsed = pacing_excess = 0
             if non_realtime and previous_sample_ns is not None:
                 # 只尽力保持模型节奏：从上次实际采样算剩余等待，慢轮不追赶或积压输入。
-                remaining = (previous_sample_ns + round(experiment.scene.period * 1e9) - perf_counter_ns()) / 1e9
-                if remaining > 0:
-                    wait_started = perf_counter_ns() if timing_observer is not None else None
-                    session.cancelled.wait(remaining)
-                    if timing_observer is not None:
-                        pacing_requested = round(remaining*1e9)
-                        pacing_elapsed = perf_counter_ns()-wait_started
-                        pacing_excess = max(0,pacing_elapsed-pacing_requested)
+                target_ns = previous_sample_ns + round(experiment.scene.period * 1e9)
+                pacing_requested, pacing_elapsed, pacing_excess = _wait_nonrealtime(
+                    target_ns, session.cancelled, control)
                 if session.cancelled.is_set() or control.stop_requested:
                     if timing_observer is not None:
                         timing_observer.waiting_terminal = {"status":"cancelled" if session.cancelled.is_set() else "stopped",
