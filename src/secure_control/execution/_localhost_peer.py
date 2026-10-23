@@ -27,7 +27,9 @@ from .localhost_codec import (
     HelloPayload,
     WireEnvelope,
     _CompactBatchPayload,
+    _decode_integer_residues,
     _decode_residues,
+    _encode_integer_residues,
     _encode_residues,
     decode_envelope,
     encode_envelope,
@@ -244,14 +246,21 @@ class LocalhostProtocol3PeerPort:
         if self._wire_profile not in _COMPACT_PROFILES:
             return payload
         if self._wire_profile == _MATRIX_PROFILE:
-            values = [type(item.e)(int(v)) for item in payload.products
-                      for array in (item.e, item.f) for v in array.value.flat]
+            from secure_control.crypto.matrix_beaver import matrix_values
+            meta = self._batch_context[0].product_resources[0]
+            modulus = self._batch_context[4]
+            values = [int(v) for item in payload.products
+                      for share,shape in ((item.e,(meta.rows,meta.inner)),(item.f,(meta.inner,1)))
+                      for v in matrix_values(share,shape,modulus).flat]
+            values.extend(item.value.value for item in payload.truncations)
+            encoded = _encode_integer_residues(values,len(values),modulus)
         else:
             values = [share for item in payload.products for share in (item.d, item.e)]
-        values.extend(item.value for item in payload.truncations)
+            values.extend(item.value for item in payload.truncations)
+            encoded = _encode_residues(values, self._batch_context[4])
         return _CompactBatchPayload(payload.phase, payload.plan_sha256, payload.run_id,
             payload.epoch_id, payload.physical_step, payload.batch_index,
-            _encode_residues(values, self._batch_context[4]), self._wire_profile)
+            encoded, self._wire_profile)
 
     def _validate_batch(self, message, plan, phase, ids):
         run_id, epoch_id, physical_step, _ = self._batch_identity(plan)
@@ -276,17 +285,18 @@ class LocalhostProtocol3PeerPort:
             count = (plan.multiplication_mask_elements if self._wire_profile == _MATRIX_PROFILE
                      and phase == "product" else len(ids) * (2 if phase == "product" else 1)
                      if phase in {"product", "truncation"} else 0)
-            values = iter(_decode_residues(payload.values,
+            matrix_product = self._wire_profile == _MATRIX_PROFILE and phase == "product"
+            values = iter((_decode_integer_residues if matrix_product else _decode_residues)(payload.values,
                 count,
                 self._batch_context[4]))
-            if self._wire_profile == _MATRIX_PROFILE and phase == "product":
+            if matrix_product:
                 import numpy as np
 
                 from secure_control.crypto import AdditiveShare
                 meta = plan.product_resources[0]
-                e = AdditiveShare(np.array([next(values).value for _ in range(meta.rows*meta.inner)],
+                e = AdditiveShare(np.array([next(values) for _ in range(meta.rows*meta.inner)],
                                           dtype=object).reshape(meta.rows, meta.inner))
-                f = AdditiveShare(np.array([next(values).value for _ in range(meta.inner)],
+                f = AdditiveShare(np.array([next(values) for _ in range(meta.inner)],
                                           dtype=object).reshape(meta.inner, 1))
                 products = (MatrixMaskPayload(e, f, 0 if self._peer == "P1" else 1),)
             else:

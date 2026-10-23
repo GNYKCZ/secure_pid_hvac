@@ -166,6 +166,108 @@ def test_matrix_plan_codec_material_identity_and_legacy_mixing_fail_closed():
             peer.close();b.close()
 
 
+@pytest.mark.parametrize("q", [3,257,2**256-189])
+def test_matrix_integer_codec_matches_independent_bytes_and_owns_arrays(q):
+    """非对称shape和手写row-major字节；不从新编码器反推期望。"""
+    from types import SimpleNamespace
+
+    from test_two_party_protocol import make_stack
+
+    from secure_control.execution import localhost_codec as codec
+    from secure_control.execution._localhost_peer import LocalhostProtocol3PeerPort
+    from secure_control.protocol import Client
+    from secure_control.protocol.messages import (
+        ControllerLayout,
+        InputShareMessage,
+        MatrixMaskPayload,
+    )
+
+    _,_,_,_,distribution = make_stack()
+    layout = ControllerLayout(1,2,1,distribution.p1.layout.scale_ledger)
+    plan = Client._resource_plan(layout,"session","round",0,encoding_profile='control-dynamic-matrix-v1')
+    width = (q.bit_length()+7)//8
+    # U(2,3),V(3,1),W(2,1),一份(r,r_prime)，故意不使用默认5×6。
+    integers = [0,q-1,1,2,0,q-1, 1,0,q-1, 2,1, q-1,0]
+    raw = b''.join(x.to_bytes(width,'big') for x in integers)
+    inp = InputShareMessage(0,"session","round",0,AdditiveShare(np.zeros(2,dtype=object)))
+    restored = codec._decode_preloaded_values(raw,inp,plan,q)
+    next_plan = Client._resource_plan(layout,"session","next",1,encoding_profile='control-dynamic-matrix-v1')
+    second = codec._decode_preloaded_values(raw,replace(inp,round_id='next',step=1),next_plan,q)
+    for data in (raw[:-1],raw+b'\0',raw[:-width]+q.to_bytes(width,'big')):
+        with pytest.raises(ValueError):
+            codec._decode_preloaded_values(data,inp,plan,q)
+    product = restored.product_resources[0]
+    expected = (integers[:6],integers[6:9],integers[9:11])
+    for share,values,shape in zip((product.u,product.v,product.w),expected,((2,3),(3,1),(2,1)),strict=True):
+        assert share.value.dtype == object and share.value.shape == shape
+        assert share.value.tolist() == np.array(values,dtype=object).reshape(shape).tolist()
+    assert [(t.r.value,t.r_prime.value) for t in restored.state_truncation_resources] == [(q-1,0)]
+    resource = SimpleNamespace(owner=0,metadata=plan.product_resources[0],
+        triple=SimpleNamespace(u=product.u,v=product.v,w=product.w))
+    from secure_control.protocol.messages import PartyResources
+    material = PartyResources(0,plan,(resource,),tuple(SimpleNamespace(owner=0,metadata=t.metadata,
+        truncation=SimpleNamespace(r=t.r,r_prime=t.r_prime)) for t in restored.state_truncation_resources))
+    assert codec._encode_preloaded_values(material,q) == raw
+    for invalid,error in ((True,TypeError),(1.5,TypeError),(-1,ValueError),(q,ValueError)):
+        bad_array = product.u.value.copy()
+        bad_array[0,0] = invalid
+        bad = replace(material,product_resources=(SimpleNamespace(owner=0,metadata=resource.metadata,
+            triple=SimpleNamespace(u=AdditiveShare(bad_array),v=product.v,w=product.w)),))
+        with pytest.raises(error):
+            codec._encode_preloaded_values(bad,q)
+    for bad in (replace(material,recipient=True),replace(material,product_resources=(
+        SimpleNamespace(owner=1,metadata=resource.metadata,triple=resource.triple),))):
+        with pytest.raises(ValueError):
+            codec._encode_preloaded_values(bad,q)
+    # 支持矩阵Integral并先校验再转int；原标量仍不接受numpy整数。
+    numpy_array = product.u.value.copy()
+    numpy_array[0,0] = np.int64(0)
+    numpy_material = replace(material,product_resources=(SimpleNamespace(owner=0,metadata=resource.metadata,
+        triple=SimpleNamespace(u=AdditiveShare(numpy_array),v=product.v,w=product.w)),))
+    assert codec._encode_preloaded_values(numpy_material,q) == raw
+    with pytest.raises(ValueError):
+        codec._encode_residues([AdditiveShare(np.int64(0))],q)
+    product.u.value[0,0] = 1
+    assert second.product_resources[0].u.value[0,0] == 0
+    assert not np.shares_memory(product.u.value,product.v.value)
+    # 单独核peer E/F字节与独立恢复，无须真实传输或新计时。
+    sender = LocalhostProtocol3PeerPort(None,'P1',8*1024*1024,1.,batch_enabled=True,
+        wire_profile='control-dynamic-matrix-v1')
+    receiver = LocalhostProtocol3PeerPort(None,'P2',8*1024*1024,1.,batch_enabled=True,
+        wire_profile='control-dynamic-matrix-v1')
+    for peer in (sender,receiver):
+        peer.bind(plan.session_id)
+        peer.set_batch_round(plan,modulus=q,run_id='run',epoch_id='epoch')
+    ids = tuple(item.resource_id for item in plan.product_resources)
+    masks = integers[:9]
+    payload = sender._batch_payload(plan,'product',ids,products=(MatrixMaskPayload(
+        AdditiveShare(np.array(masks[:6],dtype=object).reshape(2,3)),
+        AdditiveShare(np.array(masks[6:],dtype=object).reshape(3,1)),0),))
+    compact = sender._wire_batch(payload)
+    assert compact.values == b''.join(x.to_bytes(width,'big') for x in masks)
+    for invalid,error in ((True,TypeError),(1.5,TypeError),(-1,ValueError),(q,ValueError)):
+        e = payload.products[0].e.value.copy()
+        e[0,0] = invalid
+        bad = replace(payload,products=(replace(payload.products[0],e=AdditiveShare(e)),))
+        with pytest.raises(error):
+            sender._wire_batch(bad)
+    with pytest.raises(ValueError):
+        sender._wire_batch(replace(payload,products=(replace(payload.products[0],
+            e=AdditiveShare(np.zeros((1,6),dtype=object))),)))
+    frame = codec.WireEnvelope(codec.SCHEMA_VERSION,'request','P1','P2',1,'peer_batch',
+        plan.session_id,plan.round_id,plan.step,None,compact)
+    for data in (compact.values[:-1],compact.values+b'\0',q.to_bytes(width,'big')+compact.values[width:]):
+        with pytest.raises(ValueError):
+            receiver._validate_batch(replace(frame,payload=replace(compact,values=data)),plan,'product',ids)
+        assert receiver._receive_sequence == 1
+    result = receiver._validate_batch(frame,plan,'product',ids).products[0]
+    assert result.e.value.dtype == result.f.value.dtype == object
+    assert result.e.value.tolist() == payload.products[0].e.value.tolist()
+    assert result.f.value.tolist() == payload.products[0].f.value.tolist()
+    result.e.value[0,0] = 1
+    assert payload.products[0].e.value[0,0] == 0
+
+
 def test_local_cost_math_and_codec_with_fake_clock(monkeypatch):
     """只验证局部成本函数算术与字段；假时钟无性能样本、不调用P0入口。"""
     from types import SimpleNamespace

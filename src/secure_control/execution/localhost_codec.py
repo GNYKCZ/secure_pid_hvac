@@ -790,14 +790,14 @@ def _encode_preloaded_values(resources: PartyResources, modulus: int) -> bytes:
             meta = plan.product_resources[0]
             for share, shape in zip((item.triple.u, item.triple.v, item.triple.w),
                                    ((meta.rows,meta.inner),(meta.inner,1),(meta.rows,1)), strict=True):
-                values.extend(AdditiveShare(int(v)) for v in matrix_values(share,shape,modulus).flat)
+                values.extend(int(v) for v in matrix_values(share,shape,modulus).flat)
         else:
-            values.extend((item.triple.a, item.triple.b, item.triple.c))
+            values.extend((item.triple.a.value, item.triple.b.value, item.triple.c.value))
     for item in resources.state_truncation_resources:
         if type(item.owner) is not int or item.owner != resources.recipient:
             raise ValueError("预送资源角色不匹配")
-        values.extend((item.truncation.r, item.truncation.r_prime))
-    result = _encode_residues(values, modulus)
+        values.extend((item.truncation.r.value, item.truncation.r_prime.value))
+    result = _encode_integer_residues(values, len(values), modulus)
     if len(result) != size:
         raise ValueError("预送数值长度错误")
     return result
@@ -805,12 +805,16 @@ def _encode_preloaded_values(resources: PartyResources, modulus: int) -> bytes:
 
 def _encode_residues(values, modulus: int) -> bytes:
     """紧凑动态与原预送共用定宽无符号 residue 编码。"""
+    return _encode_integer_residues((share.value for share in values), len(values), modulus)
+
+
+def _encode_integer_residues(values, count, modulus):
+    """共用canonical检查；矩阵元素经matrix_values校验后直接编码，不构造标量份额。"""
     width = _residue_width(modulus)
-    if len(values) * width > _COMPACT_MAX_VALUES:
+    if count * width > _COMPACT_MAX_VALUES:
         raise ValueError("residue 数值块超过公共预算")
     encoded = []
-    for share in values:
-        value = share.value
+    for value in values:
         if type(value) is not int or not 0 <= value < modulus:
             raise ValueError("预送数值必须是 canonical scalar residue")
         encoded.append(value.to_bytes(width, "big"))
@@ -825,6 +829,11 @@ def _residue_width(modulus):
 
 def _decode_residues(data, count: int, modulus: int):
     """按公开数量先验长度校验后创建原 AdditiveShare。"""
+    return tuple(AdditiveShare(value) for value in _decode_integer_residues(data,count,modulus))
+
+
+def _decode_integer_residues(data, count: int, modulus: int):
+    """整个数值块通过原预算/长度/范围校验后才返回任意精度整数。"""
     width = _residue_width(modulus)
     if (type(count) is not int or count < 0 or count * width > _COMPACT_MAX_VALUES
             or type(data) is not bytes or len(data) != count * width):
@@ -834,7 +843,7 @@ def _decode_residues(data, count: int, modulus: int):
         value = int.from_bytes(data[offset:offset + width], "big")
         if value >= modulus:
             raise ValueError("预送数值必须是 canonical residue")
-        values.append(AdditiveShare(value))
+        values.append(value)
     return tuple(values)
 
 
@@ -847,15 +856,15 @@ def _decode_preloaded_values(data: bytes, inp: InputShareMessage,
         raise ValueError("预送输入角色无效")
     if type(plan) is MatrixStepResourcePlan:
         count = plan.multiplication_material_elements + 2*plan.truncation_count
-        values = iter(_decode_residues(data, count, modulus))
+        values = iter(_decode_integer_residues(data, count, modulus))
         meta = plan.product_resources[0]
         def array(shape):
-            return AdditiveShare(np.array([next(values).value for _ in range(prod(shape))],
+            return AdditiveShare(np.array([next(values) for _ in range(prod(shape))],
                                          dtype=object).reshape(shape))
         material = MatrixProductMaterial(inp.recipient, meta, array((meta.rows,meta.inner)),
                                          array((meta.inner,1)), array((meta.rows,1)))
         return PartyOnlineMaterial(inp, plan, (material,),
-            tuple(TruncationResourceMaterial(inp.recipient, item, next(values), next(values))
+            tuple(TruncationResourceMaterial(inp.recipient, item, AdditiveShare(next(values)), AdditiveShare(next(values)))
                   for item in plan.state_truncation_resources))
     values = _decode_residues(data, 3 * plan.triple_count + 2 * plan.truncation_count, modulus)
     iterator = iter(values)
