@@ -2019,7 +2019,16 @@ def _party_job(
     timeout_trace=False, material_comparison=False, worker_wait_diagnostic=False, server_gc_candidate=False,
     stage_wait_diagnostic=False, compact_history_candidate=False, compact_history_steps=4000,
     compact_history_qualification=False, network_observation=False, wire_profile=None,
+    source_manifest=None,
 ) -> None:
+    source_binding = None
+    if source_manifest is not None:
+        from .network_benchmark import matrix_process_binding
+        try:
+            source_binding = matrix_process_binding(source_manifest)
+        except (OSError, ValueError, RuntimeError) as error:
+            queue.put({"role":config.role, "status":"failed", "error_type":type(error).__name__, "steps":[]})
+            return
     role_steps = []
     history = None
     if compact_history_candidate:
@@ -2081,6 +2090,13 @@ def _party_job(
             outcome["network_tls"] = network_tls
         if wire_profile is not None:
             outcome["wire_profile"] = wire_profile
+        if source_manifest is not None:
+            try:
+                outcome["source_binding"] = matrix_process_binding(source_manifest)
+                if outcome["source_binding"] != source_binding:
+                    raise ValueError("角色源绑定发生变化")
+            except (OSError, ValueError, RuntimeError) as error:
+                outcome.update(status="failed", source_binding_error=type(error).__name__)
         if diagnostic:
             outcome["diagnostic"] = diagnostic.report()
         if stage_wait:
@@ -2711,7 +2727,8 @@ def run_continuous_observation(*, steps: int, delay_ms: float,
     return report
 
 
-def _material_run_gate(result, report, candidate, target_steps, *, strict=False, numeric_key="worker_long_run"):
+def _material_run_gate(result, report, candidate, target_steps, *, strict=False, numeric_key="worker_long_run",
+                       expected_resources=None):
     """复用S5材料/周期门禁；长期样本还须有全分母、身份链与双方确认。"""
     material = result.get("material_summary") or {}
     cycles = result.get("cycles", [])
@@ -2738,8 +2755,8 @@ def _material_run_gate(result, report, candidate, target_steps, *, strict=False,
         if (result.get("requested_steps") != target_steps or result.get("successful_steps") != target_steps
                 or result.get("failed_attempts") != 0 or result["cycle_summary"].get("attempts") != target_steps
                 or result.get("failure_category") is not None or result.get("failed_phase") is not None
-                or result.get("resource_counts") != {"products_consumed": 30 * target_steps,
-                                                      "truncations_consumed": 4 * target_steps}
+                or result.get("resource_counts") != (expected_resources if expected_resources is not None else
+                    {"products_consumed": 30 * target_steps, "truncations_consumed": 4 * target_steps})
                 or len({row["round_id"] for row in cycles}) != target_steps
                 or len({row["run_id"] for row in cycles}) != 1
                 or material["worker"].get("memory_guard_failed") is not False
@@ -2968,9 +2985,15 @@ def _finish_stage_wait(result, report, metadata, observers):
 
 def _compact_sample_pass(result, report, metadata, *, target_steps=4000):
     """复用原身份/材料检查；独立补充本候选的数值、维护和观察完整性。"""
+    matrix = result.get("wire_profile") == "control-dynamic-matrix-v1"
+    expected = ({"matrix_products_consumed": target_steps, "scalar_equivalent_products": 30*target_steps,
+                 "multiplication_material_elements": 41*target_steps, "truncations_consumed": 4*target_steps}
+                if matrix else None)
     if not (metadata["representation_complete"] and metadata["thread_registration_complete"]
             and (result.get("stage_wait_diagnostic") or {}).get("evidence_complete") is True
-            and _material_run_gate(result, report, "worker", target_steps, strict=True, numeric_key="stage_wait_diagnostic")):
+            and (not matrix or result.get("schema") == "matrix-dynamic-evidence-v1")
+            and _material_run_gate(result, report, "worker", target_steps, strict=True,
+                                  numeric_key="stage_wait_diagnostic", expected_resources=expected)):
         return False
     numeric = metadata["numeric_contract"] or {}
     if any(numeric.get(k) != v for k, v in (("block_steps", 19), ("parameter_bits", 40), ("runtime_payload_bits", 46))):
@@ -3499,7 +3522,10 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
         steps if qpc_stage_receive_candidate or qpc_dynamic_qualification or network_configs is not None else 4000,
         qpc_dynamic_qualification or network_configs is not None and steps == 10000,
         *((True, network_wire_profile) if network_configs is not None else ()),
-    )) for index, role in enumerate(("P1", "P2"))] if role_config is None else []
+    ), **({"kwargs":{"source_manifest":network_candidate_manifest}}
+          if isinstance(network_candidate_manifest, dict)
+          and network_candidate_manifest.get("scope") == "issue128-matrix-comparison-v1" else {}))
+        for index, role in enumerate(("P1", "P2"))] if role_config is None else []
     records, events, outcomes, writer_batches = [], [], [], []
     history = _compact_history
     def record_count():
@@ -3826,7 +3852,8 @@ def _run_continuous_observation(*, steps: int, delay_ms: float,
         if diagnostic_report["encoded_bytes"] > diagnostic_report["encoded_limit"]:
             raise RuntimeError("有限诊断编码超出预声明预算。")
     return {
-        "schema": "cycle-qualification-v1" if optimized else "continuous-observation-v1",
+        "schema": ("matrix-dynamic-evidence-v1" if network_wire_profile == "control-dynamic-matrix-v1"
+                   else "cycle-qualification-v1" if optimized else "continuous-observation-v1"),
         **({"network_tls": network_tls} if network_configs is not None else {}),
         **({"wire_profile": network_wire_profile} if network_wire_profile is not None else {}),
         "recording_mode": recording_mode,

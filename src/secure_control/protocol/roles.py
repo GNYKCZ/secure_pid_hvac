@@ -52,6 +52,9 @@ from .messages import (
     ControlShareMessage,
     ExportedPreloadedStep,
     InputShareMessage,
+    MatrixProductMetadata,
+    MatrixProductResourceShare,
+    MatrixStepResourcePlan,
     OfflineControllerMessage,
     OfflineDistribution,
     OnlineRound,
@@ -1329,7 +1332,8 @@ class Client:
 
     @staticmethod
     def _resource_plan(
-        layout: ControllerLayout, session_id: str, round_id: str, step: int
+        layout: ControllerLayout, session_id: str, round_id: str, step: int,
+        *, encoding_profile="control-batch-v1"
     ) -> StepResourcePlan:
         """按 ledger 分配所有乘法 triple，以及零份或逐 state 行一份 Trunc mask。"""
         shapes = {
@@ -1340,7 +1344,17 @@ class Client:
         }
         products: list[ResourceMetadata] = []
         ledger = layout.scale_ledger
-        for term in _PROTOCOL3_TERM_ORDER:
+        matrix = encoding_profile == "control-dynamic-matrix-v1"
+        if matrix:
+            from secure_control.crypto.matrix_beaver import matrix_shape
+            if any(type(v) is not int or v < 1 for v in
+                   (layout.state_dimension, layout.input_dimension, layout.output_dimension)):
+                raise ValueError("矩阵计划需要非零动态维度")
+            matrix_shape(layout.state_dimension+layout.output_dimension,
+                         layout.state_dimension+layout.input_dimension, 3)
+            products.append(MatrixProductMetadata(round_id+":matrix", session_id, round_id, step,
+                layout.state_dimension+layout.output_dimension, layout.state_dimension+layout.input_dimension))
+        for term in (() if matrix else _PROTOCOL3_TERM_ORDER):
             rows, columns = shapes[term]
             right_scale = ledger.state if term in {"A", "C"} else ledger.input
             left_scale = getattr(ledger, term)
@@ -1381,7 +1395,8 @@ class Client:
             if ledger.state_truncation_bits
             else ()
         )
-        return StepResourcePlan(
+        plan_type = MatrixStepResourcePlan if matrix else StepResourcePlan
+        return plan_type(
             session_id,
             round_id,
             step,
@@ -1617,14 +1632,15 @@ class _PreparedResourceOwner:
             self._preload_tokens.pop(batch._token, None)
             return current
 
-    def create(self, step: int, *, rng=None, round_id=None) -> PreparedOnlineResources:
+    def create(self, step: int, *, rng=None, round_id=None, encoding_profile="control-batch-v1") -> PreparedOnlineResources:
         """复用 canonical 原语生成全新 owner/lifecycle；仅创建入口可登记能力。"""
         step = _require_step(step)
         horizon = self.horizon
         if horizon is not None and step >= horizon:
             raise ValueError("step 超出已证明的 finite horizon。")
         plan = Client._resource_plan(self.layout, self.session_id,
-                                    f"round-{secrets.token_hex(16)}" if round_id is None else round_id, step)
+                                    f"round-{secrets.token_hex(16)}" if round_id is None else round_id, step,
+                                     encoding_profile=encoding_profile)
         token = object()
         prepared = PreparedOnlineResources(
             *_create_resource_pair(plan, self.multiplier, self.truncation, rng=rng), self, token,
@@ -1672,11 +1688,17 @@ class _PreparedResourceOwner:
 def _create_resource_pair(plan, multiplier, truncation, *, rng=None):
     """原路径与本地工人共用的唯一新鲜材料生成顺序，不签发 Client 输出。"""
     products, truncations = ([], []), ([], [])
+    matrix = type(plan) is MatrixStepResourcePlan
+    if matrix:
+        from secure_control.crypto.matrix_beaver import MatrixBeaverMultiplier
+        multiplier = MatrixBeaverMultiplier(multiplier.sharing)
     for metadata in plan.product_resources:
-        pair = multiplier.create_triple(rng=rng)
+        pair = (multiplier.create_triple(metadata.rows, metadata.inner, rng=rng) if matrix
+                else multiplier.create_triple(rng=rng))
         lifecycle = _ResourceLifecycle()
         for party in (0, 1):
-            products[party].append(ProductResourceShare(party, metadata, pair[party], lifecycle))
+            products[party].append((MatrixProductResourceShare if matrix else ProductResourceShare)(
+                party, metadata, pair[party], lifecycle))
     for metadata in plan.state_truncation_resources:
         pair = truncation.create_auxiliary(rng=rng)
         lifecycle = _ResourceLifecycle()

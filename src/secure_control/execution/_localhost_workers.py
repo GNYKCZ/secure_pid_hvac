@@ -25,16 +25,20 @@ from secure_control.protocol.coordinator import (
 )
 from secure_control.protocol.messages import (
     ControlShareMessage,
+    MatrixClientStepResult,
+    MatrixStepResourcePlan,
     OnlineRound,
     PartyOfflineMaterial,
     PartyOnlineMaterial,
     PartyOnlineRound,
     Protocol3CommitAuthorization,
     Protocol3EndpointCommand,
-    Protocol3LocalStageReceipt,
     Protocol3StageReceipt,
     ResourceMetadata,
     StepResourcePlan,
+    commit_authorization_type,
+    local_receipt_type,
+    receipt_operation_count,
 )
 
 from ._localhost_peer import LocalhostProtocol3PeerPort, accept_p1_peer, connect_p2_peer
@@ -153,7 +157,7 @@ class _ClientPartyEndpoint:
         if self.share is None:
             raise RuntimeError("尚未完成 stage，不能提交。")
         if ((self.completion_strategy == "client_authorized")
-                != (type(authorization) is Protocol3CommitAuthorization)):
+                != (type(authorization) is commit_authorization_type(self._plan))):
             raise ValueError("提交操作与协商完成策略不匹配。")
         request = WireEnvelope(
             SCHEMA_VERSION, "request", "Client", self._role, self.sequence, "endpoint",
@@ -232,7 +236,7 @@ class _ClientPartyEndpoint:
         self._pending_batch = None
         if not isinstance(response.payload, PartyStageResult):
             raise TypeError("批量角色未返回暂存回执和输出份额")
-        receipt_type = (Protocol3LocalStageReceipt if self.completion_strategy == "client_authorized"
+        receipt_type = (local_receipt_type(self._plan) if self.completion_strategy == "client_authorized"
                         else Protocol3StageReceipt)
         if type(response.payload.receipt) is not receipt_type:
             raise ValueError("暂存回执与协商完成策略不匹配。")
@@ -897,8 +901,9 @@ def _complete_client_round(
         orchestrator.commit(first, second)
     if on_phase is not None:
         on_phase("commit")
-    return ClientStepResult(
-        result, plan.round_id, plan.step, receipts[0].products, receipts[0].truncations
+    result_type = MatrixClientStepResult if type(plan) is MatrixStepResourcePlan else ClientStepResult
+    return result_type(
+        result, plan.round_id, plan.step, receipt_operation_count(receipts[0]), receipts[0].truncations
     )
 
 

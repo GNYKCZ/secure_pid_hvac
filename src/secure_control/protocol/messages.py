@@ -424,8 +424,113 @@ class StepResourcePlan:
         return len(self.state_truncation_resources)
 
 
+@dataclass(frozen=True, slots=True)
+class MatrixProductMetadata:
+    """一个完整矩阵operation的公开身份，不冒充标量乘法索引。"""
+
+    resource_id: str
+    session_id: str
+    round_id: str
+    step: int
+    rows: int
+    inner: int
+
+    def __post_init__(self):
+        if (any(type(v) is not str or not v for v in
+                (self.resource_id, self.session_id, self.round_id))
+                or type(self.step) is not int or self.step < 0
+                or any(type(v) is not int or v < 1 for v in (self.rows, self.inner))):
+            raise ValueError("矩阵材料身份和维度必须准确且非布尔")
+
+
+@dataclass(frozen=True, slots=True)
+class MatrixStepResourcePlan:
+    """D128-1同ell动态矩阵计划；旧triple_count接口不适用于本类型。"""
+
+    session_id: str
+    round_id: str
+    step: int
+    state_shape: tuple[int]
+    input_shape: tuple[int]
+    output_shape: tuple[int]
+    scale_ledger: ControllerScaleLedger
+    product_resources: tuple[MatrixProductMetadata]
+    state_truncation_resources: tuple[ResourceMetadata, ...]
+    version: str = "matrix-dynamic-plan-v1"
+    arithmetic_profile: str = "matrix-beaver-v1"
+    order: str = "row-major/state-first"
+
+    def __post_init__(self):
+        from secure_control.crypto.matrix_beaver import matrix_shape
+        if (self.version != "matrix-dynamic-plan-v1" or self.arithmetic_profile != "matrix-beaver-v1"
+                or self.order != "row-major/state-first" or type(self.step) is not int or self.step < 0
+                or any(type(v) is not str or not v for v in (self.session_id, self.round_id))
+                or any(type(s) is not tuple or len(s) != 1 or type(s[0]) is not int or s[0] < 1
+                       for s in (self.state_shape, self.input_shape, self.output_shape))):
+            raise ValueError("矩阵计划公开身份/维度/版本错误")
+        n, m, p = self.state_shape[0], self.input_shape[0], self.output_shape[0]
+        ledger = self.scale_ledger
+        if (type(ledger) is not ControllerScaleLedger
+                or any(type(getattr(ledger, name)) is not int for name in ledger.__dataclass_fields__)):
+            raise TypeError("矩阵计划需要规范尺度账本")
+        ell = ledger.state
+        if (ell < 1 or any(getattr(ledger,k) != ell for k in ('input','A','B','C','D','state_truncation_bits'))
+                or ledger.output != 2*ell):
+            raise ValueError("矩阵首版只接受同ell动态布局")
+        matrix_shape(n+p, n+m, 3)
+        expected = MatrixProductMetadata(self.round_id+':matrix', self.session_id, self.round_id,
+                                         self.step, n+p, n+m)
+        if (type(self.product_resources) is not tuple or len(self.product_resources) != 1
+                or type(self.product_resources[0]) is not MatrixProductMetadata
+                or self.product_resources != (expected,)):
+            raise ValueError("矩阵operation身份错误")
+        truncations = tuple(ResourceMetadata(f'{self.round_id}:state[{i}]', self.session_id,
+            self.round_id, self.step, 'state_truncation', 'state', (i,), (n,), 2*ell, None, ell)
+            for i in range(n))
+        if (type(self.state_truncation_resources) is not tuple
+                or any(type(v) is not ResourceMetadata for v in self.state_truncation_resources)
+                or json.dumps([asdict(v) for v in self.state_truncation_resources], sort_keys=True)
+                   != json.dumps([asdict(v) for v in truncations], sort_keys=True)):
+            raise ValueError("矩阵状态截断计划错误")
+
+    @property
+    def matrix_products(self):
+        return 1
+
+    @property
+    def scalar_equivalent_products(self):
+        item = self.product_resources[0]
+        return item.rows * item.inner
+
+    @property
+    def multiplication_material_elements(self):
+        item = self.product_resources[0]
+        return item.rows * item.inner + item.inner + item.rows
+
+    @property
+    def multiplication_mask_elements(self):
+        item = self.product_resources[0]
+        return item.rows * item.inner + item.inner
+
+    @property
+    def truncation_count(self):
+        return len(self.state_truncation_resources)
+
+    @property
+    def fractional_bits(self):
+        return self.scale_ledger.state
+
+
+def product_operation_count(plan):
+    """明确区分矩阵操作次数与旧标量三元组次数，不改变旧计数定义。"""
+    if type(plan) is MatrixStepResourcePlan:
+        return plan.matrix_products
+    return plan.triple_count
+
+
 _PUBLIC_PLAN_JSON_FIELDS = {kind: tuple(item.name for item in fields(kind))
-                            for kind in (StepResourcePlan, ResourceMetadata, ControllerScaleLedger)}
+                            for kind in (StepResourcePlan, ResourceMetadata, ControllerScaleLedger,
+                                         MatrixStepResourcePlan, MatrixProductMetadata)}
 
 
 def _deeply_immutable_public_plan(plan: StepResourcePlan) -> bool:
@@ -439,7 +544,7 @@ def _deeply_immutable_public_plan(plan: StepResourcePlan) -> bool:
         names = _PUBLIC_PLAN_JSON_FIELDS.get(kind)
         return names is not None and all(immutable(getattr(value, name)) for name in names)
     try:
-        return type(plan) is StepResourcePlan and immutable(plan)
+        return type(plan) in (StepResourcePlan, MatrixStepResourcePlan) and immutable(plan)
     except RecursionError:
         # 不缓存非法循环；由未修改的 canonical 函数保持原失败类别。
         return False
@@ -458,12 +563,13 @@ def _public_plan_json_fields(value):
 
 def public_step_plan_sha256(plan: StepResourcePlan) -> str:
     """仅绑定公开 layout、尺度、资源身份和顺序，不摘要秘密矩阵值。"""
-    if not isinstance(plan, StepResourcePlan):
+    if not isinstance(plan, StepResourcePlan) and type(plan) is not MatrixStepResourcePlan:
         raise TypeError("批次计划需要 StepResourcePlan")
     # 旧asdict在循环记录进入JSON前即RecursionError；保持非法循环的失败类别。
     encoded = json.dumps(plan, default=_public_plan_json_fields, sort_keys=True, separators=(",", ":"),
                          ensure_ascii=False, allow_nan=False, check_circular=False).encode("utf-8")
-    return sha256(b"control-batch-v1-plan\0" + encoded).hexdigest()
+    prefix = b"matrix-dynamic-plan-v1\0" if type(plan) is MatrixStepResourcePlan else b"control-batch-v1-plan\0"
+    return sha256(prefix + encoded).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -501,7 +607,7 @@ class Protocol3BatchPayload:
         if self.phase == "product":
             valid = (len(self.products) == len(self.resource_ids)
                      and not self.truncations
-                     and all(isinstance(item, ProductMaskPayload) for item in self.products))
+                     and all(type(item) in (ProductMaskPayload, MatrixMaskPayload) for item in self.products))
         elif self.phase == "truncation":
             valid = (len(self.truncations) == len(self.resource_ids)
                      and not self.products
@@ -562,6 +668,16 @@ class ProductResourceShare:
     owner: PartyIndex
     metadata: ResourceMetadata
     triple: BeaverTripleShare
+    _lifecycle: _ResourceLifecycle = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class MatrixProductResourceShare:
+    """单方矩阵三元组，独立类型及operation生命周期。"""
+
+    owner: PartyIndex
+    metadata: MatrixProductMetadata
+    triple: object
     _lifecycle: _ResourceLifecycle = field(repr=False, compare=False)
 
 
@@ -821,6 +937,17 @@ class ProductResourceMaterial:
 
 
 @dataclass(frozen=True, slots=True)
+class MatrixProductMaterial:
+    """矩阵材料wire DTO；不携带lifecycle或对方份额。"""
+
+    owner: PartyIndex
+    metadata: MatrixProductMetadata
+    u: AdditiveShare
+    v: AdditiveShare
+    w: AdditiveShare
+
+
+@dataclass(frozen=True, slots=True)
 class TruncationResourceMaterial:
     """一个角色的一份 Trunc 数值材料；不信任 wire 上的消费状态。"""
 
@@ -845,6 +972,14 @@ class PartyOnlineMaterial:
         if not isinstance(online, PartyOnlineRound):
             raise TypeError("online 必须是 PartyOnlineRound。")
         resources = online.resources
+        if type(resources.plan) is MatrixStepResourcePlan:
+            return cls(online.input_message, resources.plan,
+                tuple(MatrixProductMaterial(item.owner, item.metadata, item.triple.u,
+                                             item.triple.v, item.triple.w)
+                      for item in resources.product_resources),
+                tuple(TruncationResourceMaterial(item.owner, item.metadata,
+                    item.truncation.r, item.truncation.r_prime)
+                      for item in resources.state_truncation_resources))
         return cls(
             online.input_message,
             resources.plan,
@@ -876,6 +1011,15 @@ class ProductMaskPayload:
 
     d: AdditiveShare
     e: AdditiveShare
+    party: PartyIndex
+
+
+@dataclass(frozen=True, slots=True)
+class MatrixMaskPayload:
+    """矩阵E_i/F_i掩码，不与标量d/e类型混用。"""
+
+    e: AdditiveShare
+    f: AdditiveShare
     party: PartyIndex
 
 
@@ -952,6 +1096,68 @@ class Protocol3CommitAuthorization:
         if (type(self.prepared_parties) is not tuple or self.prepared_parties != (0, 1)
                 or any(type(value) is not int for value in self.prepared_parties)):
             raise ValueError("提交授权必须确认严格的 P1/P2 两方。")
+
+
+@dataclass(frozen=True, slots=True)
+class MatrixLocalStageReceipt:
+    """矩阵本方暂存；一个operation，不声称30份标量材料。"""
+
+    party: PartyIndex
+    session_id: str
+    round_id: str
+    step: int
+    matrix_products: int
+    truncations: int
+    plan_sha256: str
+    scope: str = "local_staged"
+
+    def __post_init__(self):
+        Protocol3LocalStageReceipt(self.party, self.session_id, self.round_id, self.step,
+                                   self.matrix_products, self.truncations, self.plan_sha256, self.scope)
+        if type(self.matrix_products) is not int or self.matrix_products != 1 or self.truncations < 1:
+            raise ValueError("矩阵暂存计数错误")
+
+
+@dataclass(frozen=True, slots=True)
+class MatrixCommitAuthorization:
+    """矩阵Client授权，仅接受精确矩阵计划与两方回执。"""
+
+    plan_sha256: str
+    prepared_parties: tuple[PartyIndex, PartyIndex]
+    matrix_products: int
+    truncations: int
+
+    def __post_init__(self):
+        Protocol3CommitAuthorization(self.plan_sha256, self.prepared_parties,
+                                      self.matrix_products, self.truncations)
+        if type(self.matrix_products) is not int or self.matrix_products != 1 or self.truncations < 1:
+            raise ValueError("矩阵授权计数错误")
+
+
+def receipt_operation_count(value):
+    """回执的矩阵operation与标量product保持显式类型区别。"""
+    if type(value) in (MatrixLocalStageReceipt, MatrixCommitAuthorization, MatrixClientStepResult):
+        return value.matrix_products
+    return value.products
+
+
+def local_receipt_type(plan):
+    return MatrixLocalStageReceipt if type(plan) is MatrixStepResourcePlan else Protocol3LocalStageReceipt
+
+
+def commit_authorization_type(plan):
+    return MatrixCommitAuthorization if type(plan) is MatrixStepResourcePlan else Protocol3CommitAuthorization
+
+
+@dataclass(frozen=True, slots=True)
+class MatrixClientStepResult:
+    """Client完成双ACK后的矩阵结果；独立资源计数而非旧products。"""
+
+    output: np.ndarray
+    round_id: str
+    step: int
+    matrix_products: int
+    truncations: int
 
 
 Protocol3Operation = Literal[

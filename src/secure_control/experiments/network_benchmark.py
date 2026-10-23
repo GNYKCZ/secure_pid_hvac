@@ -13,10 +13,11 @@ import ssl
 import subprocess
 import sys
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import patch
 from xml.etree import ElementTree
 
 from secure_control.execution.lan_config import LanEndpoint, LanTopology
@@ -93,6 +94,465 @@ SC_VARIABLE_FILES = (SC_SCALAR, "tests/test_secret_sharing.py")
 SC_SUPPORT_FILES = ("src/secure_control/experiments/network_benchmark.py",
                     "src/secure_control/experiments/lan_runner.py",
                     "tests/test_network_benchmark.py", "docs/network_performance.md")
+
+# #128的共同测量支持H可以在无矩阵模块的完整A版本上导入。
+MATRIX_AUTHORIZATION = "https://github.com/GNYKCZ/secure_pid_hvac/issues/128#issuecomment-6338813023"
+MATRIX_DESIGN = "https://github.com/GNYKCZ/secure_pid_hvac/issues/128#issuecomment-6338770182"
+MATRIX_MAIN = "32fbb11224ad4e48588e041583288d5bac1be896"
+MATRIX_WIRE = "control-dynamic-matrix-v1"
+MATRIX_SCOPE = "issue128-matrix-comparison-v1"
+MATRIX_MODULE = "src/secure_control/crypto/matrix_beaver.py"
+MATRIX_VARIABLE_FILES = (MATRIX_MODULE, "src/secure_control/protocol/messages.py",
+    "src/secure_control/protocol/roles.py", "src/secure_control/protocol/coordinator.py",
+    *(f"src/secure_control/execution/{name}.py" for name in
+      ("localhost_codec", "_localhost_peer", "_localhost_workers", "_material_worker", "lan_runtime")),
+    "tests/test_matrix_beaver.py")
+MATRIX_SUPPORT_FILES = (*SC_SUPPORT_FILES, "src/secure_control/experiments/communication_benchmark.py")
+MATRIX_COMMENT = re.compile(r"https://github\.com/GNYKCZ/secure_pid_hvac/issues/128#issuecomment-[0-9]+\Z")
+
+
+def matrix_source():
+    """本Issue覆盖全部核心源码/运行配置/依赖；缺失矩阵模块在A显式记null。"""
+    files = subprocess.check_output(["git", "ls-files", "src/secure_control", "configs", "scripts",
+                                     "pyproject.toml", "uv.lock"], cwd=ROOT, text=True).splitlines()
+    # 四份交互部署配置不参与本机固定实验，仍由Work独立做字节前后保护。
+    excluded = {"configs/"+n for n in ("lab-client-cart-pole.example.yaml", "lab-p1.example.yaml",
+                                     "lab-p2.example.yaml", "local-deployment.example.yaml")}
+    files = sorted((set(files) | {MATRIX_MODULE}) - excluded)
+    return (subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+            {name: hashlib.sha256((ROOT/name).read_bytes()).hexdigest() if (ROOT/name).is_file() else None
+             for name in files})
+
+
+def matrix_process_binding(m):
+    """每个spawn角色从自己的完整解释器核实际源及已导入包路径。"""
+    if matrix_source() != (m["head"], m["source_sha256"]):
+        raise ValueError("角色实际源与冻结完整版本不同")
+    source_root = (ROOT/"src").resolve()
+    for name, module in tuple(sys.modules.items()):
+        path = getattr(module, "__file__", None)
+        if name.startswith("secure_control") and path is not None and not Path(path).resolve().is_relative_to(source_root):
+            raise ValueError("角色从冻结仓库外导入核心")
+    return {"head":m["head"], "source_sha256_digest":digest(m["source_sha256"])}
+
+
+class _MatrixBoundOutput:
+    """共同H只给原worker终报附加实际来源，不改变材料或控制消息。"""
+
+    def __init__(self, output, manifest):
+        self.output, self.manifest = output, manifest
+
+    def send_bytes(self, data):
+        if data[:1] == b"R":
+            report = json.loads(data[1:])
+            try:
+                report["source_binding"] = matrix_process_binding(self.manifest)
+            except (OSError, ValueError, RuntimeError) as error:
+                report["error_type"] = type(error).__name__
+            data = b"R"+json.dumps(report, separators=(",", ":"), allow_nan=False).encode()
+            if len(data) > 16*1024:
+                raise ValueError("工人来源终报超过原预算")
+        self.output.send_bytes(data)
+
+    def close(self):
+        self.output.close()
+
+
+def _matrix_worker_job(manifest, spec, credit, output):
+    from secure_control.execution._material_worker import _worker_main
+    matrix_process_binding(manifest)
+    _worker_main(spec, credit, _MatrixBoundOutput(output, manifest))
+
+
+@contextmanager
+def _matrix_worker_binding(manifest):
+    from functools import partial
+
+    from secure_control.execution import _material_worker
+    with patch.object(_material_worker, "_worker_main", partial(_matrix_worker_job, manifest)):
+        yield
+
+
+def _matrix_manifest_valid(m):
+    if not isinstance(m, dict) or m.get("comparison_stage") not in ("M128-P0", "M128-A", "M128-B"):
+        return False
+    stage = m["comparison_stage"]
+    versions = m.get("matrix_versions")
+    if (not isinstance(versions, dict) or set(versions) != {"A", "B"}
+            or any(type(v) is not dict or set(v) != {"head", "source_sha256"}
+                   or re.fullmatch(r"[0-9a-f]{40}", str(v.get("head"))) is None
+                   or type(v.get("source_sha256")) is not dict for v in versions.values())):
+        return False
+    a, b = versions["A"], versions["B"]
+    sources = a["source_sha256"]
+    if (a["head"] == b["head"] or sources.keys() != b["source_sha256"].keys()
+            or sources.get(MATRIX_MODULE, "missing") is not None
+            or not isinstance(b["source_sha256"].get(MATRIX_MODULE), str)
+            or any(value != b["source_sha256"][name] for name, value in sources.items()
+                   if name not in MATRIX_VARIABLE_FILES)):
+        return False
+    version = versions["A" if stage == "M128-A" else "B"]
+    return (m.get("scope") == MATRIX_SCOPE and m.get("authorization_url") == MATRIX_AUTHORIZATION
+        and m.get("comparison_design_url") == MATRIX_DESIGN
+        and (m.get("head"), m.get("source_sha256")) == (version["head"], version["source_sha256"])
+        and m.get("software_pass") is True and m.get("readback_exact") is True
+        and isinstance(m.get("review_url"), str) and MATRIX_COMMENT.fullmatch(m["review_url"]) is not None
+        and m.get("review_heads") == [a["head"], b["head"]]
+        and (m.get("profile"), m.get("phase")) == ("N0", "candidate")
+        and m.get("wire_profile") == (_COMPACT_PROFILE_V3 if stage == "M128-A" else MATRIX_WIRE)
+        and all(type(m.get(k)) is int and m[k] == v for k, v in {
+            "call": ("M128-P0", "M128-A", "M128-B").index(stage)+1,
+            "maximum_calls": 3, "total_maximum_attempts": 2000,
+            "maximum_attempts": 0 if stage == "M128-P0" else 1000}.items())
+        and m.get("ports") == list(V2_PORTS)
+        and m.get("budget_path") == str((ROOT/".tmp/issue128-performance-budget.json").resolve())
+        and m.get("native_ledger_path") == str((ROOT/".tmp/issue128-native-invocations.json").resolve())
+        and m.get("certificate_directory") == str((ROOT/".tmp/issue128-matrix-certs").resolve())
+        and m.get("environment") == {"platform": platform.platform(), "python": sys.version.split()[0],
+                                     "openssl": ssl.OPENSSL_VERSION})
+
+
+def _require_matrix_versions(m):
+    if not _matrix_manifest_valid(m):
+        raise ValueError("#128缺少完整A/B版本及独审")
+    def git(*args):
+        return subprocess.check_output(["git", *args], cwd=ROOT)
+    a, b = (m["matrix_versions"][name]["head"] for name in ("A", "B"))
+    common = set(git("diff", "--name-only", MATRIX_MAIN, a).decode().splitlines())
+    variable = set(git("diff", "--name-only", a, b).decode().splitlines())
+    if (not common or not common <= set(MATRIX_SUPPORT_FILES) or MATRIX_MODULE not in variable
+            or not variable <= set(MATRIX_VARIABLE_FILES)
+            or git("merge-base", a, b).decode().strip() != a):
+        raise ValueError("#128 A必须为main+H，B仅增加矩阵实现")
+    for name in ("beaver", "truncation", "secret_sharing"):
+        path = f"src/secure_control/crypto/{name}.py"
+        if any(git("show", f"{head}:{path}") != git("show", f"{MATRIX_MAIN}:{path}") for head in (a, b)):
+            raise ValueError("P0旧标量原语必须与main字节相同")
+
+
+def _require_matrix_certificates(m, configs=None):
+    directory = Path(m["certificate_directory"])
+    if (certificate_validity(directory) != m.get("public_certificate_validity")
+            or {n: hashlib.sha256((directory/n).read_bytes()).hexdigest()
+                for n in ("ca.pem", "client.pem", "p1.pem", "p2.pem")} != m.get("public_certificate_sha256")):
+        raise ValueError("#128证书来源/规格/余期不符，不自动续证")
+    if configs is not None and configs != role_configs(directory, V2_PORTS, "N0"):
+        raise ValueError("#128只能复用固定N0 mutual TLS配置")
+
+
+def require_matrix_candidate(m, wire_profile, configs=None):
+    """共享及实际循环只能使用当前进程已占的同一次原生调用。"""
+    if (not _matrix_manifest_valid(m) or m["comparison_stage"] == "M128-P0"
+            or wire_profile != m["wire_profile"] or matrix_source() != (m["head"], m["source_sha256"])):
+        raise ValueError("#128运行来源或编码未获本次独审")
+    ledger = Path(m["budget_path"])
+    saved = json.loads(ledger.read_text(encoding="utf-8"))
+    entries = saved.get("entries")
+    lock = ledger.with_suffix(ledger.suffix + ".lock")
+    if (saved.get("schema") != "network-call-budget-v1" or type(entries) is not list
+            or len(entries) != m["call"] or not lock.is_file()
+            or lock.read_text(encoding="utf-8").strip() != str(os.getpid())):
+        raise ValueError("#128共享入口缺少当前进程持有的占项")
+    current = entries[-1]
+    if (type(current) is not dict or current.get("finished") is not False
+            or current.get("sample_pass") is not False or type(current.get("started_utc")) is not str
+            or any(current.get(k) != value for k, value in m.items())):
+        raise ValueError("#128当前占项已结束或与本次manifest不同")
+    # 与外层占项复用同一前件判定；只核验，不追加或退款。
+    _next_matrix_call(entries[:-1], m["profile"], m["phase"], m["head"], m["source_sha256"], m)
+    _require_matrix_certificates(m, configs)
+
+
+def _matrix_previous(entry):
+    raw = Path(entry["output"]).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != entry.get("raw_sha256") or entry.get("sample_pass") is not True:
+        raise ValueError("#128前项原件缺失/变化/未通过")
+    return json.loads(raw)
+
+
+def _next_matrix_call(entries, profile, phase, head, sources, m):
+    if (not _matrix_manifest_valid(m) or type(entries) is not list or len(entries) >= 3
+            or m["call"] != len(entries)+1 or (profile, phase, head, sources) !=
+               (m["profile"], m["phase"], m["head"], m["source_sha256"])):
+        raise ValueError("#128独立三次scope已耗尽或阶段/来源不符")
+    _require_matrix_versions(m)
+    rows = json.loads(Path(m["native_ledger_path"]).read_text(encoding="utf-8"))["entries"]
+    keys = ("call", "head", "source_sha256", "comparison_stage", "authorization_url", "maximum_attempts",
+            "profile", "phase", "wire_profile", "output")
+    if (type(rows) is not list or len(rows) != len(entries)+1
+            or any(row.get("completed") is not True or row.get("native_exit") != 0 for row in rows[:-1])
+            or rows[-1].get("completed") is not False or rows[-1].get("native_exit") is not None
+            or type(rows[-1].get("started_utc")) is not str
+            or any(rows[-1].get(k) != m.get(k) for k in keys)):
+        raise ValueError("#128缺少唯一真实START或前项正常原生退出")
+    for i, entry in enumerate(entries):
+        if (not _matrix_manifest_valid(entry) or entry.get("finished") is not True
+                or entry["comparison_stage"] != ("M128-P0", "M128-A")[i]
+                or any(rows[i].get(k) != entry.get(k) for k in keys)
+                or rows[i].get("raw_sha256") != entry.get("raw_sha256")
+                or any(entry.get(k) != m.get(k) for k in
+                    ("matrix_versions", "review_heads", "review_url", "environment",
+                     "public_certificate_sha256", "public_certificate_validity"))):
+            raise ValueError("#128前项失败/在途/条件不一致，禁止下一项")
+        previous = _matrix_previous(entry)
+        if i == 0:
+            if not _matrix_cost_pass(previous):
+                raise ValueError("P0结构/功能不完整")
+        elif not _assemble_matrix(previous, entry).get("network_sample_pass"):
+            raise ValueError("A未完整1000零超期，禁止B")
+    return m["maximum_attempts"]
+
+
+def _assemble_matrix(result, manifest):
+    """保留完整尝试/失败，矩阵计数独立；复用原周期/身份/资源门禁。"""
+    matrix = manifest["comparison_stage"] == "M128-B"
+    schema = "matrix-dynamic-evidence-v1" if matrix else "matrix-comparison-scalar-evidence-v1"
+    expected_schema = "matrix-dynamic-evidence-v1" if matrix else "cycle-qualification-v1"
+    incoming_schema = result.get("schema")
+    complete = False
+    try:
+        complete = (incoming_schema in (expected_schema, schema)
+            and benchmark._compact_sample_pass(result, result.get("material_comparison") or {},
+                                              result.get("network_history") or {}, target_steps=1000))
+    except (KeyError, TypeError, ValueError, IndexError):
+        pass
+    wire = manifest["wire_profile"]
+    material = result.get("material_summary") or {}
+    sample = bool(_matrix_manifest_valid(manifest) and result.get("status") == "stopped" and complete
+        and result.get("code_sha") == manifest["head"] and result.get("source_sha256") == manifest["source_sha256"]
+        and result.get("network_source_integrity_failed") is not True and _tls_pass(result)
+        and (result.get("network_history") or {}).get("finite_sample_pass") is True
+        and result.get("wire_profile") == wire and material.get("encoding_profile") == wire
+        and (material.get("worker") or {}).get("encoding_profile") == wire
+        and (material.get("worker") or {}).get("source_binding") ==
+            {"head":manifest["head"], "source_sha256_digest":digest(manifest["source_sha256"])}
+        and all(p.get("source_binding") ==
+            {"head":manifest["head"], "source_sha256_digest":digest(manifest["source_sha256"])}
+            for p in result.get("party_outcomes", []))
+        and all(p.get("wire_profile") == wire for p in result.get("party_outcomes", []))
+        and _staged_frames_pass(result, _COMPACT_PROFILE_V3))
+    result.update(schema=schema, arithmetic_profile="matrix-beaver-v1" if matrix else "scalar-beaver-v1",
+        network_manifest=manifest, network_manifest_sha256=digest(manifest), network_sample_pass=sample,
+        network_dynamic_qualification_pass=False, local_dynamic_qualification_pass=False, qualification_pass=False,
+        stage_pass=False, worker_long_run_gate_pass=False, candidate_gate_pass=False, server_gc_candidate_gate_pass=False,
+        eligible_for_candidate=False, qualification_allowed=False, comparison_only=True, diagnostic=True)
+    if not sample and result.get("status") == "stopped":
+        result.update(status="failed", failure_category="MatrixEvidenceIncomplete", failed_phase="MATRIX_REPORT")
+    return result
+
+
+def _run_matrix_network(*, profile, phase, certs, ports, ledger, approval, output, wire_profile):
+    manifest = json.loads(Path(approval).read_text(encoding="utf-8"))
+    head, sources = matrix_source()
+    output = Path(output).resolve()
+    if (not _matrix_manifest_valid(manifest) or output.exists() or str(output) != manifest.get("output")
+            or (head, sources) != (manifest["head"], manifest["source_sha256"])
+            or (profile, phase, wire_profile, list(ports)) !=
+               (manifest["profile"], manifest["phase"], manifest["wire_profile"], manifest["ports"])
+            or str(Path(ledger).resolve()) != manifest["budget_path"]
+            or str(Path(certs).resolve()) != manifest["certificate_directory"]
+            or not gc.isenabled() or gc.get_threshold() != (700,10,10)
+            or gc.get_freeze_count() or gc.get_debug() or gc.callbacks):
+        raise ValueError("#128正式入口不符，未启动角色")
+    _require_matrix_certificates(manifest)
+    with RunBudget(ledger) as budget:
+        steps = _next_matrix_call(budget.entries, profile, phase, head, sources, manifest)
+        entry = manifest | {"started_utc": datetime.now(UTC).isoformat(), "finished": False, "sample_pass": False}
+        budget.entries.append(entry)
+        budget._save()
+        result = {}
+        with output.open("x", encoding="utf-8") as stream:
+            try:
+                if manifest["comparison_stage"] == "M128-P0":
+                    result = _matrix_local_cost(manifest)
+                else:
+                    with _matrix_worker_binding(manifest):
+                        result = benchmark.run_network_observation(configs=role_configs(certs, ports, "N0"), steps=steps,
+                            wire_profile=wire_profile, candidate_manifest=manifest)
+                if matrix_source() != (head, sources):
+                    result["network_source_integrity_failed"] = True
+            except Exception as error:  # noqa: BLE001 - 不暴露秘密/异常内容，失败占项保留
+                result.update(status="failed", failure_category=type(error).__name__, failed_phase="MATRIX_RUN_OR_CLEANUP")
+            result.update(code_sha=head, source_sha256=sources)
+            if manifest["comparison_stage"] == "M128-P0":
+                result.update(network_sample_pass=bool(_matrix_cost_pass(result)
+                    and result.get("network_source_integrity_failed") is not True), network_manifest=manifest,
+                    network_dynamic_qualification_pass=False)
+            else:
+                result = _assemble_matrix(result, manifest)
+                if manifest["comparison_stage"] == "M128-B":
+                    result["network_progress_goal_pass"] = bool(result["network_sample_pass"]
+                        and _staged_gain(_matrix_previous(budget.entries[1]), result))
+                    result["observed_5ms_headroom"] = bool(result["network_sample_pass"]
+                        and max(r["cycle_completed_ns"]-r["scheduled_start_ns"] for r in result["cycles"]) <= 15000000)
+            export_started = time.perf_counter_ns()
+            json.dump(result, stream, ensure_ascii=False, indent=2, allow_nan=False)
+        export_ns = time.perf_counter_ns()-export_started
+        budget.finish(result, hashlib.sha256(output.read_bytes()).hexdigest())
+        if manifest["comparison_stage"] == "M128-P0":
+            budget.entries[-1]["primitive_pairs"] = len(result.get("pairs", []))
+            budget._save()
+    result["network_export_ns"] = export_ns
+    return result
+
+
+def _matrix_cost_pass(result):
+    """只检查局部功能/结构/全样本；局部时延绝不替代完整周期收益门禁。"""
+    phases = {"prepare_random_share", "encode_numeric_material", "restore_numeric_material", "multiply", "truncate_and_oracle"}
+    if (result.get("schema") != "matrix-primitive-cost-v1" or result.get("functional_pass") is not True
+            or result.get("status") != "stopped" or len(result.get("pairs", [])) != 18):
+        return False
+    try:
+        for index, pair in enumerate(result["pairs"]):
+            order = ["scalar", "matrix"] if index % 2 == 0 else ["matrix", "scalar"]
+            if (type(pair["index"]) is not int or pair["index"] != index or pair["warmup"] is not (index<2)
+                    or pair["order"] != order or len(pair["samples"]) != 2):
+                return False
+            for kind, sample in zip(order, pair["samples"], strict=True):
+                elements = 49 if kind == "matrix" else 98
+                if (sample["kind"] != kind or sample["functional_pass"] is not True
+                        or sample["material_elements_per_party"] != elements
+                        or sample["material_bytes_both_parties"] != elements*32*2
+                        or sample["mask_elements_per_direction"] != (36 if kind == "matrix" else 60)
+                        or any(set(sample[k]) != phases or any(type(v) is not int or v < 0 for v in sample[k].values())
+                               for k in ("wall_ns", "cpu_ns"))
+                        or any(type(sample[k]) is not int or sample[k] < sum(sample[p].values())
+                               for k,p in (("total_wall_ns","wall_ns"),("total_cpu_ns","cpu_ns")))):
+                    return False
+    except (KeyError, TypeError, ValueError):
+        return False
+    return True
+
+
+def _matrix_primitive_sample(kind, prepared):
+    """P0仅测共同裸数值codec和原语，两方本地调用；不模拟IPC或完整控制周期。"""
+    import numpy as np
+
+    from secure_control.crypto import (
+        AdditiveShare,
+        BeaverMultiplier,
+        SecureTruncation,
+        TwoPartySharing,
+    )
+    from secure_control.crypto.beaver import BeaverTripleShare, _TripleLifecycle
+    from secure_control.crypto.matrix_beaver import MatrixBeaverMultiplier, MatrixTripleShare
+    from secure_control.crypto.truncation import TruncationAuxiliaryShare, _MaskLifecycle
+
+    q, ell = prepared.context.modulus, prepared.context.fractional_bits
+    sharing = TwoPartySharing(q)
+    spec = prepared.spec
+    matrix = np.asarray(prepared.context.encode_to_residue(np.block([[spec.A, spec.B], [spec.C, spec.D]])), dtype=object)
+    vector = np.asarray(prepared.context.encode_to_residue(np.concatenate((spec.x0, np.zeros(2)))) , dtype=object).reshape(6, 1)
+    expected = [sum(int(matrix[i,j])*int(vector[j,0]) for j in range(6)) % q for i in range(5)]
+    phases, cpu_phases = {}, {}
+    wall, cpu = time.perf_counter_ns(), time.process_time_ns()
+    total_wall, total_cpu = wall, cpu
+    def mark(name):
+        nonlocal wall, cpu
+        next_wall, next_cpu = time.perf_counter_ns(), time.process_time_ns()
+        phases[name], cpu_phases[name] = next_wall-wall, next_cpu-cpu
+        wall, cpu = next_wall, next_cpu
+    owner = MatrixBeaverMultiplier(sharing) if kind == "matrix" else BeaverMultiplier(sharing)
+    trunc = SecureTruncation(sharing, ell, prepared.security_parameter, prepared.evidence)
+    left, right = sharing.share(matrix), sharing.share(vector)
+    triples = [owner.create_triple(5, 6)] if kind == "matrix" else [owner.create_triple() for _ in range(30)]
+    auxiliaries = [trunc.create_auxiliary() for _ in range(4)]
+    mark("prepare_random_share")
+    def flattened(party):
+        values = []
+        for pair in triples:
+            t = pair[party]
+            for share in ((t.u, t.v, t.w) if kind == "matrix" else (t.a, t.b, t.c)):
+                values.extend(int(v) for v in np.asarray(share.value, dtype=object).flat)
+        for pair in auxiliaries:
+            values.extend((pair[party].r.value, pair[party].r_prime.value))
+        return values
+    width = (q.bit_length()+7)//8
+    encoded = [b"".join(v.to_bytes(width, "big") for v in flattened(p)) for p in (0, 1)]
+    mark("encode_numeric_material")
+    del triples, auxiliaries  # 未mask的源DTO不再可领取；恢复值仅用于本次局部原语。
+    numbers = [[int.from_bytes(data[i:i+width], "big") for i in range(0, len(data), width)] for data in encoded]
+    owner = MatrixBeaverMultiplier(sharing) if kind == "matrix" else BeaverMultiplier(sharing)
+    trunc = SecureTruncation(sharing, ell, prepared.security_parameter, prepared.evidence)
+    triples = []
+    for index in range(1 if kind == "matrix" else 30):
+        life = _TripleLifecycle(owner)
+        if kind == "matrix":
+            pair = tuple(MatrixTripleShare(AdditiveShare(np.array(numbers[p][:30],dtype=object).reshape(5,6)),
+                AdditiveShare(np.array(numbers[p][30:36],dtype=object).reshape(6,1)),
+                AdditiveShare(np.array(numbers[p][36:41],dtype=object).reshape(5,1)), p, 5, 6, life) for p in (0,1))
+        else:
+            pair = tuple(BeaverTripleShare(*(AdditiveShare(v) for v in numbers[p][3*index:3*index+3]), p, life)
+                         for p in (0,1))
+        triples.append(pair)
+    base = 41 if kind == "matrix" else 90
+    auxiliaries = []
+    for row in range(4):
+        life = _MaskLifecycle(trunc)
+        auxiliaries.append(tuple(TruncationAuxiliaryShare(*(AdditiveShare(v) for v in
+            numbers[p][base+2*row:base+2*row+2]), p, life) for p in (0,1)))
+    mark("restore_numeric_material")
+    if kind == "matrix":
+        masks = [owner.mask_inputs(left[p], right[p], triples[0][p]) for p in (0,1)]
+        mask_elements = sum(np.asarray(v.value).size for v in (masks[0].e,masks[0].f))
+        opened = owner.open_masked_differences(*masks)
+        product = [owner.finish(triples[0][p], opened) for p in (0,1)]
+    else:
+        mask_elements = 0
+        values = [[0]*5 for _ in (0,1)]
+        for index, pair in enumerate(triples):
+            row, col = divmod(index, 6)
+            masks = [owner.mask_inputs(AdditiveShare(int(left[p].value[row,col])),
+                AdditiveShare(int(right[p].value[col,0])), pair[p]) for p in (0,1)]
+            mask_elements += sum(np.asarray(v.value).size for v in (masks[0].d,masks[0].e))
+            opened = owner.open_masked_differences(*masks)
+            for p in (0,1):
+                values[p][row] = (values[p][row]+owner.finish(pair[p], opened).value) % q
+        product = [AdditiveShare(np.array(v,dtype=object).reshape(5,1)) for v in values]
+    mark("multiply")
+    reconstructed = sharing.reconstruct(*product).reshape(5).tolist()
+    valid = reconstructed == expected
+    for row, pair in enumerate(auxiliaries):
+        inputs = [AdditiveShare(int(product[p].value[row,0])) for p in (0,1)]
+        masked = [trunc.mask_input(inputs[p], pair[p]) for p in (0,1)]
+        opened = trunc.p1_reconstruct_masked(masked[0], trunc.p2_send_masked(masked[1]))
+        output = sharing.reconstruct(trunc.finish_p1(inputs[0], pair[0], opened), trunc.finish_p2(inputs[1], pair[1]))
+        centered = expected[row] if expected[row] <= q//2 else expected[row]-q
+        rounded = trunc.paper_round_divide(centered)
+        output = output if output <= q//2 else output-q
+        valid = valid and abs(output-rounded) <= 1
+    mark("truncate_and_oracle")
+    elements = 49 if kind == "matrix" else 98
+    valid = valid and all(len(data) == elements*width for data in encoded)
+    valid = valid and mask_elements == (36 if kind == "matrix" else 60)
+    return {"kind":kind, "wall_ns":phases, "cpu_ns":cpu_phases,
+        "total_wall_ns":time.perf_counter_ns()-total_wall, "total_cpu_ns":time.process_time_ns()-total_cpu,
+        "material_elements_per_party":elements, "material_bytes_both_parties":sum(map(len,encoded)),
+        "mask_elements_per_direction":int(mask_elements), "functional_pass":bool(valid)}
+
+
+def _matrix_local_cost(manifest):
+    from secure_control.scenarios.cart_pole.interactive import InteractiveSession
+
+    from .lan_continuous_profile import load_segmented_experiment
+    prepared = load_segmented_experiment(benchmark._config("Client", V2_PORTS).experiment_config,
+                                         400, InteractiveSession())
+    pairs = []
+    for index in range(18):
+        order = ("scalar", "matrix") if index % 2 == 0 else ("matrix", "scalar")
+        row = {"index":index, "warmup":index<2, "order":list(order), "samples":[]}
+        pairs.append(row)
+        for kind in order:
+            try:
+                sample = _matrix_primitive_sample(kind, prepared)
+            except Exception as error:  # noqa: BLE001 - 保存先前全部样本且不暴露数值秘密
+                sample = {"kind":kind, "functional_pass":False, "error_type":type(error).__name__}
+            row["samples"].append(sample)
+            if sample["functional_pass"] is not True:
+                return {"schema":"matrix-primitive-cost-v1", "status":"failed", "functional_pass":False, "pairs":pairs}
+    return {"schema":"matrix-primitive-cost-v1", "status":"stopped", "functional_pass":True, "pairs":pairs,
+            "cycles":[], "scope":"local primitives and common numeric material codec; not full cycle/IPC/network",
+            "matrix_versions":manifest["matrix_versions"], "warmup_pairs":2, "formal_pairs":16}
 
 
 def sc_source():
@@ -831,6 +1291,9 @@ def require_staged_candidate(m, configs=None):
 
 def require_network_candidate(m, wire_profile, configs=None):
     """只按明确批次路由许可；不能把 v3 放入旧 R1/Q1 的能力集合。"""
+    if isinstance(m, dict) and m.get("authorization_url") == MATRIX_AUTHORIZATION:
+        require_matrix_candidate(m, wire_profile, configs)
+        return
     if isinstance(m, dict) and m.get("authorization_url") == SC_DESIGN:
         if m.get("wire_profile") != wire_profile:
             raise ValueError("SC实际编码不符。")
@@ -1303,6 +1766,12 @@ def validate_cli(args):
         raise ValueError("网络实验参数必须独占、固定场景/阶段/正常GC/原动态资源；不能设置任意steps。")
     wire = getattr(args, "network_wire_profile", None)
     authorization = getattr(args, "network_authorization", None)
+    if authorization == MATRIX_AUTHORIZATION:
+        if ((args.network_profile, args.network_phase) != ("N0", "candidate")
+                or wire not in (_COMPACT_PROFILE_V3, MATRIX_WIRE)
+                or args.network_repair_note is not None or args.network_ports != "55121,55122,55123"):
+            raise ValueError("#128只允许已审A/B、N0和固定端口")
+        return V2_PORTS
     local = authorization == LOCAL_DESIGN
     w_batch = authorization == W_DESIGN
     v1 = authorization == V1_DESIGN or w_batch
@@ -1579,8 +2048,9 @@ class RunBudget:
             v1 = any(e.get("authorization_url") == V1_DESIGN for e in self.entries)
             w_batch = any(e.get("authorization_url") == W_DESIGN for e in self.entries)
             sc = any(e.get("authorization_url") == SC_DESIGN for e in self.entries)
-            json.dump({"schema": "network-call-budget-v1", "maximum_calls": 17 if sc else 16 if w_batch else 14 if v1 else 13 if local else 12 if staged else 10 if repair else 9 if closure else 6,
-                       "maximum_attempts": 17000 if sc else 16000 if w_batch else 14000 if v1 else 13000 if local else 12000 if staged else 19000 if repair else 18000 if closure else 15000,
+            matrix = bool(self.entries) and all(e.get("authorization_url") == MATRIX_AUTHORIZATION for e in self.entries)
+            json.dump({"schema": "network-call-budget-v1", "maximum_calls": 3 if matrix else 17 if sc else 16 if w_batch else 14 if v1 else 13 if local else 12 if staged else 10 if repair else 9 if closure else 6,
+                       "maximum_attempts": 2000 if matrix else 17000 if sc else 16000 if w_batch else 14000 if v1 else 13000 if local else 12000 if staged else 19000 if repair else 18000 if closure else 15000,
                        "entries": self.entries}, stream, ensure_ascii=False, indent=2, allow_nan=False)
             stream.flush()
             os.fsync(stream.fileno())
@@ -1632,6 +2102,8 @@ def _tls_pass(result):
 
 def assemble(result, *, profile, phase, manifest, relay):
     """有限样本与最终资格严格分开，保留原失败、周期及旧资格false语义。"""
+    if str(result.get("schema", "")).startswith("matrix-"):
+        raise ValueError("矩阵证据需要#128显式reader，不能解释为旧网络结果")
     result.update(schema="network-cycle-v1", network_profile=profile, network_phase=phase,
                   network_manifest=manifest, network_manifest_sha256=digest(manifest), network_relay=relay)
     target = 10000 if phase == "qualification" else 1000
@@ -1695,6 +2167,11 @@ def assemble(result, *, profile, phase, manifest, relay):
 def run_network_benchmark(*, profile, phase, certs, ports, ledger, approval, output, repair_note=None,
                           wire_profile=None, authorization=None):
     """唯一新网络性能入口；校验审查来源和额度后才启动角色/转发器。"""
+    if authorization == MATRIX_AUTHORIZATION:
+        if repair_note is not None:
+            raise ValueError("#128性能阶段不接受源码修复/补跑")
+        return _run_matrix_network(profile=profile, phase=phase, certs=certs, ports=ports,
+                                   ledger=ledger, approval=approval, output=output, wire_profile=wire_profile)
     head, fingerprints = sc_source() if authorization == SC_DESIGN else source()
     approval = json.loads(Path(approval).read_text(encoding="utf-8"))
     environment = {"platform": platform.platform(), "python": sys.version.split()[0], "openssl": ssl.OPENSSL_VERSION}

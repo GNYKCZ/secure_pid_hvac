@@ -21,6 +21,12 @@ from secure_control.crypto import (
     TwoPartySharing,
 )
 from secure_control.crypto.beaver import _TripleLifecycle
+from secure_control.crypto.matrix_beaver import (
+    MatrixBeaverMultiplier,
+    MatrixMaskedShare,
+    MatrixTripleShare,
+    matrix_values,
+)
 from secure_control.crypto.truncation import _MaskLifecycle
 
 from .evidence import ProtocolStepSnapshot, copy_share
@@ -28,6 +34,10 @@ from .messages import (
     _PROTOCOL3_TERM_ORDER,
     ControllerRangeContract,
     ControlShareMessage,
+    MatrixMaskPayload,
+    MatrixProductMaterial,
+    MatrixProductResourceShare,
+    MatrixStepResourcePlan,
     OfflineControllerMessage,
     OnlineRound,
     P2TruncationPayload,
@@ -40,7 +50,6 @@ from .messages import (
     ProductResourceShare,
     Protocol3CommitAuthorization,
     Protocol3EndpointCommand,
-    Protocol3LocalStageReceipt,
     Protocol3StageReceipt,
     ResourceMetadata,
     StateTruncationResourceShare,
@@ -49,7 +58,11 @@ from .messages import (
     TruncationResourceMaterial,
     _deeply_immutable_public_plan,
     _ResourceLifecycle,
+    commit_authorization_type,
+    local_receipt_type,
+    product_operation_count,
     public_step_plan_sha256,
+    receipt_operation_count,
 )
 from .roles import P1, P2, _Server, _vector_from_scalars
 
@@ -166,18 +179,18 @@ class Protocol3Orchestrator:
     def _validate_receipts(
         self, receipts: tuple[Protocol3StageReceipt, Protocol3StageReceipt], plan: StepResourcePlan,
     ) -> None:
-        receipt_type = (Protocol3LocalStageReceipt if self.completion_strategy == "client_authorized"
+        receipt_type = (local_receipt_type(plan) if self.completion_strategy == "client_authorized"
                         else Protocol3StageReceipt)
         if len(receipts) != 2 or any(type(item) is not receipt_type for item in receipts):
             raise ValueError("Protocol 3 暂存回执类型与完成策略不匹配。")
-        if receipt_type is Protocol3LocalStageReceipt and any(
+        if self.completion_strategy == "client_authorized" and any(
                 item.plan_sha256 != _authorization_plan_digest(self, plan) for item in receipts):
             raise ValueError("Protocol 3 局部暂存计划摘要不匹配。")
         expected = (
             plan.session_id,
             plan.round_id,
             plan.step,
-            plan.triple_count,
+            product_operation_count(plan),
             plan.truncation_count,
         )
         if any(
@@ -186,7 +199,7 @@ class Protocol3Orchestrator:
                 receipt.session_id,
                 receipt.round_id,
                 receipt.step,
-                receipt.products,
+                receipt_operation_count(receipt),
                 receipt.truncations,
             )
             != expected
@@ -199,8 +212,8 @@ class Protocol3Orchestrator:
         if self.completion_strategy != "client_authorized":
             raise ValueError("旧完成策略不签发 Client 授权。")
         self._validate_receipts(receipts, plan)
-        return Protocol3CommitAuthorization(_authorization_plan_digest(self, plan), (0, 1),
-                                            plan.triple_count, plan.truncation_count)
+        return commit_authorization_type(plan)(_authorization_plan_digest(self, plan), (0, 1),
+                                            product_operation_count(plan), plan.truncation_count)
 
     def commit(self, p1: Protocol3PartyEndpoint, p2: Protocol3PartyEndpoint) -> None:
         """在调用方完成输出验证后按固定 P1/P2 顺序提交两方 state。"""
@@ -214,10 +227,10 @@ class Protocol3Orchestrator:
         try:
             self._validate_endpoints(p1, p2, plan)
             if self.completion_strategy == "client_authorized":
-                if (type(authorization) is not Protocol3CommitAuthorization
+                if (type(authorization) is not commit_authorization_type(plan)
                         or (authorization.plan_sha256, authorization.prepared_parties,
-                            authorization.products, authorization.truncations) != (
-                            _authorization_plan_digest(self, plan), (0, 1), plan.triple_count, plan.truncation_count)):
+                            receipt_operation_count(authorization), authorization.truncations) != (
+                            _authorization_plan_digest(self, plan), (0, 1), product_operation_count(plan), plan.truncation_count)):
                     raise ValueError("提交授权与本轮计划不匹配。")
                 p1.start_commit(authorization)
                 p2.start_commit(authorization)
@@ -238,7 +251,7 @@ class Protocol3Orchestrator:
         p2: Protocol3PartyEndpoint,
         plan: StepResourcePlan,
     ) -> None:
-        if not isinstance(plan, StepResourcePlan):
+        if not isinstance(plan, StepResourcePlan) and type(plan) is not MatrixStepResourcePlan:
             raise TypeError("Protocol 3 调度需要 StepResourcePlan。")
         if (p1.party, p2.party) != (0, 1):
             raise ValueError("Protocol 3 endpoint 必须按 P1/P2 顺序提供。")
@@ -288,7 +301,7 @@ def stage_protocol3_batch(
     try:
         masks = tuple(endpoint.mask_product(item) for item in plan.product_resources)
         incoming = peer.exchange_products(plan, masks)
-        if len(incoming) != plan.triple_count:
+        if len(incoming) != product_operation_count(plan):
             raise ValueError("乘法批次不完整")
         for metadata, value in zip(plan.product_resources, incoming, strict=True):
             endpoint.finish_product(metadata, value)
@@ -455,7 +468,7 @@ class LocalProtocol3PartyEndpoint:
         ) or plan.scale_ledger != role.layout.scale_ledger:
             raise ValueError("在线资源计划的 shape 或 scale ledger 不匹配。")
         if (
-            len(resources.product_resources) != plan.triple_count
+            len(resources.product_resources) != product_operation_count(plan)
             or len(resources.state_truncation_resources) != plan.truncation_count
         ):
             raise ValueError("单方在线资源数量与计划不匹配。")
@@ -468,13 +481,15 @@ class LocalProtocol3PartyEndpoint:
             round_id=plan.round_id,
             step=plan.step,
         )
+        if type(plan) is MatrixStepResourcePlan and completion_strategy != "client_authorized":
+            raise ValueError("矩阵仅允许Client授权完成策略")
         self._control_sender = control_sender
         self._products = {item.metadata.resource_id: item for item in resources.product_resources}
         self._truncations = {
             item.metadata.resource_id: item for item in resources.state_truncation_resources
         }
         if (
-            len(self._products) != plan.triple_count
+            len(self._products) != product_operation_count(plan)
             or len(self._truncations) != plan.truncation_count
         ):
             raise ValueError("Protocol 3 资源 ID 必须在当前 round 内唯一。")
@@ -555,6 +570,15 @@ class LocalProtocol3PartyEndpoint:
         if metadata.resource_id in self._product_state:
             raise ValueError("同一乘法资源不得重复开始。")
         multiplier = resource.triple._lifecycle.owner
+        if type(self._plan) is MatrixStepResourcePlan:
+            controller = self._role.controller_share
+            matrix = AdditiveShare(np.block([[controller.A.value, controller.B.value],
+                                            [controller.C.value, controller.D.value]]))
+            vector = AdditiveShare(np.concatenate((self._role.state_share.value, self._input.value)).reshape(-1, 1))
+            resource._lifecycle.claim(self.party)
+            masked = multiplier.mask_inputs(matrix, vector, resource.triple)
+            self._product_state[metadata.resource_id] = (resource, multiplier, masked)
+            return MatrixMaskPayload(masked.e, masked.f, self.party)
         right = (
             self._role.state_value(metadata.index[1])
             if metadata.term in {"A", "C"}
@@ -572,6 +596,17 @@ class LocalProtocol3PartyEndpoint:
     def finish_product(self, metadata: ResourceMetadata, peer: ProductMaskPayload) -> None:
         resource, multiplier, masked = self._product_entry(metadata)
         other = 1 - self.party
+        if type(self._plan) is MatrixStepResourcePlan:
+            if type(peer) is not MatrixMaskPayload or type(peer.party) is not int or peer.party != other:
+                raise ValueError("矩阵对端mask类型/角色错误")
+            matrix_values(peer.e, (metadata.rows, metadata.inner), self._sharing.modulus)
+            matrix_values(peer.f, (metadata.inner, 1), self._sharing.modulus)
+            masked._lifecycle.claim_masking(other)
+            rebound = MatrixMaskedShare(peer.e, peer.f, other, masked._lifecycle)
+            opened = multiplier.open_masked_differences(masked, rebound)
+            self._matrix_result = multiplier.finish(resource.triple, opened)
+            self._local_products.add(metadata.resource_id)
+            return
         if not isinstance(peer, ProductMaskPayload) or peer.party != other:
             raise ValueError("Protocol 1 对端遮蔽消息的角色错误。")
         lifecycle = masked._lifecycle
@@ -610,8 +645,14 @@ class LocalProtocol3PartyEndpoint:
     def finish_products(self) -> None:
         completed = (self._local_products if self.completion_strategy == "client_authorized"
                      else self._completed_products)
-        if self._closed or self._output is not None or len(completed) != self._plan.triple_count:
+        if self._closed or self._output is not None or len(completed) != product_operation_count(self._plan):
             raise ValueError("Protocol 3 尚未完成全部乘法资源。")
+        if type(self._plan) is MatrixStepResourcePlan:
+            n = self._role.layout.state_dimension
+            values = self._matrix_result.value
+            self._raw_state = AdditiveShare(values[:n, 0].copy())
+            self._output = AdditiveShare(values[n:, 0].copy())
+            return
         self._output = self._role.add(
             self._sharing,
             self._term_vector("C", self._role.layout.output_dimension),
@@ -760,16 +801,16 @@ class LocalProtocol3PartyEndpoint:
         )
         self._staged = True
         if self.completion_strategy == "client_authorized":
-            return Protocol3LocalStageReceipt(
+            return local_receipt_type(self._plan)(
                 self.party, self._plan.session_id, self._plan.round_id, self._plan.step,
-                self._plan.triple_count, self._plan.truncation_count,
+                product_operation_count(self._plan), self._plan.truncation_count,
                 _authorization_plan_digest(self, self._plan))
         return Protocol3StageReceipt(
             self.party,
             self._plan.session_id,
             self._plan.round_id,
             self._plan.step,
-            self._plan.triple_count,
+            product_operation_count(self._plan),
             self._plan.truncation_count,
         )
 
@@ -790,11 +831,11 @@ class LocalProtocol3PartyEndpoint:
 
     def _accept_authorization(self, authorization: Protocol3CommitAuthorization) -> None:
         if (self.completion_strategy != "client_authorized" or self._closed
-                or not self._staged or type(authorization) is not Protocol3CommitAuthorization
+                or not self._staged or type(authorization) is not commit_authorization_type(self._plan)
                 or (authorization.plan_sha256, authorization.prepared_parties,
-                    authorization.products, authorization.truncations) != (
+                    receipt_operation_count(authorization), authorization.truncations) != (
                     _authorization_plan_digest(self, self._plan), (0, 1),
-                    self._plan.triple_count, self._plan.truncation_count)):
+                    product_operation_count(self._plan), self._plan.truncation_count)):
             raise ValueError("授权与当前完整局部暂存状态不匹配。")
         for resource in self._products.values():
             resource.triple._lifecycle.attest_peer_finish(self.party)
@@ -828,6 +869,13 @@ class LocalProtocol3PartyEndpoint:
         if self._closed:
             raise ValueError("禁止重复开始：当前 endpoint 已封闭。")
         resource = self._products.get(metadata.resource_id)
+        if type(self._plan) is MatrixStepResourcePlan:
+            if (type(resource) is not MatrixProductResourceShare or resource.metadata != metadata
+                    or metadata != self._plan.product_resources[0]
+                    or type(resource.owner) is not int or resource.owner != self.party
+                    or type(resource.triple.party_index) is not int or resource.triple.party_index != self.party):
+                raise ValueError("矩阵operation与本地计划不匹配")
+            return resource
         if not isinstance(resource, ProductResourceShare) or resource.metadata != metadata:
             raise ValueError("乘法资源与 Protocol 3 计划不匹配。")
         right_scale = (
@@ -878,7 +926,7 @@ class LocalProtocol3PartyEndpoint:
         if entry is None:
             raise RuntimeError("乘法资源尚未开始。")
         resource, multiplier, masked = entry
-        if not isinstance(resource, ProductResourceShare):
+        if not isinstance(resource, ProductResourceShare) and type(resource) is not MatrixProductResourceShare:
             raise TypeError("乘法 endpoint 内部资源类型错误。")
         return resource, multiplier, masked
 
@@ -931,7 +979,7 @@ class LocalProtocol3PartyEndpoint:
         if not products:
             raise ValueError("Protocol 3 资源计划缺少必须存在的 D 项乘法。")
         multiplier = products[0].triple._lifecycle.owner
-        if not isinstance(multiplier, BeaverMultiplier):
+        if not isinstance(multiplier, BeaverMultiplier) and type(multiplier) is not MatrixBeaverMultiplier:
             raise TypeError("乘法资源未绑定 BeaverMultiplier。")
         return multiplier.sharing
 
@@ -1038,7 +1086,7 @@ def _rehydrate_online_material(
     ) != (plan.session_id, plan.round_id, plan.step):
         raise ValueError("在线输入与资源计划 identity 不匹配。")
     if (
-        len(material.product_resources) != plan.triple_count
+        len(material.product_resources) != product_operation_count(plan)
         or len(material.state_truncation_resources) != plan.truncation_count
     ):
         raise ValueError("在线数值材料数量与资源计划不匹配。")
@@ -1047,6 +1095,16 @@ def _rehydrate_online_material(
     # protocol 是既有 crypto lifecycle 的拥有边界；execution/wire 不实例化或传输私有对象。
     products: list[ProductResourceShare] = []
     for expected, item in zip(plan.product_resources, material.product_resources, strict=True):
+        if type(plan) is MatrixStepResourcePlan:
+            if (type(item) is not MatrixProductMaterial or item.metadata != expected
+                    or type(item.owner) is not int or item.owner != party):
+                raise ValueError("矩阵材料身份或类型不匹配")
+            matrix_owner = MatrixBeaverMultiplier(sharing)
+            triple = MatrixTripleShare(item.u, item.v, item.w, party, expected.rows, expected.inner,
+                                        _TripleLifecycle(matrix_owner))
+            matrix_owner._validate(triple)
+            products.append(MatrixProductResourceShare(party, expected, triple, _ResourceLifecycle()))
+            continue
         _validate_product_material(item, expected, party)
         for value in (item.a, item.b, item.c):
             if isinstance(sharing._validated_share_values(value), np.ndarray):

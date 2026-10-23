@@ -433,9 +433,9 @@ def _run_prepared_segmented(config, experiment, *, control, session,
             "round_id": lifecycle.attempted_round_id if lifecycle else None,
             "protocol_committed_count": lifecycle.protocol_committed_count if lifecycle else 0,
             "confirmed_step_count": lifecycle.physically_confirmed_count if lifecycle else 0,
-            "resource_counts": ({"products_consumed": lifecycle.products_consumed,
-                                 "truncations_consumed": lifecycle.truncations_consumed}
-                                if lifecycle else {}),
+            "resource_counts": getattr(runtime, "resource_counts",
+                {"products_consumed": lifecycle.products_consumed,
+                 "truncations_consumed": lifecycle.truncations_consumed} if lifecycle else {}),
             "lifecycle": asdict(lifecycle) if lifecycle else None,
             "cycle_summary": {"attempts": cycle_count, "misses": misses,
                               "last_cycle": last_cycle},
@@ -642,7 +642,8 @@ def _run() -> int:
     benchmark.add_argument("--network-ledger", type=Path)
     benchmark.add_argument("--network-approval", type=Path)
     benchmark.add_argument("--network-repair-note")
-    benchmark.add_argument("--network-wire-profile", choices=("control-dynamic-compact-v1", _COMPACT_PROFILE_V2, _COMPACT_PROFILE_V3))
+    benchmark.add_argument("--network-wire-profile", choices=("control-dynamic-compact-v1", _COMPACT_PROFILE_V2,
+                                                            _COMPACT_PROFILE_V3, "control-dynamic-matrix-v1"))
     benchmark.add_argument("--network-authorization", help="当前 Issue 的直接用户批准登记评论 URL")
     benchmark.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
@@ -670,7 +671,7 @@ def _run() -> int:
                 "attempts": len(report.get("cycles", [])), "history_export_ns": report["network_export_ns"],
                 "report": str(args.output)}, ensure_ascii=False, sort_keys=True))
             comparison = (report.get("network_manifest") or {}).get("comparison_stage")
-            return 0 if (report["network_sample_pass"] and (comparison not in ("T2", "T3", "U2", "V1", "W1", "W2", "SC-B")
+            return 0 if (report["network_sample_pass"] and (comparison not in ("T2", "T3", "U2", "V1", "W1", "W2", "SC-B", "M128-B")
                            or report.get("network_progress_goal_pass") is True)) else 5
         if args.steps is None:
             parser.error("benchmark requires --steps outside the fixed network profiles")

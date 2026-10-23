@@ -483,3 +483,46 @@ SC独立scope只追加call16/17，总占项上限17000，不挪旧PS/W2；锁、
 控制样本通过与收益门槛单列，收益不足仍真实exit5，禁止重跑找通过。原N2/资格门禁不改。
 软件独审通过及完整精确预声明先于运行；结果无论好坏均公开全部失败/维护与原生退出，
 交同版本独立结果核对后停止。不自动合并/关Issue，不代表真实Wi-Fi/三机或硬件资格。
+
+## #128 矩阵动态候选
+
+[设计](https://github.com/GNYKCZ/secure_pid_hvac/issues/128#issuecomment-6338770182)及
+[用户批准](https://github.com/GNYKCZ/secure_pid_hvac/issues/128#issuecomment-6338813023)
+限定 `control-dynamic-matrix-v1` 为显式实验入口。默认、NoCERT演示和完整起摆入口不推广。
+只支持 n/m/p>0、A/B/C/D/state/input 同 ell、state 逐行截断 ell、output 保留2ell。
+新 `matrix-dynamic-plan-v1` 以独立域摘要绑定布局、尺度、身份与一次性资源；
+`MatrixLocalStageReceipt` / `MatrixCommitAuthorization` 明确记录一个矩阵操作。
+原暂存、双提交ACK、状态连续性和绝对截止语义沿用；任何未知提交结果停止会话。
+
+M=[A B; C D]、z=[x_old;v]，每次新鲜U/V，W=UV。公开E=M−U、F=z−V后，
+本方W_i+U_iF+EV_i，只有P1加入EF。前n行沿原Trunc形成下一state，后p行直接出力。
+4/2/1时每方乘法材料90→41元素，含Trunc98→49元素；乘法掩码60→36元素。
+这是数值元素数，不是TCP包数或性能成绩。
+
+共同测量支持H使用现有 benchmark CLI、控制循环及供料worker。A为main32fbb112加H；
+B为A加矩阵实现。manifest冻结两完整head、完整源/配置/依赖指纹及独审链接。
+角色和worker在各自spawn进程核来源；共同H只给worker终报增加公开来源绑定。
+四份用户交互部署配置不参与固定实验，另做字节保护，不纳入性能来源。
+
+本Issue只使用 `.tmp/issue128-performance-budget.json` 和
+`.tmp/issue128-native-invocations.json`，顺序 `M128-P0`、`M128-A`、`M128-B`。
+外层原生启动器先持久记录唯一START及命令，CLI内部再占预算；退出后记录真实exit和原件hash。
+共享入口和实际循环都核对当前进程的预算锁、同manifest未结束占项及原生START，
+并复用同一P0/A前件判定。读取已保存manifest不能绕过占项或重放已结束调用；
+这些下游核验只读取事实，不再次占项或退款。
+任何启动失败或在途项均不可退款。P0一次2对预热+16对正式AB/BA交替、新鲜材料，保留全部样本；
+裸数值编码、恢复和本地原语不代表IPC或完整周期，局部速度不作A的10%准入条件。
+A/B各唯一一次最多1000周期，A全量零失败/零超期、真实exit0、证据与清退完整才允许B。
+
+固定N0 mutual TLS、observer初态5°、20ms、段400、库存16/8MiB、light全样本有界历史、
+正常GC，无relay/WPR/额外控制预热。批准的一次测试证书生成使用现有fixture，目标新空目录
+`.tmp/issue128-matrix-certs`，A/B同链、启动余期至少1小时。证书失效停止。
+运行命令仍为 `uv run secure-control benchmark` 的固定网络参数组合；必须同时提供已审精确
+`--network-approval`、本Issue授权URL和匹配wire，不支持任意步数覆盖。
+
+矩阵结果schema为 `matrix-dynamic-evidence-v1`；A为 `matrix-comparison-scalar-evidence-v1`。
+矩阵资源字段为 matrix_products_consumed、scalar_equivalent_products、
+multiplication_material_elements、truncations_consumed；嵌套原维护/生命周期中的products
+表示该wire的operation计数，不能解释为旧标量三元组。旧结果与历史计数不回填。
+B全1000 p50较A下降≥10%、p99不升、max≤20ms及完整门禁才能宣称本次收益通过；
+max≤15ms另列观察余量。结果不足保留候选并停止，不追加补测、自动修复或合并。

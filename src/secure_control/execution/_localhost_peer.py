@@ -8,6 +8,8 @@ from copy import deepcopy
 from typing import Literal
 
 from secure_control.protocol.messages import (
+    MatrixMaskPayload,
+    MatrixStepResourcePlan,
     P2TruncationPayload,
     ProductMaskPayload,
     Protocol3BatchPayload,
@@ -17,8 +19,9 @@ from secure_control.protocol.messages import (
 )
 
 from .localhost_codec import (
-    _COMPACT_PROFILE_V3,
+    _CLIENT_AUTH_PROFILES,
     _COMPACT_PROFILES,
+    _MATRIX_PROFILE,
     SCHEMA_VERSION,
     BatchHelloPayload,
     HelloPayload,
@@ -88,11 +91,13 @@ class LocalhostProtocol3PeerPort:
         run_id: str | None = None, epoch_id: str | None = None,
         physical_step: int | None = None,
     ) -> None:
+        if (type(plan) is MatrixStepResourcePlan) != (self._wire_profile == _MATRIX_PROFILE):
+            raise ValueError("矩阵计划与显式协商的wire不一致")
         if not self._batch_enabled or self._session_id != plan.session_id:
             raise ValueError("peer 未协商批量能力或 session 不匹配")
         if type(modulus) is not int or modulus < 3:
             raise ValueError("批量 peer 模数无效")
-        if self._wire_profile == _COMPACT_PROFILE_V3 and (
+        if self._wire_profile in _CLIENT_AUTH_PROFILES and (
                 not plan.truncation_count or getattr(self, "_v3_last_step", -1)+1 != plan.step
                 or getattr(self, "_v3_phase", "truncated") != "truncated"):
             raise ValueError("局部暂存 peer 需要连续新鲜且前轮完整的动态截断轮次。")
@@ -100,7 +105,7 @@ class LocalhostProtocol3PeerPort:
                                physical_step, modulus)
         # 独立快照保留每次调用的变化检测；摘要仅计算一次，不信任调用者的对象 identity。
         self._batch_digest = public_step_plan_sha256(plan)
-        if self._wire_profile == _COMPACT_PROFILE_V3:
+        if self._wire_profile in _CLIENT_AUTH_PROFILES:
             self._v3_last_step = plan.step
             self._v3_phase = "prepared"
 
@@ -108,7 +113,7 @@ class LocalhostProtocol3PeerPort:
         self, plan: StepResourcePlan, masks: tuple[ProductMaskPayload, ...],
     ) -> tuple[ProductMaskPayload, ...]:
         self._check_v3_phase("prepared")
-        if self._wire_profile == _COMPACT_PROFILE_V3:
+        if self._wire_profile in _CLIENT_AUTH_PROFILES:
             self._v3_phase = "in_flight"
         ids = tuple(item.resource_id for item in plan.product_resources)
         self._check_batch_values(masks, len(ids), "product", sender=self._role)
@@ -121,7 +126,7 @@ class LocalhostProtocol3PeerPort:
             incoming = self._receive_batch(plan, "product", ids).products
             self._send_batch(plan, "product", ids, products=masks)
         self._check_batch_values(incoming, len(ids), "product", sender=self._peer)
-        if self._wire_profile == _COMPACT_PROFILE_V3:
+        if self._wire_profile in _CLIENT_AUTH_PROFILES:
             self._v3_phase = "products"
         return incoming
 
@@ -135,24 +140,24 @@ class LocalhostProtocol3PeerPort:
         if self._role != "P2":
             raise ValueError("只有 P2 能发送截断批次")
         self._check_v3_phase("products")
-        if self._wire_profile == _COMPACT_PROFILE_V3:
+        if self._wire_profile in _CLIENT_AUTH_PROFILES:
             self._v3_phase = "in_flight"
         ids = tuple(item.resource_id for item in plan.state_truncation_resources)
         self._check_batch_values(values, len(ids), "truncation")
         self._send_batch(plan, "truncation", ids, truncations=values)
-        if self._wire_profile == _COMPACT_PROFILE_V3:
+        if self._wire_profile in _CLIENT_AUTH_PROFILES:
             self._v3_phase = "truncated"
 
     def receive_truncations(self, plan: StepResourcePlan) -> tuple[P2TruncationPayload, ...]:
         if self._role != "P1":
             raise ValueError("只有 P1 能接收截断批次")
         self._check_v3_phase("products")
-        if self._wire_profile == _COMPACT_PROFILE_V3:
+        if self._wire_profile in _CLIENT_AUTH_PROFILES:
             self._v3_phase = "in_flight"
         ids = tuple(item.resource_id for item in plan.state_truncation_resources)
         values = self._receive_batch(plan, "truncation", ids).truncations
         self._check_batch_values(values, len(ids), "truncation")
-        if self._wire_profile == _COMPACT_PROFILE_V3:
+        if self._wire_profile in _CLIENT_AUTH_PROFILES:
             self._v3_phase = "truncated"
         return values
 
@@ -161,7 +166,7 @@ class LocalhostProtocol3PeerPort:
                       tuple(item.resource_id for item in plan.state_truncation_resources))
 
     def _barrier(self, plan: StepResourcePlan, phase: str, ids: tuple[str, ...]) -> None:
-        if self._wire_profile == _COMPACT_PROFILE_V3:
+        if self._wire_profile in _CLIENT_AUTH_PROFILES:
             raise ValueError("局部暂存 peer 拒绝完成屏障。")
         if self._wire_profile in _COMPACT_PROFILES:
             self._exchange_batch(plan, phase, ids)
@@ -174,7 +179,7 @@ class LocalhostProtocol3PeerPort:
 
     def _check_v3_phase(self, expected: str) -> None:
         """严格保留实际传输次序，跳过的语义索引不允许重新进入。"""
-        if (self._wire_profile == _COMPACT_PROFILE_V3
+        if (self._wire_profile in _CLIENT_AUTH_PROFILES
                 and getattr(self, "_v3_phase", None) != expected):
             raise ValueError("局部暂存 peer 阶段重复或提前。")
 
@@ -238,7 +243,11 @@ class LocalhostProtocol3PeerPort:
     def _wire_batch(self, payload):
         if self._wire_profile not in _COMPACT_PROFILES:
             return payload
-        values = [share for item in payload.products for share in (item.d, item.e)]
+        if self._wire_profile == _MATRIX_PROFILE:
+            values = [type(item.e)(int(v)) for item in payload.products
+                      for array in (item.e, item.f) for v in array.value.flat]
+        else:
+            values = [share for item in payload.products for share in (item.d, item.e)]
         values.extend(item.value for item in payload.truncations)
         return _CompactBatchPayload(payload.phase, payload.plan_sha256, payload.run_id,
             payload.epoch_id, payload.physical_step, payload.batch_index,
@@ -264,13 +273,28 @@ class LocalhostProtocol3PeerPort:
                 {"product": 0, "product_complete": 1, "truncation": 2, "state_complete": 3}[phase]
             ):
                 raise ValueError("紧凑 peer 阶段或公开身份不匹配")
+            count = (plan.multiplication_mask_elements if self._wire_profile == _MATRIX_PROFILE
+                     and phase == "product" else len(ids) * (2 if phase == "product" else 1)
+                     if phase in {"product", "truncation"} else 0)
             values = iter(_decode_residues(payload.values,
-                len(ids) * (2 if phase == "product" else 1) if phase in {"product", "truncation"} else 0,
+                count,
                 self._batch_context[4]))
+            if self._wire_profile == _MATRIX_PROFILE and phase == "product":
+                import numpy as np
+
+                from secure_control.crypto import AdditiveShare
+                meta = plan.product_resources[0]
+                e = AdditiveShare(np.array([next(values).value for _ in range(meta.rows*meta.inner)],
+                                          dtype=object).reshape(meta.rows, meta.inner))
+                f = AdditiveShare(np.array([next(values).value for _ in range(meta.inner)],
+                                          dtype=object).reshape(meta.inner, 1))
+                products = (MatrixMaskPayload(e, f, 0 if self._peer == "P1" else 1),)
+            else:
+                products = (tuple(ProductMaskPayload(next(values), next(values), 0 if self._peer == "P1" else 1)
+                                  for _ in ids) if phase == "product" else ())
             payload = Protocol3BatchPayload(payload.phase, payload.plan_sha256, payload.run_id,
                 payload.epoch_id, payload.physical_step, payload.batch_index, ids,
-                tuple(ProductMaskPayload(next(values), next(values), 0 if self._peer == "P1" else 1)
-                      for _ in ids) if phase == "product" else (),
+                products,
                 tuple(P2TruncationPayload(next(values)) for _ in ids) if phase == "truncation" else ())
         if not isinstance(payload, Protocol3BatchPayload) or (
             payload.phase, payload.plan_sha256, payload.run_id, payload.epoch_id,
@@ -297,6 +321,18 @@ class LocalhostProtocol3PeerPort:
         modulus = self._batch_context[4]
         for item in values:
             if phase == "product":
+                if self._wire_profile == _MATRIX_PROFILE:
+                    from secure_control.crypto.matrix_beaver import matrix_values
+                    if (type(item) is not MatrixMaskPayload or type(item.party) is not int
+                            or item.party != (0 if sender == "P1" else 1)):
+                        raise ValueError("矩阵mask角色/类型错误")
+                    plan = self._batch_context[0]
+                    if type(plan) is not MatrixStepResourcePlan:
+                        raise ValueError("矩阵peer缺少矩阵计划")
+                    meta = plan.product_resources[0]
+                    matrix_values(item.e, (meta.rows, meta.inner), modulus)
+                    matrix_values(item.f, (meta.inner, 1), modulus)
+                    continue
                 if not isinstance(item, ProductMaskPayload) or item.party != (
                     0 if sender == "P1" else 1
                 ):
