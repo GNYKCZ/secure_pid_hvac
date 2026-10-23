@@ -241,10 +241,25 @@ def _require_matrix_certificates(m, configs=None):
 
 
 def require_matrix_candidate(m, wire_profile, configs=None):
+    """共享及实际循环只能使用当前进程已占的同一次原生调用。"""
     if (not _matrix_manifest_valid(m) or m["comparison_stage"] == "M128-P0"
             or wire_profile != m["wire_profile"] or matrix_source() != (m["head"], m["source_sha256"])):
         raise ValueError("#128运行来源或编码未获本次独审")
-    _require_matrix_versions(m)
+    ledger = Path(m["budget_path"])
+    saved = json.loads(ledger.read_text(encoding="utf-8"))
+    entries = saved.get("entries")
+    lock = ledger.with_suffix(ledger.suffix + ".lock")
+    if (saved.get("schema") != "network-call-budget-v1" or type(entries) is not list
+            or len(entries) != m["call"] or not lock.is_file()
+            or lock.read_text(encoding="utf-8").strip() != str(os.getpid())):
+        raise ValueError("#128共享入口缺少当前进程持有的占项")
+    current = entries[-1]
+    if (type(current) is not dict or current.get("finished") is not False
+            or current.get("sample_pass") is not False or type(current.get("started_utc")) is not str
+            or any(current.get(k) != value for k, value in m.items())):
+        raise ValueError("#128当前占项已结束或与本次manifest不同")
+    # 与外层占项复用同一前件判定；只核验，不追加或退款。
+    _next_matrix_call(entries[:-1], m["profile"], m["phase"], m["head"], m["source_sha256"], m)
     _require_matrix_certificates(m, configs)
 
 

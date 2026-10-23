@@ -165,6 +165,70 @@ def test_matrix_three_scope_native_start_failed_a_and_no_restart(matrix_context,
     assert saved["maximum_calls"]==3 and saved["maximum_attempts"]==2000
 
 
+@pytest.mark.parametrize("entrypoint", ["shared", "loop"])
+@pytest.mark.parametrize("stage,fault", [("M128-B", fault) for fault in
+    ("absent_budget", "absent_native", "absent_lock", "wrong_pid", "no_claim", "finished",
+     "changed_manifest", "ended_native", "missing_p0", "failed_a", "raw_corrupt", "valid")]
+    + [("M128-A", "absent_budget"), ("M128-A", "valid")])
+def test_matrix_current_reservation_required_at_both_entries(matrix_context, monkeypatch, entrypoint, stage, fault):
+    """RV-001：合成磁盘事实+下游哨兵；保留真实准入/前件校验，绝不开角色。"""
+    m = _matrix_test_manifest(matrix_context, stage)
+    if stage == "M128-B" and network.MATRIX_WIRE not in benchmark._COMPACT_ADVANCE_PROFILES:
+        pytest.skip("完整A版本没有矩阵wire；其共享/实际准入由M128-A用例验证")
+    # 隔离Git/证书环境；不替换共享准入、占项、前件或结果判定函数。
+    monkeypatch.setattr(network, "matrix_source", lambda: (m["head"], m["source_sha256"]))
+    monkeypatch.setattr(network, "_require_matrix_versions", lambda _: None)
+    monkeypatch.setattr(network, "_require_matrix_certificates", lambda *args: None)
+    entries, native = [], []
+    for prior_stage in ("M128-P0", "M128-A")[:m["call"]-1]:
+        previous = _matrix_test_manifest(m, prior_stage)
+        result = _matrix_test_p0() if prior_stage == "M128-P0" else _matrix_test_result(previous)
+        path = network.Path(previous["output"])
+        path.write_text(json.dumps(result), encoding="utf-8")
+        sha = network.hashlib.sha256(path.read_bytes()).hexdigest()
+        entries.append(previous | {"finished": True, "sample_pass": True, "raw_sha256": sha})
+        native.append(previous | {"completed": True, "native_exit": 0, "raw_sha256": sha})
+    entries.append(m | {"finished": False, "sample_pass": False, "started_utc": "test"})
+    native.append(m | {"completed": False, "native_exit": None, "started_utc": "test"})
+    if fault == "no_claim": entries.pop()
+    elif fault == "finished": entries[-1]["finished"] = True
+    elif fault == "changed_manifest": entries[-1]["output"] += ".other"
+    elif fault == "ended_native": native[-1].update(completed=True, native_exit=0)
+    elif fault == "missing_p0": entries.pop(0); native.pop(0)
+    elif fault == "failed_a": entries[1]["sample_pass"] = False
+    elif fault == "raw_corrupt": network.Path(entries[1]["output"]).write_text("{}", encoding="utf-8")
+    ledger, native_path = (network.Path(m[k]) for k in ("budget_path", "native_ledger_path"))
+    lock = ledger.with_suffix(ledger.suffix + ".lock")
+    if fault != "absent_budget":
+        ledger.write_text(json.dumps({"schema": "network-call-budget-v1", "maximum_calls": 3,
+            "maximum_attempts": 2000, "entries": entries}), encoding="utf-8")
+    if fault != "absent_native": native_path.write_text(json.dumps({"entries": native}), encoding="utf-8")
+    if fault != "absent_lock": lock.write_text(str(os.getpid() + (fault == "wrong_pid")), encoding="utf-8")
+    configs = network.role_configs(m["certificate_directory"], network.V2_PORTS, "N0")
+    calls = []
+    class ReachedRunner(Exception):
+        pass
+    def sentinel(*args, **kwargs):
+        calls.append(True)
+        raise ReachedRunner
+    # 两个真实入口之后的第一处控制准备即截断，不产生进程/材料/TLS。
+    monkeypatch.setattr(benchmark, "_run_material_comparison", sentinel)
+    monkeypatch.setattr(benchmark.mp, "get_context", sentinel)
+    before = {p: p.read_bytes() for p in (ledger, native_path, lock) if p.exists()}
+    def invoke():
+        if entrypoint == "shared":
+            benchmark.run_network_observation(configs=configs, steps=1000,
+                wire_profile=m["wire_profile"], candidate_manifest=m)
+        else:
+            benchmark._run_continuous_observation(steps=1000, delay_ms=0., segment_steps=400,
+                optimized=True, recording_mode="light", material_candidate="worker", stage_wait_diagnostic=True,
+                network_configs=configs, network_wire_profile=m["wire_profile"], network_candidate_manifest=m)
+    with pytest.raises(ReachedRunner if fault == "valid" else (ValueError, OSError)):
+        invoke()
+    assert calls == ([True] if fault == "valid" else [])
+    assert {p: p.read_bytes() for p in before} == before  # 下游核验不能再次占项/退款。
+
+
 def test_matrix_worker_binding_records_own_source_without_changing_material(matrix_context,monkeypatch):
     m=matrix_context
     monkeypatch.setattr(network,"ROOT",ROOT)
