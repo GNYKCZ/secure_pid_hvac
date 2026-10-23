@@ -22,6 +22,8 @@ if __name__ == "__main__":
     parser.add_argument("--preload-execution", choices=("staged", "fused"), default="fused")
     parser.add_argument("--recording", choices=("light", "full"),
                         help="仅动态持续：默认light不保存完整轨迹；full可靠留证并支持回放")
+    parser.add_argument("--non-realtime", action="store_true",
+                        help="仅动态持续light：无周期截止的非实时仿真，模型步长保持不变")
     parser.add_argument("--full-output", type=Path)
     parser.add_argument("--full-non-realtime", action="store_true",
                         help="安全完整路线的显式非实时诊断；没有20ms资格")
@@ -35,6 +37,26 @@ if __name__ == "__main__":
                         default=Path(__file__).resolve().parents[1]
                         / "configs/shared_prime_256_pocklington.yaml")
     args = parser.parse_args()
+    # 在创建窗口/连接/供料前拒绝不兼容模式，不能悄悄忽略 wire 或 full 请求。
+    if args.non_realtime or not (args.full_route == "plaintext" or args.full_gui_route == "plaintext"):
+        from secure_control.execution.lan_config import load_lan_config
+        from secure_control.execution.localhost_codec import _COMPACT_ADVANCE_PROFILES
+
+        selected = load_lan_config(args.config, "Client")
+        if args.non_realtime or selected.wire_profile in _COMPACT_ADVANCE_PROFILES:
+            if args.finite or args.full_route or args.full_gui_route:
+                parser.error("紧凑/矩阵协议或 --non-realtime 仅支持动态持续light，不支持finite或完整路线")
+            from secure_control.experiments.lan_continuous_profile import load_segmented_experiment
+            from secure_control.experiments.lan_runner import validate_segmented_mode
+            from secure_control.scenarios.cart_pole.interactive import InteractiveSession
+
+            try:
+                prepared = load_segmented_experiment(selected.experiment_config, args.segment_steps,
+                                                     InteractiveSession())
+                validate_segmented_mode(selected, prepared, non_realtime=args.non_realtime,
+                                        recording_mode=args.recording, preload_steps=args.preload_steps)
+            except (ValueError, TypeError) as error:
+                parser.error(str(error))
     if args.recording is not None and (args.finite or args.full_route or args.full_gui_route):
         parser.error("--recording 只支持动态observer持续入口")
     if args.full_non_realtime and args.full_route != "secure" and args.full_gui_route != "secure":
@@ -138,6 +160,7 @@ if __name__ == "__main__":
                 session=InteractiveSession(),
                 preload_steps=args.preload_steps, preload_execution=args.preload_execution,
                 recording_mode=args.recording,
+                **({"non_realtime": True} if args.non_realtime else {}),
             ) if dynamic else run_client_segmented(
                 config, segment_steps=args.segment_steps, control=control,
             ))
@@ -151,4 +174,5 @@ if __name__ == "__main__":
     run_window(args.config, segment_steps=args.segment_steps,
                mode="finite" if args.finite else "segmented",
                preload_steps=args.preload_steps, preload_execution=args.preload_execution,
-               recording_mode=args.recording)
+               recording_mode=args.recording,
+               **({"non_realtime": True} if args.non_realtime else {}))

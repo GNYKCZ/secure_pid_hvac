@@ -1,5 +1,13 @@
 # secure_pid_hvac
 
+## 无证书两机倒立摆演示
+
+已配齐三份 `lab-*-cart-pole-demo.example.yaml`：无证书TCP、矩阵协议、两测量动态观测器。
+只需在 `configs/local-deployment.example.yaml` 填写B的地址并同步到A/B，按
+[两机启动指南](docs/cart_pole_interactive.md#无证书两机非实时动态演示)的三条命令启动。
+B运行P1/P2，A运行Client/动画；Client显式传 `--non-realtime --recording light`。
+必须传指南中的专用角色配置路径；下节不带参数的三个脚本仍是原paper PID实验。
+
 ## 本机连续实验：直接运行三个 Python 文件
 
 在仓库根目录运行 `uv sync --locked`，在 VS Code 选择项目的 Python 3.11

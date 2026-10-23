@@ -632,6 +632,211 @@ def test_light_coordinator_never_constructs_or_reads_artifacts(tmp_path, monkeyp
     assert set(tmp_path.rglob("*")) == before
 
 
+def test_non_realtime_demo_preflight_and_empty_timing_are_explicit(tmp_path, monkeypatch):
+    paths = _plain_deployment(tmp_path)
+    _observer_profile_for(paths)
+    config = load_lan_config(paths["Client"], "Client")
+    calls = []
+    def run(config, prepared, **kwargs):
+        assert kwargs["non_realtime"] is True
+        calls.append(True)
+        return {"status": "stopped", "confirmed_step_count": 2,
+                "cycle_summary": {"attempts": 2, "misses": None, "last_cycle": None}}
+    monkeypatch.setattr(evidence, "_run_prepared_segmented", run)
+    result = evidence.run_cart_pole_segmented(config, control=RunControl(),
+        session=InteractiveSession(), non_realtime=True)
+    assert result["recording_summary"]["recent_timing"]["p50_ms"] is None
+    assert result["cycle_summary"]["attempts"] == 2
+    for changed in ({"recording_mode": "full"}, {"preload_steps": 1}):
+        with pytest.raises(ValueError):
+            evidence.run_cart_pole_segmented(config, control=RunControl(),
+                session=InteractiveSession(), non_realtime=True, **changed)
+    config = replace(config, wire_profile="control-dynamic-compact-v2")
+    with pytest.raises(ValueError):
+        evidence.run_cart_pole_segmented(config, control=RunControl(),
+            session=InteractiveSession(), recording_mode="full")
+    _profile_for(paths)
+    with pytest.raises(ValueError):
+        evidence.run_cart_pole_segmented(load_lan_config(paths["Client"], "Client"),
+            control=RunControl(), session=InteractiveSession(), non_realtime=True)
+    assert calls == [True]
+
+
+_DEMO_CLIENT = r'''
+import contextlib, io, json, runpy, sys
+from pathlib import Path
+from secure_control.execution import lan_runtime as lan
+from secure_control.execution import lan_transport
+from secure_control.experiments import cart_pole_segmented_evidence as evidence
+mode = sys.argv[2]
+def forbid_tls(*args, **kwargs):
+    raise AssertionError('certificate-free Client must not construct TLS context')
+lan_transport._context = forbid_tls
+rows, began = [], []
+controls = []
+original = evidence.run_cart_pole_segmented
+begin = lan._MaterialWorkerPool.control_begin
+take = lan._MaterialWorkerPool.take
+def control_begin(self):
+    began.append(True)
+    result = begin(self)
+    if mode == 'stop_preparing':
+        controls[0].request_stop()
+    return result
+def claim(self, step):
+    if mode == 'worker_failure' and step == 2:
+        raise RuntimeError('test worker supply failure')
+    return take(self, step)
+lan._MaterialWorkerPool.control_begin = control_begin
+lan._MaterialWorkerPool.take = claim
+next_segment = lan.LanSegmentedRuntime.next_segment
+def advance(self, **kwargs):
+    result = next_segment(self, **kwargs)
+    if mode == 'stop_advance':
+        controls[0].request_stop()
+    return result
+lan.LanSegmentedRuntime.next_segment = advance
+close = lan.LanSegmentedRuntime.close
+def closed(self):
+    close(self)
+    if mode == 'cleanup_failure':
+        raise RuntimeError('test cleanup failure after owned worker exit')
+lan.LanSegmentedRuntime.close = closed
+def run(config, **kwargs):
+    controls.append(kwargs['control'])
+    def confirmed(record):
+        rows.append({'g':record.protocol.global_step,'session':record.protocol.session_id,
+            'round':record.protocol.round_id,'resources':record.protocol.resource_ids,
+            'state':record.snapshot.observation_after})
+        if mode == 'cancel' and len(rows) == 2:
+            kwargs['session'].close()
+        if len(rows) == 19:
+            kwargs['control'].request_stop()
+    result = original(config, **kwargs, on_step=confirmed)
+    return result
+evidence.run_cart_pole_segmented = run
+config = sys.argv[1]
+sys.argv = ['run_cart_pole_client.py',config,'--headless-continuous',
+            '--segment-steps','6','--non-realtime','--recording','light']
+output = io.StringIO()
+with contextlib.redirect_stdout(output):
+    try:
+        runpy.run_path('scripts/run_cart_pole_client.py',run_name='__main__')
+    except SystemExit as error:
+        native_exit = error.code
+assert 'tkinter' not in sys.modules
+print(json.dumps({'result':json.loads(output.getvalue()),'rows':rows,'began':began,'exit':native_exit}))
+'''
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("wire", ["control-dynamic-compact-v2", "control-dynamic-matrix-v1"])
+@pytest.mark.parametrize("mode", ["normal", "commit_ack_loss", "worker_failure", "cancel", "mismatch",
+                                  "stop_preparing", "stop_advance", "cleanup_failure"])
+def test_demo_ordinary_scripts_use_compact_worker_and_stop_without_cycle_claims(tmp_path, mode, wire):
+    """真实无证书脚本/worker；短功能用例跨段并覆盖失败，不测性能或声明跨机。"""
+    from lan_test_support import start_processes
+    from test_lan_single_step import _run_fault
+
+    paths = _plain_deployment(tmp_path)
+    shipped_demo = mode == "normal" and wire == "control-dynamic-matrix-v1"
+    if not shipped_demo:
+        _observer_profile_for(paths)
+    for role, path in paths.items():
+        data = yaml.safe_load(path.read_text(encoding="utf8"))
+        if shipped_demo:
+            # 实际发布的三份示例直接配对；只隔离测试地址，不替用户补协议或换场景。
+            source = ROOT / "configs" / f"lab-{role.lower()}-cart-pole-demo.example.yaml"
+            template = yaml.safe_load(source.read_text(encoding="utf8"))
+            selected = load_lan_config(source, role)
+            assert selected.transport == "insecure_tcp" and selected.wire_profile == wire
+            assert selected.ca is selected.certificate is selected.private_key is None
+            assert template["topology"] == "local-deployment.example.yaml"
+            template["topology"] = data["topology"]
+            if role == "Client":
+                assert template["experiment"] == "cart_pole_observer_lan.example.yaml"
+                template["experiment"] = str(selected.experiment_config)
+            data = template
+        else:
+            data["wire_profile"] = "control-batch-v1" if mode == "mismatch" and role == "P2" else wire
+            data["timeouts"].update(startup=5, step=3, shutdown=2)
+        path.write_text(yaml.safe_dump(data), encoding="utf8")
+    parties, client = [], None
+    try:
+        for role in ("P1", "P2"):
+            if mode == "commit_ack_loss" and role == "P2":
+                parties.append(_run_fault(role, paths[role], mode))
+            else:
+                parties.extend(start_processes([[sys.executable, f"scripts/run_continuous_{role.lower()}.py", str(paths[role])]]))
+        client = start_processes([[sys.executable, "-c", _DEMO_CLIENT, str(paths["Client"]), mode]])[0]
+        code, report, errors = _finish(client, 40)
+        assert code == 0, (report, errors)
+        result, rows = report["result"], report["rows"]
+        assert result["timing_mode"] == "non_realtime_demo" and result["model_period_s"] == .02
+        assert result["transport"] == "insecure_tcp" and result["wire_profile"] == wire
+        assert result["cycle_summary"]["misses"] is result["cycle_summary"]["last_cycle"] is None
+        assert result["recording_summary"]["recent_count"] == 0
+        assert result["recording_summary"]["recent_timing"]["max_ms"] is None
+        assert result["run_dir"] is None and result["evidence_state"] == "not_recorded"
+        if mode == "mismatch":
+            assert result["status"] == "failed" and not rows and not report["began"]
+            assert result["cycle_summary"]["attempts"] == 0
+        else:
+            assert report["began"] == [True] and result["material_source"] == "worker", (result, errors)
+            material = result["material_summary"]
+            assert material["encoding_profile"] == material["worker"]["encoding_profile"] == wire
+            assert material["worker_exited"] and material["receiver_exited"] and material["credit_thread_exited"]
+            assert not material["cleanup_failed"] and material["inventory_inflight"] == 0
+            assert material["material_high_water"] <= 16 and material["material_reserved_bytes"] == 8388608
+        if mode in ("stop_preparing", "stop_advance"):
+            count = 0 if mode == "stop_preparing" else 6
+            assert result["status"] == "stopped" and report["exit"] == 0
+            assert result["confirmed_step_count"] == result["cycle_summary"]["attempts"] == count
+            assert len(rows) == count and all(_finish(p, 10)[0] == 0 for p in parties)
+        elif mode == "normal":
+            assert report["exit"] == 0 and result["status"] == "stopped"
+            assert result["cycle_summary"]["attempts"] == result["confirmed_step_count"] == 19
+            assert result["protocol_committed_count"] == 19 and result["final_segment"]["hello"]["segment_index"] == 3
+            assert [row["g"] for row in rows] == list(range(19)) and len({row["session"] for row in rows}) == 1
+            assert len({row["round"] for row in rows}) == 19
+            matrix = wire == "control-dynamic-matrix-v1"
+            assert len({r for row in rows for r in row["resources"]}) == 19 * (5 if matrix else 34)
+            assert result["resource_counts"] == ({"matrix_products_consumed": 19,
+                "scalar_equivalent_products": 570, "multiplication_material_elements": 779,
+                "truncations_consumed": 76} if matrix else {"products_consumed": 570, "truncations_consumed": 76})
+            assert material["claimed"] == 19 and material["generated_received"] >= 19
+            # 独立普通闭环 oracle，证明跨段沿同一动态状态而非重置 x0。
+            from secure_control.execution.runtime import PlaintextStateSpaceRuntime
+            from secure_control.experiments.cart_pole_lan_profile import load_cart_pole_lan_profile
+            from secure_control.scenarios.cart_pole.plant import CartPolePlant
+            prepared = load_segmented_experiment(load_lan_config(paths["Client"], "Client").experiment_config, 6, InteractiveSession())
+            runtime = PlaintextStateSpaceRuntime(prepared.spec)
+            design = load_cart_pole_lan_profile(
+                load_lan_config(paths["Client"], "Client").experiment_config).observer_design
+            plant = CartPolePlant(design.plant)
+            for row in rows:
+                observation = plant.output()
+                force = runtime.step(np.array([observation[0], observation[2]]))
+                plant.step(force)
+                np.testing.assert_allclose(row["state"], plant.state, atol=1e-7, rtol=0)
+            assert all(_finish(p, 10)[0] == 0 for p in parties)
+        else:
+            assert report["exit"] == 1 and result["status"] != "stopped"
+            if mode == "commit_ack_loss":
+                assert result["status"] == "uncertain" and not rows
+                assert result["cycle_summary"]["attempts"] == 1
+                assert "fault:commit_ack_loss" in _finish(parties[1], 10)[2]
+            if mode == "cleanup_failure":
+                assert result["status"] == "failed" and result["failure_phase"] == "CLEANUP"
+                assert result["cleanup_error_type"] == "RuntimeError" and len(rows) == 19
+            if mode in ("worker_failure", "cancel"):
+                assert len(rows) == result["confirmed_step_count"] == 2
+                assert result["cycle_summary"]["attempts"] == (3 if mode == "worker_failure" else 2)
+        assert not list(tmp_path.rglob("checkpoint.json"))
+    finally:
+        reap_processes([*parties, *([client] if client is not None else [])])
+
+
 @pytest.mark.integration
 def test_light_real_dynamic_segments_obey_integer_and_physical_oracles(tmp_path, dynamic_published):
     source, _ = dynamic_published

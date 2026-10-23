@@ -1,14 +1,22 @@
 # 配置文件怎么选
 
-日常只需认清两条入口：**三个文件各启动一个角色的连续实验**，或**一个命令生成四精度 Fig3 图**。二者复用部分论文对象和数值证据，但运行方式、结果目录不同。
+日常入口包括**无证书倒立摆两机演示**、**三个文件各启动一个角色的paper PID连续实验**，以及**一个命令生成四精度 Fig3 图**。各自使用配套配置，不混用角色文件。
 
 | 想做什么 | 运行入口 | 需要看的配置 | 输出 |
 | --- | --- | --- | --- |
+| A运行倒立摆动画Client，B运行P1/P2，无需证书 | 见[三条启动命令](../docs/cart_pole_interactive.md#无证书两机非实时动态演示) | 三份 `lab-*-cart-pole-demo.example.yaml` 已配好matrix-v1和动态observer；只改共用 `local-deployment.example.yaml` 的机器地址 | 持续light演示，停止后摘要；不保存完整轨迹 |
 | 一台或三台电脑分别启动 P1、P2、Client，完成一次连续实验 | `scripts/run_continuous_p1.py`、`run_continuous_p2.py`、`run_continuous_client.py` | 通常只改 `paper_pid_lan.example.yaml`；三机时还要改各机内容相同的 `local-deployment.example.yaml` | Client 配置指定的 `results/lan_continuous/<run-id>/control.png` |
 | 一次算完 `ell=32/40/48/56` 并画一张 Fig3 对比图 | `python -m secure_control.experiments.paper_pid_fig3` | `paper_pid_fig3_sweep.yaml`；它引用的论文对象与素数证据是冻结输入 | 新输出目录下的 `fig3.png`、`manifest.json` 和四个 run |
 
 ## 三角色连续实验
 
+两机无证书倒立摆使用 `lab-client-cart-pole-demo.example.yaml`、
+`lab-p1-cart-pole-demo.example.yaml`、`lab-p2-cart-pole-demo.example.yaml`，
+三份协议已经一致，无需手工补wire或更换experiment。显式指定这三份配置，
+Client传 `--non-realtime --recording light`；省略非实时选项仍是20 ms绝对截止模式。
+所有机器地址由同一拓扑文件管理，填好后复制到A/B，详细步骤见上表。
+
+以下为原batch静态反馈和留证路线，不能混用上述matrix配置：
 倒立摆专用入口仍先启动同一 P1/P2，再运行 `scripts/run_cart_pole_client.py`：
 默认持续 Tk 动画，`--segment-steps 400` 是每段容量，点击“停止并保存”才确定实际 N；
 不修改 `cart_pole_balance.yaml` 的有限 horizon。Client 使用
