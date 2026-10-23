@@ -717,7 +717,9 @@ def run(config, **kwargs):
 evidence.run_cart_pole_segmented = run
 config = sys.argv[1]
 sys.argv = ['run_cart_pole_client.py',config,'--headless-continuous',
-            '--segment-steps','6','--non-realtime','--recording','light']
+            '--segment-steps','6','--non-realtime','--recording','light',
+            '--performance','samples','--performance-sample-limit','2',
+            '--performance-output',str(Path(config).parent/'performance.json')]
 output = io.StringIO()
 with contextlib.redirect_stdout(output):
     try:
@@ -772,6 +774,11 @@ def test_demo_ordinary_scripts_use_compact_worker_and_stop_without_cycle_claims(
         code, report, errors = _finish(client, 40)
         assert code == 0, (report, errors)
         result, rows = report["result"], report["rows"]
+        from secure_control.experiments.live_timing import load_timing_report
+        performance = result["performance"]
+        assert performance["statistics_complete"] and performance["export"]["status"] == "saved", performance
+        measured = load_timing_report(performance["export"]["path"])
+        assert measured["control_outcome"]["status"] == result["status"]
         assert result["timing_mode"] == "non_realtime_demo" and result["model_period_s"] == .02
         assert result["transport"] == "insecure_tcp" and result["wire_profile"] == wire
         assert result["cycle_summary"]["misses"] is result["cycle_summary"]["last_cycle"] is None
@@ -794,6 +801,10 @@ def test_demo_ordinary_scripts_use_compact_worker_and_stop_without_cycle_claims(
             assert result["confirmed_step_count"] == result["cycle_summary"]["attempts"] == count
             assert len(rows) == count and all(_finish(p, 10)[0] == 0 for p in parties)
         elif mode == "normal":
+            assert measured["observations"] == 19 and measured["raw"]["captured"] == 2
+            assert measured["raw"]["omitted"] == 17
+            assert [r["global_step"] for r in measured["recent"] if r["phase_durations_ns"].get("maintenance")] == [5,11,17]
+            assert measured["metrics"]["work_elapsed_ns"]["count"] == 19
             assert report["exit"] == 0 and result["status"] == "stopped"
             assert result["cycle_summary"]["attempts"] == result["confirmed_step_count"] == 19
             assert result["protocol_committed_count"] == 19 and result["final_segment"]["hello"]["segment_index"] == 3
@@ -824,6 +835,8 @@ def test_demo_ordinary_scripts_use_compact_worker_and_stop_without_cycle_claims(
             assert report["exit"] == 1 and result["status"] != "stopped"
             if mode == "commit_ack_loss":
                 assert result["status"] == "uncertain" and not rows
+                assert measured["recent"][0]["round_id"] == result["round_id"]
+                assert measured["recent"][0]["round_id"] is not None
                 assert result["cycle_summary"]["attempts"] == 1
                 assert "fault:commit_ack_loss" in _finish(parties[1], 10)[2]
             if mode == "cleanup_failure":

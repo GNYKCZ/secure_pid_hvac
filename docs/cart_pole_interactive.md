@@ -92,7 +92,61 @@ uv run python scripts/run_cart_pole_client.py configs/lab-client-cart-pole-demo.
 本入口直接装配通用runtime，不经过受限network benchmark，不放宽其TLS/来源/额度门禁，也不复用#128已消费的P0/A/B预算。
 本轮只做短软件功能检查；真实两机功能和性能待用户设备验证，本机三进程不冒充跨机验收。
 
-### 原20 ms截止模式与结果提取
+### 每步性能观察与结束报告（#132 阶段A）
+
+动态持续light默认启用 `--performance summary`。沿用上面的三份demo配置和启动命令，
+P1/P2不增加参数；Client窗口新增带实际步号的性能文字和最多256步的工作耗时趋势。
+动画仍约40ms轮询，性能最多每100ms刷新；界面可以合并，后台仍统计每个尝试。
+趋势纵轴0–60ms，超出范围只在图上截顶，文字与报告保留真实值。
+
+四个口径独立：施力耗时从实际采样到双提交、plant推进及confirm_applied返回；
+完整工作还包括本步记账和应归本步的自动段尾维护；采样间隔是两次实际采样的距离；
+主动等待记录请求值、实际耗时和正常到期后的超出值。首步间隔和未到达端点为null。
+非实时满段维护虽然在下一循环顶部执行，仍归刚填满段的上一控制步，不移动实际操作。
+启动、正常停止和worker清退另列。`stage`是通信与服务器处理的合计，不能叫纯网络RTT；
+维护总计与maintenance_*、commit与各party细项有包含关系，不能相加。
+
+全程次数/总和/均值/min/max及完整工作>15ms、>20ms参考计数精确累计；
+P50/P95/P99为全程固定0.1ms桶的nearest-rank区间，超过1000ms报告下界且上界null。
+每个指标都有自己的count和missing_count，失败端点不补零；控制失败/不确定/取消仍单独报告。
+旧 `cycle_summary` 与 `recording_summary` 含义不变，非实时仍没有强制deadline或miss结论。
+观察在Client本机perf_counter_ns域采样，不跨电脑相减绝对钟。
+
+非实时GUI采样并保存前10000次观察的命令如下，输出必须是不存在的新JSON文件：
+
+```powershell
+uv run python scripts/run_cart_pole_client.py configs/lab-client-cart-pole-demo.example.yaml --non-realtime --recording light --performance samples --performance-sample-limit 10000 --performance-output results/diagnostics/cart-pole-timing-01.json
+```
+
+`10000`只是记录容量，满后继续控制并继续全程汇总，原始样本明确标记不完整；
+它不安排10000步实验、不自动停止、不补跑。加 `--headless-continuous` 使用相同后端，Ctrl+C正常停止。
+GUI点击“停止”结束，关窗沿原取消流程；强杀/掉电可能丢失内存统计。
+使用 `--performance off` 可关闭新增观察；full/finite/完整起摆不接受显式启用请求。
+省略performance-output时默认保存至 `results/lan_continuous/performance/<独立ID>.json`。
+报告不是完整轨迹，不能提高evidence_state或当成正式控制证据。
+
+控制期不新增逐步打印、写盘、fsync或网络消息；固定性能缓冲（含预留）最多8MiB，
+只保留全程汇总、近期256、最慢8及可选首N原始样本。退出和worker清退后集中保存，原子发布且不覆盖文件。
+写盘失败会单独显示，控制终态保留；headless返回非零。观察器故障标记partial并停止后续采集，
+不吞掉控制异常。观察与快照成本仍受原绝对截止保护，不宣称零开销；
+单行observation_ns测到终端时间戳，后续固定直方图/打包/缓冲存储尾操作无法完全自测，报告声明此边界。
+
+离线读取并校验报告，无需启动控制或P1/P2：
+
+```python
+from secure_control.experiments.live_timing import load_timing_report
+report = load_timing_report("results/diagnostics/cart-pole-timing-01.json")
+print(report["metrics"]["work_elapsed_ns"])
+print(report["metrics"]["sample_interval_ns"])
+print(report["control_outcome"], report["raw"]["complete"])
+```
+
+实测前记录A/B代码SHA、各自接入方式和配置；报告自动记录本机SHA/dirty及配置摘要，
+对端SHA/接入方式未经核实记unknown。正常停止后保留报告、三方终端结果和运行设置，
+不要用不同计时/记录/网络条件的两次数据声称净性能收益。阶段A只交付观察软件；
+#132的瓶颈归因与优化仍待用户两机新数据（AC7–8未完成），不自动关闭Issue或追加性能运行。
+
+### 原截止模式的已有摘要
 
 先确认三个角色的最终JSON标识实际使用 `insecure_tcp`，Client还应为
 `wire_profile=control-dynamic-matrix-v1`、`material_source=worker`。

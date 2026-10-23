@@ -68,8 +68,10 @@ class _Segment:
     index: int
 
 
-@pytest.mark.parametrize("late_phase", ["before_device", "after_device", "maintenance", "observation"])
-def test_unique_runner_rejects_late_command_and_keeps_applied_fact(monkeypatch, late_phase):
+@pytest.mark.parametrize("late_phase,performance", [
+    (phase,enabled) for phase in ("before_device","after_device","maintenance","observation")
+    for enabled in (False,True)] + [("performance_observation",True)])
+def test_unique_runner_rejects_late_command_and_keeps_applied_fact(monkeypatch, late_phase, performance):
     time_ns = [0]
     control, session = RunControl(), InteractiveSession()
     applied, timings = [], []
@@ -145,16 +147,29 @@ def test_unique_runner_rejects_late_command_and_keeps_applied_fact(monkeypatch, 
         if late_phase == "observation":
             time_ns[0] += 21_000_000
 
+    from secure_control.experiments.live_timing import LiveTimingCollector
+    def performance_frame(_snapshot):
+        if late_phase == "performance_observation":
+            time_ns[0] += 21_000_000
+    collector = LiveTimingCollector("samples",sample_limit=2,on_snapshot=performance_frame) if performance else None
     report = lan_runner._run_prepared_segmented(
         None, experiment, control=control, session=session, realtime=True,
         material_slots=0, on_cycle=observe,
+        **({"timing_observer":collector} if collector else {}),
     )
     assert report["status"] == "failed"
     assert len(timings) == 1 and timings[0].global_step == 0
     assert timings[0].protocol_committed_count == 1
     assert applied == ([] if late_phase == "before_device" else [0])
     assert timings[0].physically_confirmed_count == len(applied)
-    if late_phase == "observation":
+    if collector:
+        statistics = collector.report()
+        assert statistics["observations"] == 1 and statistics["statistics_complete"]
+        assert statistics["metrics"]["work_elapsed_ns"]["count"] == 0
+        assert statistics["recent"][0]["work_completed_ns"] is None
+        assert statistics["recent"][0]["status"] == ("miss_before_apply" if not applied else "miss_after_apply")
+        assert statistics["metrics"]["control_latency_ns"]["count"] == (0 if not applied else 1)
+    if late_phase in ("observation","performance_observation"):
         from secure_control.experiments.cart_pole_segmented_evidence import (
             _correct_cycle_tail,
             _LightRecording,

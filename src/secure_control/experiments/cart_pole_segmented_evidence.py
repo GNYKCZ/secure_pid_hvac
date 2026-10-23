@@ -2185,7 +2185,8 @@ def run_cart_pole_segmented(config, *, control: RunControl, session: Interactive
                            segment_steps=400, prepared: PreparedSegmentedExperiment | None = None,
                            on_step=None, phase=None, realtime=None,
                            preload_steps=0, preload_execution="fused", recording_mode=None,
-                           non_realtime=False) -> dict:
+                           non_realtime=False, performance=None, performance_output=None,
+                           performance_sample_limit=None, on_performance=None) -> dict:
     """Client 专用发布协调；安全循环只有一份，后端失败不会进入成功出版。"""
     if not isinstance(control, RunControl) or not isinstance(session, InteractiveSession):
         raise TypeError("持续发布需要原 RunControl/InteractiveSession。")
@@ -2204,15 +2205,38 @@ def run_cart_pole_segmented(config, *, control: RunControl, session: Interactive
     from .lan_runner import validate_segmented_mode
     validate_segmented_mode(config, prepared, non_realtime=non_realtime,
                             recording_mode=mode, preload_steps=preload_steps)
+    from .live_timing import (
+        LiveTimingCollector,
+        export_timing,
+        performance_options,
+        timing_metadata,
+    )
+    performance_mode, performance_path, performance_limit = performance_options(performance,
+        supported=dynamic and mode == "light", output=performance_output,
+        sample_limit=performance_sample_limit)
     phase = phase if phase is not None else lambda _: None
     if mode == "light":
         recent = _LightRecording()
+        collector = (LiveTimingCollector(performance_mode, sample_limit=performance_limit,
+                     on_snapshot=on_performance) if performance_mode != "off" else None)
+        metadata = timing_metadata(config,prepared,non_realtime=non_realtime,
+                                   mode=performance_mode) if collector else None
         stopped = _run_prepared_segmented(
             config, prepared, control=control, session=session, on_step=on_step,
             phase=phase, realtime=realtime, on_cycle=recent.record_cycle,
             preload_steps=preload_steps, preload_execution=preload_execution,
             **({"non_realtime": True} if non_realtime else {}),
+            **({"timing_observer":collector} if collector else {}),
         )
+        if collector:
+            metadata.update(timing_mode=stopped.get("timing_mode",
+                "non_realtime_demo" if non_realtime else "unpaced" if realtime is False else "absolute"),
+                material_source=stopped.get("material_source","unknown"))
+            try:
+                collector.publish(force=True)
+            except Exception as error:  # noqa: BLE001 - 控制已经终止，显示故障不覆盖控制终态
+                collector.disable(error)
+            stopped["performance"] = export_timing(collector,performance_path,metadata,stopped)
         return {**stopped, "recording_mode": "light", "evidence_state": "not_recorded",
                 "run_dir": None, "prefix_dir": None, "durable_step_count": 0,
                 "recording_summary": recent.summary(stopped)}

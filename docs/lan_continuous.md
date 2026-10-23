@@ -11,6 +11,10 @@ P1/P2脚本将选择传给原协议owner，Client专用持续入口也使用同�
 `transport: insecure_tcp`无需证书；TLS仍由独立transport选项决定，不能只删TLS配置字段隐式降级。
 无性能要求的两机近直立演示使用专用脚本的 `--non-realtime --recording light`，动态profile、三角色配置及启动步骤见
 [两机操作](cart_pole_interactive.md#无证书两机非实时动态演示)。保留Ts=.02、全部安全算术/双提交和仿真确认，不使用绝对周期钟。
+动态持续light另有默认轻量性能汇总，可用 `--performance off|summary|samples`、
+`--performance-output` 和仅samples有效的 `--performance-sample-limit 1..10000` 选择。
+每步采集与截止判断独立，非实时旧miss仍为null；全程近似分位、明确失败/缺失和退出导出见
+[性能报告](cart_pole_interactive.md#每步性能观察与结束报告132-阶段a)。该功能不增加P1/P2消息或更改数学协议。
 compact/matrix即使关闭周期截止也先准备唯一worker及16份有界池，沿原owner补货和清退。
 摘要区分实际尝试/提交/物理确认与worker清退；无周期记录时misses/last_cycle为null。
 省略 `--non-realtime` 仍是原20 ms绝对截止模式，输出 `timing_mode=absolute`；

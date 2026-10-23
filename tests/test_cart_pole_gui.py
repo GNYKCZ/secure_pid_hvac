@@ -82,6 +82,48 @@ def test_mailbox_bounds_notifications_and_preserves_terminal_latest_frame():
     assert window._terminal == ("complete", "verified")
 
 
+@pytest.mark.gui
+@_isolated_tk_test
+def test_live_performance_throttle_reuses_canvas_and_export_failure_keeps_control(tmp_path,tk_root,monkeypatch):
+    """真实Tk只显示独立快照；保存失败不抹去控制方已停止的事实。"""
+    from test_cart_pole_lan import _observer_profile_for
+    from test_lan_continuous import _plain_deployment
+    from test_live_timing import observation
+
+    from secure_control.experiments.live_timing import LiveTimingCollector
+    from secure_control.scenarios.cart_pole import gui
+    paths = _plain_deployment(tmp_path)
+    _observer_profile_for(paths)
+    window = CartPoleWindow(tk_root,paths["Client"],performance="summary",
+                            performance_output=tmp_path/'report.json')
+    objects = window.performance_canvas.find_all()
+    now = [0.]
+    monkeypatch.setattr(gui,"perf_counter",lambda:now[0])
+    collector = LiveTimingCollector(on_snapshot=lambda view:window._notify('performance',view))
+    collector.record(observation())
+    collector.record(observation(1))
+    collector.publish(force=True)
+    window._poll()
+    assert 'step=2' in window.performance_text.get() and '15.000ms' in window.performance_text.get()
+    collector.record(observation(2))
+    collector.publish(force=True)
+    window._poll()
+    assert 'step=2' in window.performance_text.get()
+    now[0] = .101
+    window._poll()
+    assert 'step=3' in window.performance_text.get()
+    assert window.performance_canvas.find_all() == objects
+    def stopped(*args,**kwargs):
+        return {'status':'stopped','confirmed_step_count':3,'recording_mode':'light',
+                'performance':{'export':{'status':'failed','error_type':'OSError'},
+                    'metrics':collector.report()['metrics'],'statistics_complete':True}}
+    monkeypatch.setattr(gui,'run_cart_pole_segmented',stopped)
+    window._run_worker()
+    window._poll()
+    assert window._performance_export_failed and '用户停止' in window.phase.get()
+    assert '保存失败' in window.location.get() and '结束统计' in window.performance_text.get()
+
+
 @pytest.mark.integration
 @pytest.mark.gui
 @_isolated_tk_test
@@ -291,7 +333,11 @@ def test_demo_script_options_reject_unsupported_routes_before_runner(tmp_path, m
             runpy.run_path(str(entry), run_name="__main__")
     assert len(calls) == 2
     for flags in (["--finite"], ["--full-route", "secure"], ["--full-gui-route", "secure"],
-                  ["--headless-continuous", "--preload-steps", "1"], ["--recording", "full"]):
+                  ["--headless-continuous", "--preload-steps", "1"], ["--recording", "full"],
+                  ["--performance","samples","--performance-sample-limit","0"],
+                  ["--performance","summary","--performance-sample-limit","1"],
+                  ["--performance","off","--performance-output",str(tmp_path/'unused.json')],
+                  ["--performance","summary","--performance-output",str(path)]):
         monkeypatch.setattr(sys, "argv", [str(entry), str(path), *mode_flags, *flags])
         with pytest.raises(SystemExit) as exit:
             runpy.run_path(str(entry), run_name="__main__")

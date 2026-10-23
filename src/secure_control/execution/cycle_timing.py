@@ -122,3 +122,53 @@ class CycleTiming:
                 raise ValueError("公开时长/队列/流量必须是非负整数。")
         if self.durable_step_count > self.physically_confirmed_count:
             raise ValueError("可靠前缀不能超过物理确认计数。")
+
+
+@dataclass(frozen=True, slots=True)
+class StepTimingObservation:
+    """不执行截止判断的本机公开时刻；工作与施力端点独立，未到达为 None。"""
+
+    attempt_seq: int
+    global_step: int
+    segment_index: int
+    actual_sample_start_ns: int | None = None
+    control_applied_ns: int | None = None
+    work_completed_ns: int | None = None
+    sample_interval_ns: int | None = None
+    pacing_requested_ns: int | None = 0
+    pacing_elapsed_ns: int | None = 0
+    pacing_excess_ns: int | None = 0
+    scheduled_start_ns: int | None = None
+    deadline_ns: int | None = None
+    terminal_elapsed_ns: int | None = None
+    observation_ns: int = 0
+    round_id: str | None = None
+    status: str = "failed"
+    failure_phase: str | None = None
+    phase_durations_ns: dict[str, int] = field(default_factory=dict)
+    queue_levels: dict[str, int] = field(default_factory=dict)
+
+    def __post_init__(self):
+        """只核对值类型和时序；引用20ms不产生一个虚假的强制deadline。"""
+        for name in self.__dataclass_fields__:
+            if name.endswith("_ns") or name in ("attempt_seq", "global_step", "segment_index"):
+                value = getattr(self, name)
+                if isinstance(value, dict):
+                    continue
+                if value is not None and (type(value) is not int or not 0 <= value < 2**63):
+                    raise ValueError(f"{name} 必须为有界非负整数或 None。")
+        start = self.actual_sample_start_ns
+        for end in (self.control_applied_ns, self.work_completed_ns):
+            if end is not None and (start is None or end < start):
+                raise ValueError("观察端点早于实际采样。")
+        if (self.work_completed_ns is not None and self.control_applied_ns is not None
+                and self.work_completed_ns < self.control_applied_ns):
+            raise ValueError("完整工作不能早于施力确认。")
+        if self.work_completed_ns is not None and self.control_applied_ns is None:
+            raise ValueError("完整工作缺少施力确认端点。")
+        if self.status == "confirmed" and self.work_completed_ns is None:
+            raise ValueError("未到达完整工作端点不能标为confirmed。")
+        if (self.scheduled_start_ns is None) != (self.deadline_ns is None):
+            raise ValueError("计划起点与截止必须同时存在或同时为空。")
+        if self.deadline_ns is not None and self.deadline_ns <= self.scheduled_start_ns:
+            raise ValueError("截止必须晚于计划起点。")
