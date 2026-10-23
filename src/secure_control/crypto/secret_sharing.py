@@ -20,6 +20,8 @@ def _require_integer(value: Any, name: str) -> int:
 
 def _map_values(value: Any, mapper: Callable[[Any], int]) -> int | np.ndarray:
     """逐元素处理标量、向量或矩阵，并用 object dtype 保留任意精度整数。"""
+    if type(value) is int:
+        return mapper(value)
     try:
         array = np.asarray(value, dtype=object)
     except ValueError as error:
@@ -171,6 +173,8 @@ class TwoPartySharing:
         operation: Callable[[int, int], int],
     ) -> int | np.ndarray:
         """组合标量或相同 shape 的数组，拒绝隐式广播造成的份额错配。"""
+        if type(left) is int and type(right) is int:
+            return operation(left, right) % self.modulus
         left_array = np.asarray(left, dtype=object)
         right_array = np.asarray(right, dtype=object)
         if left_array.ndim != 0 and right_array.ndim != 0 and left_array.shape != right_array.shape:

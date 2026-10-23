@@ -2,7 +2,8 @@
 
 ## 无证书两机非实时动态演示
 
-本入口保留原两测量observer、约5°初态、20 ms模型步长和秘密分享计算，只取消本次演示的采样周期截止要求。
+本次推荐使用已合并矩阵后端的 `control-dynamic-matrix-v1`，保留原两测量observer、约5°初态、20 ms模型步长和秘密分享计算。
+显式 `--non-realtime` 取消本次演示的采样周期截止要求；省略它仍执行原20 ms绝对截止检查。
 墙钟慢于20或40 ms不会单独导致失败，没有速度指标。每个已双提交并完成仿真确认的步骤才推进20 ms仿真时间。
 快机器尽力按相邻实际采样间隔至少20 ms展示；慢时不追赶、不跳步、不积压旧测量。
 启动、通信、空闲和关停仍有原秒级超时；材料短缺、非法消息、断连或缺提交回执仍停止，不重试未知轮。
@@ -40,7 +41,7 @@ B允许A访问TCP 34401/34402；34403只供B本机P2连接P1，A无须监听。
 ```yaml
 role: P1
 transport: insecure_tcp
-wire_profile: control-dynamic-compact-v2
+wire_profile: control-dynamic-matrix-v1
 topology: local-deployment.example.yaml
 timeouts:
   startup: 180
@@ -54,7 +55,7 @@ A的 `configs/lab-client-cart-pole.example.yaml` 使用下面内容，**不要�
 ```yaml
 role: Client
 transport: insecure_tcp
-wire_profile: control-dynamic-compact-v2
+wire_profile: control-dynamic-matrix-v1
 topology: local-deployment.example.yaml
 experiment: cart_pole_observer_lan.example.yaml
 timeouts:
@@ -66,7 +67,8 @@ timeouts:
 
 timeout单位是秒，`step: 30`不是30 ms。三个角色wire必须一致，不能只改Client。
 transport与wire独立；省略wire仍是原 `control-batch-v1`，不会自动升级协议或关闭实时保护。
-本轮没有改旧示例默认；恢复旧演示时三角色都恢复原wire及所需场景。
+本轮没有改您已有部署配置或示例默认，请在三份角色配置中手工选择同一wire。
+旧 `control-dynamic-compact-v2` 仍可用；恢复旧演示时三角色都恢复原wire及所需场景。
 
 依次启动，每个命令占一个独立终端。B的终端一：
 
@@ -100,9 +102,46 @@ uv run python scripts/run_cart_pole_client.py configs/lab-client-cart-pole.examp
 
 非实时摘要写明transport、wire、material_source、timing_mode=`non_realtime_demo`、model_period_s、墙钟耗时和实际尝试/提交/物理确认数。
 没有CycleTiming时misses/last_cycle和近期分位为null，表示不适用，不是零超期或零耗时通过。
-当前compact-v2或`--non-realtime`只支持动态持续light；与静态、finite、预送、full记录及完整起摆组合均在联网前拒绝。
+当前compact-v2、matrix-v1或`--non-realtime`只支持动态持续light；与静态、finite、预送、full记录及完整安全起摆组合均在联网前拒绝。
 旧batch/full和实时功能保持。`--full-non-realtime`属于另一完整路线，不替代本选项。
-本轮不接入relay/native等待、不复用旧R1/Q1预算。真实两机功能待用户设备验证，本机三进程不冒充跨机验收。
+本入口直接装配通用runtime，不经过受限network benchmark，不放宽其TLS/来源/额度门禁，也不复用#128已消费的P0/A/B预算。
+本轮只做短软件功能检查；真实两机功能和性能待用户设备验证，本机三进程不冒充跨机验收。
+
+### 原20 ms截止模式与结果提取
+
+先确认三个角色的最终JSON标识实际使用 `insecure_tcp`，Client还应为
+`wire_profile=control-dynamic-matrix-v1`、`material_source=worker`。
+控制方程、矩阵材料、双提交和原模型0.02s均保留；取消TLS只影响信道加密/身份认证。
+两台电脑请用同一PR整合后的完整提交，旧PR125或只含矩阵核心的main不能替代此入口整合。
+
+需要观察原截止模式时，重启B的P1/P2，再在A省略 `--non-realtime`：
+
+```powershell
+uv run python scripts/run_cart_pole_client.py configs/lab-client-cart-pole.example.yaml --headless-continuous --recording light --segment-steps 400
+```
+
+此时 `timing_mode=absolute`，周期从计划采样起点计算，包含仿真设备确认、记账及跨段维护。
+任何超期沿原规则停止；不是把本次已批准演示改成40 ms控制。需要动画时只去掉
+`--headless-continuous`，GUI与headless使用同一后端；窗口刷新率不能当作控制周期。
+
+headless结束时输出一行JSON；Ctrl+C请求正常停止，先等最终JSON和双方停止回执，再重启三个角色。
+如需保存原始摘要，可先创建本机临时输出目录并用PowerShell保存stdout（下例仍是截止模式）：
+
+```powershell
+New-Item -ItemType Directory -Force .tmp | Out-Null
+uv run python scripts/run_cart_pole_client.py configs/lab-client-cart-pole.example.yaml --headless-continuous --recording light --segment-steps 400 | Tee-Object -FilePath .tmp/cart-pole-client.json
+$demoResult = Get-Content .tmp/cart-pole-client.json -Raw | ConvertFrom-Json
+$demoResult | Select-Object status, transport, wire_profile, material_source, timing_mode, model_period_s, confirmed_step_count, protocol_committed_count, failure_phase, category
+$demoResult.cycle_summary | Format-List
+$demoResult.recording_summary.recent_timing | Format-List
+$demoResult.material_summary | Select-Object encoding_profile, claimed, generated_received, worker_exited, receiver_exited, credit_thread_exited, cleanup_failed, error_type
+```
+
+`cycle_summary`是全程尝试/超期计数；`recording_summary.recent_timing`只覆盖最近最多256条中
+有完整端点的周期，不是全程分位。未完成端点不补零，`final_failure`保留最后失败；
+非实时模式没有CycleTiming，因此这些分位为null，墙钟平均耗时也不能替代它们。
+比较速度前先核三角色同版本、同wire、同模式、相同输入和网络条件，并记录实际运行SHA；
+本次不预先承诺两机20/15/40 ms，也不强制您做TLS对照。
 
 默认窗口持续运行，点击“停止并保存”提交正常停止请求。段容量由
 `--segment-steps 400` 指定（允许 1…1000），总步数由实际停止时的双方确认前缀决定，

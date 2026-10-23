@@ -36,7 +36,12 @@ from secure_control.execution.lan_transport import (
     LanIdentityError,
     LanTimeoutError,
 )
-from secure_control.execution.localhost_codec import _COMPACT_PROFILE_V2, LocalhostCodecError
+from secure_control.execution.localhost_codec import (
+    _COMPACT_ADVANCE_PROFILES,
+    _COMPACT_PROFILE_V2,
+    _COMPACT_PROFILE_V3,
+    LocalhostCodecError,
+)
 from secure_control.execution.localhost_transport import (
     LocalhostTransportDisconnected,
     LocalhostTransportTimeout,
@@ -127,9 +132,9 @@ def validate_segmented_mode(config, experiment, *, non_realtime=False,
     mode = recording_mode if recording_mode is not None else "light" if dynamic else "full"
     if type(non_realtime) is not bool:
         raise ValueError("non_realtime 必须是布尔值。")
-    compact = config.wire_profile == _COMPACT_PROFILE_V2
+    compact = config.wire_profile in _COMPACT_ADVANCE_PROFILES
     if (non_realtime or compact) and (not dynamic or mode != "light" or preload_steps):
-        raise ValueError("compact-v2 / 非实时演示仅支持动态持续 light，不能预送或保存 full。")
+        raise ValueError("紧凑/矩阵协议或非实时演示仅支持动态持续 light，不能预送或保存 full。")
     return mode
 
 
@@ -169,7 +174,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
     control.bind_stop(session.reject_new)
     wire_profile = _wire_profile if _wire_profile is not None else getattr(config, "wire_profile", "control-batch-v1")
     # 旧实验显式参数仍归原实验 owner；普通角色配置的选择才装配演示 worker。
-    configured_compact = _wire_profile is None and wire_profile == _COMPACT_PROFILE_V2
+    configured_compact = _wire_profile is None and wire_profile in _COMPACT_ADVANCE_PROFILES
     if non_realtime or configured_compact:
         validate_segmented_mode(config, experiment, non_realtime=non_realtime,
                                 preload_steps=preload_steps)
@@ -190,6 +195,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
     previous_sample_ns = None
     outcome = None
     wall_started = perf_counter()
+    dynamic_realtime = (experiment.spec.state_dimension != 0 if realtime is None else realtime) and not non_realtime
 
     def summary():
         """非实时没有周期截止证据；尝试数独立于 CycleTiming 的存在。"""
@@ -329,7 +335,6 @@ def _run_prepared_segmented(config, experiment, *, control, session,
         )
         if on_start is not None:
             on_start(runtime.snapshot(), runtime.public_setup)
-        dynamic_realtime = (experiment.spec.state_dimension != 0 if realtime is None else realtime) and not non_realtime
         if preload_steps:
             progress("PRELOADING")
             runtime.enable_material_preload(cancelled=lambda: session.cancelled.is_set()
@@ -442,7 +447,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                 last_cycle["cycle_completed_ns"] = None
                 raise CycleDeadlineExceeded("CYCLE_OBSERVATION")
     except Exception as error:  # noqa: BLE001 - 生命周期出口不披露协议秘密或异常载荷
-        if (runtime is not None and wire_profile == _COMPACT_PROFILE_V2
+        if (runtime is not None and wire_profile in _COMPACT_ADVANCE_PROFILES
                 and runtime.last_maintenance_operation == "advance"
                 and (runtime.phase == "CONNECTING_NEXT" or attempt is not None
                      and "maintenance_advance" in attempt["durations"]
@@ -475,9 +480,9 @@ def _run_prepared_segmented(config, experiment, *, control, session,
             "round_id": lifecycle.attempted_round_id if lifecycle else None,
             "protocol_committed_count": lifecycle.protocol_committed_count if lifecycle else 0,
             "confirmed_step_count": lifecycle.physically_confirmed_count if lifecycle else 0,
-            "resource_counts": ({"products_consumed": lifecycle.products_consumed,
-                                 "truncations_consumed": lifecycle.truncations_consumed}
-                                if lifecycle else {}),
+            "resource_counts": getattr(runtime, "resource_counts",
+                {"products_consumed": lifecycle.products_consumed,
+                 "truncations_consumed": lifecycle.truncations_consumed} if lifecycle else {}),
             "lifecycle": asdict(lifecycle) if lifecycle else None,
             "cycle_summary": summary(),
             "material_summary": getattr(runtime, "material_summary", runtime.cycle_queue_levels) if runtime is not None else {},
@@ -486,7 +491,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
             **({"last_sealed_segment": asdict(runtime.last_sealed_record)
                 if runtime.last_sealed_record is not None else None,
                 "known_segment_receipts": [asdict(r) for r in runtime.last_segment_receipts]}
-               if runtime is not None and wire_profile == _COMPACT_PROFILE_V2 else {}),
+               if runtime is not None and wire_profile in _COMPACT_ADVANCE_PROFILES else {}),
             "recording_error": getattr(error, "_public_recording_error", None),
         }
         return outcome
@@ -496,17 +501,18 @@ def _run_prepared_segmented(config, experiment, *, control, session,
             try:
                 runtime.close()
             except Exception as error:
-                if not non_realtime or outcome is None:
+                if not (non_realtime or configured_compact) or outcome is None:
                     raise
                 outcome["cleanup_error_type"] = type(error).__name__
                 if outcome["status"] == "stopped":
                     outcome.update(status="failed", category=type(error).__name__, failure_phase="CLEANUP")
-        if non_realtime and outcome is not None:
+        if outcome is not None:
             # close 后再取工人清退事实，不以构造 return 时的旧快照声称清理完成。
             material = runtime.material_summary if runtime is not None else {}
             outcome.update(transport=config.transport, wire_profile=wire_profile,
                 material_source="worker" if material_candidate == "worker" else "inline",
-                timing_mode="non_realtime_demo", model_period_s=experiment.scene.period,
+                timing_mode=("non_realtime_demo" if non_realtime else "absolute" if dynamic_realtime else "unpaced"),
+                model_period_s=experiment.scene.period,
                 wall_elapsed_s=perf_counter() - wall_started, material_summary=material)
             if (material.get("cleanup_failed") or material.get("error_type")
                     or (material.get("worker") or {}).get("memory_guard_failed")) and outcome["status"] == "stopped":
@@ -520,7 +526,7 @@ def _run_prepared_client(config: LanConfig, experiment: PreparedLanExperiment,
                          | None = None) -> dict[str, object]:
     """通用会话/资源/正式发布只保留一份；交互入口仅换执行计划。"""
     if config.wire_profile != "control-batch-v1":
-        raise ValueError("compact-v2 仅支持动态持续 light。")
+        raise ValueError("紧凑/矩阵协议仅支持动态持续 light。")
     def check_cancelled() -> None:
         if cancelled is not None and cancelled.is_set():
             raise RuntimeError("Client 运行已取消。")
@@ -703,7 +709,8 @@ def _run() -> int:
     benchmark.add_argument("--network-ledger", type=Path)
     benchmark.add_argument("--network-approval", type=Path)
     benchmark.add_argument("--network-repair-note")
-    benchmark.add_argument("--network-wire-profile", choices=("control-dynamic-compact-v1", _COMPACT_PROFILE_V2))
+    benchmark.add_argument("--network-wire-profile", choices=("control-dynamic-compact-v1", _COMPACT_PROFILE_V2,
+                                                            _COMPACT_PROFILE_V3, "control-dynamic-matrix-v1"))
     benchmark.add_argument("--network-authorization", help="当前 Issue 的直接用户批准登记评论 URL")
     benchmark.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
@@ -725,10 +732,14 @@ def _run() -> int:
                 return _failure("Client", 5, "network_benchmark", error)
             print(json.dumps({"status": report["status"], "profile": args.network_profile, "phase": args.network_phase,
                 "network_sample_pass": report["network_sample_pass"],
+                **({"network_progress_goal_pass": report.get("network_progress_goal_pass")}
+                   if (report.get("network_manifest") or {}).get("comparison_stage") else {}),
                 "network_dynamic_qualification_pass": report["network_dynamic_qualification_pass"],
                 "attempts": len(report.get("cycles", [])), "history_export_ns": report["network_export_ns"],
                 "report": str(args.output)}, ensure_ascii=False, sort_keys=True))
-            return 0 if report["network_sample_pass"] else 5
+            comparison = (report.get("network_manifest") or {}).get("comparison_stage")
+            return 0 if (report["network_sample_pass"] and (comparison not in ("T2", "T3", "U2", "V1", "W1", "W2", "SC-B", "M128-B")
+                           or report.get("network_progress_goal_pass") is True)) else 5
         if args.steps is None:
             parser.error("benchmark requires --steps outside the fixed network profiles")
         if args.segment_steps is None:
@@ -846,7 +857,7 @@ def _run() -> int:
     try:
         config = load_lan_config(args.config, role)
         if role == "Client" and config.wire_profile != "control-batch-v1":
-            raise ValueError("compact-v2 Client 请使用倒立摆专用动态持续入口。")
+            raise ValueError("紧凑/矩阵 Client 请使用倒立摆专用动态持续入口。")
         trial = (HvacScenario(config.controller_config).build_lan_single_step()
                  if role == "Client" and config.controller_config is not None else None)
         if role == "Client" and config.experiment_config is not None:

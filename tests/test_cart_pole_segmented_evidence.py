@@ -666,8 +666,12 @@ _DEMO_CLIENT = r'''
 import contextlib, io, json, runpy, sys
 from pathlib import Path
 from secure_control.execution import lan_runtime as lan
+from secure_control.execution import lan_transport
 from secure_control.experiments import cart_pole_segmented_evidence as evidence
 mode = sys.argv[2]
+def forbid_tls(*args, **kwargs):
+    raise AssertionError('certificate-free Client must not construct TLS context')
+lan_transport._context = forbid_tls
 rows, began = [], []
 controls = []
 original = evidence.run_cart_pole_segmented
@@ -692,6 +696,12 @@ def advance(self, **kwargs):
         controls[0].request_stop()
     return result
 lan.LanSegmentedRuntime.next_segment = advance
+close = lan.LanSegmentedRuntime.close
+def closed(self):
+    close(self)
+    if mode == 'cleanup_failure':
+        raise RuntimeError('test cleanup failure after owned worker exit')
+lan.LanSegmentedRuntime.close = closed
 def run(config, **kwargs):
     controls.append(kwargs['control'])
     def confirmed(record):
@@ -720,9 +730,10 @@ print(json.dumps({'result':json.loads(output.getvalue()),'rows':rows,'began':beg
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("wire", ["control-dynamic-compact-v2", "control-dynamic-matrix-v1"])
 @pytest.mark.parametrize("mode", ["normal", "commit_ack_loss", "worker_failure", "cancel", "mismatch",
-                                  "stop_preparing", "stop_advance"])
-def test_demo_ordinary_scripts_use_compact_worker_and_stop_without_cycle_claims(tmp_path, mode):
+                                  "stop_preparing", "stop_advance", "cleanup_failure"])
+def test_demo_ordinary_scripts_use_compact_worker_and_stop_without_cycle_claims(tmp_path, mode, wire):
     """真实无证书脚本/worker；短功能用例跨段并覆盖失败，不测性能或声明跨机。"""
     from lan_test_support import start_processes
     from test_lan_single_step import _run_fault
@@ -731,7 +742,7 @@ def test_demo_ordinary_scripts_use_compact_worker_and_stop_without_cycle_claims(
     _observer_profile_for(paths)
     for role, path in paths.items():
         data = yaml.safe_load(path.read_text(encoding="utf8"))
-        data["wire_profile"] = "control-batch-v1" if mode == "mismatch" and role == "P2" else "control-dynamic-compact-v2"
+        data["wire_profile"] = "control-batch-v1" if mode == "mismatch" and role == "P2" else wire
         data["timeouts"].update(startup=5, step=3, shutdown=2)
         path.write_text(yaml.safe_dump(data), encoding="utf8")
     parties, client = [], None
@@ -746,7 +757,7 @@ def test_demo_ordinary_scripts_use_compact_worker_and_stop_without_cycle_claims(
         assert code == 0, (report, errors)
         result, rows = report["result"], report["rows"]
         assert result["timing_mode"] == "non_realtime_demo" and result["model_period_s"] == .02
-        assert result["transport"] == "insecure_tcp" and result["wire_profile"] == "control-dynamic-compact-v2"
+        assert result["transport"] == "insecure_tcp" and result["wire_profile"] == wire
         assert result["cycle_summary"]["misses"] is result["cycle_summary"]["last_cycle"] is None
         assert result["recording_summary"]["recent_count"] == 0
         assert result["recording_summary"]["recent_timing"]["max_ms"] is None
@@ -757,6 +768,7 @@ def test_demo_ordinary_scripts_use_compact_worker_and_stop_without_cycle_claims(
         else:
             assert report["began"] == [True] and result["material_source"] == "worker"
             material = result["material_summary"]
+            assert material["encoding_profile"] == material["worker"]["encoding_profile"] == wire
             assert material["worker_exited"] and material["receiver_exited"] and material["credit_thread_exited"]
             assert not material["cleanup_failed"] and material["inventory_inflight"] == 0
             assert material["material_high_water"] <= 16 and material["material_reserved_bytes"] == 8388608
@@ -771,8 +783,11 @@ def test_demo_ordinary_scripts_use_compact_worker_and_stop_without_cycle_claims(
             assert result["protocol_committed_count"] == 19 and result["final_segment"]["hello"]["segment_index"] == 3
             assert [row["g"] for row in rows] == list(range(19)) and len({row["session"] for row in rows}) == 1
             assert len({row["round"] for row in rows}) == 19
-            assert len({r for row in rows for r in row["resources"]}) == 19 * 34
-            assert result["resource_counts"] == {"products_consumed": 570, "truncations_consumed": 76}
+            matrix = wire == "control-dynamic-matrix-v1"
+            assert len({r for row in rows for r in row["resources"]}) == 19 * (5 if matrix else 34)
+            assert result["resource_counts"] == ({"matrix_products_consumed": 19,
+                "scalar_equivalent_products": 570, "multiplication_material_elements": 779,
+                "truncations_consumed": 76} if matrix else {"products_consumed": 570, "truncations_consumed": 76})
             assert material["claimed"] == 19 and material["generated_received"] >= 19
             # 独立普通闭环 oracle，证明跨段沿同一动态状态而非重置 x0。
             from secure_control.execution.runtime import PlaintextStateSpaceRuntime
@@ -793,6 +808,10 @@ def test_demo_ordinary_scripts_use_compact_worker_and_stop_without_cycle_claims(
             if mode == "commit_ack_loss":
                 assert result["status"] == "uncertain" and not rows
                 assert result["cycle_summary"]["attempts"] == 1
+                assert "fault:commit_ack_loss" in _finish(parties[1], 10)[2]
+            if mode == "cleanup_failure":
+                assert result["status"] == "failed" and result["failure_phase"] == "CLEANUP"
+                assert result["cleanup_error_type"] == "RuntimeError" and len(rows) == 19
             if mode in ("worker_failure", "cancel"):
                 assert len(rows) == result["confirmed_step_count"] == 2
                 assert result["cycle_summary"]["attempts"] == (3 if mode == "worker_failure" else 2)

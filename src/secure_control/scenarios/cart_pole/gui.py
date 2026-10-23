@@ -67,7 +67,7 @@ class CartPoleWindow:
         self.recording_mode = recording_mode if recording_mode is not None else "light" if dynamic else "full"
         from secure_control.experiments.lan_runner import validate_segmented_mode
         if mode != "segmented" and (non_realtime or self.config.wire_profile != "control-batch-v1"):
-            raise ValueError("compact-v2 / 非实时演示仅支持动态持续light。")
+            raise ValueError("紧凑/矩阵协议或非实时演示仅支持动态持续light。")
         validate_segmented_mode(self.config, self.prepared, non_realtime=non_realtime,
                                 recording_mode=self.recording_mode, preload_steps=preload_steps)
         self.non_realtime = non_realtime

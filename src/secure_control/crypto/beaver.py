@@ -14,7 +14,15 @@ class _TripleLifecycle:
     """记录一个三元组的分阶段使用状态，阻止跨乘法或跨参与方复用。"""
 
     # 固定字段省去每份材料的实例字典；仍新建状态/集合并保留原弱引用能力。
-    __slots__ = ("__weakref__", "consumed", "finished_parties", "masked_parties", "opened", "owner")
+    __slots__ = (
+        "__weakref__",
+        "client_attested_parties",
+        "consumed",
+        "finished_parties",
+        "masked_parties",
+        "opened",
+        "owner",
+    )
 
     def __init__(self, owner: object) -> None:
         self.owner = owner
@@ -22,6 +30,14 @@ class _TripleLifecycle:
         self.opened = False
         self.finished_parties: set[int] = set()
         self.consumed = False
+        self.client_attested_parties: set[int] = set()
+
+    def attest_peer_finish(self, party: int) -> None:
+        """Client 确认双方完成；不把远端完成加入本地观察集合。"""
+        if self.consumed or self.finished_parties != {party} or not self.opened:
+            raise ValueError("Beaver 本方尚未完成或已确认。")
+        self.client_attested_parties.add(1 - party)
+        self.consumed = True
 
     def claim_masking(self, party_index: int) -> None:
         """记录该参与方已用此三元组生成遮蔽差值。"""

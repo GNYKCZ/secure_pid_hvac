@@ -37,6 +37,10 @@ class RelayCpuLimitError(RuntimeError):
     """完整实际观测窗超过单核50%；不能用CPU开销解释掉模型误差。"""
 
 
+class RelayModelError(RuntimeError):
+    """本批显式首超差停止；已发送事实及原首异常先保存。"""
+
+
 class _WaitPolicy:
     """单个relay拥有的有界等待/CPU累计事实，无逐窗列表或额外采样线程。"""
 
@@ -206,13 +210,16 @@ class PublicRing:
     TIMING_FIELDS = ("wait_kind", "wait_started_ns", "wait_returned_ns", "planned_wake_ns",
                      "loop_started_ns", "rss_started_ns", "rss_ended_ns", "send_started_ns", "send_ended_ns")
 
-    def __init__(self):
+    def __init__(self, *, fail_first=False, native=None):
         self.data = array("q", [0]) * (self.CAPACITY * len(self.FIELDS))
         self.seen = 0
         self.first_anomaly = None
         self.first_anomaly_timing = None
         self.timing = [0, -1, -1, -1, -1, -1, -1]
         self.active_direction = None
+        self.fail_first = fail_first
+        self.native = native
+        self.first_wait_evidence = None
 
     def append(self, values, *, send_started_ns=None):
         start = self.seen % self.CAPACITY * len(self.FIELDS)
@@ -223,6 +230,26 @@ class PublicRing:
             self.first_anomaly = tuple(values)
             self.first_anomaly_timing = (*self.timing,
                 values[12] if send_started_ns is None else send_started_ns, values[7])
+            if self.native is not None and self.native.evidence is not None:
+                # 异常发生时才复制固定8槽，退出后编码；不假称最近等待必然唤醒当前块。
+                self.first_wait_evidence = (self.native.evidence.count, self.native.evidence.rows[:])
+
+    def wait_report(self):
+        """公开原首异常附近快照；仅目标/时序相符才给关联ID，其他明确未关联。"""
+        if self.first_wait_evidence is None:
+            return None
+        from ._network_wait_win32 import WaitEvidence
+        count, rows = self.first_wait_evidence
+        width = len(WaitEvidence.FIELDS)
+        snapshots = [list(rows[(i % 8)*width:(i % 8+1)*width]) for i in range(max(0,count-8),count)]
+        last = snapshots[-1] if snapshots else None
+        eligible, sent = self.first_anomaly[14], self.first_anomaly[12]
+        associated = bool(last and last[15] == 1 and last[14] == 6 and last[4] == eligible
+                          and 0 <= last[11] <= last[13] <= sent)
+        return {"version": 1, "fields": WaitEvidence.FIELDS, "rows": snapshots, "waits_seen": count,
+                "associated_wait_id": last[0] if associated else None,
+                "association": "timer target equals block eligible and returned before send" if associated else "unassociated",
+                "scope": "Python-visible FFI boundaries; no kernel timer signal timestamp"}
 
     def rows(self):
         width = len(self.FIELDS)
@@ -321,6 +348,8 @@ def _dispatch(direction, now, writable_at, ring, native=None):
     elif native is not None and direction.queued < queued_before:
         # 实际正数send也是写能力事实；短写继续沿原公平策略，直到真实would-block。
         native.write_progressed(direction.destination)
+    if ring.fail_first and ring.first_anomaly is not None:
+        raise RelayModelError("本批首个真实转发超差，事实已保存，停止不重试。")
 
 
 def _serve_due(directions, rotation, ring, native=None):
@@ -347,6 +376,10 @@ def _wait_for_events(selector, stop, future_due, wake_at, policy, ring, *, stopp
     if policy.native_wait is not None:
         target = min(wake_at, future_due) if future_due is not None else wake_at
         selected, returned, kind = selector.wait_until(target)
+        if getattr(selector, "evidence", None) is not None:
+            stamp = _clock_ns(time.perf_counter_ns())
+            selector.evidence.current[13] = stamp
+            selector.evidence.finish()
         ring.timing[:4] = [kind, selector.last_start, returned, target]
         return selected, returned if selected else None
     if sys.platform == "win32" and future_due is not None:
@@ -406,7 +439,7 @@ def _wait_for_events(selector, stop, future_due, wake_at, policy, ring, *, stopp
     return [], None
 
 
-def _relay_main(profile, endpoints, stop, pipe, wait_strategy=None):
+def _relay_main(profile, endpoints, stop, pipe, wait_strategy=None, wait_diagnostic=False, fail_first_model=False):
     """一个临时子进程、一个selector，三连接六方向；TLS在原角色内完成。"""
     from .communication_benchmark import _process_memory
 
@@ -416,14 +449,14 @@ def _relay_main(profile, endpoints, stop, pipe, wait_strategy=None):
             from ._network_wait_win32 import STRATEGY, NativeWait
             if wait_strategy != STRATEGY:
                 raise ValueError("未知原生等待候选。")
-            selector = NativeWait()
+            selector = NativeWait(**({"observe_wait": True} if wait_diagnostic else {}))
         else:
             selector = selectors.DefaultSelector()
     except Exception as failure:  # noqa: BLE001 - 初始化能力失败也由原报告保存首因，绝不回退。
         initialization_error = failure
     listeners, sockets, directions, pending = [], [], [], {}
-    ring, policy, error, ready = PublicRing(), _WaitPolicy(), None, False
     native = selector if wait_strategy is not None else None
+    ring, policy, error, ready = PublicRing(fail_first=fail_first_model, native=native), _WaitPolicy(), None, False
     policy.native_wait = native
     cleanup_error = None
     failure_at, operation, event_direction, error_errno, error_winerror = None, "startup", None, None, None
@@ -658,6 +691,13 @@ def _relay_main(profile, endpoints, stop, pipe, wait_strategy=None):
             report.update(ring_version=3, scope="opaque TCP read blocks; native event notification and cached write state; sampled RSS",
                 writable_state_scope="writable_return_ns=-1: no new FD_WRITE; positive short-write continuation measured from prior send completion")
             report["wait_kinds"].update({"5": "native_network", "6": "native_timer"})
+        if wait_diagnostic:
+            report["wait_diagnostic"] = {"version": 1, "enabled": True,
+                "recent": native.evidence.report() if native is not None else None,
+                "first_anomaly": ring.wait_report(),
+                "clock_mapping": native.clock_mapping if native is not None else None}
+        if fail_first_model:
+            report["first_model_failure_stop"] = True
         for _ in range(3):
             report["encoded_bytes"] = len(json.dumps(report, separators=(",", ":")).encode())
         report["model_valid"] = (error is None and set(public) == set(DIRECTIONS)
@@ -667,6 +707,10 @@ def _relay_main(profile, endpoints, stop, pipe, wait_strategy=None):
                     and r["early_sends"] == r["unexplained_over_tolerance"] == 0
                     and r["queue_high_water"] <= QUEUE_LIMIT for r in public.values())
             and report["encoded_bytes"]+256 <= report["encoded_limit"])
+        if report["encoded_bytes"]+256 > report["encoded_limit"]:
+            report["evidence_budget_failed"] = True
+            if error is None:
+                report["error_type"] = "EvidenceBudgetExceeded"
         try:
             pipe.send(report)
         finally:
@@ -676,7 +720,10 @@ def _relay_main(profile, endpoints, stop, pipe, wait_strategy=None):
 class NetworkRelay:
     """实验编排持有的单个转发进程；启动失败和强制退出均显式拒绝模型资格。"""
 
-    def __init__(self, profile, endpoints, *, wait_strategy=None):
+    def __init__(self, profile, endpoints, *, wait_strategy=None, wait_diagnostic=False, fail_first_model=False):
+        if (type(wait_diagnostic) is not bool or type(fail_first_model) is not bool
+                or (wait_diagnostic or fail_first_model) and wait_strategy != "win32-event-wait-v1"):
+            raise ValueError("本批诊断/首超差停止仅限显式原生等待。")
         if profile not in ("N1", "N2", "N3") or len(endpoints) != 3:
             raise ValueError("转发器仅支持三条固定本机实验链路。")
         for host, port, backend in endpoints:
@@ -692,7 +739,9 @@ class NetworkRelay:
         self.stop = context.Event()
         self.reader, writer = context.Pipe(duplex=False)
         args = (profile, endpoints, self.stop, writer)
-        self.process = context.Process(target=_relay_main, args=args+((wait_strategy,) if wait_strategy is not None else ()))
+        extra = (wait_strategy, wait_diagnostic, fail_first_model) if wait_diagnostic or fail_first_model else (
+            (wait_strategy,) if wait_strategy is not None else ())
+        self.process = context.Process(target=_relay_main, args=args+extra)
         self.writer = writer
         self.report = None
         self.closed = False

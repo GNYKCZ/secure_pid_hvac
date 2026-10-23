@@ -40,12 +40,12 @@ if __name__ == "__main__":
     # 在创建窗口/连接/供料前拒绝不兼容模式，不能悄悄忽略 wire 或 full 请求。
     if args.non_realtime or not (args.full_route == "plaintext" or args.full_gui_route == "plaintext"):
         from secure_control.execution.lan_config import load_lan_config
-        from secure_control.execution.localhost_codec import _COMPACT_PROFILE_V2
+        from secure_control.execution.localhost_codec import _COMPACT_ADVANCE_PROFILES
 
         selected = load_lan_config(args.config, "Client")
-        if args.non_realtime or selected.wire_profile == _COMPACT_PROFILE_V2:
+        if args.non_realtime or selected.wire_profile in _COMPACT_ADVANCE_PROFILES:
             if args.finite or args.full_route or args.full_gui_route:
-                parser.error("compact-v2 / --non-realtime 仅支持动态持续light，不支持finite或完整路线")
+                parser.error("紧凑/矩阵协议或 --non-realtime 仅支持动态持续light，不支持finite或完整路线")
             from secure_control.experiments.lan_continuous_profile import load_segmented_experiment
             from secure_control.experiments.lan_runner import validate_segmented_mode
             from secure_control.scenarios.cart_pole.interactive import InteractiveSession

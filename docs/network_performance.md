@@ -318,3 +318,216 @@ native记录工具在发起CLI前持久化START并保留原生exit，不能另�
 入口适配的新head须相关与全量软件检查、独立软件审查、完整预声明及全文读回后才运行。R1/Q1各自全部原件/命令/native退出、
 材料/状态/资源/清理和后置退出观察均保存并独立核验；失败/null/慢步不删、不将成功前缀冒作完整样本。
 软件通过、R1有限样本、Q1本机N2资格分别记录；不据此宣布真实Wi-Fi/设备/长期硬实时、gen2专项或完整路线通过，不自动合并或关闭Issue。
+
+## compact-v3 局部暂存与 T1/T2/T3 有限比较
+
+[本轮设计](https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6284803981)及
+[追加用户批准](https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6284903029)
+允许显式11帧候选的软件实施、首次独审、一次必要返工，以及软件/独审通过后的最多三次比较。
+PR #125 非前置且不纳入此轮；不更改默认配置、数学、20ms周期、精度、材料、GC或网络模型。
+
+`control-dynamic-compact-v3` 仅用于需要聚合行 Trunc 的动态分段 worker 实验，拒绝静态、
+无截断、preload/full入口和混合版本。正常 peer 为 product×2、truncation×1，取消两道
+peer 完成屏障；Client 验证两份局部回执及输出后授权提交，双方 ACK 保留。
+普通完整轮11应用帧，满段 advance 连同维护15帧；v2仍为15/19帧。
+
+原 `RunBudget` 增加本批 `comparison_stage`，保留已封闭九项 canonical 摘要
+`08805f3aa8e0149771f05d7519c51f8801345e9c47f24a86d9848eb447a14852` 与 native 摘要
+`61dcefa48b1314ca1d86e9ab039dc3f214ab0c746ced453090557d26c3b079be`。
+九项9000预留/4209实际保持；新增call10–12各最多1000，累计最大12次/12000预留。
+旧R1/Q1判断和历史对象不改；旧授权不接受新阶段，新批准也不能解锁旧资格。
+
+T1=N0/TLS直连/v2，T2=N0/TLS直连/v3，T3=N2/v3，均固定candidate/1000。
+T1完整1000、零失败零超期及全部原门禁通过才允许T2；两次必须同head/来源/条件，使用
+各自新鲜材料。T2完整周期p50≤T1的90%、p99≤T1且max≤20ms，两份精确原件经独立审计
+才允许T3。T3保留原六向250–500µs/100Mbit/s、seed、原生事件等待、单核50%实际100ms窗、
+1ms模型误差、材料与角色内存保护；完整1000零失败零超期，余量目标p99≤16ms/max≤18ms。
+统计包含首轮及400/800维护，帧计数来自三角色实际transport。正常结束、材料清退和TLS
+身份也必须通过；不足不能只用平均值或成功前缀掩盖。
+
+每次native START（含准备/启动失败）消费一次；首次失败立即停，剩余额度不补发。
+任何源码变化使同源比较失效，停止剩余阶段；没有热身、探针、重跑或10000资格。
+T2墙钟收益不足单独报告，不冒充控制错误。一次Review修复也不返还性能额度。
+当前进程锁、在途占项、原件hash、来源及前件门禁在CLI/共享/实际循环都核验。
+
+仅T1前旧证余期不足时，在此前不存在的`.tmp/issue120-stage-authorized-certs`一次生成
+原同身份/SAN/RSA2048/SHA256/25h测试证书，记录旧/新公开指纹、有效期、条件和批准URL；
+旧证及私钥不覆盖。三阶段同套且每次余期至少一小时，中途失败不自动换证。
+本节登记候选及受限验证流程，不代表已产生有效性能成绩或整个Issue #120验收通过。
+
+## PR #126 局部摘要优化续接：U1/U2
+
+[新设计及直接用户“允许按顺序”登记](https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6289274852)
+仅允许本轮 owner 摘要复用和期望对象减负、软件/独审，以及新同head的两次N0直连对照。
+原T1/T2已完成且净收益失败，T2原生exit5保留；T3继续封闭。
+
+新增协议授权路径摘要目标为Client每轮最多1次、每Party最多1次，其他LAN/peer已有摘要
+单列。仅缓存经核实深层不可变且为同一对象的本地公开plan；不缓存消息检查成功或动态状态，
+不信任收到的摘要。wire、11/15帧、原数学、双ACK、20ms及phase时点均不改。
+
+现有预算owner仅接受本次设计/批准URL、`comparison_stage=U1/U2`与固定原11项摘要：
+canonical `b9a468b68413d80e2c1daaa4ac9ce6700d555bb9c7717fee00563c951909d2d7`，native
+`61f4826e58ff45d91417fb72024dd8c43f5a6d51bed7d7829650306f62705cb7`。
+原11次/11000预留/6209实际不变；仅call12/U1=N0/v2和call13/U2=N0/v3，各一次最多1000，
+累计最多13次/13000预留/8209实际。U1须新已审head/来源，不能重跑旧head；U1完整成功且
+正常原生退出才U2，同head/同条件。原失败不篡改，不要求把旧T2退出改成0。
+
+正常GC、原启动清理、worker16/8MiB、light/preload0、段400和TLS保持。必须复用现有
+同套证书/条件，不含再次换证授权；余期不足一小时则报告停止，不启动注定失败调用。
+完整来源/真实命令和条件预声明在START前发布并全文读回。START含准备失败均消耗，
+首败停，无重试/热身/探针/额外10000；U2无论结果都停止，不继续N2或借用旧T3。
+
+保持原收益门槛：两组各1000完整、0失败/null/超期，首步及399/799维护全部计入；
+U2全周期p50≤新U1的90%、p99≤U1、max≤20ms。复用整数端点与原门禁，分项中位数不求和，
+不拿旧head基线正式配对。完整raw/native/hash/条件/账本与退出结果再次实际交Review审计；
+软件无变更不重复全量。这里尚未产生U1/U2实测结果，不宣称收益或Issue完成，不自动合并。
+
+## PR #126 固定控制实现的唯一 N2 续接：V1
+
+[新执行设计与用户批准登记](https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6307818461)
+仅允许一次V1=N2/candidate/compact-v3，最多1000次尝试；不借用旧T3或已用尽U批次。
+[U1/U2独立结果审计](https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6291716161)
+确认同head各1000零超期和11.00%有限中位收益，旧失败及退出5仍保持。
+
+控制基线为`44472725f908ef5c8a9a610a689b037bb38ee36f`。本轮只在既有实验预算/证据owner
+增加V1许可，必要CLI退出路由、测试和本节文档；控制循环、protocol/crypto、worker、codec、
+transport、relay/native等待、GC、动态配置和依赖不变。实际运行记录新入口head，不把旧N0
+成绩重标为新网络成绩。来源核验逐文件对照旧U2，只有实验入口/退出路由可变化。
+
+原13项canonical/native规范摘要固定为
+`32bda5b0e9b350164dcb8f972edc02f2724fe3b7e167222b50c9f12f807e6a22` /
+`ba432f89d849b8a3cbcb39b20943e6b3653df83046be0d3a7d1d655c042d41a8`。
+只追加call14、batch1/1000，累计最多14调用/14000预留/9209实际。两个原账本、原独占锁、
+真实native START和当前在途占项继续核验；正式START含准备失败均消费，不删缺项或补跑。
+V1绑定精确新批准、旧控制head、独立审计与两份固定raw摘要，重新读取完整原件并按原样本
+门禁及10%收益重算。CLI/共享/实际循环使用同一许可；第15次、第二V1、旧T/U、N0/N3和
+qualification均拒绝。新软件检查及独立软件审查必须先完成，不重复N0对照。
+
+原六方向250–500微秒/100Mbit/s读取块FIFO模型、seed12020261016、4096字节读取上限、
+原N2拓扑、TLS身份、win32-event-wait-v1/version2、100ms实际CPU窗单核50%、1ms无法解释
+转发误差、每方向1MiB及原退出门禁保持。不能用N0占位或仅凭共同条件hash判定实际模型。
+复用现有stage-authorized-certs四公开证书，每次正式START前只读核至少一小时余期；
+本轮不含生成或替换证书许可。余期不足或端口/来源等预检不满足就报告停止，不试连探针。
+
+结果分别报告原模型有效性、完整1000周期零失败/null/20ms超期样本，以及p99≤16ms、
+max≤18ms的余量目标。18ms不是新的控制deadline。首轮、399/799维护与末轮全部计入；
+普通11帧、完整维护15帧、双ACK/材料/STOP/TLS/资源及退出门禁不放宽。模型无效时不能
+判断网络性能通过，保留实际控制事实；样本按时但余量不足也分开报告，原生CLI返回失败。
+
+完整raw、真实命令/START/原生exit、全部角色与relay记录及后置退出观察可恢复发布，再
+实际交Review独立结果审计。成功或失败都在此次V1后停止，不追加热身、探针、重跑、
+10000、网络/控制优化或换证。这里只登记新许可，不代表已运行、真实多机/Wi-Fi、无证书
+演示、gen2专项、长期资格或整个Issue验收通过；不自动合并或关闭Issue。
+
+## 中继等待取证与有限修复：W1 / W2
+
+[本批设计与用户同意](https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6308806798)
+允许先观察原等待算法、唯一W1取证、独立核原因；仅证据支持相对期限准备、当前owner缓冲/
+句柄准备或确认的重复派发工作时，实施一个局部修复、软件独审，再唯一W2复核。
+主要归属系统Ready→Running、未知内核等待、未复现或证据不足时停止，W2不使用。
+控制、密码、材料、模型/阈值、正常GC及系统电源/优先级/亲和性/全局timer resolution保持。
+
+W1在现有NativeWait内显式启用8次最近等待整数环；记录PID/native TID/wait ID、原QPC目标、
+相对100ns值、timer设置前后、句柄准备完、等待调用前/返回后、事件收集结束、返回relay。
+时点是Python可观察FFI边界，不是内核timer signal。未执行/异常字段为-1，不继承旧值。
+首超差保存原256读取块环、原首异常及固定等待快照；仅目标与时序相符才关联wait ID，
+否则明确unassociated。仍保持64KiB公开上限，超预算显式失败。默认无细粒度观察，W2关闭。
+
+W1/W2显式首模型失败停止：实际send/would-block的字节/计数/首错先记录，再走原关闭和
+失败报告，不声称撤回已发送内容，不修改due/eligible或扣掉系统开销。TLS启动期异常同样
+消费本次。控制角色沿原断连/未知提交保护停止，清理不盖首错；W1不足1000是诊断结果，
+W2不足1000是验收失败，均不补跑。
+
+W1还在canonical预留后、控制前启动本机WPR任务具名实例Issue120W1，一次32MiB内存环，
+只含ProcessThread/CSwitch/ReadyThread/ThreadPriority/CpuConfig/Interrupt/DPC，无stack、
+采样或网络载荷。先只读验证profile/工具/无他人会话，finally只停止本任务已启动实例并保存
+本地ETL；外层native所有者限制总采集90秒。WPR失败/丢事件/解码或时钟映射不可靠时，
+不能给确定根因或重复采集。原ETL留本地，公开仅relay目标线程与必要匿名化调度片段、
+原件hash和映射方法；不上传其他应用的名称/命令行或完整ETL。离线tracerpt解码可重做。
+
+现有两账本仅追加call15=W1/call16=W2，各最多1000，batch2/2000，累计最大16/16000预留/
+11209实际。前14项canonical/native固定为
+`55b2fda1991b4ba65cd67fb7ec87addc0b865bb8f14289b10c71eb49cc403902` /
+`08374e2f98cc0381ff855bb5b3ac0dd3a03aa0a46508b366efd6b898fe686b93`，旧exit5保留。
+W2不是root_cause布尔解锁：必须有精确W1 raw/native、新修复head、原因区间及系统证据摘要、
+独立原因审计和修复报告。旧许可/第17次/第二W1/10000拒绝。每阶段相关及全量软件检查、
+独审与完整精确预声明先于运行。正式START后准备失败亦消费，缺项不修账返额。
+
+优先复用原证；仅W1前不足原≥1h余期时，可按原生成器在新的ignored目录一次生成同规格
+同身份链，保留旧公开指纹/有效期/条件及本批理由；W1/W2同链，不允许中途第二次签发。
+原N2六向250–500µs/100Mbit/s、seed、20ms与16/18余量、4096B/1MiB、CPU实际100ms窗50%、
+句柄≤16、普通11/维护15应用帧及原TLS/资源/退出门禁不变。W1不是配对净收益基线，W2
+没有WPR或细粒度观察。任何路径均实际交Review审计原件后停止，不自动合并或关闭Issue。
+
+RV-009清理约束：start前在确认全局及本任务具名实例均未记录后，先持久化独占claim；
+start命令超时也保留归属。stop失败/超时与已停止但保存失败分别记录，只核本任务具名状态，
+必要时一次具名cancel并再次确认停止；确认前不释放归属，不覆盖首个start/stop/控制错误。
+外层native所有者对正常0、失败5、异常和超时均在finally核claim并有界收尾，不仅等待超时才
+处理。无claim或claim不符不碰任何会话；无法确认停止时保留未释放事实、阻断后续，不重采。
+原CLI70秒、只清理任务进程树≤5秒，剩余时限内具名status≤3秒/cancel≤5秒/确认≤3秒，
+总采集上限90秒不扩大。此处cancel是终结已失败的本次记录，不是第二次采集或重跑。
+
+## SC完整周期两版本比较（N0/TLS）
+
+[SC-E2E设计与用户批准](https://github.com/GNYKCZ/secure_pid_hvac/issues/120#issuecomment-6333274397)
+只允许SC-A/SC-B各一次最多1000周期。A从main767c2a14只加共同实验支持H，B从已审
+SC提交2b1c40a4加相同H；两完整版本只允许secret_sharing.py四行及其测试不同。
+新增来源明确包含secret_sharing.py，旧记录的来源键/摘要不回填。SC manifest绑定两head、
+两source映射和实际独审报告，两版本共同H及其余生产文件通过Git内容核验；所有角色和
+worker在同一冻结checkout上正常spawn，不使用进程内算法替换。
+
+原15项budget/native摘要分别固定为
+e1e6ebdc02516f43624ec5c82a3de1db30a5873a6ea686b6e65843a2866fec56 /
+b0f927d5e368a97a8e16b3de4d9eb7898ad6e3edb413f56a40ab020876b43a0d。
+SC独立scope只追加call16/17，总占项上限17000，不挪旧PS/W2；锁、START、准备失败
+消费及唯一原件保持。A须全部1000完整零失败/超期、原生0、原TLS/帧数/材料/退出门禁
+和原件hash通过才B。复用W1原链，每次START至少余1小时；无续证或无证书降级许可。
+
+两次N0直连TLS、v3、20ms完整周期、400步维护、observer/初态、worker16/8MiB、light
+和正常GC一致，无relay/WPR。SC-B复用_staged_gain的10%中位改善、p99不升及max≤20ms；
+控制样本通过与收益门槛单列，收益不足仍真实exit5，禁止重跑找通过。原N2/资格门禁不改。
+软件独审通过及完整精确预声明先于运行；结果无论好坏均公开全部失败/维护与原生退出，
+交同版本独立结果核对后停止。不自动合并/关Issue，不代表真实Wi-Fi/三机或硬件资格。
+
+## #128 矩阵动态候选
+
+[设计](https://github.com/GNYKCZ/secure_pid_hvac/issues/128#issuecomment-6338770182)及
+[用户批准](https://github.com/GNYKCZ/secure_pid_hvac/issues/128#issuecomment-6338813023)
+限定 `control-dynamic-matrix-v1` 为显式实验入口。默认、NoCERT演示和完整起摆入口不推广。
+只支持 n/m/p>0、A/B/C/D/state/input 同 ell、state 逐行截断 ell、output 保留2ell。
+新 `matrix-dynamic-plan-v1` 以独立域摘要绑定布局、尺度、身份与一次性资源；
+`MatrixLocalStageReceipt` / `MatrixCommitAuthorization` 明确记录一个矩阵操作。
+原暂存、双提交ACK、状态连续性和绝对截止语义沿用；任何未知提交结果停止会话。
+
+M=[A B; C D]、z=[x_old;v]，每次新鲜U/V，W=UV。公开E=M−U、F=z−V后，
+本方W_i+U_iF+EV_i，只有P1加入EF。前n行沿原Trunc形成下一state，后p行直接出力。
+4/2/1时每方乘法材料90→41元素，含Trunc98→49元素；乘法掩码60→36元素。
+这是数值元素数，不是TCP包数或性能成绩。
+
+共同测量支持H使用现有 benchmark CLI、控制循环及供料worker。A为main32fbb112加H；
+B为A加矩阵实现。manifest冻结两完整head、完整源/配置/依赖指纹及独审链接。
+角色和worker在各自spawn进程核来源；共同H只给worker终报增加公开来源绑定。
+四份用户交互部署配置不参与固定实验，另做字节保护，不纳入性能来源。
+
+本Issue只使用 `.tmp/issue128-performance-budget.json` 和
+`.tmp/issue128-native-invocations.json`，顺序 `M128-P0`、`M128-A`、`M128-B`。
+外层原生启动器先持久记录唯一START及命令，CLI内部再占预算；退出后记录真实exit和原件hash。
+共享入口和实际循环都核对当前进程的预算锁、同manifest未结束占项及原生START，
+并复用同一P0/A前件判定。读取已保存manifest不能绕过占项或重放已结束调用；
+这些下游核验只读取事实，不再次占项或退款。
+任何启动失败或在途项均不可退款。P0一次2对预热+16对正式AB/BA交替、新鲜材料，保留全部样本；
+裸数值编码、恢复和本地原语不代表IPC或完整周期，局部速度不作A的10%准入条件。
+A/B各唯一一次最多1000周期，A全量零失败/零超期、真实exit0、证据与清退完整才允许B。
+
+固定N0 mutual TLS、observer初态5°、20ms、段400、库存16/8MiB、light全样本有界历史、
+正常GC，无relay/WPR/额外控制预热。批准的一次测试证书生成使用现有fixture，目标新空目录
+`.tmp/issue128-matrix-certs`，A/B同链、启动余期至少1小时。证书失效停止。
+运行命令仍为 `uv run secure-control benchmark` 的固定网络参数组合；必须同时提供已审精确
+`--network-approval`、本Issue授权URL和匹配wire，不支持任意步数覆盖。
+
+矩阵结果schema为 `matrix-dynamic-evidence-v1`；A为 `matrix-comparison-scalar-evidence-v1`。
+矩阵资源字段为 matrix_products_consumed、scalar_equivalent_products、
+multiplication_material_elements、truncations_consumed；嵌套原维护/生命周期中的products
+表示该wire的operation计数，不能解释为旧标量三元组。旧结果与历史计数不回填。
+B全1000 p50较A下降≥10%、p99不升、max≤20ms及完整门禁才能宣称本次收益通过；
+max≤15ms另列观察余量。结果不足保留候选并停止，不追加补测、自动修复或合并。

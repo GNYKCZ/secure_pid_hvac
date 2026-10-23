@@ -2,15 +2,19 @@
 
 ## 无证书动态演示的显式选择
 
-普通角色配置支持可选 `wire_profile: control-dynamic-compact-v2`，省略仍为 `control-batch-v1`；仅这两个值可用于普通配置。
+普通角色配置支持可选 `wire_profile: control-dynamic-matrix-v1`（本次两机推荐）或旧
+`control-dynamic-compact-v2`，省略仍为 `control-batch-v1`。三角色必须显式选择同一版本，不自动升级。
 P1/P2脚本将选择传给原协议owner，Client专用持续入口也使用同一协议，错配失败不回退。
 `transport: insecure_tcp`无需证书；TLS仍由独立transport选项决定，不能只删TLS配置字段隐式降级。
 无性能要求的两机近直立演示使用专用脚本的 `--non-realtime --recording light`，动态profile、三角色配置及启动步骤见
 [两机操作](cart_pole_interactive.md#无证书两机非实时动态演示)。保留Ts=.02、全部安全算术/双提交和仿真确认，不使用绝对周期钟。
-compact即使关闭周期截止也先准备唯一worker及16份有界池，沿原owner补货和清退。
+compact/matrix即使关闭周期截止也先准备唯一worker及16份有界池，沿原owner补货和清退。
 摘要区分实际尝试/提交/物理确认与worker清退；无周期记录时misses/last_cycle为null。
+省略 `--non-realtime` 仍是原20 ms绝对截止模式，输出 `timing_mode=absolute`；
+完整周期包含维护/记账。light的p50/p99/max只代表最近最多256条有完整端点的周期，不能冒充全程分位。
 新模式不支持full、finite、预送、静态或完整起摆，原batch/full和实时功能保持。
 这不是旧网络许可的延续，也不是20/40 ms性能验收、真实三机或硬件证据。
+普通演示直接装配generic runtime，不借用或放宽network benchmark的固定N0/TLS/来源/占项门禁。
 
 ## S6 独立 worker 首轮通信定位（#120）
 

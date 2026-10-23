@@ -85,9 +85,9 @@ def load_lan_config(path: str | Path, role: Role) -> LanConfig:
     fields = {"role", "topology", "timeouts"}
     wire_profile = data.get("wire_profile", "control-batch-v1")
     if type(wire_profile) is not str or wire_profile not in (
-        "control-batch-v1", "control-dynamic-compact-v2",
+        "control-batch-v1", "control-dynamic-compact-v2", "control-dynamic-matrix-v1",
     ):
-        raise ValueError("wire_profile 只能是 control-batch-v1 或 control-dynamic-compact-v2。")
+        raise ValueError("wire_profile 只能是 batch-v1、compact-v2 或 matrix-v1 的完整名称。")
     if "wire_profile" in data:
         fields.add("wire_profile")
     if transport == "mutual_tls":

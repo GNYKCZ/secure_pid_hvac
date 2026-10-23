@@ -254,7 +254,9 @@ def test_headless_recording_selection_and_rejection_precede_network(tmp_path, mo
     assert exit.value.code == 2 and received == [None, "full"]
 
 
-def test_demo_script_options_reject_unsupported_routes_before_runner(tmp_path, monkeypatch):
+@pytest.mark.parametrize("wire", ["control-dynamic-compact-v2", "control-dynamic-matrix-v1"])
+@pytest.mark.parametrize("non_realtime", [False, True])
+def test_demo_script_options_reject_unsupported_routes_before_runner(tmp_path, monkeypatch, wire, non_realtime):
     import runpy
 
     import yaml
@@ -268,18 +270,19 @@ def test_demo_script_options_reject_unsupported_routes_before_runner(tmp_path, m
     _observer_profile_for(paths)
     path = paths["Client"]
     data = yaml.safe_load(path.read_text(encoding="utf8"))
-    data["wire_profile"] = "control-dynamic-compact-v2"
+    data["wire_profile"] = wire
     path.write_text(yaml.safe_dump(data), encoding="utf8")
     calls = []
     def run(config, **kwargs):
-        assert kwargs["non_realtime"] is True
+        assert kwargs.get("non_realtime", False) is non_realtime
         calls.append(kwargs)
         return {"status": "stopped"}
     monkeypatch.setattr(evidence, "run_cart_pole_segmented", run)
     monkeypatch.setattr(gui, "run_window", run)
     entry = ROOT / "scripts/run_cart_pole_client.py"
+    mode_flags = ["--non-realtime"] if non_realtime else []
     for flags in (["--headless-continuous"], []):
-        monkeypatch.setattr(sys, "argv", [str(entry), str(path), "--non-realtime", *flags])
+        monkeypatch.setattr(sys, "argv", [str(entry), str(path), *mode_flags, *flags])
         if flags:
             with pytest.raises(SystemExit) as exit:
                 runpy.run_path(str(entry), run_name="__main__")
@@ -289,7 +292,7 @@ def test_demo_script_options_reject_unsupported_routes_before_runner(tmp_path, m
     assert len(calls) == 2
     for flags in (["--finite"], ["--full-route", "secure"], ["--full-gui-route", "secure"],
                   ["--headless-continuous", "--preload-steps", "1"], ["--recording", "full"]):
-        monkeypatch.setattr(sys, "argv", [str(entry), str(path), "--non-realtime", *flags])
+        monkeypatch.setattr(sys, "argv", [str(entry), str(path), *mode_flags, *flags])
         with pytest.raises(SystemExit) as exit:
             runpy.run_path(str(entry), run_name="__main__")
         assert exit.value.code == 2

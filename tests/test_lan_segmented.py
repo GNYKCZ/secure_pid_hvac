@@ -35,8 +35,8 @@ from secure_control.protocol import ControllerRangeContract
 from secure_control.scenarios.cart_pole.interactive import InteractiveSession
 
 
-@pytest.fixture
-def compact_advance(monkeypatch):
+@pytest.fixture(params=("control-dynamic-compact-v2", "control-dynamic-compact-v3", "control-dynamic-matrix-v1"))
+def compact_advance(monkeypatch, request):
     """400个已双提交且确认的公开条目；所有网络操作可逐项注入失败。"""
     from secure_control.execution import localhost_codec as codec
 
@@ -49,7 +49,7 @@ def compact_advance(monkeypatch):
         _products=12000, _truncations=1600, setup=None, scale_ledger=None,
         range_verification=None, modulus_verification=None, _material_pool=None,
         last_commit_observation=None, _last_phase_ns={}, close=lambda: closed.append(True))
-    runtime.__dict__.update(_v2=True, _full_v3=False, _wire_profile=codec._COMPACT_PROFILE_V2,
+    runtime.__dict__.update(_v2=True, _full_v3=False, _wire_profile=request.param,
         config=SimpleNamespace(shutdown_timeout=1.), control=RunControl(), _segment=segment,
         _pending=None, phase="RUNNING", run_id="run", controller_epoch="e"*64,
         segment_capacity=400, segment_index=0, global_start=0, confirmed_step_count=400,
@@ -131,11 +131,14 @@ def test_compact_advance_keeps_old_seal_and_sequence_then_zero_step_stop(compact
 
 
 @pytest.mark.parametrize("stage", ["seal", "source", "release", "deadline"])
-def test_compact_advance_local_failure_keeps_both_known_seals(compact_advance, monkeypatch, stage):
+@pytest.mark.parametrize("configured", [False, True])
+def test_compact_advance_local_failure_keeps_both_known_seals(compact_advance, monkeypatch, stage, configured):
     from secure_control.execution.cycle_timing import CycleDeadlineExceeded
     from secure_control.experiments import lan_runner
 
     runtime, sent, _injection, closed = compact_advance
+    runtime._begin_material_control = lambda: None
+    runtime.enable_material_preparation = lambda **kw: None
     calls = []
     def source():
         calls.append("source")
@@ -154,10 +157,10 @@ def test_compact_advance_local_failure_keeps_both_known_seals(compact_advance, m
     experiment = SimpleNamespace(spec=SimpleNamespace(state_dimension=1), context=None,
         contract=None, security_parameter=8, evidence=None, segment_capacity=400,
         recheck_sources=source, scene=SimpleNamespace(period=.02))
-    result = lan_runner._run_prepared_segmented(SimpleNamespace(transport="fixture"), experiment,
+    result = lan_runner._run_prepared_segmented(SimpleNamespace(transport="fixture", wire_profile=runtime._wire_profile), experiment,
         control=runtime.control, session=InteractiveSession(), realtime=False,
         on_segment=lambda _packet: callback("seal"), on_segment_ready=lambda _packet: callback("release"),
-        _wire_profile="control-dynamic-compact-v2")
+        **({} if configured else {"_wire_profile":runtime._wire_profile}))
     assert runtime.phase == "UNCERTAIN" and closed and len(sent) == 2
     assert result["status"] == "uncertain" and len(result["known_segment_receipts"]) == 2
     assert result["last_sealed_segment"]["hello"]["segment_index"] == 0
@@ -860,8 +863,9 @@ def test_dynamic_v2_keeps_secret_state_in_one_session_across_segments(tmp_path):
 
 @pytest.mark.parametrize("delay_ns", [0, 55_000_000])
 @pytest.mark.parametrize("non_realtime", [True, False])
+@pytest.mark.parametrize("wire", ["control-batch-v1", "control-dynamic-compact-v2", "control-dynamic-matrix-v1"])
 def test_demo_paces_actual_samples_and_slow_steps_do_not_refresh_realtime_deadline(
-    tmp_path, monkeypatch, delay_ns, non_realtime,
+    tmp_path, monkeypatch, delay_ns, non_realtime, wire,
 ):
     from secure_control.execution.cycle_timing import AbsoluteCycleClock, check_deadline
     from secure_control.experiments import lan_runner as runner
@@ -869,13 +873,16 @@ def test_demo_paces_actual_samples_and_slow_steps_do_not_refresh_realtime_deadli
     paths = _plain_deployment(tmp_path)
     from test_cart_pole_lan import _observer_profile_for
     _observer_profile_for(paths)
-    config = load_lan_config(paths["Client"], "Client")
+    config = replace(load_lan_config(paths["Client"], "Client"), wire_profile=wire)
     control, session = RunControl(), InteractiveSession()
     prepared = load_segmented_experiment(config.experiment_config, 3, session)
     now, samples, deadlines, initialized = [1_000_000_000], [], [], []
     class Runtime:
         def __init__(self, *args, **kwargs):
             self.phase = "RUNNING"
+            self.last_maintenance_operation = None
+            self.last_sealed_record = None
+            self.last_segment_receipts = ()
             self.run_id = "r"
             self.confirmed_step_count = self.protocol_committed_count = 0
             self.cycle_phase_ns = self.cycle_queue_levels = self.material_summary = {}
@@ -885,6 +892,8 @@ def test_demo_paces_actual_samples_and_slow_steps_do_not_refresh_realtime_deadli
             return False
         def enable_material_preparation(self, **kwargs):
             initialized.append(kwargs)
+        def _begin_material_control(self):
+            pass
         def snapshot(self):
             n = self.confirmed_step_count
             return lan_runtime.LanLifecycleSnapshot(self.phase, "r", "s", "e", 0, 0,
@@ -916,6 +925,10 @@ def test_demo_paces_actual_samples_and_slow_steps_do_not_refresh_realtime_deadli
     monkeypatch.setattr(runner, "AbsoluteCycleClock", lambda p: AbsoluteCycleClock(p, now=lambda: now[0], sleep=wait))
     result = runner._run_prepared_segmented(config, replace(prepared, scene=scene),
         control=control, session=session, non_realtime=non_realtime)
+    assert result["wire_profile"] == wire and result["transport"] == "insecure_tcp"
+    assert result["model_period_s"] == .02
+    assert result["timing_mode"] == ("non_realtime_demo" if non_realtime else "absolute")
+    assert result["material_source"] == ("inline" if wire == "control-batch-v1" else "worker")
     if delay_ns and not non_realtime:
         assert result["status"] == "failed" and len(samples) == 1
         assert result["cycle_summary"]["misses"] == 1
@@ -924,7 +937,8 @@ def test_demo_paces_actual_samples_and_slow_steps_do_not_refresh_realtime_deadli
         assert result["status"] == "stopped" and result["confirmed_step_count"] == 3
         assert samples == [1_000_000_000 + i * max(20_000_000, delay_ns) for i in range(3)]
         if non_realtime:
-            assert deadlines == [None] * 3 and not initialized
+            assert deadlines == [None] * 3
+            assert initialized == ([] if wire == "control-batch-v1" else [{"slots":16,"_candidate":"worker"}])
             assert result["cycle_summary"] == {"attempts": 3, "misses": None, "last_cycle": None}
             assert result["model_period_s"] == .02 and result["timing_mode"] == "non_realtime_demo"
 

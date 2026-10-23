@@ -25,14 +25,20 @@ from secure_control.protocol.coordinator import (
 )
 from secure_control.protocol.messages import (
     ControlShareMessage,
+    MatrixClientStepResult,
+    MatrixStepResourcePlan,
     OnlineRound,
     PartyOfflineMaterial,
     PartyOnlineMaterial,
     PartyOnlineRound,
+    Protocol3CommitAuthorization,
     Protocol3EndpointCommand,
     Protocol3StageReceipt,
     ResourceMetadata,
     StepResourcePlan,
+    commit_authorization_type,
+    local_receipt_type,
+    receipt_operation_count,
 )
 
 from ._localhost_peer import LocalhostProtocol3PeerPort, accept_p1_peer, connect_p2_peer
@@ -71,7 +77,7 @@ class _ClientPartyEndpoint:
         limit: int,
         timeout: float,
         deadline: float | None = None,
-        *, activation=None, on_send=None,
+        *, activation=None, on_send=None, completion_strategy: str = "peer_barriers",
     ) -> None:
         self._sock = sock
         self._party = party
@@ -85,6 +91,9 @@ class _ClientPartyEndpoint:
         self._pending_batch: WireEnvelope | None = None
         self._activation = activation
         self._on_send = on_send
+        if completion_strategy not in ("peer_barriers", "client_authorized"):
+            raise ValueError("未知 Protocol 3 完成策略。")
+        self.completion_strategy = completion_strategy
         self._commit_state = "not_started"
         self._pending_commit = None
         self.commit_timings = {}
@@ -143,14 +152,18 @@ class _ClientPartyEndpoint:
         finally:
             self.commit_duration_ns = perf_counter_ns() - started
 
-    def start_commit(self) -> None:
+    def start_commit(self, authorization: Protocol3CommitAuthorization | None = None) -> None:
         self._check_available()
         if self.share is None:
             raise RuntimeError("尚未完成 stage，不能提交。")
+        if ((self.completion_strategy == "client_authorized")
+                != (type(authorization) is commit_authorization_type(self._plan))):
+            raise ValueError("提交操作与协商完成策略不匹配。")
         request = WireEnvelope(
             SCHEMA_VERSION, "request", "Client", self._role, self.sequence, "endpoint",
             self.session_id, self.plan.round_id, self.plan.step, None,
-            Protocol3EndpointCommand("commit"),
+            Protocol3EndpointCommand("commit_staged", authorization=authorization)
+            if authorization is not None else Protocol3EndpointCommand("commit"),
         )
         self._commit_started = perf_counter_ns()
         self._commit_deadline = (self._deadline if self._deadline is not None
@@ -193,8 +206,9 @@ class _ClientPartyEndpoint:
 
     def start_stage_batch(self) -> None:
         self._check_available()
-        if self._pending_batch is not None:
+        if self._pending_batch is not None or getattr(self, "_stage_started", False):
             raise RuntimeError("批量 stage 已发送")
+        self._stage_started = True
         request = WireEnvelope(
             SCHEMA_VERSION, "request", "Client", self._role, self.sequence,
             "endpoint", self._plan.session_id, self._plan.round_id,
@@ -222,6 +236,10 @@ class _ClientPartyEndpoint:
         self._pending_batch = None
         if not isinstance(response.payload, PartyStageResult):
             raise TypeError("批量角色未返回暂存回执和输出份额")
+        receipt_type = (local_receipt_type(self._plan) if self.completion_strategy == "client_authorized"
+                        else Protocol3StageReceipt)
+        if type(response.payload.receipt) is not receipt_type:
+            raise ValueError("暂存回执与协商完成策略不匹配。")
         self.share = response.payload.share
         return response.payload.receipt
 
@@ -853,7 +871,12 @@ def _complete_client_round(
     """仅在两方暂存、重构与双提交均完成后签发父进程可见结果。"""
     if type(overlap_commit) is not bool or overlap_commit and not batch:
         raise ValueError("重叠 commit 只允许 batch。")
-    orchestrator = Protocol3Orchestrator()
+    strategy = getattr(first, "completion_strategy", "peer_barriers")
+    if strategy != getattr(second, "completion_strategy", "peer_barriers"):
+        raise ValueError("两方完成策略不一致。")
+    if strategy == "client_authorized" and (not batch or not overlap_commit):
+        raise ValueError("Client 授权候选必须采用整步及双请求提交。")
+    orchestrator = Protocol3Orchestrator(completion_strategy=strategy)
     receipts = (orchestrator.stage_batch(first, second, plan) if batch else
                 orchestrator.stage(first, second, plan))
     if on_phase is not None:
@@ -869,13 +892,18 @@ def _complete_client_round(
         on_phase("reconstruct")
     # P2 提交或回执不确定时不能返回结果；调用方必须废弃整组角色。
     if overlap_commit:
-        orchestrator.commit_batch(first, second, plan)
+        if strategy == "client_authorized":
+            authorization = orchestrator.authorize(receipts, plan)
+            orchestrator.commit_batch(first, second, plan, authorization)
+        else:
+            orchestrator.commit_batch(first, second, plan)
     else:
         orchestrator.commit(first, second)
     if on_phase is not None:
         on_phase("commit")
-    return ClientStepResult(
-        result, plan.round_id, plan.step, receipts[0].products, receipts[0].truncations
+    result_type = MatrixClientStepResult if type(plan) is MatrixStepResourcePlan else ClientStepResult
+    return result_type(
+        result, plan.round_id, plan.step, receipt_operation_count(receipts[0]), receipts[0].truncations
     )
 
 

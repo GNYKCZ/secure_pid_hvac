@@ -45,8 +45,10 @@ from secure_control.protocol.messages import (
     Protocol3StageReceipt,
     TruncationResourceMaterial,
     _EncodedInputRound,
+    local_receipt_type,
     preloaded_material_budget,
     public_step_plan_sha256,
+    receipt_operation_count,
 )
 
 from . import localhost_transport
@@ -63,9 +65,11 @@ from .cycle_timing import check_deadline, network_deadline
 from .lan_config import LanConfig, Role
 from .lan_transport import accept_role, connect_role, listener
 from .localhost_codec import (
+    _CLIENT_AUTH_PROFILES,
+    _COMPACT_ADVANCE_PROFILES,
     _COMPACT_PROFILE,
-    _COMPACT_PROFILE_V2,
     _COMPACT_PROFILES,
+    _MATRIX_PROFILE,
     SCHEMA_VERSION,
     BatchHelloPayload,
     LanContinuousSetupPayload,
@@ -440,7 +444,7 @@ def run_client_single_step(config: LanConfig, trial: Any, *, batch: bool = True)
             "maximum_raw_difference": float(np.max(np.abs(output - trial.expected_raw_output))),
             "controller_config_sha256": trial.config_sha256,
             "resource_counts": {
-                "products_consumed": result.products,
+                "products_consumed": receipt_operation_count(result),
                 "truncations_consumed": result.truncations,
             },
             "timings_ms": _timings(stamps),
@@ -455,6 +459,21 @@ def run_client_single_step(config: LanConfig, trial: Any, *, batch: bool = True)
     finally:
         for sock in sockets:
             sock.close()
+
+
+def _matrix_layout_preflight(spec, fixed_point):
+    """新profile在联网/分享前拒绝非同ell动态布局，不改旧入口。"""
+    from secure_control.crypto.matrix_beaver import matrix_shape
+    n, m, p = spec.state_dimension, spec.input_dimension, spec.output_dimension
+    if any(type(v) is not int or v < 1 for v in (n, m, p)):
+        raise ValueError("矩阵profile需要非零动态维度")
+    ell = fixed_point.fractional_bits
+    metadata = spec.scale_metadata
+    if ell < 1 or metadata is not None and (
+            any(getattr(metadata, k) != ell for k in ('state','input','A','B','C','D'))
+            or metadata.output != 2*ell):
+        raise ValueError("矩阵profile只支持同ell动态与2ell输出")
+    matrix_shape(n+p, n+m, fixed_point.modulus)
 
 
 class LanContinuousRuntime:
@@ -484,6 +503,13 @@ class LanContinuousRuntime:
         ):
             raise ValueError("紧凑动态候选仅允许显式批量 v2 且不预送")
         self._wire_profile = wire_profile
+        if wire_profile == _MATRIX_PROFILE:
+            # 在联网和材料分配之前验证本profile支持的公开尺度/形状。
+            _matrix_layout_preflight(spec, fixed_point)
+        if wire_profile in _CLIENT_AUTH_PROFILES and not (
+                spec.state_dimension and (spec.scale_metadata.A if spec.scale_metadata is not None
+                                          else fixed_point.fractional_bits) > 0):
+            raise ValueError("compact-v3 仅支持动态聚合行截断。")
         if v2:
             if (range_contract.reachability_block_steps is None
                     or range_contract.horizon_steps is not None
@@ -671,6 +697,13 @@ class LanContinuousRuntime:
 
     @property
     def resource_counts(self) -> dict[str, int]:
+        if self._wire_profile == _MATRIX_PROFILE:
+            layout = self.spec
+            n, m, p = layout.state_dimension, layout.input_dimension, layout.output_dimension
+            return {"matrix_products_consumed": self._products,
+                    "scalar_equivalent_products": self._products*(n+p)*(n+m),
+                    "multiplication_material_elements": self._products*((n+p)*(n+m)+n+m+n+p),
+                    "truncations_consumed": self._truncations}
         return {"products_consumed": self._products,
                 "truncations_consumed": self._truncations}
 
@@ -779,6 +812,8 @@ class LanContinuousRuntime:
                     self.config.step_timeout, deadline,
                     activation=(request, encoded) if fused else None,
                     on_send=lambda: setattr(self, "_round_started", True),
+                    completion_strategy=("client_authorized" if self._wire_profile in _CLIENT_AUTH_PROFILES
+                                         else "peer_barriers"),
                 ))
             if not fused:
                 for sock, request in zip(self._sockets, pending, strict=True):
@@ -809,11 +844,11 @@ class LanContinuousRuntime:
             self._observe_commits(endpoints)
             self._sequences = [endpoint.sequence for endpoint in endpoints]
             self._step += 1
-            self._products += result.products
+            self._products += receipt_operation_count(result)
             self._truncations += result.truncations
             self._confirmed_steps.append({
                 "step": plan.step, "status": "double_committed",
-                "products": result.products, "truncations": result.truncations,
+                "products": receipt_operation_count(result), "truncations": result.truncations,
             })
             self._confirmed_plans.append({
                 "step": plan.step, "round_id": plan.round_id,
@@ -1020,6 +1055,9 @@ class LanSegmentedRuntime:
         ):
             raise ValueError("紧凑动态候选仅允许 v2 且不预送")
         self._wire_profile = wire_profile
+        if wire_profile == _MATRIX_PROFILE:
+            # 在联网和材料分配之前验证本profile支持的公开尺度/形状。
+            _matrix_layout_preflight(spec, fixed_point)
         if (type(preload_steps) is not int or not 0 <= preload_steps <= 1000
                 or preload_execution not in {"staged", "fused"}
                 or (preload_steps and (not self._v2 or self._full_v3))):
@@ -1102,6 +1140,13 @@ class LanSegmentedRuntime:
 
     @property
     def resource_counts(self) -> dict[str, int]:
+        if self._wire_profile == _MATRIX_PROFILE:
+            layout = self.spec
+            n, m, p = layout.state_dimension, layout.input_dimension, layout.output_dimension
+            return {"matrix_products_consumed": self._products,
+                    "scalar_equivalent_products": self._products*(n+p)*(n+m),
+                    "multiplication_material_elements": self._products*((n+p)*(n+m)+n+m+n+p),
+                    "truncations_consumed": self._truncations}
         return {"products_consumed": self._products, "truncations_consumed": self._truncations}
 
     def snapshot(self) -> LanLifecycleSnapshot:
@@ -1210,11 +1255,11 @@ class LanSegmentedRuntime:
                 self.run_id, self.segment_index, self._segment.session_id,
                 result.round_id, self.confirmed_step_count - self.global_start,
                 self.confirmed_step_count,
-                tuple(float(value) for value in raw), result.products, result.truncations,
+                tuple(float(value) for value in raw), receipt_operation_count(result), result.truncations,
                 tuple(item.resource_id for item in (*plan.product_resources,
                                                     *plan.state_truncation_resources)),
             )
-            self._products += result.products
+            self._products += receipt_operation_count(result)
             self._truncations += result.truncations
             self.phase = "AWAITING_PLANT"
             return self._pending
@@ -1249,7 +1294,7 @@ class LanSegmentedRuntime:
             if action == "continue" and not self.segment_full:
                 raise RuntimeError("只有满段才能继续。")
             self.phase = "STOPPING" if action == "stop" else "ENDING_SEGMENT"
-            advance = self._wire_profile == _COMPACT_PROFILE_V2 and action == "continue"
+            advance = self._wire_profile in _COMPACT_ADVANCE_PROFILES and action == "continue"
             self.last_maintenance_operation = "advance" if advance else "end"
         completed = False
         self.last_segment_receipts = ()
@@ -1299,7 +1344,7 @@ class LanSegmentedRuntime:
             self._last_end_round_id = end.last_round_id
             self._last_closed_segment_count = self.confirmed_step_count
             # 双方密封是独立事实；周期出口超期也不能丢掉刚收到的真实回执。
-            if self._full_v3 or self._wire_profile == _COMPACT_PROFILE_V2:
+            if self._full_v3 or self._wire_profile in _COMPACT_ADVANCE_PROFILES:
                 self.last_sealed_record = record
             self._advance_begin = begin
             self.phase = ("SWITCHED" if action == "switch" else
@@ -1325,7 +1370,7 @@ class LanSegmentedRuntime:
                 self.controller_epoch, self._last_end_round_id,
             )
             try:
-                if self._wire_profile == _COMPACT_PROFILE_V2:
+                if self._wire_profile in _COMPACT_ADVANCE_PROFILES:
                     if self._advance_begin != begin:
                         raise RuntimeError("复合维护未完整确认，禁止激活下一段")
                     check_deadline(deadline_ns, "SEGMENT_ADVANCE_LOCAL")
@@ -1370,7 +1415,7 @@ class LanSegmentedRuntime:
 
     def abort_segment_transition(self) -> None:
         """维护已发出后，本地回调或原周期出口失败只能异常关闭。"""
-        if self._wire_profile != _COMPACT_PROFILE_V2 or self.last_maintenance_operation != "advance":
+        if self._wire_profile not in _COMPACT_ADVANCE_PROFILES or self.last_maintenance_operation != "advance":
             raise RuntimeError("当前没有 compact-v2 复合维护")
         self.phase = "UNCERTAIN"
         self.close()
@@ -1443,7 +1488,7 @@ def _validate_segment_chain(hello: LanSegmentedHelloPayload, session: str,
 def _restore_compact_online(value, *, layout, session, round_id, step, modulus, run_id, epoch_id, party,
                             wire_profile=_COMPACT_PROFILE):
     """只从认证 setup 与当前信封恢复公开计划，再交给原资源 recovery。"""
-    plan = Client._resource_plan(layout, session, round_id, step)
+    plan = Client._resource_plan(layout, session, round_id, step, encoding_profile=wire_profile)
     if not isinstance(value, _CompactOnlinePayload) or value.version != wire_profile or (
         value.run_id, value.epoch_id, value.plan_sha256
     ) != (run_id, epoch_id, public_step_plan_sha256(plan)):
@@ -1685,13 +1730,13 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
             if segmented and online_request.operation in {"segment_end", "segment_advance"}:
                 advance = online_request.operation == "segment_advance"
                 _check_request(online_request, role, sequence, online_request.operation, session)
-                if advance and (expected_wire_profile != _COMPACT_PROFILE_V2
+                if advance and (expected_wire_profile not in _COMPACT_ADVANCE_PROFILES
                                 or not isinstance(online_request.payload, SegmentAdvancePayload)):
                     raise ValueError("复合维护必须精确协商 compact-v2")
                 end = online_request.payload.end if advance else online_request.payload
                 if not isinstance(end, SegmentEndPayload):
                     raise TypeError("段结束请求类型错误。")
-                if (expected_wire_profile == _COMPACT_PROFILE_V2 and end.action == "continue"
+                if (expected_wire_profile in _COMPACT_ADVANCE_PROFILES and end.action == "continue"
                         and not advance):
                     raise ValueError("compact-v2 满段 continue 必须使用复合维护")
                 if end.action == "switch" and hello.mode != "lan-full-v3":
@@ -1769,6 +1814,8 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
             endpoint = LocalProtocol3PartyEndpoint(
                 role_object, online,
                 lambda message, collected=staged: _capture_stage_share(message, collected),
+                completion_strategy=("client_authorized" if expected_wire_profile in _CLIENT_AUTH_PROFILES
+                                     else "peer_barriers"),
             )
             if (endpoint.plan.round_id, endpoint.plan.step) != (
                 online_request.round_id, expected_step
@@ -1788,9 +1835,12 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                 )
             direct = DirectProtocol3PartyEndpoint(endpoint, peer_port)
             activation_result = None
+            receipt_type = (local_receipt_type(endpoint.plan) if expected_wire_profile in _CLIENT_AUTH_PROFILES
+                            else Protocol3StageReceipt)
+            commit_operation = "commit_staged" if expected_wire_profile in _CLIENT_AUTH_PROFILES else "commit"
             if fused:
                 receipt = stage_protocol3_batch(endpoint, peer_port)
-                if not isinstance(receipt, Protocol3StageReceipt) or len(staged) != 1:
+                if type(receipt) is not receipt_type or len(staged) != 1:
                     raise ValueError("融合暂存回执与输出份额不完整")
                 activation_result = PartyStageResult(receipt, staged[0])
             _party_reply(client_socket, online_request, activation_result, config.step_timeout,
@@ -1807,16 +1857,20 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                     raise ValueError("endpoint command 与当前 round 不匹配。")
                 try:
                     command = command_request.payload.operation
-                    if fused and command != "commit":
+                    if fused and command != commit_operation:
                         raise ValueError("融合激活后只允许原双提交命令")
                     if batch and command == "stage_batch":
                         result = stage_protocol3_batch(endpoint, peer_port)
-                    elif (batch and command != "commit") or (not batch and command == "stage_batch"):
+                    elif command == "commit_staged" and expected_wire_profile in _CLIENT_AUTH_PROFILES:
+                        if command_request.resource_id is not None:
+                            raise ValueError("提交授权不能绑定其他资源。")
+                        result = endpoint.commit_staged(command_request.payload.authorization)
+                    elif (batch and command != commit_operation) or (not batch and command == "stage_batch"):
                         raise ValueError("endpoint 操作与协商的批量能力不匹配")
                     else:
                         result = dispatch_direct_protocol3_command(direct, command_request.payload)
                     if command in {"stage_output", "stage_batch"}:
-                        if not isinstance(result, Protocol3StageReceipt) or len(staged) != 1:
+                        if type(result) is not receipt_type or len(staged) != 1:
                             raise ValueError("暂存回执与输出份额不完整。")
                         result = PartyStageResult(result, staged[0])
                     _party_reply(client_socket, command_request, result,
@@ -1825,7 +1879,7 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                     _party_error(client_socket, command_request, error, config.step_timeout)
                     raise
                 sequence += 1
-                if command == "commit":
+                if command == commit_operation:
                     if preload_store is not None:
                         preload_store.commit(endpoint.plan)
                     committed += 1
