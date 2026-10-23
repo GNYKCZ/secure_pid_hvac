@@ -32,7 +32,8 @@ class CartPoleWindow:
 
     def __init__(self, root: tk.Tk, config_path: Path, *, segment_steps=400,
                  mode="segmented", preload_steps=0, preload_execution="fused",
-                 recording_mode=None, non_realtime=False) -> None:
+                 recording_mode=None, non_realtime=False, performance=None,
+                 performance_output=None, performance_sample_limit=None) -> None:
         if mode not in ("segmented", "finite"):
             raise ValueError("窗口模式无效。")
         self.mode, self.segment_steps = mode, segment_steps
@@ -71,6 +72,13 @@ class CartPoleWindow:
         validate_segmented_mode(self.config, self.prepared, non_realtime=non_realtime,
                                 recording_mode=self.recording_mode, preload_steps=preload_steps)
         self.non_realtime = non_realtime
+        from secure_control.experiments.live_timing import performance_options
+        self.performance, self.performance_output, self.performance_limit = performance_options(
+            performance, supported=dynamic and self.recording_mode == "light",
+            output=performance_output, sample_limit=performance_sample_limit)
+        self._latest_performance = None
+        self._performance_next = 0.
+        self._performance_export_failed = False
         self._wall_started = None
         self._result: tuple[object, dict[str, object], Path] | None = None
         self._verified = None
@@ -97,6 +105,16 @@ class CartPoleWindow:
         self.canvas.pack()
         tk.Label(root, textvariable=self.values).pack(pady=3)
         tk.Label(root, textvariable=self.detail, wraplength=820).pack(pady=3)
+        if self.performance != "off":
+            root.geometry("860x850")
+            self.performance_text = tk.StringVar(value="性能观察：等待首个完成步骤（参考15/20ms）")
+            tk.Label(root,textvariable=self.performance_text,wraplength=820).pack()
+            self.performance_canvas = tk.Canvas(root,width=800,height=65,bg="white")
+            self.performance_canvas.pack()
+            for milliseconds in (15,20):
+                y = 60-milliseconds
+                self.performance_canvas.create_line(0,y,800,y,fill="#999",dash=(3,3))
+            self._performance_curve = self.performance_canvas.create_line(0,60,1,60,fill="#2b75b8")
         controls = tk.Frame(root)
         controls.pack(pady=8)
         tk.Button(controls, text="← −1 N / 20 ms", command=lambda: self._request(-1.0)).pack(
@@ -139,6 +157,8 @@ class CartPoleWindow:
                 self._latest_frame = value
             elif kind == "phase":
                 self._latest_phase = value
+            elif kind == "performance":
+                self._latest_performance = value
             elif kind in ("complete", "failed", "light_stopped"):
                 self._terminal = (kind, value)
             elif kind == "seek":
@@ -284,7 +304,12 @@ class CartPoleWindow:
                     preload_steps=self.preload_steps, preload_execution=self.preload_execution,
                     recording_mode=self.recording_mode if self.prepared.spec.state_dimension else None,
                     **({"non_realtime": True} if self.non_realtime else {}),
+                    **({"performance":self.performance,"performance_output":self.performance_output,
+                        **({"performance_sample_limit":self.performance_limit} if self.performance == "samples" else {}),
+                        "on_performance":lambda value:self._notify("performance",value)}
+                       if self.performance != "off" else {"performance":"off"}),
                 )
+                self._performance_export_failed = result.get("performance",{}).get("export",{}).get("status") == "failed"
                 if result.get("recording_mode") == "light":
                     self._notify("light_stopped", result)
                     return
@@ -334,6 +359,12 @@ class CartPoleWindow:
             seek, self._seek_result = self._seek_result, None
             messages = tuple(self.messages)
             self.messages.clear()
+            performance = None
+            if getattr(self,"_latest_performance",None) is not None and perf_counter() >= self._performance_next:
+                performance, self._latest_performance = self._latest_performance, None
+                self._performance_next = perf_counter()+.1
+        if performance is not None and self._final_count is None:
+            self._show_performance(performance)
         if frame is not None and self._final_count is None and not self._closing:
             self._draw(frame["state"])
             self.values.set(
@@ -383,6 +414,18 @@ class CartPoleWindow:
                           else f"{value['status']} / {value.get('category', '失败')}")
                 self.phase.set(f"{reason}；已确认{self._final_count}步；停止时 {value.get('observed_status', '未记录')}")
                 self.location.set("未保存完整实验轨迹；不能正式回放")
+                statistics = value.get("performance")
+                if statistics:
+                    exported = statistics["export"]
+                    self.location.set("未保存完整轨迹；" + (
+                        f"性能报告：{exported['path']}" if exported["status"] == "saved" else
+                        f"性能报告保存失败：{exported.get('error_type')}"))
+                    work = statistics["metrics"].get("work_elapsed_ns")
+                    self.performance_text.set(f"结束统计：完整工作{work['count']}步；均值 "
+                        f"{work['mean_ns']/1e6:.3f} ms；最大 {work['max_ns']/1e6:.3f} ms；"
+                        f">20ms参考线 {work['above_20ms']}步" if work and work["count"] else "结束统计：无完整工作端点/统计不可用")
+                    if not statistics["statistics_complete"]:
+                        self.performance_text.set(self.performance_text.get()+f"；统计不完整：{statistics['observation_error']}")
             elif kind == "complete" and not self._closing:
                 if self.mode == "segmented":
                     self._verified = value
@@ -420,6 +463,25 @@ class CartPoleWindow:
         else:
             self.root.after(40, self._poll)
 
+    def _show_performance(self, performance):
+        """主线程低频刷新既有图元；每步采集与UI丢帧完全独立。"""
+        row = performance["latest"]
+        if row is None:
+            return
+        def ms(value):
+            return "未完成" if value is None else f"{value/1e6:.3f}ms"
+        self.performance_text.set(f"性能 step={row['global_step']+1}（全程观察{performance['observations']}次）："
+            f"施力 {ms(row['control_latency_ns'])} · 完整工作 {ms(row['work_elapsed_ns'])} · "
+            f"采样间隔 {ms(row['sample_interval_ns'])} · 主动等待 {ms(row['pacing_elapsed_ns'])} · "
+            f"{row['status']}；趋势{performance['trend'][0][0]+1}–{performance['trend'][-1][0]+1}步，纵轴0–60ms，超出截顶" +
+            ("；统计不完整" if not performance["statistics_complete"] else ""))
+        points = []
+        for k,(_,value) in enumerate(performance["trend"]):
+            if value is not None:
+                points.extend((k*800/255,60-min(60,value/1e6)))
+        if len(points) >= 4:
+            self.performance_canvas.coords(self._performance_curve,*points)
+
     def _on_close(self) -> None:
         if self._worker is None:
             self.session.close()
@@ -433,18 +495,22 @@ class CartPoleWindow:
 
 def run_window(config_path: Path, *, segment_steps=400, mode="segmented",
                preload_steps=0, preload_execution="fused", recording_mode=None,
-               non_realtime=False) -> None:
+               non_realtime=False, performance=None, performance_output=None,
+               performance_sample_limit=None) -> bool:
     """配置和 Tk 创建均在拨号前完成；没有窗口时直接失败。"""
     root = tk.Tk()
     try:
         window = CartPoleWindow(root, config_path, segment_steps=segment_steps, mode=mode,
                                preload_steps=preload_steps, preload_execution=preload_execution,
-                               recording_mode=recording_mode, non_realtime=non_realtime)
+                               recording_mode=recording_mode, non_realtime=non_realtime,
+                               performance=performance,performance_output=performance_output,
+                               performance_sample_limit=performance_sample_limit)
     except Exception:
         root.destroy()
         raise
     window.start()
     root.mainloop()
+    return not window._performance_export_failed
 
 
 class FullRouteWindow:

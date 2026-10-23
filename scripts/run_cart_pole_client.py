@@ -24,6 +24,11 @@ if __name__ == "__main__":
                         help="仅动态持续：默认light不保存完整轨迹；full可靠留证并支持回放")
     parser.add_argument("--non-realtime", action="store_true",
                         help="仅动态持续light：无周期截止的非实时仿真，模型步长保持不变")
+    parser.add_argument("--performance",choices=("off","summary","samples"),
+                        help="动态持续light默认summary；off关闭；samples有界保存首N次观察")
+    parser.add_argument("--performance-output",type=Path,help="退出后保存的新性能JSON文件，不能覆盖")
+    parser.add_argument("--performance-sample-limit",type=int,
+                        help="仅samples，1..10000；记录容量耗尽后控制仍继续")
     parser.add_argument("--full-output", type=Path)
     parser.add_argument("--full-non-realtime", action="store_true",
                         help="安全完整路线的显式非实时诊断；没有20ms资格")
@@ -37,6 +42,27 @@ if __name__ == "__main__":
                         default=Path(__file__).resolve().parents[1]
                         / "configs/shared_prime_256_pocklington.yaml")
     args = parser.parse_args()
+    performance_kwargs = {}
+    if args.performance is not None or args.performance_output is not None or args.performance_sample_limit is not None:
+        from secure_control.experiments.live_timing import performance_options
+        try:
+            if args.finite or args.full_route or args.full_gui_route:
+                supported = False
+            else:
+                from secure_control.execution.lan_config import load_lan_config
+                from secure_control.experiments.lan_continuous_profile import (
+                    load_segmented_experiment,
+                )
+                from secure_control.scenarios.cart_pole.interactive import InteractiveSession
+                candidate = load_lan_config(args.config,"Client")
+                prepared = load_segmented_experiment(candidate.experiment_config,args.segment_steps,InteractiveSession())
+                supported = prepared.spec.state_dimension != 0 and args.recording != "full"
+            selected_mode, selected_output, selected_limit = performance_options(args.performance,
+                supported=supported,output=args.performance_output,sample_limit=args.performance_sample_limit)
+            performance_kwargs = {"performance":selected_mode,"performance_output":selected_output,
+                **({"performance_sample_limit":selected_limit} if selected_mode == "samples" else {})}
+        except (ValueError,TypeError,OSError) as error:
+            parser.error(str(error))
     # 在创建窗口/连接/供料前拒绝不兼容模式，不能悄悄忽略 wire 或 full 请求。
     if args.non_realtime or not (args.full_route == "plaintext" or args.full_gui_route == "plaintext"):
         from secure_control.execution.lan_config import load_lan_config
@@ -161,18 +187,22 @@ if __name__ == "__main__":
                 preload_steps=args.preload_steps, preload_execution=args.preload_execution,
                 recording_mode=args.recording,
                 **({"non_realtime": True} if args.non_realtime else {}),
+                **performance_kwargs,
             ) if dynamic else run_client_segmented(
                 config, segment_steps=args.segment_steps, control=control,
             ))
             print(json.dumps(result, ensure_ascii=False))
         finally:
             signal.signal(signal.SIGINT, previous)
-        sys.exit(0 if result["status"] in ("stopped", "complete") else 1)
+        sys.exit(0 if result["status"] in ("stopped", "complete") and
+                 result.get("performance",{}).get("export",{}).get("status") != "failed" else 1)
     # 其他场景和 P1/P2 从不导入 Tk；只有专用入口创建窗口。
     from secure_control.scenarios.cart_pole.gui import run_window
 
-    run_window(args.config, segment_steps=args.segment_steps,
+    window_ok = run_window(args.config, segment_steps=args.segment_steps,
                mode="finite" if args.finite else "segmented",
                preload_steps=args.preload_steps, preload_execution=args.preload_execution,
                recording_mode=args.recording,
-               **({"non_realtime": True} if args.non_realtime else {}))
+               **({"non_realtime": True} if args.non_realtime else {}),**performance_kwargs)
+    if window_ok is False:
+        sys.exit(1)

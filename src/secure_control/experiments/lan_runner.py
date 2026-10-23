@@ -10,7 +10,7 @@ import os
 import sys
 from collections.abc import Callable
 from contextlib import AbstractContextManager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from threading import Event
 from time import perf_counter, perf_counter_ns
@@ -19,6 +19,7 @@ from secure_control.execution.cycle_timing import (
     AbsoluteCycleClock,
     CycleDeadlineExceeded,
     CycleTiming,
+    StepTimingObservation,
     check_deadline,
 )
 from secure_control.execution.lan_config import LanConfig, load_lan_config
@@ -169,7 +170,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                             before_sample=None, preload_steps=0,
                             preload_execution="fused", on_segment_ready=None,
                             _material_candidate=None, _wire_profile=None,
-                            non_realtime=False) -> dict[str, object]:
+                            non_realtime=False, timing_observer=None) -> dict[str, object]:
     """唯一持续循环接收已装配场景；保存/GUI 与 headless 不重复 parse 或创建 plant。"""
     control.bind_stop(session.reject_new)
     wire_profile = _wire_profile if _wire_profile is not None else getattr(config, "wire_profile", "control-batch-v1")
@@ -196,6 +197,38 @@ def _run_prepared_segmented(config, experiment, *, control, session,
     outcome = None
     wall_started = perf_counter()
     dynamic_realtime = (experiment.spec.state_dimension != 0 if realtime is None else realtime) and not non_realtime
+    observation = None
+    observation_seq = 0
+    observer_started = perf_counter_ns() if timing_observer is not None else None
+    if timing_observer is not None:
+        timing_observer.completion_clock = perf_counter_ns
+
+    def observe_finish(status="confirmed", failure_phase=None, *, complete=True, endpoint=None):
+        """独立观察不创建CycleTiming；异常只使统计不可用，原控制异常仍由外层处理。"""
+        nonlocal observation, observation_seq
+        if timing_observer is None or observation is None:
+            return None
+        data, observation = observation, None
+        start = data["actual_sample_start_ns"]
+        now = perf_counter_ns()
+        try:
+            if data.pop("runtime_called", False):
+                data["phase_durations_ns"].update(runtime.cycle_phase_ns)
+                if data.get("round_id") is None:
+                    known = runtime.snapshot()
+                    if known.attempted_round == data["global_step"]:
+                        data["round_id"] = known.attempted_round_id
+            data["queue_levels"] = runtime.cycle_queue_levels
+            row = StepTimingObservation(**data, status=status, failure_phase=failure_phase,
+                work_completed_ns=(now if endpoint is None else endpoint) if complete else None,
+                terminal_elapsed_ns=now-start if not complete and start is not None else None,
+                observation_ns=perf_counter_ns()-now)
+            observation_seq += 1
+            timing_observer.record(row)
+            return row
+        except Exception as error:  # noqa: BLE001 - 观察不改变协议/plant
+            timing_observer.disable(error)
+            return None
 
     def summary():
         """非实时没有周期截止证据；尝试数独立于 CycleTiming 的存在。"""
@@ -242,9 +275,13 @@ def _run_prepared_segmented(config, experiment, *, control, session,
             try:
                 return action()
             finally:
-                if attempt is not None:
+                if attempt is not None or observation is not None:
                     key = name() if callable(name) else name
-                    attempt["durations"]["maintenance_" + key] = perf_counter_ns() - started
+                    elapsed = perf_counter_ns() - started
+                    if attempt is not None:
+                        attempt["durations"]["maintenance_" + key] = elapsed
+                    if observation is not None:
+                        observation["phase_durations_ns"]["maintenance_" + key] = elapsed
 
         progress("ENDING_SEGMENT", "STOPPING" if control.stop_requested else None)
         segment = measured(lambda: getattr(runtime, "last_maintenance_operation", "end"),
@@ -356,52 +393,102 @@ def _run_prepared_segmented(config, experiment, *, control, session,
             if dynamic_realtime and not control.stop_requested:
                 clock = AbsoluteCycleClock(experiment.scene.period)
         progress("RUNNING")
+        if timing_observer is not None:
+            timing_observer.lifecycle_ns["startup"] = perf_counter_ns()-observer_started
         while True:
             if session.cancelled.is_set():
                 raise RuntimeError("Client 运行已取消。")
             if control.stop_requested or runtime.segment_full:
-                stopped = transition()
+                # 非实时自动维护保持原位置，观察归刚填满的上一控制步。
+                if control.stop_requested:
+                    observe_finish()
+                started = perf_counter_ns() if timing_observer is not None else None
+                try:
+                    stopped = transition()
+                finally:
+                    if observation is not None:
+                        observation["phase_durations_ns"]["maintenance"] = perf_counter_ns()-started
+                    elif timing_observer is not None and control.stop_requested:
+                        timing_observer.lifecycle_ns["stop"] = perf_counter_ns()-started
+                observe_finish()
                 if stopped is not None:
                     outcome = stopped
                     return outcome
                 continue
             deadline_ns = None
+            pacing_requested = pacing_elapsed = pacing_excess = 0
             if non_realtime and previous_sample_ns is not None:
                 # 只尽力保持模型节奏：从上次实际采样算剩余等待，慢轮不追赶或积压输入。
                 remaining = (previous_sample_ns + round(experiment.scene.period * 1e9) - perf_counter_ns()) / 1e9
                 if remaining > 0:
+                    wait_started = perf_counter_ns() if timing_observer is not None else None
                     session.cancelled.wait(remaining)
+                    if timing_observer is not None:
+                        pacing_requested = round(remaining*1e9)
+                        pacing_elapsed = perf_counter_ns()-wait_started
+                        pacing_excess = max(0,pacing_elapsed-pacing_requested)
                 if session.cancelled.is_set() or control.stop_requested:
+                    if timing_observer is not None:
+                        timing_observer.waiting_terminal = {"status":"cancelled" if session.cancelled.is_set() else "stopped",
+                            "pacing_requested_ns":pacing_requested,"pacing_elapsed_ns":pacing_elapsed,
+                            "pacing_excess_ns":None,"actual_sample_start_ns":None}
                     continue
             if clock is not None:
+                wait_started = perf_counter_ns() if timing_observer is not None else None
                 scheduled, deadline_ns = clock.wait(runtime.confirmed_step_count)
+                if timing_observer is not None:
+                    pacing_requested = max(0,scheduled-wait_started)
+                    pacing_elapsed = perf_counter_ns()-wait_started if pacing_requested else 0
+                    pacing_excess = max(0,pacing_elapsed-pacing_requested)
                 lifecycle = runtime.snapshot()
                 attempt = {"scheduled": scheduled, "deadline": deadline_ns,
                            "run_id": lifecycle.run_id, "session_id": lifecycle.session_id,
                            "controller_epoch": lifecycle.controller_epoch,
                            "segment_index": lifecycle.segment_index,
                            "step": lifecycle.physically_confirmed_count, "durations": {}}
+                if timing_observer is not None:
+                    observation = {"attempt_seq":observation_seq,"global_step":runtime.confirmed_step_count,
+                        "segment_index":lifecycle.segment_index,"actual_sample_start_ns":None,
+                        "pacing_requested_ns":pacing_requested,"pacing_elapsed_ns":pacing_elapsed,
+                        "pacing_excess_ns":pacing_excess,"scheduled_start_ns":scheduled,
+                        "deadline_ns":deadline_ns,"phase_durations_ns":{}}
                 check_deadline(deadline_ns, "SAMPLE_START")
                 if session.cancelled.is_set():
                     raise RuntimeError("Client 运行已取消。")
+            if timing_observer is not None and observation is None:
+                observation = {"attempt_seq":observation_seq,"global_step":runtime.confirmed_step_count,
+                    "segment_index":runtime.snapshot().segment_index,"actual_sample_start_ns":None,
+                    "phase_durations_ns":{},"pacing_requested_ns":pacing_requested,
+                    "pacing_elapsed_ns":pacing_elapsed,"pacing_excess_ns":pacing_excess}
             if before_sample is not None:
                 before_sample()
             progress("INPUT")
             started = perf_counter_ns()
+            if timing_observer is not None:
+                observation.update(actual_sample_start_ns=started,
+                    sample_interval_ns=started-previous_sample_ns if previous_sample_ns is not None else None)
             previous_sample_ns = started
             sample_count += 1
             if attempt is not None:
                 attempt["sample"] = started
             value = experiment.scene.controller_input()
+            if observation is not None:
+                observation["phase_durations_ns"]["input"] = perf_counter_ns()-started
             check_deadline(deadline_ns, "INPUT")
             if attempt is not None:
                 attempt["durations"]["input"] = perf_counter_ns() - started
             progress("ROUND_IN_FLIGHT")
+            if observation is not None:
+                observation["runtime_called"] = True
             identity = (runtime.step(value) if deadline_ns is None
                         else runtime.step(value, deadline_ns=deadline_ns))
             if identity is None:
+                observe_finish("stopped_before_commit", complete=False)
                 attempt = None
                 continue
+            if observation is not None:
+                observation["round_id"] = identity.round_id
+                observation["phase_durations_ns"].update(runtime.cycle_phase_ns)
             if attempt is not None:
                 attempt["round_id"] = identity.round_id
                 attempt["durations"].update(runtime.cycle_phase_ns)
@@ -415,6 +502,9 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                             identity.global_step, identity.raw_control, deadline_ns=deadline_ns,
                         ))
             runtime.confirm_applied(identity)
+            if observation is not None:
+                observation["control_applied_ns"] = perf_counter_ns()
+                observation["phase_durations_ns"]["device"] = observation["control_applied_ns"]-started
             if preload_steps and runtime.confirmed_step_count == preload_steps:
                 control.request_stop()
             if attempt is not None:
@@ -427,6 +517,8 @@ def _run_prepared_segmented(config, experiment, *, control, session,
             started = perf_counter_ns()
             if on_step is not None:
                 on_step(record)
+            if observation is not None:
+                observation["phase_durations_ns"]["recording"] = perf_counter_ns()-started
             if attempt is not None:
                 attempt["bookkeeping"] = perf_counter_ns()
                 attempt["durations"]["recording"] = attempt["bookkeeping"] - started
@@ -437,6 +529,8 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                     transition(deadline_ns)
                 finally:
                     attempt["durations"]["maintenance"] = perf_counter_ns() - started
+                    if observation is not None:
+                        observation["phase_durations_ns"]["maintenance"] = attempt["durations"]["maintenance"]
             check_deadline(deadline_ns, "CYCLE_COMPLETE")
             emit_cycle("confirmed")
             # 公开观测回调自身也受预算约束；不能靠观测出口隐藏一次超期。
@@ -446,6 +540,17 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                 last_cycle["failure_phase"] = "CYCLE_OBSERVATION"
                 last_cycle["cycle_completed_ns"] = None
                 raise CycleDeadlineExceeded("CYCLE_OBSERVATION")
+            if timing_observer is not None and not (non_realtime and runtime.segment_full and not control.stop_requested):
+                final_observation = observe_finish()
+                # 新汇总/显示的成本与旧回调一样受原截止保护。
+                if deadline_ns is not None and perf_counter_ns() >= deadline_ns:
+                    misses += 1
+                    last_cycle.update(status="miss_after_apply", failure_phase="CYCLE_OBSERVATION", cycle_completed_ns=None)
+                    if final_observation is not None:
+                        timing_observer.correct_last(replace(final_observation,status="miss_after_apply",
+                            work_completed_ns=None,failure_phase="CYCLE_OBSERVATION",
+                            terminal_elapsed_ns=perf_counter_ns()-final_observation.actual_sample_start_ns))
+                    raise CycleDeadlineExceeded("CYCLE_OBSERVATION")
     except Exception as error:  # noqa: BLE001 - 生命周期出口不披露协议秘密或异常载荷
         if (runtime is not None and wire_profile in _COMPACT_ADVANCE_PROFILES
                 and runtime.last_maintenance_operation == "advance"
@@ -457,6 +562,15 @@ def _run_prepared_segmented(config, experiment, *, control, session,
         lifecycle = runtime.snapshot() if runtime is not None else None
         uncertain = lifecycle is not None and lifecycle.phase == "UNCERTAIN"
         failure_phase = getattr(error, "phase", phase_name)
+        observation_missed = (isinstance(error,CycleDeadlineExceeded) or observation is not None
+            and observation.get("deadline_ns") is not None and perf_counter_ns() >= observation["deadline_ns"])
+        observation_applied = ("device_started" in attempt and failure_phase != "BEFORE_DEVICE_SIGNAL"
+                               if attempt is not None else observation is not None
+                               and observation.get("control_applied_ns") is not None)
+        observe_finish("cancelled" if session.cancelled.is_set() else "uncertain" if uncertain else
+            "miss_after_apply" if observation_missed and observation_applied else
+            "miss_before_apply" if observation_missed else "failed",
+            failure_phase, complete=False)
         if attempt is not None:
             attempt["durations"].update(runtime.cycle_phase_ns)
             applied = "device_started" in attempt and failure_phase != "BEFORE_DEVICE_SIGNAL"
@@ -498,6 +612,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
     finally:
         session.stop_accepting()
         if runtime is not None:
+            cleanup_started = perf_counter_ns()
             try:
                 runtime.close()
             except Exception as error:
@@ -506,6 +621,9 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                 outcome["cleanup_error_type"] = type(error).__name__
                 if outcome["status"] == "stopped":
                     outcome.update(status="failed", category=type(error).__name__, failure_phase="CLEANUP")
+            finally:
+                if timing_observer is not None:
+                    timing_observer.lifecycle_ns["cleanup"] = perf_counter_ns()-cleanup_started
         if (non_realtime or configured_compact) and outcome is not None:
             # close 后再取工人清退事实，不以构造 return 时的旧快照声称清理完成。
             material = runtime.material_summary if runtime is not None else {}

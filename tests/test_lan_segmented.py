@@ -923,8 +923,20 @@ def test_demo_paces_actual_samples_and_slow_steps_do_not_refresh_realtime_deadli
     monkeypatch.setattr(session.cancelled, "wait", wait)
     monkeypatch.setattr(runner, "check_deadline", lambda d, p: check_deadline(d, p, now=lambda: now[0]))
     monkeypatch.setattr(runner, "AbsoluteCycleClock", lambda p: AbsoluteCycleClock(p, now=lambda: now[0], sleep=wait))
+    from secure_control.experiments.live_timing import LiveTimingCollector
+    collector = LiveTimingCollector("samples",sample_limit=2)
     result = runner._run_prepared_segmented(config, replace(prepared, scene=scene),
-        control=control, session=session, non_realtime=non_realtime)
+        control=control, session=session, non_realtime=non_realtime,timing_observer=collector)
+    statistics = collector.report()
+    assert statistics["statistics_complete"]
+    if non_realtime or not delay_ns:
+        assert statistics["observations"] == 3 and statistics["raw"]["omitted"] == 1
+        assert statistics["metrics"]["work_elapsed_ns"]["sum_ns"] == 3*delay_ns
+        assert statistics["metrics"]["sample_interval_ns"]["sum_ns"] == 2*max(20_000_000,delay_ns)
+        assert statistics["recent"][0]["sample_interval_ns"] is None
+        assert all(row["deadline_ns"] is None for row in statistics["recent"]) is non_realtime
+    else:
+        assert statistics["observations"] == 1 and statistics["recent"][0]["work_completed_ns"] is None
     if non_realtime or wire != "control-batch-v1":
         assert result["wire_profile"] == wire and result["transport"] == "insecure_tcp"
         assert result["model_period_s"] == .02
@@ -942,6 +954,33 @@ def test_demo_paces_actual_samples_and_slow_steps_do_not_refresh_realtime_deadli
             assert initialized == ([] if wire == "control-batch-v1" else [{"slots":16,"_candidate":"worker"}])
             assert result["cycle_summary"] == {"attempts": 3, "misses": None, "last_cycle": None}
             assert result["model_period_s"] == .02 and result["timing_mode"] == "non_realtime_demo"
+    if non_realtime and not delay_ns and wire == "control-dynamic-matrix-v1":
+        # 在两次采样之间取消/停止：保留等待终态，不制造第二个已采样步骤。
+        for reason in ("cancelled","stopped"):
+            control,session = RunControl(),InteractiveSession()
+            now[0] = 1_000_000_000
+            def interrupted_wait(seconds,session=session,reason=reason,control=control):
+                now[0] += round(seconds*1e9)
+                session.cancelled.set() if reason == "cancelled" else control.request_stop()
+            monkeypatch.setattr(session.cancelled,"wait",interrupted_wait)
+            observed = LiveTimingCollector("samples",sample_limit=2)
+            terminal = runner._run_prepared_segmented(config,replace(prepared,scene=scene),
+                control=control,session=session,non_realtime=True,timing_observer=observed)
+            assert terminal["status"] == reason
+            assert observed.count == 1 and observed.waiting_terminal["status"] == reason
+            assert observed.waiting_terminal["actual_sample_start_ns"] is None
+            assert observed.waiting_terminal["pacing_excess_ns"] is None
+        control,session = RunControl(),InteractiveSession()
+        observed = LiveTimingCollector("samples",sample_limit=2)
+        def failed_before_sample():
+            raise ValueError("test failure before actual sample")
+        terminal = runner._run_prepared_segmented(config,replace(prepared,scene=scene),
+            control=control,session=session,non_realtime=True,timing_observer=observed,
+            before_sample=failed_before_sample)
+        assert terminal["status"] == "failed" and observed.count == 1
+        row = observed.report()["recent"][0]
+        assert row["status"] == "failed" and row["actual_sample_start_ns"] is None
+        assert row["control_applied_ns"] is row["work_completed_ns"] is None
 
 
 @pytest.mark.parametrize("misuse", ["copy", "duplicate", "close"])
