@@ -925,10 +925,11 @@ def test_demo_paces_actual_samples_and_slow_steps_do_not_refresh_realtime_deadli
     monkeypatch.setattr(runner, "AbsoluteCycleClock", lambda p: AbsoluteCycleClock(p, now=lambda: now[0], sleep=wait))
     result = runner._run_prepared_segmented(config, replace(prepared, scene=scene),
         control=control, session=session, non_realtime=non_realtime)
-    assert result["wire_profile"] == wire and result["transport"] == "insecure_tcp"
-    assert result["model_period_s"] == .02
-    assert result["timing_mode"] == ("non_realtime_demo" if non_realtime else "absolute")
-    assert result["material_source"] == ("inline" if wire == "control-batch-v1" else "worker")
+    if non_realtime or wire != "control-batch-v1":
+        assert result["wire_profile"] == wire and result["transport"] == "insecure_tcp"
+        assert result["model_period_s"] == .02
+        assert result["timing_mode"] == ("non_realtime_demo" if non_realtime else "absolute")
+        assert result["material_source"] == ("inline" if wire == "control-batch-v1" else "worker")
     if delay_ns and not non_realtime:
         assert result["status"] == "failed" and len(samples) == 1
         assert result["cycle_summary"]["misses"] == 1

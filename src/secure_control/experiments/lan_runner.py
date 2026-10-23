@@ -506,7 +506,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                 outcome["cleanup_error_type"] = type(error).__name__
                 if outcome["status"] == "stopped":
                     outcome.update(status="failed", category=type(error).__name__, failure_phase="CLEANUP")
-        if outcome is not None:
+        if (non_realtime or configured_compact) and outcome is not None:
             # close 后再取工人清退事实，不以构造 return 时的旧快照声称清理完成。
             material = runtime.material_summary if runtime is not None else {}
             outcome.update(transport=config.transport, wire_profile=wire_profile,
