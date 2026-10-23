@@ -5,6 +5,9 @@
 普通角色配置支持可选 `wire_profile: control-dynamic-matrix-v1`（本次两机推荐）或旧
 `control-dynamic-compact-v2`，省略仍为 `control-batch-v1`。三角色必须显式选择同一版本，不自动升级。
 P1/P2脚本将选择传给原协议owner，Client专用持续入口也使用同一协议，错配失败不回退。
+仓库已提供三份配套 `lab-client-cart-pole-demo.example.yaml`、`lab-p1-cart-pole-demo.example.yaml`、
+`lab-p2-cart-pole-demo.example.yaml`，均预设insecure_tcp和matrix-v1，Client预设两测量observer。
+新演示显式使用这三份配置；原通用角色文件及脚本不带参数时的batch默认保留，不能混搭。
 `transport: insecure_tcp`无需证书；TLS仍由独立transport选项决定，不能只删TLS配置字段隐式降级。
 无性能要求的两机近直立演示使用专用脚本的 `--non-realtime --recording light`，动态profile、三角色配置及启动步骤见
 [两机操作](cart_pole_interactive.md#无证书两机非实时动态演示)。保留Ts=.02、全部安全算术/双提交和仿真确认，不使用绝对周期钟。

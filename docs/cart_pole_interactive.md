@@ -36,56 +36,41 @@ p1_peer:
 ```
 
 B允许A访问TCP 34401/34402；34403只供B本机P2连接P1，A无须监听。
-网络需允许设备互访，不用生成或分发证书。在B的 `configs/lab-p1.example.yaml` 使用：
+网络需允许设备互访，不用生成或分发证书。仓库已经配齐下列专用配置，直接使用，不必再手工添加wire、修改experiment或删除TLS字段：
 
-```yaml
-role: P1
-transport: insecure_tcp
-wire_profile: control-dynamic-matrix-v1
-topology: local-deployment.example.yaml
-timeouts:
-  startup: 180
-  step: 30
-  shutdown: 5
-```
+| 机器 / 角色 | 已配好的角色文件 | 固定选择 |
+| --- | --- | --- |
+| A / Client | `configs/lab-client-cart-pole-demo.example.yaml` | 无证书TCP、matrix-v1、两测量动态observer |
+| B / P1 | `configs/lab-p1-cart-pole-demo.example.yaml` | 无证书TCP、matrix-v1 |
+| B / P2 | `configs/lab-p2-cart-pole-demo.example.yaml` | 无证书TCP、matrix-v1 |
 
-B的 `configs/lab-p2.example.yaml` 内容相同，只把 `role` 改为 `P2`。
-A的 `configs/lab-client-cart-pole.example.yaml` 使用下面内容，**不要改水箱使用的lab-client-continuous配置**：
+三份文件共用 `local-deployment.example.yaml`；下载后唯一需要按机器填写的文件就是上述拓扑，
+填好后将**同一份**文件复制到A/B的configs目录。不要把某台机器的私有IP当作所有下载者的默认地址。
+若已有本机拓扑可继续使用，P1/P2同机时peer也可填B的本机可达地址，但A/B文件内容须完全相同。
+timeout单位是秒，`step: 30`不是30 ms。
 
-```yaml
-role: Client
-transport: insecure_tcp
-wire_profile: control-dynamic-matrix-v1
-topology: local-deployment.example.yaml
-experiment: cart_pole_observer_lan.example.yaml
-timeouts:
-  startup: 180
-  step: 30
-  idle: 30
-  shutdown: 5
-```
-
-timeout单位是秒，`step: 30`不是30 ms。三个角色wire必须一致，不能只改Client。
+**必须使用下面命令里的完整配置路径。**通用 `lab-p1.example.yaml` / `lab-p2.example.yaml`
+及不带配置参数的P1/P2启动保留原batch默认，供paper PID等旧实验使用，不能与本套matrix Client混用。
+原 `lab-client-cart-pole.example.yaml` 是静态反馈/旧路线配置，不是本套动态演示；已有本机修改也不会被此专用配置覆盖。
 transport与wire独立；省略wire仍是原 `control-batch-v1`，不会自动升级协议或关闭实时保护。
-本轮没有改您已有部署配置或示例默认，请在三份角色配置中手工选择同一wire。
-旧 `control-dynamic-compact-v2` 仍可用；恢复旧演示时三角色都恢复原wire及所需场景。
+本套演示仍需显式传 `--non-realtime`，不会把原20 ms检查悄悄关闭。旧compact-v2保留，但不需要为本套演示再选它。
 
 依次启动，每个命令占一个独立终端。B的终端一：
 
 ```powershell
-uv run python scripts/run_continuous_p1.py configs/lab-p1.example.yaml
+uv run python scripts/run_continuous_p1.py configs/lab-p1-cart-pole-demo.example.yaml
 ```
 
 B的终端二：
 
 ```powershell
-uv run python scripts/run_continuous_p2.py configs/lab-p2.example.yaml
+uv run python scripts/run_continuous_p2.py configs/lab-p2-cart-pole-demo.example.yaml
 ```
 
 A在180秒启动等待内运行：
 
 ```powershell
-uv run python scripts/run_cart_pole_client.py configs/lab-client-cart-pole.example.yaml --non-realtime --recording light --segment-steps 400
+uv run python scripts/run_cart_pole_client.py configs/lab-client-cart-pole-demo.example.yaml --non-realtime --recording light --segment-steps 400
 ```
 
 窗口标注“非实时仿真，模型步长20 ms”，仿真时间、确认步数与墙钟时间分开。
@@ -97,7 +82,7 @@ light不保存完整轨迹，不能正式回放或声称完整实验已保存。
 无窗口时A使用同一后端，以Ctrl+C请求正常停止：
 
 ```powershell
-uv run python scripts/run_cart_pole_client.py configs/lab-client-cart-pole.example.yaml --headless-continuous --non-realtime --recording light --segment-steps 400
+uv run python scripts/run_cart_pole_client.py configs/lab-client-cart-pole-demo.example.yaml --headless-continuous --non-realtime --recording light --segment-steps 400
 ```
 
 非实时摘要写明transport、wire、material_source、timing_mode=`non_realtime_demo`、model_period_s、墙钟耗时和实际尝试/提交/物理确认数。
@@ -117,7 +102,7 @@ uv run python scripts/run_cart_pole_client.py configs/lab-client-cart-pole.examp
 需要观察原截止模式时，重启B的P1/P2，再在A省略 `--non-realtime`：
 
 ```powershell
-uv run python scripts/run_cart_pole_client.py configs/lab-client-cart-pole.example.yaml --headless-continuous --recording light --segment-steps 400
+uv run python scripts/run_cart_pole_client.py configs/lab-client-cart-pole-demo.example.yaml --headless-continuous --recording light --segment-steps 400
 ```
 
 此时 `timing_mode=absolute`，周期从计划采样起点计算，包含仿真设备确认、记账及跨段维护。
@@ -129,7 +114,7 @@ headless结束时输出一行JSON；Ctrl+C请求正常停止，先等最终JSON�
 
 ```powershell
 New-Item -ItemType Directory -Force .tmp | Out-Null
-uv run python scripts/run_cart_pole_client.py configs/lab-client-cart-pole.example.yaml --headless-continuous --recording light --segment-steps 400 | Tee-Object -FilePath .tmp/cart-pole-client.json
+uv run python scripts/run_cart_pole_client.py configs/lab-client-cart-pole-demo.example.yaml --headless-continuous --recording light --segment-steps 400 | Tee-Object -FilePath .tmp/cart-pole-client.json
 $demoResult = Get-Content .tmp/cart-pole-client.json -Raw | ConvertFrom-Json
 $demoResult | Select-Object status, transport, wire_profile, material_source, timing_mode, model_period_s, confirmed_step_count, protocol_committed_count, failure_phase, category
 $demoResult.cycle_summary | Format-List
@@ -142,6 +127,12 @@ $demoResult.material_summary | Select-Object encoding_profile, claimed, generate
 非实时模式没有CycleTiming，因此这些分位为null，墙钟平均耗时也不能替代它们。
 比较速度前先核三角色同版本、同wire、同模式、相同输入和网络条件，并记录实际运行SHA；
 本次不预先承诺两机20/15/40 ms，也不强制您做TLS对照。
+
+## 旧batch静态反馈与完整留证路线
+
+本节使用原 `lab-client-cart-pole.example.yaml`（experiment为`cart_pole_lan.example.yaml`、wire省略或batch-v1），
+配套通用 `lab-p1.example.yaml` / `lab-p2.example.yaml`。不得沿用上节matrix配置运行finite/full/预送。
+本机已改过旧配置时，应先核对这三项；以下保存/回放描述不适用于上节light演示。
 
 默认窗口持续运行，点击“停止并保存”提交正常停止请求。段容量由
 `--segment-steps 400` 指定（允许 1…1000），总步数由实际停止时的双方确认前缀决定，

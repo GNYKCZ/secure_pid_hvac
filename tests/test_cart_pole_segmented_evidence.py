@@ -739,11 +739,27 @@ def test_demo_ordinary_scripts_use_compact_worker_and_stop_without_cycle_claims(
     from test_lan_single_step import _run_fault
 
     paths = _plain_deployment(tmp_path)
-    _observer_profile_for(paths)
+    shipped_demo = mode == "normal" and wire == "control-dynamic-matrix-v1"
+    if not shipped_demo:
+        _observer_profile_for(paths)
     for role, path in paths.items():
         data = yaml.safe_load(path.read_text(encoding="utf8"))
-        data["wire_profile"] = "control-batch-v1" if mode == "mismatch" and role == "P2" else wire
-        data["timeouts"].update(startup=5, step=3, shutdown=2)
+        if shipped_demo:
+            # 实际发布的三份示例直接配对；只隔离测试地址，不替用户补协议或换场景。
+            source = ROOT / "configs" / f"lab-{role.lower()}-cart-pole-demo.example.yaml"
+            template = yaml.safe_load(source.read_text(encoding="utf8"))
+            selected = load_lan_config(source, role)
+            assert selected.transport == "insecure_tcp" and selected.wire_profile == wire
+            assert selected.ca is selected.certificate is selected.private_key is None
+            assert template["topology"] == "local-deployment.example.yaml"
+            template["topology"] = data["topology"]
+            if role == "Client":
+                assert template["experiment"] == "cart_pole_observer_lan.example.yaml"
+                template["experiment"] = str(selected.experiment_config)
+            data = template
+        else:
+            data["wire_profile"] = "control-batch-v1" if mode == "mismatch" and role == "P2" else wire
+            data["timeouts"].update(startup=5, step=3, shutdown=2)
         path.write_text(yaml.safe_dump(data), encoding="utf8")
     parties, client = [], None
     try:
@@ -766,7 +782,7 @@ def test_demo_ordinary_scripts_use_compact_worker_and_stop_without_cycle_claims(
             assert result["status"] == "failed" and not rows and not report["began"]
             assert result["cycle_summary"]["attempts"] == 0
         else:
-            assert report["began"] == [True] and result["material_source"] == "worker"
+            assert report["began"] == [True] and result["material_source"] == "worker", (result, errors)
             material = result["material_summary"]
             assert material["encoding_profile"] == material["worker"]["encoding_profile"] == wire
             assert material["worker_exited"] and material["receiver_exited"] and material["credit_thread_exited"]
@@ -795,7 +811,8 @@ def test_demo_ordinary_scripts_use_compact_worker_and_stop_without_cycle_claims(
             from secure_control.scenarios.cart_pole.plant import CartPolePlant
             prepared = load_segmented_experiment(load_lan_config(paths["Client"], "Client").experiment_config, 6, InteractiveSession())
             runtime = PlaintextStateSpaceRuntime(prepared.spec)
-            design = load_cart_pole_lan_profile(paths["Client"].parent / "observer-profile.yaml").observer_design
+            design = load_cart_pole_lan_profile(
+                load_lan_config(paths["Client"], "Client").experiment_config).observer_design
             plant = CartPolePlant(design.plant)
             for row in rows:
                 observation = plant.output()

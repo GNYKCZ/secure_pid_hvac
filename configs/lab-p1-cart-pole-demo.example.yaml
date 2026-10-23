@@ -1,0 +1,9 @@
+# 配套 lab-client/p2-cart-pole-demo；两机地址只在共用 topology 文件填写。
+role: P1
+transport: insecure_tcp
+wire_profile: control-dynamic-matrix-v1
+topology: local-deployment.example.yaml
+timeouts:
+  startup: 180
+  step: 30
+  shutdown: 5
