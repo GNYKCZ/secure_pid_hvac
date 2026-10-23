@@ -876,7 +876,7 @@ def test_demo_paces_actual_samples_and_slow_steps_do_not_refresh_realtime_deadli
     config = replace(load_lan_config(paths["Client"], "Client"), wire_profile=wire)
     control, session = RunControl(), InteractiveSession()
     prepared = load_segmented_experiment(config.experiment_config, 3, session)
-    now, samples, deadlines, initialized = [1_000_000_000], [], [], []
+    now, samples, deadlines, initialized, sleeps, closed = [1_000_000_000], [], [], [], [], []
     class Runtime:
         def __init__(self, *args, **kwargs):
             self.phase = "RUNNING"
@@ -911,16 +911,17 @@ def test_demo_paces_actual_samples_and_slow_steps_do_not_refresh_realtime_deadli
             self.phase = "STOPPED"
             return lan_runtime.SegmentRecord(None, "s", (), (), None, 0., None, None, None)
         def close(self):
-            pass
+            closed.append(True)
     def sample():
         samples.append(now[0])
         return [0., 0.]
     def wait(seconds):
+        sleeps.append(seconds)
         now[0] += round(seconds * 1e9)
     scene = SimpleNamespace(period=.02, controller_input=sample, advance=lambda *a, **k: {}, terminal_summary=dict)
     monkeypatch.setattr(runner, "LanSegmentedRuntime", Runtime)
     monkeypatch.setattr(runner, "perf_counter_ns", lambda: now[0])
-    monkeypatch.setattr(session.cancelled, "wait", wait)
+    monkeypatch.setattr(runner, "sleep", wait)
     monkeypatch.setattr(runner, "check_deadline", lambda d, p: check_deadline(d, p, now=lambda: now[0]))
     monkeypatch.setattr(runner, "AbsoluteCycleClock", lambda p: AbsoluteCycleClock(p, now=lambda: now[0], sleep=wait))
     from secure_control.experiments.live_timing import LiveTimingCollector
@@ -929,6 +930,14 @@ def test_demo_paces_actual_samples_and_slow_steps_do_not_refresh_realtime_deadli
         control=control, session=session, non_realtime=non_realtime,timing_observer=collector)
     statistics = collector.report()
     assert statistics["statistics_complete"]
+    if non_realtime:
+        assert all(0 < seconds <= .005 for seconds in sleeps)
+        if delay_ns:
+            assert not sleeps
+        expected_wait = 0 if delay_ns else 40_000_000
+        assert statistics["metrics"]["pacing_requested_ns"]["sum_ns"] == expected_wait
+        assert statistics["metrics"]["pacing_elapsed_ns"]["sum_ns"] == expected_wait
+        assert statistics["metrics"]["pacing_excess_ns"]["sum_ns"] == 0
     if non_realtime or not delay_ns:
         assert statistics["observations"] == 3 and statistics["raw"]["omitted"] == 1
         assert statistics["metrics"]["work_elapsed_ns"]["sum_ns"] == 3*delay_ns
@@ -962,7 +971,7 @@ def test_demo_paces_actual_samples_and_slow_steps_do_not_refresh_realtime_deadli
             def interrupted_wait(seconds,session=session,reason=reason,control=control):
                 now[0] += round(seconds*1e9)
                 session.cancelled.set() if reason == "cancelled" else control.request_stop()
-            monkeypatch.setattr(session.cancelled,"wait",interrupted_wait)
+            monkeypatch.setattr(runner,"sleep",interrupted_wait)
             observed = LiveTimingCollector("samples",sample_limit=2)
             terminal = runner._run_prepared_segmented(config,replace(prepared,scene=scene),
                 control=control,session=session,non_realtime=True,timing_observer=observed)
@@ -981,6 +990,70 @@ def test_demo_paces_actual_samples_and_slow_steps_do_not_refresh_realtime_deadli
         row = observed.report()["recent"][0]
         assert row["status"] == "failed" and row["actual_sample_start_ns"] is None
         assert row["control_applied_ns"] is row["work_completed_ns"] is None
+        # 关闭观察不选择另一套等待；睡眠错误仍走原失败/清退，不回退Event等待。
+        for performance_mode in ("off", "summary", "sleep_failure"):
+            control,session = RunControl(),InteractiveSession()
+            now[0] = 1_000_000_000
+            samples.clear()
+            observed = LiveTimingCollector(performance_mode if performance_mode == "summary" else "samples",sample_limit=2)
+            def failing_sleep(_seconds):
+                raise OSError("test sleep failure")
+            monkeypatch.setattr(runner,"sleep",failing_sleep if performance_mode == "sleep_failure" else wait)
+            close_count = len(closed)
+            terminal = runner._run_prepared_segmented(config,replace(prepared,scene=scene),
+                control=control,session=session,non_realtime=True,
+                **({"timing_observer":observed} if performance_mode != "off" else {}))
+            assert len(closed) == close_count+1 and closed[-1] is True
+            if performance_mode == "sleep_failure":
+                assert terminal["status"] == "failed" and terminal["category"] == "OSError"
+                assert terminal["confirmed_step_count"] == observed.count == len(samples) == 1
+            else:
+                assert terminal["status"] == "stopped"
+                assert samples == [1_000_000_000,1_020_000_000,1_040_000_000]
+
+
+def test_nonrealtime_sleep_keeps_fixed_target_and_observes_interruptions(monkeypatch):
+    """独立整数时刻预期：早醒重算同目标，迟醒不补睡，终点前后均核停止。"""
+    from secure_control.experiments import lan_runner as runner
+
+    now,calls = [100_000_000],[]
+    control,session = RunControl(),InteractiveSession()
+    monkeypatch.setattr(runner,"perf_counter_ns",lambda:now[0])
+    def early(seconds):
+        calls.append(round(seconds*1e9))
+        now[0] += min(round(seconds*1e9),2_000_000)
+    monkeypatch.setattr(runner,"sleep",early)
+    assert runner._wait_nonrealtime(109_000_000,session.cancelled,control) == (9_000_000,9_000_000,0)
+    assert calls == [5_000_000,5_000_000,5_000_000,3_000_000,1_000_000]
+    calls.clear()
+    for target in (now[0],now[0]-1):
+        assert runner._wait_nonrealtime(target,session.cancelled,control) == (0,0,0)
+    assert not calls
+    def late(seconds):
+        calls.append(round(seconds*1e9))
+        now[0] += round(seconds*1e9)+8_000_000
+    monkeypatch.setattr(runner,"sleep",late)
+    assert runner._wait_nonrealtime(now[0]+9_000_000,session.cancelled,control) == (9_000_000,13_000_000,4_000_000)
+    assert calls == [5_000_000]
+    for cancel in (False,True):
+        for when in ("before","slice","target"):
+            control,session = RunControl(),InteractiveSession()
+            now[0] = 100_000_000
+            calls.clear()
+            def signal(session=session,cancel=cancel,control=control):
+                session.cancelled.set() if cancel else control.request_stop()
+            def interrupted(seconds,when=when,signal=signal):
+                calls.append(round(seconds*1e9))
+                now[0] += 20_000_000 if when == "target" else round(seconds*1e9)
+                signal()
+            monkeypatch.setattr(runner,"sleep",interrupted)
+            if when == "before":
+                signal()
+            requested,elapsed,excess = runner._wait_nonrealtime(120_000_000,session.cancelled,control)
+            assert excess is None
+            assert calls == ([] if when == "before" else [5_000_000])
+            assert requested == (0 if when == "before" else 20_000_000)
+            assert elapsed == (0 if when == "before" else 20_000_000 if when == "target" else 5_000_000)
 
 
 @pytest.mark.parametrize("misuse", ["copy", "duplicate", "close"])
