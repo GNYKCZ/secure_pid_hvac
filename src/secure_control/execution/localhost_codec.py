@@ -22,7 +22,11 @@ from secure_control.crypto import (
     PrimeModulusEvidence,
     PrimeModulusVerification,
 )
-from secure_control.crypto.seeded_material import SEEDED_PROFILE
+from secure_control.crypto.seeded_material import (
+    PREAUTHORIZED_PROFILE,
+    SEEDED_PROFILE,
+    SEEDED_PROFILES,
+)
 from secure_control.protocol import ControllerRangeVerification, ControllerScaleLedger
 from secure_control.protocol.arithmetic import (
     ScalarGate,
@@ -31,6 +35,7 @@ from secure_control.protocol.arithmetic import (
     ScalarProgram,
 )
 from secure_control.protocol.messages import (
+    CommittedStepReply,
     ControllerLayout,
     ControllerShare,
     ControlShareMessage,
@@ -52,7 +57,9 @@ from secure_control.protocol.messages import (
     Protocol3EndpointCommand,
     Protocol3LocalStageReceipt,
     Protocol3StageReceipt,
+    ReadyReceipt,
     ResourceMetadata,
+    StepAdvancePermit,
     StepResourcePlan,
     TruncationMaskPayload,
     TruncationResourceMaterial,
@@ -63,7 +70,7 @@ _COMPACT_PROFILE = "control-dynamic-compact-v1"
 _COMPACT_PROFILE_V2 = "control-dynamic-compact-v2"
 _COMPACT_PROFILE_V3 = "control-dynamic-compact-v3"
 _MATRIX_PROFILE = "control-dynamic-matrix-v1"
-_MATRIX_PROFILES = (_MATRIX_PROFILE, SEEDED_PROFILE)
+_MATRIX_PROFILES = (_MATRIX_PROFILE, *SEEDED_PROFILES)
 _CLIENT_AUTH_PROFILES = (_COMPACT_PROFILE_V3, *_MATRIX_PROFILES)
 _COMPACT_PROFILES = (_COMPACT_PROFILE, _COMPACT_PROFILE_V2, *_CLIENT_AUTH_PROFILES)
 _COMPACT_ADVANCE_PROFILES = (_COMPACT_PROFILE_V2, *_CLIENT_AUTH_PROFILES)
@@ -71,6 +78,7 @@ _COMPACT_MAX_VALUES = 512 * 1024
 _ROLES = {"Supervisor", "Client", "P1", "P2"}
 _KINDS = {"hello", "ready", "request", "reply", "error", "shutdown"}
 _OPERATIONS = {
+    "online_permit", "peer_prefix", "peer_suffix", "peer_ready",
     "hello",
     "ready",
     "offline",
@@ -243,7 +251,7 @@ class _SeedInitPayload:
         _text(self.epoch_id,"epoch_id")
         _required_sha256(self.context_sha256,"context_sha256")
         if (type(self.party) is not int or self.party not in (0,1)
-                or type(self.key) is not bytes or len(self.key) != 32 or self.version != SEEDED_PROFILE):
+                or type(self.key) is not bytes or len(self.key) != 32 or self.version not in SEEDED_PROFILES):
             raise LocalhostCodecError("种子初始化角色/版本/密钥长度错误")
 
 
@@ -266,7 +274,55 @@ class _CompactOnlinePayload:
         _text(self.run_id, "run_id")
         _text(self.epoch_id, "epoch_id")
         _required_sha256(self.plan_sha256, "plan_sha256")
-        _check_compact_bytes(self.values,empty=self.version == SEEDED_PROFILE and self.input_message.recipient == 0)
+        _check_compact_bytes(self.values,empty=self.version in SEEDED_PROFILES and self.input_message.recipient == 0)
+
+
+@dataclass(frozen=True, slots=True)
+class _PreauthorizedOnlinePayload:
+    online: _CompactOnlinePayload = field(repr=False)
+    permit: StepAdvancePermit
+
+    def __post_init__(self):
+        if (type(self.online) is not _CompactOnlinePayload or type(self.permit) is not StepAdvancePermit
+                or type(self.online.input_message.recipient) is not int
+                or self.online.input_message.recipient not in (0, 1)
+                or self.online.version != PREAUTHORIZED_PROFILE
+                or (self.online.run_id, self.online.epoch_id, self.online.plan_sha256,
+                    self.online.input_message.session_id, self.online.input_message.round_id,
+                    self.online.input_message.step) != (self.permit.run_id, self.permit.controller_epoch,
+                    self.permit.plan_sha256, self.permit.session_id, self.permit.round_id, self.permit.global_step)):
+            raise ValueError("预授权与online身份不匹配")
+
+
+@dataclass(frozen=True, slots=True)
+class _PrefixPayload:
+    identity: tuple
+    party: int
+    values: bytes = field(repr=False)
+
+    def __post_init__(self):
+        if (type(self.identity) is not tuple or len(self.identity) != 7
+                or any(type(v) is not str or not 1 <= len(v) <= 256 for v in self.identity[:3])
+                or any(type(v) is not int or v < 0 for v in self.identity[3:6])
+                or self.identity[4] != self.identity[5] or self.identity[4] >= 1 << 64
+                or type(self.identity[6]) is not str or len(self.identity[6]) != 64
+                or any(c not in "0123456789abcdef" for c in self.identity[6])
+                or type(self.party) is not int or self.party not in (0, 1)):
+            raise ValueError("前缀公开身份无效")
+        _check_compact_bytes(self.values)
+
+
+@dataclass(frozen=True, slots=True)
+class _SuffixPayload:
+    permit: StepAdvancePermit
+    party: int
+    values: bytes = field(repr=False)
+
+    def __post_init__(self):
+        if (type(self.permit) is not StepAdvancePermit
+                or type(self.party) is not int or self.party not in (0, 1)):
+            raise ValueError("后缀公开身份无效")
+        _check_compact_bytes(self.values)
 
 
 @dataclass(frozen=True, slots=True)
@@ -612,6 +668,8 @@ WirePayload = (
     | _CompactOnlinePayload
     | _CompactBatchPayload
     | _SeedInitPayload
+    | StepAdvancePermit | ReadyReceipt | CommittedStepReply
+    | _PreauthorizedOnlinePayload | _PrefixPayload | _SuffixPayload
     | None
 )
 
@@ -902,6 +960,15 @@ def _decode_preloaded_values(data: bytes, inp: InputShareMessage,
 
 
 def _encode_value(value: object) -> object:
+    preauthorized_types = (StepAdvancePermit, ReadyReceipt, CommittedStepReply,
+                          _PreauthorizedOnlinePayload, _PrefixPayload, _SuffixPayload)
+    if type(value) in preauthorized_types:
+        result = {"type": type(value).__name__}
+        for name in value.__dataclass_fields__:
+            item = getattr(value, name)
+            result[name] = (_encode_value(item) if type(item) in (*preauthorized_types, _CompactOnlinePayload)
+                            else base64.b64encode(item).decode("ascii") if type(item) is bytes else item)
+        return result
     if type(value) is _SeedInitPayload:
         return {"type":"seed_init", "run_id":value.run_id,"epoch_id":value.epoch_id,
             "party":value.party,"context_sha256":value.context_sha256,
@@ -1304,6 +1371,24 @@ def _typed_union(value, classes):
 def _decode_value(value: object) -> object:
     mapping = _mapping(value, "wire value")
     kind = mapping.get("type")
+    preauthorized_types = {c.__name__: c for c in (StepAdvancePermit, ReadyReceipt,
+        CommittedStepReply, _PreauthorizedOnlinePayload, _PrefixPayload, _SuffixPayload)}
+    if type(kind) is str and kind in preauthorized_types:
+        cls = preauthorized_types[kind]
+        _exact_fields(mapping, {"type", *cls.__dataclass_fields__}, kind)
+        args = {name: mapping[name] for name in cls.__dataclass_fields__}
+        for name, typ in (("permit", StepAdvancePermit), ("ready", ReadyReceipt),
+                          ("peer_ready", ReadyReceipt), ("online", _CompactOnlinePayload)):
+            if name in args:
+                args[name] = _typed(args[name], typ)
+        for name in ("values", "output"):
+            if name in args:
+                args[name] = _decode_compact_base64(args[name])
+        if "identity" in args:
+            if type(args["identity"]) is not list:
+                raise LocalhostCodecError("前缀身份必须为数组")
+            args["identity"] = tuple(args["identity"])
+        return cls(**args)
     if kind == "seed_init":
         _exact_fields(mapping,{"type",*_SeedInitPayload.__dataclass_fields__},kind)
         return _SeedInitPayload(mapping["run_id"],mapping["epoch_id"],mapping["party"],
@@ -1820,6 +1905,12 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
         ("request", "peer_product"): peer,
         ("request", "peer_truncation"): {("P2", "P1")},
         ("request", "peer_batch"): peer,
+        ("request", "peer_prefix"): peer,
+        ("request", "peer_suffix"): peer,
+        ("request", "peer_ready"): peer,
+        ("request", "online_permit"): to_party,
+        ("reply", "online_permit"): to_client,
+        ("error", "online_permit"): to_client,
         ("shutdown", "shutdown"): {("Supervisor", "Client")} | to_party,
         ("reply", "shutdown"): {("Client", "Supervisor")} | to_client,
         ("error", "shutdown"): {("Client", "Supervisor")} | to_client,
@@ -1859,6 +1950,14 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
                     (PartyStageResult,) if message.operation == "activate_stage" else (type(None),))
     elif message.operation == "online_stage":
         expected = (_CompactOnlinePayload,) if message.kind == "request" else (PartyStageResult,)
+    elif message.operation == "online_permit":
+        expected = (_PreauthorizedOnlinePayload,) if message.kind == "request" else (CommittedStepReply,)
+    elif message.operation == "peer_prefix":
+        expected = (_PrefixPayload,)
+    elif message.operation == "peer_suffix":
+        expected = (_SuffixPayload,)
+    elif message.operation == "peer_ready":
+        expected = (ReadyReceipt,)
     elif message.operation == "seed_init":
         expected = (_SeedInitPayload,) if message.kind == "request" else (type(None),)
     elif key == ("request", "step"):
@@ -1908,6 +2007,22 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
         expected = None
     if expected is None or not isinstance(payload, expected):
         raise LocalhostCodecError("wire kind/operation 与 payload 类型组合非法。")
+    if isinstance(payload, (_PreauthorizedOnlinePayload, CommittedStepReply, ReadyReceipt, _SuffixPayload)):
+        permit = payload.ready.permit if type(payload) is CommittedStepReply else payload.permit
+        if (message.session_id, message.round_id, message.step, message.resource_id) != (
+                permit.session_id, permit.round_id, permit.global_step, None):
+            raise LocalhostCodecError("预授权信封身份错误")
+        party = (payload.ready.party if type(payload) is CommittedStepReply else
+                 payload.online.input_message.recipient if type(payload) is _PreauthorizedOnlinePayload
+                 else payload.party)
+        wire_party = message.recipient if type(payload) is _PreauthorizedOnlinePayload else message.sender
+        if wire_party != ("P1" if party == 0 else "P2"):
+            raise LocalhostCodecError("预授权信封角色错误")
+    if isinstance(payload, _PrefixPayload) and (
+            (message.session_id, message.round_id, message.step, message.resource_id) != (
+                payload.identity[1], None, payload.identity[4], None)
+            or message.sender != ("P1" if payload.party == 0 else "P2")):
+        raise LocalhostCodecError("前缀信封身份错误")
     if isinstance(payload, _CompactOnlinePayload):
         inp = payload.input_message
         if (message.session_id, message.round_id, message.step, message.resource_id) != (

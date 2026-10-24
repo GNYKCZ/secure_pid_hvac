@@ -12,6 +12,8 @@ from .matrix_beaver import matrix_shape, matrix_vector
 from .secret_sharing import AdditiveShare
 
 SEEDED_PROFILE = "control-dynamic-matrix-seeded-v1"
+PREAUTHORIZED_PROFILE = "control-dynamic-matrix-preauthorized-v1"
+SEEDED_PROFILES = (SEEDED_PROFILE, PREAUTHORIZED_PROFILE)
 _DOMAIN = b"secure-control.seeded-material.v1\0"
 _LABELS = (b"U", b"V", b"W", b"r", b"r-prime")
 
@@ -28,9 +30,10 @@ class SeededContext:
     dimensions: tuple[int, int, int]
     ledger: tuple[int, ...]
     security_parameter: int
+    profile: str = SEEDED_PROFILE
 
     def __post_init__(self):
-        if (any(type(v) is not str or not 1 <= len(v) <= 256 for v in
+        if (self.profile not in SEEDED_PROFILES or any(type(v) is not str or not 1 <= len(v) <= 256 for v in
                 (self.run_id,self.session_id,self.epoch))
                 or type(self.party) is not int or self.party not in (0,1)
                 or type(self.modulus) is not int or not 3 <= self.modulus < 1 << 256
@@ -50,7 +53,7 @@ class SeededContext:
 
     def digest(self):
         """UTF-8紧凑JSON数组固定顺序；q用十进制文本，所有身份均包含。"""
-        value = [SEEDED_PROFILE,self.run_id,self.session_id,self.epoch,self.party,
+        value = [self.profile,self.run_id,self.session_id,self.epoch,self.party,
                  str(self.modulus),self.dimensions,self.ledger,self.security_parameter]
         return hashlib.sha256(_DOMAIN+json.dumps(value,ensure_ascii=False,
             separators=(",", ":"),allow_nan=False).encode("utf-8")).digest()
@@ -109,8 +112,8 @@ def dealer_corrections(keys, contexts, step, truncation):
             or tuple(c.party for c in contexts) != (0,1)):
         raise ValueError("dealer需要两个独立角色种子")
     left,right = contexts
-    if (left.run_id,left.session_id,left.epoch,left.modulus,left.dimensions,left.ledger,left.security_parameter) != (
-            right.run_id,right.session_id,right.epoch,right.modulus,right.dimensions,right.ledger,right.security_parameter):
+    if (left.run_id,left.session_id,left.epoch,left.modulus,left.dimensions,left.ledger,left.security_parameter,left.profile) != (
+            right.run_id,right.session_id,right.epoch,right.modulus,right.dimensions,right.ledger,right.security_parameter,right.profile):
         raise ValueError("dealer公开上下文不匹配")
     if (truncation.sharing.modulus,truncation.ell,truncation.security_parameter) != (
             left.modulus,left.ledger[0],left.security_parameter):

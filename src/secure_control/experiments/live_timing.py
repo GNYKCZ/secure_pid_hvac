@@ -24,6 +24,7 @@ PHASES = (
     "material_bind",
     "online_distribution",
     "stage",
+    "single_exchange",
     "reconstruct",
     "commit",
     "device",
@@ -453,7 +454,7 @@ class LiveTimingCollector:
             "lifecycle_ns": dict(self.lifecycle_ns),
             "buffer_bytes": self.buffer_bytes,
             "observation_boundary": "observation_ns measures assembly/aggregation/UI snapshot up to terminal stamp; fixed final histogram/packing/buffer stores are not self-measured; all remain inside original strict deadline check",
-            "phase_semantics": "stage includes distribution/server processing/network wait; not pure RTT; maintenance parent contains maintenance_*; commit contains p1/p2_commit; do not sum nested times",
+            "phase_semantics": "stage/single_exchange include distribution/server processing/network wait, not pure RTT; preauthorized single_exchange includes READY and commit; old stage/commit absent there; maintenance parent contains maintenance_*; commit contains p1/p2_commit; do not sum nested times",
         }
 
 
@@ -631,7 +632,7 @@ def _validate_timing_report(report):
         "pacing_excess_ns",
         "observation_ns",
     }
-    if set(metrics) != names:
+    if set(metrics) not in (names, names-{"single_exchange"}):
         raise ValueError("指标集合无效。")
     for name, metric in metrics.items():
         fields = {

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from threading import Condition, Thread
 
 from secure_control.crypto import BeaverMultiplier, SecureTruncation, TwoPartySharing
-from secure_control.crypto.seeded_material import SEEDED_PROFILE, dealer_corrections
+from secure_control.crypto.seeded_material import SEEDED_PROFILES, dealer_corrections
 from secure_control.protocol.messages import public_step_plan_sha256
 from secure_control.protocol.roles import Client, _create_resource_pair, _seeded_context
 
@@ -68,16 +68,16 @@ def _check_spec(spec):
         # 生成或分配之前验证完整新布局，不在工人进程启动后才发现尺度不支持。
         Client._resource_plan(spec.layout, spec.session_id, "preflight", spec.start,
                               encoding_profile=spec.encoding_profile)
-        if spec.encoding_profile == SEEDED_PROFILE:
+        if spec.encoding_profile in SEEDED_PROFILES:
             _seeded_context(spec.layout,spec.run_id,spec.session_id,spec.epoch,0,
-                            spec.modulus,spec.security_parameter)
+                            spec.modulus,spec.security_parameter,spec.encoding_profile)
     products = n * n + n * m + p * n + p * m
     truncations = n if spec.layout.scale_ledger.state_truncation_bits else 0
     digits = spec.modulus.bit_length() * 30103 // 100000 + 1
     bound = products * (4096 + 12 * digits) + truncations * (4096 + 8 * digits) + 4096 + 512 * m
     if spec.encoding_profile in _COMPACT_PROFILES:
         elements = ((n+p)*(n+m) + n+m + n+p if spec.encoding_profile in _MATRIX_PROFILES else 3*products)
-        if spec.encoding_profile == SEEDED_PROFILE:
+        if spec.encoding_profile in SEEDED_PROFILES:
             elements = n+p
         row = (elements + 2 * truncations) * ((spec.modulus.bit_length() + 7) // 8)
         # 三份 IPC 临时包均计入原槽上限；生成资源前就排除最大合法头的最坏尺寸。
@@ -151,7 +151,7 @@ def _unpack(spec, packet, step):
             or any(c not in "0123456789abcdef" for c in head["round"][6:])
             or any(type(head[v]) is not int or head[v] < 0 for v in ("prepared_ns", "cpu_ns"))
             or type(head["lengths"]) is not list or len(head["lengths"]) != 2
-            or any(type(v) is not int or v < (0 if spec.encoding_profile == SEEDED_PROFILE else 1)
+            or any(type(v) is not int or v < (0 if spec.encoding_profile in SEEDED_PROFILES else 1)
                    for v in head["lengths"])
             or type(head["sha256"]) is not list or len(head["sha256"]) != 2
             or sum(head["lengths"]) + 5 + size != len(packet)):
@@ -160,7 +160,7 @@ def _unpack(spec, packet, step):
     if head["plan"] != public_step_plan_sha256(plan):
         raise ValueError("材料包与父进程公开计划摘要不匹配")
     expected_lengths = ([0,(plan.product_resources[0].rows+2*plan.truncation_count)*((spec.modulus.bit_length()+7)//8)]
-                        if spec.encoding_profile == SEEDED_PROFILE else
+                        if spec.encoding_profile in SEEDED_PROFILES else
                         [_preloaded_values_size(plan,spec.modulus)]*2 if spec.encoding_profile in _COMPACT_PROFILES else None)
     if expected_lengths is not None and head["lengths"] != expected_lengths:
         raise ValueError("紧凑材料片段长度与公开计划不匹配")
@@ -205,12 +205,12 @@ def _worker_main(spec, credit, output):
         truncation = SecureTruncation(sharing, ell=spec.ell, security_parameter=spec.security_parameter,
                                      modulus_evidence=spec.modulus_evidence)
         keys,contexts = None,None
-        if spec.encoding_profile == SEEDED_PROFILE:
+        if spec.encoding_profile in SEEDED_PROFILES:
             keys = (secrets.token_bytes(32),secrets.token_bytes(32))
             if keys[0] == keys[1]:
                 raise RuntimeError("种子源产生相同角色密钥")
             contexts = tuple(_seeded_context(spec.layout,spec.run_id,spec.session_id,spec.epoch,p,
-                spec.modulus,spec.security_parameter) for p in (0,1))
+                spec.modulus,spec.security_parameter,spec.encoding_profile) for p in (0,1))
             # 独立私有启动包；不将秘密加入公开spec、材料头、repr或最终report。
             output.send_bytes(b"K"+b"".join(keys))
         sample("startup")
@@ -227,7 +227,7 @@ def _worker_main(spec, credit, output):
                 raise ValueError("工人越过已证明范围")
             started, cpu = time.perf_counter_ns(), time.process_time_ns()
             plan = Client._resource_plan(spec.layout, spec.session_id, "round-" + secrets.token_hex(16), next_step, encoding_profile=spec.encoding_profile)
-            if spec.encoding_profile == SEEDED_PROFILE:
+            if spec.encoding_profile in SEEDED_PROFILES:
                 values = dealer_corrections(keys,contexts,next_step,truncation)
                 fragments = (b"",_encode_integer_residues(values,len(values),spec.modulus))
             else:
@@ -333,7 +333,7 @@ class _MaterialWorkerPool:
             while True:
                 packet = self._output.recv_bytes(_SLOT_LIMIT // 3)
                 if packet[:1] == b"K":
-                    if (self.spec.encoding_profile != SEEDED_PROFILE or len(packet) != 65
+                    if (self.spec.encoding_profile not in SEEDED_PROFILES or len(packet) != 65
                             or self._seed_keys is not None or self._received != self.spec.start
                             or packet[1:33] == packet[33:]):
                         raise ValueError("私有种子启动包错误")
@@ -401,7 +401,7 @@ class _MaterialWorkerPool:
     def seed_for_party(self, party):
         """只供Client初始化相应角色连接，不经公开snapshot/report导出。"""
         with self._condition:
-            if (self.spec.encoding_profile != SEEDED_PROFILE or self._seed_keys is None
+            if (self.spec.encoding_profile not in SEEDED_PROFILES or self._seed_keys is None
                     or type(party) is not int or party not in (0,1) or self._stop or self._claimed):
                 raise RuntimeError("秘密启动种子未就绪或已经开始控制")
             return self._seed_keys[party]

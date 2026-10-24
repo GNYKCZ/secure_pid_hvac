@@ -2,6 +2,12 @@
 
 ## 无证书动态演示的显式选择
 
+D132-8新增显式`control-dynamic-matrix-preauthorized-v1`，需三角色同时选择。
+它将普通Client往返缩为一次，并提前准备固定矩阵/已提交状态前缀；服务器按本步permit先提交，
+Client核实双提交并检查输出后才施力。失败可能已提交而未施力，必须废弃会话。
+旧默认及seeded保持；启用、启动命令、安全/失败与完整成本说明见
+[D132-8候选](cart_pole_interactive.md#显式候选单次跨机往返及前缀准备d132-8)。
+
 普通角色配置支持可选 `wire_profile: control-dynamic-matrix-v1`（本次两机推荐）或旧
 `control-dynamic-compact-v2`，省略仍为 `control-batch-v1`。三角色必须显式选择同一版本，不自动升级。
 P1/P2脚本将选择传给原协议owner，Client专用持续入口也使用同一协议，错配失败不回退。

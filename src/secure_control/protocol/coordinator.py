@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Protocol, runtime_checkable
 
 import numpy as np
@@ -25,6 +26,7 @@ from secure_control.crypto.beaver import _TripleLifecycle
 from secure_control.crypto.matrix_beaver import (
     MatrixBeaverMultiplier,
     MatrixMaskedShare,
+    MatrixPrefix,
     MatrixTripleShare,
     matrix_values,
 )
@@ -53,8 +55,10 @@ from .messages import (
     Protocol3CommitAuthorization,
     Protocol3EndpointCommand,
     Protocol3StageReceipt,
+    ReadyReceipt,
     ResourceMetadata,
     StateTruncationResourceShare,
+    StepAdvancePermit,
     StepResourcePlan,
     TruncationMaskPayload,
     TruncationResourceMaterial,
@@ -302,7 +306,8 @@ def stage_protocol3_batch(
     plan = endpoint.plan
     try:
         masks = tuple(endpoint.mask_product(item) for item in plan.product_resources)
-        incoming = peer.exchange_products(plan, masks)
+        incoming = ((peer.exchange_suffix(plan, endpoint._permit, masks[0]),)
+                    if endpoint.completion_strategy == "peer_ready" else peer.exchange_products(plan, masks))
         if len(incoming) != product_operation_count(plan):
             raise ValueError("乘法批次不完整")
         for metadata, value in zip(plan.product_resources, incoming, strict=True):
@@ -456,10 +461,12 @@ class LocalProtocol3PartyEndpoint:
         if resources.recipient not in {0, 1} or resources.recipient != role._party:
             raise ValueError("单方在线资源的角色路由错误。")
         plan = resources.plan
-        if completion_strategy not in ("peer_barriers", "client_authorized"):
+        if completion_strategy not in ("peer_barriers", "client_authorized", "peer_ready"):
             raise ValueError("未知 Protocol 3 完成策略。")
         if completion_strategy == "client_authorized" and not plan.truncation_count:
             raise ValueError("Client 授权候选仅支持需要截断的动态控制。")
+        if completion_strategy == "peer_ready" and type(plan) is not MatrixStepResourcePlan:
+            raise ValueError("READY预授权仅支持显式矩阵计划")
         self.completion_strategy = completion_strategy
         if role.session_id != plan.session_id:
             raise ValueError("角色与在线资源不属于同一 session。")
@@ -483,7 +490,7 @@ class LocalProtocol3PartyEndpoint:
             round_id=plan.round_id,
             step=plan.step,
         )
-        if type(plan) is MatrixStepResourcePlan and completion_strategy != "client_authorized":
+        if type(plan) is MatrixStepResourcePlan and completion_strategy not in ("client_authorized", "peer_ready"):
             raise ValueError("矩阵仅允许Client授权完成策略")
         self._control_sender = control_sender
         self._products = {item.metadata.resource_id: item for item in resources.product_resources}
@@ -512,7 +519,7 @@ class LocalProtocol3PartyEndpoint:
         self._local_products: set[str] = set()
         self._local_truncations: set[str] = set()
         self._closed = False
-        if completion_strategy == "client_authorized":
+        if completion_strategy in ("client_authorized", "peer_ready"):
             for item in resources.state_truncation_resources:
                 item.truncation._lifecycle.observe_as(self.party)
         rows = {
@@ -572,6 +579,12 @@ class LocalProtocol3PartyEndpoint:
         if metadata.resource_id in self._product_state:
             raise ValueError("同一乘法资源不得重复开始。")
         multiplier = resource.triple._lifecycle.owner
+        if self.completion_strategy == "peer_ready":
+            resource._lifecycle.claim(self.party)
+            prefix = self._prefix
+            value = prefix.mask_suffix(AdditiveShare(self._input.value.reshape(-1, 1)))
+            self._product_state[metadata.resource_id] = (resource, multiplier, prefix)
+            return value
         if type(self._plan) is MatrixStepResourcePlan:
             controller = self._role.controller_share
             matrix = AdditiveShare(np.block([[controller.A.value, controller.B.value],
@@ -598,6 +611,10 @@ class LocalProtocol3PartyEndpoint:
     def finish_product(self, metadata: ResourceMetadata, peer: ProductMaskPayload) -> None:
         resource, multiplier, masked = self._product_entry(metadata)
         other = 1 - self.party
+        if self.completion_strategy == "peer_ready":
+            self._matrix_result = masked.finish(peer)
+            self._local_products.add(metadata.resource_id)
+            return
         if type(self._plan) is MatrixStepResourcePlan:
             if type(peer) is not MatrixMaskPayload or type(peer.party) is not int or peer.party != other:
                 raise ValueError("矩阵对端mask类型/角色错误")
@@ -645,7 +662,7 @@ class LocalProtocol3PartyEndpoint:
         self._completed_products.add(metadata.resource_id)
 
     def finish_products(self) -> None:
-        completed = (self._local_products if self.completion_strategy == "client_authorized"
+        completed = (self._local_products if self.completion_strategy in ("client_authorized", "peer_ready")
                      else self._completed_products)
         if self._closed or self._output is not None or len(completed) != product_operation_count(self._plan):
             raise ValueError("Protocol 3 尚未完成全部乘法资源。")
@@ -733,7 +750,7 @@ class LocalProtocol3PartyEndpoint:
             raise ValueError("P1 endpoint 截断消息的角色或类型错误。")
         resource, truncation, masked, raw = self._truncation_entry(metadata)
         lifecycle = masked._lifecycle
-        if self.completion_strategy == "client_authorized":
+        if self.completion_strategy in ("client_authorized", "peer_ready"):
             lifecycle.receive_p2_message()
         else:
             if 1 not in lifecycle.masked_parties:
@@ -782,7 +799,7 @@ class LocalProtocol3PartyEndpoint:
         if self._output is None or self._raw_state is None:
             raise RuntimeError("Protocol 3 尚未完成乘法阶段。")
         if self._plan.truncation_count:
-            completed = (self._local_truncations if self.completion_strategy == "client_authorized"
+            completed = (self._local_truncations if self.completion_strategy in ("client_authorized", "peer_ready")
                          else self._completed_truncations)
             if len(completed) != self._plan.truncation_count:
                 raise ValueError("Protocol 3 尚未完成全部截断资源。")
@@ -802,7 +819,7 @@ class LocalProtocol3PartyEndpoint:
             )
         )
         self._staged = True
-        if self.completion_strategy == "client_authorized":
+        if self.completion_strategy in ("client_authorized", "peer_ready"):
             return local_receipt_type(self._plan)(
                 self.party, self._plan.session_id, self._plan.round_id, self._plan.step,
                 product_operation_count(self._plan), self._plan.truncation_count,
@@ -826,6 +843,41 @@ class LocalProtocol3PartyEndpoint:
         """验证 Client 授权后消费资源并提交；远端完成仅登记为 Client 证明。"""
         try:
             self._accept_authorization(authorization)
+            self._commit_state()
+        except Exception:
+            self.abort()
+            raise
+
+    def install_permit(self, permit, prefix):
+        if (self.completion_strategy != "peer_ready" or self._closed or self._product_state
+                or hasattr(self, "_permit") or type(permit) is not StepAdvancePermit
+                or (permit.session_id, permit.round_id, permit.global_step, permit.plan_sha256,
+                    permit.expected_state_version) != (self.session_id, self.plan.round_id,
+                    self.plan.step, public_step_plan_sha256(self.plan), self._role.state_version)
+                or type(prefix) is not MatrixPrefix or prefix.phase != "bound"
+                or prefix.triple is not self._resources.product_resources[0].triple):
+            raise ValueError("预授权/前缀与当前端点不匹配")
+        self._permit, self._prefix = permit, prefix
+
+    def ready_receipt(self):
+        if (self.completion_strategy != "peer_ready" or not self._staged or self._closed
+                or self._role.state_version != self._permit.expected_state_version
+                or len(self._local_products) != 1 or len(self._local_truncations) != self.plan.truncation_count):
+            raise ValueError("本地算术/暂存未完成，不能发READY")
+        return ReadyReceipt(self._permit, self.party, self.plan.truncation_count)
+
+    def commit_ready(self, peer):
+        try:
+            own = self.ready_receipt()
+            if (type(peer) is not ReadyReceipt or peer.permit != own.permit
+                    or peer.party != 1-self.party or peer.truncations != own.truncations):
+                raise ValueError("对方READY与本轮不匹配")
+            for resource in self._products.values():
+                resource.triple._lifecycle.accept_peer_ready(self.party)
+                resource._lifecycle.accept_peer_ready(self.party)
+            for resource in self._truncations.values():
+                resource.truncation._lifecycle.accept_peer_ready(self.party)
+                resource._lifecycle.accept_peer_ready(self.party)
             self._commit_state()
         except Exception:
             self.abort()
@@ -1057,6 +1109,75 @@ class _OnlineMaterialRecovery:
         self._seeded_key = self._seeded_context = self._seeded_slot = None
         self._seeded_next = 0
         self.seeded_statistics = {"prepared_count":0,"prepare_ns":0,"cpu_ns":0}
+        self._prefix = None
+        self.prefix_statistics = {"count": 0, "sum_ns": 0, "max_ns": 0, "cpu_ns": 0,
+                                  "first_error": None, "last_ns": None}
+
+    def prepare_prefix(self, role, peer, segment_index):
+        """唯一protocol准备owner；首次外发前领取，失败从不重建同一token。"""
+        start, cpu = time.perf_counter_ns(), time.process_time_ns()
+        prefix = None
+        try:
+            slot, context = self._seeded_slot, self._seeded_context
+            if (self._prefix is not None or slot is None or context is None
+                    or role.state_version != self._seeded_next):
+                raise ValueError("前缀缺槽/错状态版本/重复准备")
+            q = self._sharing.modulus
+            n, m, p = context.dimensions
+            owner = MatrixBeaverMultiplier(self._sharing)
+            triple = MatrixTripleShare(AdditiveShare(slot.u), AdditiveShare(slot.v),
+                AdditiveShare(slot.w if slot.w is not None else np.zeros((n+p, 1), dtype=object)),
+                context.party, n+p, n+m, _TripleLifecycle(owner))
+            if not hasattr(self, "_fixed_matrix"):
+                c = role.controller_share
+                self._fixed_matrix = AdditiveShare(np.block([[c.A.value, c.B.value], [c.C.value, c.D.value]]))
+                self._fixed_matrix.value.flags.writeable = False
+            prefix = MatrixPrefix(owner, triple, self._fixed_matrix,
+                                  AdditiveShare(role.state_share.value.reshape(n, 1)))
+            identity = (context.run_id, context.session_id, context.epoch, segment_index,
+                        self._seeded_next, role.state_version, replace(context, party=0).digest().hex())
+            e, fx = peer.exchange_prefix(identity, prefix.e_share, prefix.fx_share, q)
+            prefix.open_prefix(e, fx)
+            self._prefix = (prefix, self._seeded_next, role.state_version, segment_index)
+        except Exception as error:
+            if prefix is not None:
+                prefix.abort()
+            if self.prefix_statistics["first_error"] is None:
+                self.prefix_statistics["first_error"] = type(error).__name__
+            self.close_seeded()
+            raise
+        finally:
+            elapsed = time.perf_counter_ns()-start
+            s = self.prefix_statistics
+            s["count"] += 1
+            s["sum_ns"] += elapsed
+            s["max_ns"] = max(s["max_ns"], elapsed)
+            s["last_ns"] = elapsed
+            s["cpu_ns"] += time.process_time_ns()-cpu
+
+    def restore_preauthorized(self, material, permit, role):
+        saved, self._prefix = self._prefix, None
+        try:
+            if (saved is None or type(permit) is not StepAdvancePermit
+                    or saved[1:] != (permit.global_step, role.state_version, permit.segment_index)
+                    or self._seeded_context is None
+                    or (permit.session_id,permit.round_id,permit.global_step,permit.plan_sha256) != (
+                        material.plan.session_id,material.plan.round_id,material.plan.step,
+                        public_step_plan_sha256(material.plan))
+                    or (permit.run_id, permit.session_id, permit.controller_epoch) != (
+                        self._seeded_context.run_id, self._seeded_context.session_id, self._seeded_context.epoch)):
+                raise ValueError("前缀与预授权/当前状态不匹配")
+            prefix = saved[0]
+            triple = prefix.bind(material.product_resources[0].w)
+            # 只恢复此前未打开的截断资源；矩阵始终保留首次打开的owner/token。
+            online = _rehydrate_online_material(material, self._sharing, self._multiplier,
+                                                self._truncation, matrix_triple=triple)
+            return online, prefix
+        except Exception:
+            if saved is not None:
+                saved[0].abort()
+            self.close_seeded()
+            raise
 
     def install_seeded(self, context, key):
         """每个新session只安装一次；首槽准备完成后才允许ready。"""
@@ -1097,6 +1218,9 @@ class _OnlineMaterialRecovery:
     def close_seeded(self):
         """释放秘密引用和未用槽；Python内存释放不承诺可靠擦除，不能用旧seed重装。"""
         self._seeded_key = self._seeded_context = self._seeded_slot = None
+        if self._prefix is not None:
+            self._prefix[0].abort()
+            self._prefix = None
 
     def claim_seeded(self, inp, plan, corrections):
         """先烧毁当前裸槽再绑定当前round；原restore随后独占签发全新生命周期。"""
@@ -1147,6 +1271,7 @@ class _OnlineMaterialRecovery:
 def _rehydrate_online_material(
     material: PartyOnlineMaterial, sharing: TwoPartySharing,
     multiplier: BeaverMultiplier, truncation: SecureTruncation,
+    *, matrix_triple=None,
 ) -> PartyOnlineRound:
     """逐轮检查数值和身份；owner 可复用，triple/mask/lifecycle 必须全新。"""
     if not isinstance(material, PartyOnlineMaterial):
@@ -1175,10 +1300,15 @@ def _rehydrate_online_material(
             if (type(item) is not MatrixProductMaterial or item.metadata != expected
                     or type(item.owner) is not int or item.owner != party):
                 raise ValueError("矩阵材料身份或类型不匹配")
-            matrix_owner = MatrixBeaverMultiplier(sharing)
-            triple = MatrixTripleShare(item.u, item.v, item.w, party, expected.rows, expected.inner,
-                                        _TripleLifecycle(matrix_owner))
+            matrix_owner = matrix_triple._lifecycle.owner if matrix_triple is not None else MatrixBeaverMultiplier(sharing)
+            triple = matrix_triple if matrix_triple is not None else MatrixTripleShare(
+                item.u, item.v, item.w, party, expected.rows, expected.inner, _TripleLifecycle(matrix_owner))
             matrix_owner._validate(triple)
+            if matrix_triple is not None and (
+                    (triple.party_index, triple.rows, triple.inner) != (party, expected.rows, expected.inner)
+                    or any(not np.array_equal(a.value, b.value)
+                           for a, b in zip((item.u, item.v, item.w), (triple.u, triple.v, triple.w), strict=True))):
+                raise ValueError("已打开矩阵前缀与当前材料不一致")
             products.append(MatrixProductResourceShare(party, expected, triple, _ResourceLifecycle()))
             continue
         _validate_product_material(item, expected, party)
