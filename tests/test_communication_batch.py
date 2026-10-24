@@ -1305,10 +1305,17 @@ def test_compact_residues_and_wire_reject_noncanonical_structure_before_restore(
             codec._decode_residues(q.to_bytes(width, "big"), 1, q)
         with pytest.raises(ValueError):
             codec._decode_residues(data[:-1], 2, q)
+        for malformed,count in ((data+b'\0',2),(bytearray(data),2),(data,True),(data,-1)):
+            with pytest.raises(ValueError):
+                codec._decode_residues(malformed,count,q)
+        assert type(codec._decode_residues(data,2,q)) is tuple
+        assert all(type(s) is AdditiveShare and type(s.value) is int for s in codec._decode_residues(data,2,q))
     maximum = 512 * 1024
     assert len(codec._encode_residues([AdditiveShare(0)], 1 << (maximum*8-1))) == maximum
     with pytest.raises(ValueError):
         codec._encode_residues([AdditiveShare(0)], 1 << (maximum*8))
+    with pytest.raises(ValueError):
+        codec._decode_residues(b'',maximum+1,3)
 
     _, _, _, _, distribution = make_stack()
     layout = ControllerLayout(4, 2, 1, distribution.p1.layout.scale_ledger)
