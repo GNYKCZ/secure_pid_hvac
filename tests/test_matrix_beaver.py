@@ -680,7 +680,7 @@ def test_matrix_round_codec_real_peer_old_state_output_and_commit():
 
 
 @pytest.mark.parametrize('fault', [None, 'worker_exit', 'commit_ack', 'advance_ack'])
-def test_matrix_spawn_worker_segments_and_uncertain_failures(monkeypatch, fault):
+def test_matrix_spawn_worker_segments_and_uncertain_failures(monkeypatch, fault, profile='control-dynamic-matrix-v1'):
     """真实角色/供料进程短功能联调；无控制性能预热或长测。"""
     import multiprocessing as mp
 
@@ -690,7 +690,6 @@ def test_matrix_spawn_worker_segments_and_uncertain_failures(monkeypatch, fault)
     from secure_control.experiments.lan_continuous_profile import load_segmented_experiment
     from secure_control.scenarios.cart_pole.interactive import InteractiveSession
 
-    profile = 'control-dynamic-matrix-v1'
     ports = _ports()
     context = mp.get_context('spawn')
     queue = context.Queue()

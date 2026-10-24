@@ -1,5 +1,62 @@
 # 倒立摆动画 Client：三角色快速操作
 
+## 显式候选：种子＋校正（D132-7）
+
+旧默认和下文原矩阵演示保持。选用本候选时，A的Client、B的P1/P2三个角色配置都显式设置
+`wire_profile: control-dynamic-matrix-seeded-v1`，使用相同版本代码、原动态observer实验和同一拓扑。
+仍用原三个启动入口；Client可运行GUI或加`--headless-continuous --non-realtime --recording light`。
+不支持旧静态反馈、预送、完整路线或与旧profile静默混用；不改变20ms模型或原截止模式。
+
+可信Client的现有worker为每个新session生成两把独立32B系统随机密钥，通过专属私有IPC交给Client，
+Client在setup/offline之后只把Ki发给Pi。两方完成seed_init及首槽准备后才回复ready，随后才允许采样。
+秘密不在公开WorkerSpec、配置、计划摘要、repr或报告中。worker仍用原最多16槽校正库存；
+每个party只在现有会话线程保留一个下一步裸材料槽，首槽在启动时准备，以后在本方commit ACK发送后准备一步。
+领取当前槽后绑定round，protocol原recovery签发新生命周期；不预建未来endpoint/状态，不新增线程或进程。
+若准备延至下一请求，该等待仍在真实控制墙钟时间内。不能通过取消pacing或漏统计把准备变成“零成本”。
+数值horizon及u64计数到界不再扩展，正常跨400步段只延续全局索引；重启/重连/新epoch必须新密钥，不能恢复旧seed重放。
+失败/错步/短缺/未知提交不归还材料；ACK后准备失败阻止下一轮，不推翻上一步已确认事实。
+
+当前4/2/1布局、256位q：P1当步材料数值块严格0B，P2为5个W2和4对截断校正，严格13×32=416B。
+旧两方98×32=3136B，原始材料减少2720B（86.73%）。这不含初始化、信封/base64、输入、peer掩码、输出、提交和维护，
+不是总流量或耗时减少86.73%；普通周期的因果顺序、帧数和必要往返不减少。HMAC扩展/校正/单槽准备也有成本，净收益待测。
+
+### 固定PRF编码
+
+`D = b"secure-control.seeded-material.v1\0"`，末尾为一个NUL字节。
+`C = SHA256(D || UTF8(JSON([scheme, run, session, epoch, party, str(q), [n,m,p], ledger, lambda])))`。
+JSON使用`ensure_ascii=False,separators=(",",":"),allow_nan=False`，无额外空白。
+ledger按ControllerScaleLedger声明顺序为state/input/A/B/C/D/state_accumulator/state_truncation_bits/output_accumulator/output十个整数；
+首版必须`[ell,ell,ell,ell,ell,ell,2ell,ell,2ell,2ell]`，q不超过256位且沿原setup验证素数证据与Protocol2参数。
+每元素HMAC输入为`D || C || step:u64be || label_length:u8 || label || index:u32be || retry:u16be`。
+标签是ASCII字节`U`、`V`、`W`、`r`、`r-prime`，彼此独立；矩阵按row-major从索引0展开。
+取HMAC-SHA256前ceil(bit_length(q)/8)字节，遮去超出bit_length(q)的最高位，仅接受小于q的候选。
+retry为0至255，耗尽即失败，不取模回退；step为跨段连续u64，round_id只在领取时绑定。
+固定向量和拒绝/耗尽测试在`tests/test_seeded_material.py`；HMAC原语另对照[RFC4231§4.2](https://datatracker.ietf.org/doc/html/rfc4231#section-4.2)。
+项目向量（key=00..1f，run/session/epoch为对应英文文本、party0、q=2**61-1、2/1/1、ell8、lambda8）：
+C=`09828f6c636542da619a3a31f9d900a6cbb784e10294da6c09ea4bd13583d5d0`；step7/index0的U/V/W/r/r-prime分别为
+2092944468097547728、1148672793109831038、263392411593068148、1639045353779274445、696733048979632239。
+
+### 分布与安全边界
+
+理想独立随机函数下，P1扩展均匀独立U1/V1/W1/r1/r′1，P2扩展均匀独立U2/V2；dealer计算
+`W2=(U1+U2)(V1+V2)-W1 mod q`。因此W=UV，且变换(U,V,U1,V1,W1)与(U1,U2,V1,V2,W1)是一一对应，
+数值材料的联合分布与旧“均匀U/V、W=UV，再独立加法分享”一致。每个截断仍由原采样器独立生成有界r/r′，
+只指定均匀第一份分享，第二份为`r-r1`与`r′-r′1`模q。给定有界明文，这同样是原加法分享分布，不能让两端独立生成有界r再相加。
+实际q256/ell32/lambda80时kappa174、r∈[-2**221,2**221-1]、r′∈[-2**31,2**31-1]，原Protocol2误差/范围不变。
+
+P1只知道K1及本方流；隐藏K2的U2/V2在理想模型独立均匀，原掩码与协议视图保持原安全边界。
+P2只知道K2及本方U2/V2；W2被独立均匀W1遮蔽，截断第二份被各自独立均匀r1/r′1遮蔽，
+因此校正不额外揭示完整U/V/W或有界截断明文。全部标签、party和全局step/epoch均域分离，以上对联合跨步transcript成立。
+用HMAC替代理想函数后，论证依赖隐藏角色密钥下HMAC-SHA256为PRF的计算安全假设；本方持钥流可由模拟者照实生成，
+不把“含密钥的整个transcript”声称为与无种子的旧格式统计相同。原数值材料理想分布一致，不代表真实有限密钥输出是独立真随机。
+拒绝采样在理想模型成功条件下均匀，每元素耗尽概率至多2**-256且只停机，不靠随机性统计测试证明安全。
+依旧是可信dealer、半诚实且不串谋模型；不新增恶意安全或撤销原截断的统计误差边界。
+
+无证书网络不防抓包，泄露seed会影响整个epoch的派生份额，本候选没有前向保密；HMAC这里只作PRF，不认证整个网络。
+Client本来就知道全部材料，P1/P2同机不抵御管理员串谋；Python释放秘密引用不等于可靠内存清零。
+不增加PCG/PCF、固定矩阵预打开或材料复用。软件/安全独审通过后，才允许已批准的本机旧→新各一次、每组最多1000周期/60秒对照；
+首个功能失败停止、不补跑，保留全部样本、首步、跨段、失败和>20ms计数。只作本机证据，真实两机AC7/8仍待完成。
+
 ## 无证书两机非实时动态演示
 
 本次推荐使用已合并矩阵后端的 `control-dynamic-matrix-v1`，保留原两测量observer、约5°初态、20 ms模型步长和秘密分享计算。

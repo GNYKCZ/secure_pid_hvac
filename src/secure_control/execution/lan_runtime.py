@@ -24,6 +24,7 @@ from secure_control.crypto import (
     TwoPartySharing,
     verify_prime_modulus,
 )
+from secure_control.crypto.seeded_material import SEEDED_PROFILE
 from secure_control.protocol import P1, P2, Client, ControllerRangeContract
 from secure_control.protocol.coordinator import (
     DirectProtocol3PartyEndpoint,
@@ -50,6 +51,7 @@ from secure_control.protocol.messages import (
     public_step_plan_sha256,
     receipt_operation_count,
 )
+from secure_control.protocol.roles import _seeded_context
 
 from . import localhost_transport
 from ._inputs import normalize_step_input
@@ -69,7 +71,7 @@ from .localhost_codec import (
     _COMPACT_ADVANCE_PROFILES,
     _COMPACT_PROFILE,
     _COMPACT_PROFILES,
-    _MATRIX_PROFILE,
+    _MATRIX_PROFILES,
     SCHEMA_VERSION,
     BatchHelloPayload,
     LanContinuousSetupPayload,
@@ -92,8 +94,10 @@ from .localhost_codec import (
     WireEnvelope,
     _CompactHelloPayload,
     _CompactOnlinePayload,
+    _decode_integer_residues,
     _decode_preloaded_values,
     _EncodedOnlinePayload,
+    _SeedInitPayload,
     encode_wire_value,
 )
 from .localhost_transport import deadline_after, receive_envelope, send_envelope
@@ -101,6 +105,10 @@ from .localhost_transport import deadline_after, receive_envelope, send_envelope
 _FRAME_LIMIT = 8 * 1024 * 1024
 _MAX_CONTINUOUS_STEPS = 1000
 _LAN_LOG = logging.getLogger("secure_control.lan")
+
+
+class _SeededPreparationFailed(RuntimeError):
+    """上一步ACK后下一槽准备失败；只标记下一轮，不倒写已提交历史。"""
 
 
 class _PreloadMaterialStore:
@@ -503,9 +511,11 @@ class LanContinuousRuntime:
         ):
             raise ValueError("紧凑动态候选仅允许显式批量 v2 且不预送")
         self._wire_profile = wire_profile
-        if wire_profile == _MATRIX_PROFILE:
+        if wire_profile in _MATRIX_PROFILES:
             # 在联网和材料分配之前验证本profile支持的公开尺度/形状。
             _matrix_layout_preflight(spec, fixed_point)
+            if wire_profile == SEEDED_PROFILE and fixed_point.modulus.bit_length() > 256:
+                raise ValueError("种子首版只支持不超过256位模数")
         if wire_profile in _CLIENT_AUTH_PROFILES and not (
                 spec.state_dimension and (spec.scale_metadata.A if spec.scale_metadata is not None
                                           else fixed_point.fractional_bits) > 0):
@@ -697,7 +707,7 @@ class LanContinuousRuntime:
 
     @property
     def resource_counts(self) -> dict[str, int]:
-        if self._wire_profile == _MATRIX_PROFILE:
+        if self._wire_profile in _MATRIX_PROFILES:
             layout = self.spec
             n, m, p = layout.state_dimension, layout.input_dimension, layout.output_dimension
             return {"matrix_products_consumed": self._products,
@@ -1055,7 +1065,7 @@ class LanSegmentedRuntime:
         ):
             raise ValueError("紧凑动态候选仅允许 v2 且不预送")
         self._wire_profile = wire_profile
-        if wire_profile == _MATRIX_PROFILE:
+        if wire_profile in _MATRIX_PROFILES:
             # 在联网和材料分配之前验证本profile支持的公开尺度/形状。
             _matrix_layout_preflight(spec, fixed_point)
         if (type(preload_steps) is not int or not 0 <= preload_steps <= 1000
@@ -1140,7 +1150,7 @@ class LanSegmentedRuntime:
 
     @property
     def resource_counts(self) -> dict[str, int]:
-        if self._wire_profile == _MATRIX_PROFILE:
+        if self._wire_profile in _MATRIX_PROFILES:
             layout = self.spec
             n, m, p = layout.state_dimension, layout.input_dimension, layout.output_dimension
             return {"matrix_products_consumed": self._products,
@@ -1192,6 +1202,28 @@ class LanSegmentedRuntime:
                 segment._material_pool = _MaterialWorkerPool(segment.client, segment.distribution,
                     run_id=self.run_id, epoch=self.controller_epoch, start=segment._step, slots=slots,
                     **({"encoding_profile": self._wire_profile} if self._wire_profile in _COMPACT_PROFILES else {}))
+                if self._wire_profile == SEEDED_PROFILE:
+                    started,total = time.perf_counter_ns(),0
+                    pool = segment._material_pool
+                    for party,sock in enumerate(segment._sockets):
+                        context = _seeded_context(pool.spec.layout,self.run_id,segment.session_id,
+                            self.controller_epoch,party,pool.spec.modulus,pool.spec.security_parameter)
+                        payload = _SeedInitPayload(self.run_id,self.controller_epoch,party,
+                            context.digest().hex(),pool.seed_for_party(party))
+                        role = "P1" if party == 0 else "P2"
+                        seq = segment._sequences[party]
+                        # 只累计字节长度，绝不将秘密信封写进公开材料汇总。
+                        total += len(localhost_transport.encode_envelope(WireEnvelope(
+                            SCHEMA_VERSION,"request","Client",role,seq,"seed_init",segment.session_id,
+                            None,None,None,payload)))
+                        total += len(localhost_transport.encode_envelope(WireEnvelope(
+                            SCHEMA_VERSION,"reply",role,"Client",seq,"seed_init",segment.session_id,
+                            None,None,None,None)))
+                        _request(sock,role,seq,"seed_init",segment.session_id,
+                            self.config.startup_timeout,payload)
+                        segment._sequences[party] += 1
+                    pool.release_seeds()
+                    pool.observe_seed_init(time.perf_counter_ns()-started,total)
             except Exception as error:
                 segment._material_statistics = getattr(error, "_public_material_summary", {})
                 raise
@@ -1486,7 +1518,7 @@ def _validate_segment_chain(hello: LanSegmentedHelloPayload, session: str,
 
 
 def _restore_compact_online(value, *, layout, session, round_id, step, modulus, run_id, epoch_id, party,
-                            wire_profile=_COMPACT_PROFILE):
+                            wire_profile=_COMPACT_PROFILE, seeded_recovery=None):
     """只从认证 setup 与当前信封恢复公开计划，再交给原资源 recovery。"""
     plan = Client._resource_plan(layout, session, round_id, step, encoding_profile=wire_profile)
     if not isinstance(value, _CompactOnlinePayload) or value.version != wire_profile or (
@@ -1496,6 +1528,12 @@ def _restore_compact_online(value, *, layout, session, round_id, step, modulus, 
     inp = value.input_message
     if (inp.session_id, inp.round_id, inp.step, inp.recipient) != (session, round_id, step, party):
         raise ValueError("紧凑材料当前输入身份不匹配")
+    if wire_profile == SEEDED_PROFILE:
+        if seeded_recovery is None:
+            raise ValueError("种子在线材料没有完成初始化")
+        count = 0 if party == 0 else plan.product_resources[0].rows+2*plan.truncation_count
+        corrections = _decode_integer_residues(value.values,count,modulus)
+        return seeded_recovery.claim_seeded(inp,plan,corrections)
     return _decode_preloaded_values(value.values, inp, plan, modulus)
 
 
@@ -1511,6 +1549,8 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
     preload_store = None
     endpoint = None
     compact_hello = None
+    recovery = None
+    seeded_prepare_error = None
     try:
         startup_deadline = deadline_after(config.startup_timeout)
         _LAN_LOG.info("%s 已启动，正在等待 Client（最多 %.0f 秒）。", role,
@@ -1661,6 +1701,18 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
         )
         _party_reply(client_socket, offline_request, None, config.startup_timeout)
         sequence = 4
+        if expected_wire_profile == SEEDED_PROFILE:
+            request = _party_receive(client_socket,role,sequence,"seed_init",session,config.startup_timeout)
+            seed = request.payload
+            context = _seeded_context(material.layout,hello.run_id,session,setup.controller_epoch,
+                party,fixed.modulus,setup.security_parameter)
+            if (type(seed) is not _SeedInitPayload or (seed.run_id,seed.epoch_id,seed.party,seed.context_sha256) != (
+                    hello.run_id,setup.controller_epoch,party,context.digest().hex())):
+                raise ValueError("种子初始化公开绑定错误")
+            recovery.install_seeded(context,seed.key)
+            _party_reply(client_socket,request,None,config.startup_timeout)
+            sequence += 1
+            del seed,request
         if preload_hello is not None:
             request = receive_envelope(client_socket, deadline=startup_deadline, limit=64 * 1024)
             _check_request(request, role, sequence, "preload_init", session)
@@ -1789,6 +1841,10 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                     summary["material_summary"] = {"material_mode": "control-preloaded-v1",
                         "budget": preload_store.budget, "claimed": preload_store.next_slot,
                         "committed": preload_store.committed, "exported_count": preload_store.loaded}
+                if expected_wire_profile == SEEDED_PROFILE:
+                    summary["seeded_material"] = {**recovery.seeded_statistics,
+                        "next_prepare_error":seeded_prepare_error,"next_step":global_committed,
+                        "claimed_count":recovery._seeded_next}
                 return summary, tail
             fused = compact_hello is not None or preload_hello is not None and preload_hello.stage_mode == "fused"
             operation = ("online_stage" if compact_hello is not None else
@@ -1803,10 +1859,14 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
             online_material = (preload_store.claim(online_request.payload)
                                if preload_store is not None else online_request.payload)
             if compact_hello is not None:
+                if seeded_prepare_error is not None:
+                    error = _SeededPreparationFailed("本方ACK后下一槽准备失败，禁止开始新轮")
+                    _party_error(client_socket,online_request,error,config.step_timeout)
+                    raise error
                 online_material = _restore_compact_online(online_material, layout=material.layout,
                     session=session, round_id=online_request.round_id, step=expected_step,
                     modulus=fixed.modulus, run_id=hello.run_id, epoch_id=setup.controller_epoch, party=party,
-                    wire_profile=expected_wire_profile)
+                    wire_profile=expected_wire_profile,seeded_recovery=recovery)
             if not isinstance(online_material, PartyOnlineMaterial):
                 raise TypeError("在线单方材料类型错误。")
             online = recovery.restore(online_material)
@@ -1888,6 +1948,12 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                     products += len(endpoint.plan.product_resources)
                     truncations += len(endpoint.plan.state_truncation_resources)
                     last_round = endpoint.plan.round_id
+                    if expected_wire_profile == SEEDED_PROFILE:
+                        # ACK已发送、前步事实不回滚；准备成本可阻塞下一请求，计入其真实墙钟延迟。
+                        try:
+                            recovery.prepare_seeded()
+                        except Exception as error:  # noqa: BLE001 - ACK已发送，只记录下一准备失败，不回滚已提交步
+                            seeded_prepare_error = type(error).__name__
                     break
         shutdown_request = _party_receive(
             client_socket, role, sequence, "shutdown", session, config.shutdown_timeout
@@ -1906,6 +1972,8 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
             })
         return summary, None
     finally:
+        if recovery is not None:
+            recovery.close_seeded()
         if preload_store is not None:
             preload_store.close()
         if (preload_store is not None or compact_hello is not None) and endpoint is not None:
@@ -2095,7 +2163,7 @@ def _party_receive(
         limit=_FRAME_LIMIT,
     )
     _check_request(message, role, sequence, operation, session)
-    if operation in {"lan_ready", "lan_setup", "offline", "shutdown"} and (
+    if operation in {"lan_ready", "lan_setup", "offline", "shutdown", "seed_init"} and (
         message.round_id is not None or message.step is not None or message.resource_id is not None
     ):
         raise ValueError("LAN 准备或关闭请求不得携带 round identity。")

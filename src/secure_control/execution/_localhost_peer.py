@@ -23,7 +23,7 @@ from secure_control.protocol.messages import (
 from .localhost_codec import (
     _CLIENT_AUTH_PROFILES,
     _COMPACT_PROFILES,
-    _MATRIX_PROFILE,
+    _MATRIX_PROFILES,
     SCHEMA_VERSION,
     BatchHelloPayload,
     HelloPayload,
@@ -127,7 +127,7 @@ class LocalhostProtocol3PeerPort:
         run_id: str | None = None, epoch_id: str | None = None,
         physical_step: int | None = None,
     ) -> None:
-        if (type(plan) is MatrixStepResourcePlan) != (self._wire_profile == _MATRIX_PROFILE):
+        if (type(plan) is MatrixStepResourcePlan) != (self._wire_profile in _MATRIX_PROFILES):
             raise ValueError("矩阵计划与显式协商的wire不一致")
         if not self._batch_enabled or self._session_id != plan.session_id:
             raise ValueError("peer 未协商批量能力或 session 不匹配")
@@ -279,7 +279,7 @@ class LocalhostProtocol3PeerPort:
     def _wire_batch(self, payload):
         if self._wire_profile not in _COMPACT_PROFILES:
             return payload
-        if self._wire_profile == _MATRIX_PROFILE:
+        if self._wire_profile in _MATRIX_PROFILES:
             from secure_control.crypto.matrix_beaver import matrix_values
             meta = self._batch_context[0].product_resources[0]
             modulus = self._batch_context[4]
@@ -316,10 +316,10 @@ class LocalhostProtocol3PeerPort:
                 {"product": 0, "product_complete": 1, "truncation": 2, "state_complete": 3}[phase]
             ):
                 raise ValueError("紧凑 peer 阶段或公开身份不匹配")
-            count = (plan.multiplication_mask_elements if self._wire_profile == _MATRIX_PROFILE
+            count = (plan.multiplication_mask_elements if self._wire_profile in _MATRIX_PROFILES
                      and phase == "product" else len(ids) * (2 if phase == "product" else 1)
                      if phase in {"product", "truncation"} else 0)
-            matrix_product = self._wire_profile == _MATRIX_PROFILE and phase == "product"
+            matrix_product = self._wire_profile in _MATRIX_PROFILES and phase == "product"
             values = iter((_decode_integer_residues if matrix_product else _decode_residues)(payload.values,
                 count,
                 self._batch_context[4]))
@@ -365,7 +365,7 @@ class LocalhostProtocol3PeerPort:
         modulus = self._batch_context[4]
         for item in values:
             if phase == "product":
-                if self._wire_profile == _MATRIX_PROFILE:
+                if self._wire_profile in _MATRIX_PROFILES:
                     from secure_control.crypto.matrix_beaver import matrix_values
                     if (type(item) is not MatrixMaskPayload or type(item.party) is not int
                             or item.party != (0 if sender == "P1" else 1)):
