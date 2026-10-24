@@ -10,6 +10,125 @@ from secure_control.crypto import AdditiveShare, TwoPartySharing
 from secure_control.crypto.matrix_beaver import MatrixBeaverMultiplier
 
 
+def _matrix_plan_fields(n, m, p, ell, step):
+    """直接列出公开字段供旧语义oracle使用，不调用待测计划构造器生成期望。"""
+    from secure_control.protocol.messages import (
+        ControllerScaleLedger,
+        MatrixProductMetadata,
+        ResourceMetadata,
+    )
+
+    session, round_id = '会话"\\', f'轮次-{step}'
+    records = [{'resource_id':f'{round_id}:state[{i}]', 'session_id':session,
+        'round_id':round_id, 'step':step, 'kind':'state_truncation', 'term':'state',
+        'index':(i,), 'shape':(n,), 'left_fractional_bits':2*ell,
+        'right_fractional_bits':None, 'output_fractional_bits':ell} for i in range(n)]
+    kwargs = {'session_id':session, 'round_id':round_id, 'step':step,
+        'state_shape':(n,), 'input_shape':(m,), 'output_shape':(p,),
+        'scale_ledger':ControllerScaleLedger(ell, ell, ell, ell, ell, ell, 2*ell, ell, 2*ell, 2*ell),
+        'product_resources':(MatrixProductMetadata(round_id+':matrix', session, round_id, step, n+p, n+m),),
+        'state_truncation_resources':tuple(ResourceMetadata(**item) for item in records)}
+    return kwargs, tuple(ResourceMetadata(**item) for item in records)
+
+
+@pytest.mark.parametrize('dimensions,ell,step', [((1,2,1),1,0), ((2,1,3),7,3), ((4,2,1),32,2**80+3)])
+def test_matrix_plan_validation_matches_old_json_and_independent_digest(dimensions, ell, step):
+    """全部字段及非规范输入按旧比较裁决；摘要期望来自原始kwargs和旧JSON字节。"""
+    import json
+    from dataclasses import asdict, fields
+    from hashlib import sha256
+
+    from secure_control.protocol.messages import (
+        MatrixStepResourcePlan,
+        ResourceMetadata,
+        public_step_plan_sha256,
+    )
+
+    kwargs, expected = _matrix_plan_fields(*dimensions, ell, step)
+    original = kwargs['state_truncation_resources']
+    def old_check(resources):
+        if (type(resources) is not tuple or any(type(v) is not ResourceMetadata for v in resources)
+                or json.dumps([asdict(v) for v in resources], sort_keys=True)
+                   != json.dumps([asdict(v) for v in expected], sort_keys=True)):
+            raise ValueError('矩阵状态截断计划错误')
+    def check(resources):
+        try:
+            old_check(resources)
+        except (TypeError, ValueError, RecursionError) as error:
+            with pytest.raises(type(error)):
+                MatrixStepResourcePlan(**dict(kwargs, state_truncation_resources=resources))
+            return type(error)
+        plan = MatrixStepResourcePlan(**dict(kwargs, state_truncation_resources=resources))
+        # 不规范化历史兼容的list/子类，也不换成“当前轮”的另一个元数据对象。
+        assert plan.state_truncation_resources is resources
+        assert plan.session_id == kwargs['session_id'] and plan.step == step
+        return None
+    assert check(original) is None
+    plan = MatrixStepResourcePlan(**kwargs)
+    raw = dict(kwargs, scale_ledger=asdict(kwargs['scale_ledger']),
+        product_resources=[asdict(v) for v in kwargs['product_resources']],
+        state_truncation_resources=[asdict(v) for v in expected],
+        version='matrix-dynamic-plan-v1', arithmetic_profile='matrix-beaver-v1', order='row-major/state-first')
+    encoded = json.dumps(raw, sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False).encode()
+    assert public_step_plan_sha256(plan) == sha256(b'matrix-dynamic-plan-v1\0'+encoded).hexdigest()
+    changes = {'resource_id':'wrong', 'session_id':'other-session', 'round_id':'other-round', 'step':step+1,
+        'kind':'multiplication', 'term':'A', 'index':(-1,), 'shape':(dimensions[0]+1,),
+        'left_fractional_bits':-1, 'right_fractional_bits':0, 'output_fractional_bits':ell+1}
+    assert set(changes) == {f.name for f in fields(ResourceMetadata)}
+    # 首/末项逐字段覆盖，不能只检查id、忽略尾部或用截断zip比较。
+    for index in {0, len(original)-1}:
+        for name, value in changes.items():
+            changed = original[:index]+(replace(original[index], **{name:value}),)+original[index+1:]
+            assert check(changed) is ValueError, (index, name)
+    for resources in (original[:-1], original+(original[-1],), None, list(original), (object(),)):
+        assert check(resources) is ValueError
+    if len(original)>1:
+        assert check(original[::-1]) is ValueError
+    # Python相等会把这些数值当作原整数；旧JSON明确区分bool/float。
+    for name, value in (('index',(False,)), ('index',(0.,)), ('shape',(float(dimensions[0]),)),
+                        ('left_fractional_bits',float(2*ell)), ('output_fractional_bits',float(ell))):
+        changed = replace(original[0], **{name:value})
+        assert changed == original[0]
+        assert check((changed, *original[1:])) is ValueError
+    class PublicInt(int):
+        pass
+    class PublicString(str):
+        pass
+    class PublicTuple(tuple):
+        pass
+    class MetadataSubclass(ResourceMetadata):
+        pass
+    for name, value in (('index',[0]), ('shape',[dimensions[0]]), ('index',PublicTuple((0,))),
+                        ('step',PublicInt(step)), ('session_id',PublicString(kwargs['session_id']))):
+        assert check((replace(original[0], **{name:value}), *original[1:])) is None
+    assert check((MetadataSubclass(**asdict(original[0])), *original[1:])) is ValueError
+    cyclic = []
+    cyclic.append(cyclic)
+    for value, failure in ((object(),TypeError), (b'index',TypeError), (cyclic,RecursionError),
+                            (float('nan'),ValueError)):
+        assert check((replace(original[0], index=value), *original[1:])) is failure
+
+
+def test_matrix_canonical_plan_validation_avoids_local_serialization(monkeypatch):
+    """哨兵只约束规范构造的局部比较，完整行为另由旧语义oracle保护。"""
+    from secure_control.protocol import messages
+
+    kwargs, expected = _matrix_plan_fields(4, 2, 1, 32, 7)
+    def forbidden(*args, **kwargs):
+        pytest.fail('规范矩阵计划构造不应递归asdict或做内部JSON比较')
+    monkeypatch.setattr(messages, 'asdict', forbidden)
+    monkeypatch.setattr(messages.json, 'dumps', forbidden)
+    plan = messages.MatrixStepResourcePlan(**kwargs)
+    assert plan.state_truncation_resources == expected
+    assert plan.product_resources[0].rows == 5 and plan.product_resources[0].inner == 6
+    assert plan.fractional_bits == 32 and plan.truncation_count == 4
+    assert plan.session_id == kwargs['session_id'] and plan.round_id == kwargs['round_id'] and plan.step == 7
+    # 快路径必须在每次构造重查全部条目，不能复用上次成功状态。
+    bad = kwargs['state_truncation_resources'][:-1]+(replace(expected[-1], output_fractional_bits=33),)
+    with pytest.raises(ValueError, match='矩阵状态截断计划错误'):
+        messages.MatrixStepResourcePlan(**dict(kwargs, state_truncation_resources=bad))
+
+
 @pytest.mark.parametrize('rows,inner', [(1, 1), (2, 3), (5, 6)])
 def test_matrix_product_independent_integer_oracle_and_one_public_cross_term(rows, inner):
     q = 2**127 - 1

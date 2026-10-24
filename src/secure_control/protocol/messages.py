@@ -487,10 +487,14 @@ class MatrixStepResourcePlan:
         truncations = tuple(ResourceMetadata(f'{self.round_id}:state[{i}]', self.session_id,
             self.round_id, self.step, 'state_truncation', 'state', (i,), (n,), 2*ell, None, ell)
             for i in range(n))
+        # 仅精确不可变类型图可直接相等比较，避免False==0/1.0==1绕过旧JSON类型语义。
+        # 其他输入保留原比较与异常，包括index/shape为list的历史兼容形式。
         if (type(self.state_truncation_resources) is not tuple
                 or any(type(v) is not ResourceMetadata for v in self.state_truncation_resources)
-                or json.dumps([asdict(v) for v in self.state_truncation_resources], sort_keys=True)
-                   != json.dumps([asdict(v) for v in truncations], sort_keys=True)):
+                or (self.state_truncation_resources != truncations
+                    if _deeply_immutable_public_plan(self)
+                    else json.dumps([asdict(v) for v in self.state_truncation_resources], sort_keys=True)
+                         != json.dumps([asdict(v) for v in truncations], sort_keys=True))):
             raise ValueError("矩阵状态截断计划错误")
 
     @property
