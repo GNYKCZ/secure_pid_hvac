@@ -30,6 +30,7 @@ class _MaskLifecycle:
         "owner",
         "p1_reconstructed",
         "p2_sent",
+        "peer_ready_parties",
     )
 
     def __init__(self, owner: object, *, observation_party: int | None = None) -> None:
@@ -44,6 +45,14 @@ class _MaskLifecycle:
         self.p1_reconstructed = False
         self.finished_parties: set[int] = set()
         self.consumed = False
+        self.peer_ready_parties: set[int] = set()
+
+    def accept_peer_ready(self, party: int) -> None:
+        """与Client证明分开记录已验证的远端局部完成见证。"""
+        if self.observation_party != party or self.consumed or self.finished_parties != {party}:
+            raise ValueError("截断本方未完成或见证已消费")
+        self.peer_ready_parties.add(1-party)
+        self.consumed = True
 
     def claim_mask(self, party: int) -> None:
         """记录一方使用辅助随机量生成一次遮蔽份额。"""

@@ -245,7 +245,7 @@ def test_seeded_preparation_respects_finite_horizon_and_worker_spec_is_public():
     assert not any('seed' in field or 'key' in field for field in _WorkerSpec.__dataclass_fields__)
 
 
-def _party_with_next_prepare_failure(config,ports,queue):
+def _party_with_next_prepare_failure(config,ports,queue,profile=SEEDED_PROFILE):
     """只在测试子进程注入ACK后的第二槽失败，绝不修改实际用户进程。"""
     from secure_control.experiments.communication_benchmark import _party_job
     from secure_control.protocol import coordinator
@@ -256,10 +256,10 @@ def _party_with_next_prepare_failure(config,ports,queue):
             raise RuntimeError('test next preparation failure')
         return original(key,context,step)
     coordinator.expand_party = expand
-    _party_job(config,ports,0,True,queue,wire_profile=SEEDED_PROFILE)
+    _party_job(config,ports,0,True,queue,wire_profile=profile)
 
 
-def test_seeded_ack_then_prepare_failure_belongs_to_next_round_only():
+def test_seeded_ack_then_prepare_failure_belongs_to_next_round_only(profile=SEEDED_PROFILE):
     import multiprocessing as mp
 
     from secure_control.execution import lan_runtime
@@ -270,7 +270,7 @@ def test_seeded_ack_then_prepare_failure_belongs_to_next_round_only():
     ports = _ports()
     context = mp.get_context('spawn')
     queue = context.Queue()
-    parties = [context.Process(target=_party_with_next_prepare_failure,args=(_config(r,ports),ports,queue))
+    parties = [context.Process(target=_party_with_next_prepare_failure,args=(_config(r,ports),ports,queue,profile))
                for r in ('P1','P2')]
     runtime = None
     try:
@@ -279,7 +279,7 @@ def test_seeded_ack_then_prepare_failure_belongs_to_next_round_only():
             party.start()
         runtime = lan_runtime.LanSegmentedRuntime(_config('Client',ports),prepared.spec,prepared.context,
             prepared.contract,prepared.security_parameter,prepared.evidence,control=lan_runtime.RunControl(),
-            segment_capacity=2,wire_profile=SEEDED_PROFILE)
+            segment_capacity=2,wire_profile=profile)
         runtime.enable_material_preparation(slots=4,_candidate='worker')
         first = runtime.step(np.zeros(2))
         runtime.confirm_applied(first)

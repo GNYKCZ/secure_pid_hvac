@@ -7,6 +7,8 @@ import socket
 from copy import deepcopy
 from typing import Literal
 
+from secure_control.crypto import AdditiveShare
+from secure_control.crypto.seeded_material import PREAUTHORIZED_PROFILE
 from secure_control.protocol.messages import (
     _PUBLIC_PLAN_JSON_FIELDS,
     MatrixMaskPayload,
@@ -14,6 +16,7 @@ from secure_control.protocol.messages import (
     P2TruncationPayload,
     ProductMaskPayload,
     Protocol3BatchPayload,
+    ReadyReceipt,
     ResourceMetadata,
     StepResourcePlan,
     _deeply_immutable_public_plan,
@@ -33,6 +36,8 @@ from .localhost_codec import (
     _decode_residues,
     _encode_integer_residues,
     _encode_residues,
+    _PrefixPayload,
+    _SuffixPayload,
     decode_envelope,
     encode_envelope,
 )
@@ -135,7 +140,8 @@ class LocalhostProtocol3PeerPort:
             raise ValueError("批量 peer 模数无效")
         if self._wire_profile in _CLIENT_AUTH_PROFILES and (
                 not plan.truncation_count or getattr(self, "_v3_last_step", -1)+1 != plan.step
-                or getattr(self, "_v3_phase", "truncated") != "truncated"):
+                or getattr(self, "_v3_phase", "ready" if self._wire_profile == PREAUTHORIZED_PROFILE else "truncated")
+                    != ("ready" if self._wire_profile == PREAUTHORIZED_PROFILE else "truncated")):
             raise ValueError("局部暂存 peer 需要连续新鲜且前轮完整的动态截断轮次。")
         self._batch_context = (_snapshot_public_plan(plan), run_id, epoch_id or plan.session_id,
                                physical_step, modulus)
@@ -164,6 +170,68 @@ class LocalhostProtocol3PeerPort:
         self._check_batch_values(incoming, len(ids), "product", sender=self._peer)
         if self._wire_profile in _CLIENT_AUTH_PROFILES:
             self._v3_phase = "products"
+        return incoming
+
+    def _exchange_preauthorized(self, operation, payload, session, round_id, step):
+        if self._wire_profile != PREAUTHORIZED_PROFILE or session != self._session_id:
+            raise ValueError("前缀/预授权需要显式同一session")
+        outgoing = WireEnvelope(SCHEMA_VERSION, "request", self._role, self._peer,
+            self._send_sequence, operation, session, round_id, step, None, payload)
+        incoming = decode_envelope(_exchange_frame(self._connection, encode_envelope(outgoing),
+            deadline=self._deadline if self._deadline is not None else deadline_after(self._timeout),
+            limit=self._limit))
+        if (incoming.kind, incoming.sender, incoming.recipient, incoming.sequence, incoming.operation,
+                incoming.session_id, incoming.round_id, incoming.step, incoming.resource_id) != (
+                "request", self._peer, self._role, self._receive_sequence, operation, session, round_id, step, None):
+            raise ValueError("预授权peer身份/序号/阶段错误")
+        self._send_sequence += 1
+        self._receive_sequence += 1
+        return incoming.payload
+
+    def exchange_prefix(self, identity, e, fx, modulus):
+        import numpy as np
+        if (getattr(self, "_prefix_next", 0) != identity[4]
+                or getattr(self, "_v3_phase", "ready") != "ready"):
+            raise ValueError("前缀错步或上一轮尚未完成")
+        self._prefix_next = identity[4]+1
+        values = [int(v) for arr in (e, fx) for v in arr.flat]
+        payload = _PrefixPayload(identity, 0 if self._role == "P1" else 1,
+                                 _encode_integer_residues(values, len(values), modulus))
+        incoming = self._exchange_preauthorized("peer_prefix", payload, identity[1], None, identity[4])
+        if (type(incoming) is not _PrefixPayload or incoming.identity != identity
+                or incoming.party != 1-payload.party):
+            raise ValueError("对端前缀上下文/状态版本错误")
+        values = _decode_integer_residues(incoming.values, len(values), modulus)
+        count = e.size
+        return (AdditiveShare(np.array(values[:count], dtype=object).reshape(e.shape)),
+                AdditiveShare(np.array(values[count:], dtype=object).reshape(fx.shape)))
+
+    def exchange_suffix(self, plan, permit, value):
+        import numpy as np
+        self._check_v3_phase("prepared")
+        self._batch_identity(plan)
+        self._v3_phase = "in_flight"
+        q = self._batch_context[4]
+        payload = _SuffixPayload(permit, 0 if self._role == "P1" else 1,
+            _encode_integer_residues(tuple(int(v) for v in value.value.flat), value.value.size, q))
+        incoming = self._exchange_preauthorized("peer_suffix", payload, plan.session_id, plan.round_id, plan.step)
+        if (type(incoming) is not _SuffixPayload or incoming.permit != permit or incoming.party != 1-payload.party):
+            raise ValueError("后缀permit/角色不匹配")
+        values = _decode_integer_residues(incoming.values, plan.input_shape[0], q)
+        self._v3_phase = "products"
+        return AdditiveShare(np.array(values, dtype=object).reshape(plan.input_shape[0], 1))
+
+    def exchange_ready(self, ready):
+        self._check_v3_phase("truncated")
+        if type(ready) is not ReadyReceipt:
+            raise ValueError("需要局部READY")
+        p = ready.permit
+        self._v3_phase = "in_flight"
+        incoming = self._exchange_preauthorized("peer_ready", ready, p.session_id, p.round_id, p.global_step)
+        if (type(incoming) is not ReadyReceipt or incoming.permit != p
+                or incoming.party != 1-ready.party or incoming.truncations != ready.truncations):
+            raise ValueError("对方READY不匹配")
+        self._v3_phase = "ready"
         return incoming
 
     def product_complete(self, plan: StepResourcePlan) -> None:

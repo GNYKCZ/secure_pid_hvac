@@ -365,7 +365,10 @@ def test_server_visible_state_and_input_interfaces_reject_plaintext_or_two_share
         "_controller",
         "_state",
         "_layout",
+        "state_version",
     }
+    assert type(p1.state_version) is type(p2.state_version) is int
+    assert p1.state_version == p2.state_version == 0
     assert all(
         isinstance(getattr(p1.controller_share, name), AdditiveShare)
         for name in ("A", "B", "C", "D")
