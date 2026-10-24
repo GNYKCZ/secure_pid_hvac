@@ -129,6 +129,198 @@ def test_matrix_canonical_plan_validation_avoids_local_serialization(monkeypatch
         messages.MatrixStepResourcePlan(**dict(kwargs, state_truncation_resources=bad))
 
 
+def _matrix_mask_oracle(left, right, q, sign):
+    """只用Python整数逐项算模加减期望，不调用分享或矩阵运算实现。"""
+    a, b = np.asarray(left, dtype=object), np.asarray(right, dtype=object)
+    return [[(int(a[i,j])+sign*int(b[i,j])) % q for j in range(a.shape[1])]
+            for i in range(a.shape[0])]
+
+
+@pytest.mark.parametrize('rows,inner,q,layout', [
+    (1,1,257,'readonly'), (2,3,2**127-1,'transpose'), (5,6,2**256-189,'slice')])
+def test_matrix_masks_match_integer_oracle_and_preserve_independent_storage(rows, inner, q, layout):
+    """逐方E/F及公开E/F独立核对，含只读/非连续输入和跨调用无别名。"""
+    sharing = TwoPartySharing(q)
+    owner = MatrixBeaverMultiplier(sharing)
+    def arrange(value):
+        if layout == 'transpose':
+            value = value.T.copy().T
+        elif layout == 'slice':
+            backing = np.empty((value.shape[0]*2, value.shape[1]*2), dtype=object)
+            backing[::2,::2] = value
+            value = backing[::2,::2]
+        value.flags.writeable = False
+        return AdditiveShare(value)
+    triples = tuple(replace(t, **{name:arrange(getattr(t,name).value) for name in ('u','v','w')})
+                    for t in owner.create_triple(rows,inner,rng=random.Random(57)))
+    matrices = [arrange(np.array([[0 if (i+j+p)%2 == 0 else q-1 for j in range(inner)]
+                                 for i in range(rows)],dtype=object)) for p in (0,1)]
+    vectors = [arrange(np.array([[q-1 if (i+p)%2 == 0 else 0] for i in range(inner)],dtype=object))
+               for p in (0,1)]
+    inputs = [v.value for v in (*matrices,*vectors,*(v for t in triples for v in (t.u,t.v,t.w)))]
+    snapshots = [a.copy() for a in inputs]
+    expected_e = [_matrix_mask_oracle(matrices[p].value,triples[p].u.value,q,-1) for p in (0,1)]
+    expected_f = [_matrix_mask_oracle(vectors[p].value,triples[p].v.value,q,-1) for p in (0,1)]
+    masks = [owner.mask_inputs(matrices[p],vectors[p],triples[p]) for p in (0,1)]
+    for p in (0,1):
+        assert masks[p].e.value.tolist() == expected_e[p]
+        assert masks[p].f.value.tolist() == expected_f[p]
+    opened = owner.open_masked_differences(*masks)
+    assert opened.e.tolist() == _matrix_mask_oracle(expected_e[0],expected_e[1],q,1)
+    assert opened.f.tolist() == _matrix_mask_oracle(expected_f[0],expected_f[1],q,1)
+    results = [a for masked in masks for a in (masked.e.value,masked.f.value)]+[opened.e,opened.f]
+    for i,a in enumerate(results):
+        assert type(a) is np.ndarray and a.dtype == object and all(type(v) is int for v in a.flat)
+        assert a.shape == ((rows,inner) if i%2 == 0 else (inner,1))
+        assert not any(np.shares_memory(a,b) for b in inputs+results[:i])
+    assert all(np.array_equal(a,b) for a,b in zip(inputs,snapshots,strict=True))
+    assert triples[0]._lifecycle.masked_parties == {0,1} and triples[0]._lifecycle.opened
+    with pytest.raises(ValueError):
+        owner.open_masked_differences(*masks)
+    other = owner.create_triple(rows,inner,rng=random.Random(58))
+    fresh = owner.mask_inputs(matrices[0],vectors[0],other[0])
+    for a in (fresh.e.value,fresh.f.value):
+        assert not any(np.shares_memory(a,b) for b in inputs+results)
+    previous = masks[0].e.value.copy()
+    opened.e.flat[-1] = (opened.e.flat[-1]+1) % q
+    assert np.array_equal(masks[0].e.value,previous)
+
+
+def test_matrix_nonstandard_shares_keep_generic_dispatch_and_values(monkeypatch):
+    """每类旧许可表示仍走通用入口；子类扩展不被直接内核绕过。"""
+    class ArrayChild(np.ndarray):
+        pass
+    class ShareChild(AdditiveShare):
+        pass
+    class SharingChild(TwoPartySharing):
+        pass
+    class IntChild(int):
+        pass
+    calls = []
+    subtract, reconstruct = TwoPartySharing.subtract, TwoPartySharing.reconstruct
+    def recorded_subtract(self,a,b):
+        calls.append('subtract')
+        return subtract(self,a,b)
+    def recorded_reconstruct(self,a,b):
+        calls.append('reconstruct')
+        return reconstruct(self,a,b)
+    monkeypatch.setattr(TwoPartySharing,'subtract',recorded_subtract)
+    monkeypatch.setattr(TwoPartySharing,'reconstruct',recorded_reconstruct)
+    for kind in ('list','integer_dtype','numpy_integer','array_child','share_child','sharing_child','int_child'):
+        sharing = SharingChild(257) if kind == 'sharing_child' else TwoPartySharing(257)
+        owner = MatrixBeaverMultiplier(sharing)
+        def wrap(value, kind=kind):
+            if kind == 'list':
+                value = value.tolist()
+            elif kind == 'integer_dtype':
+                value = value.astype(np.int64)
+            elif kind in ('numpy_integer','int_child'):
+                convert = np.int64 if kind == 'numpy_integer' else IntChild
+                value = np.array([[convert(v) for v in row] for row in value],dtype=object)
+            elif kind == 'array_child':
+                value = value.view(ArrayChild)
+            return ShareChild(value) if kind == 'share_child' else AdditiveShare(value)
+        triples = tuple(replace(t,**{name:wrap(getattr(t,name).value) for name in ('u','v','w')})
+                        for t in owner.create_triple(2,3,rng=random.Random(91)))
+        x, z = wrap(np.array([[0,256,1],[256,0,2]],dtype=object)), wrap(np.array([[256],[0],[3]],dtype=object))
+        expected_e = [_matrix_mask_oracle(x.value,t.u.value,257,-1) for t in triples]
+        expected_f = [_matrix_mask_oracle(z.value,t.v.value,257,-1) for t in triples]
+        calls.clear()
+        masks = [owner.mask_inputs(x,z,t) for t in triples]
+        assert calls == ['subtract']*4, kind
+        for p in (0,1):
+            assert masks[p].e.value.tolist() == expected_e[p] and masks[p].f.value.tolist() == expected_f[p]
+        masks = [replace(t,e=wrap(t.e.value),f=wrap(t.f.value)) for t in masks]
+        opened = owner.open_masked_differences(*masks)
+        assert calls == ['subtract']*4+['reconstruct']*2, kind
+        assert opened.e.tolist() == _matrix_mask_oracle(expected_e[0],expected_e[1],257,1)
+        assert opened.f.tolist() == _matrix_mask_oracle(expected_f[0],expected_f[1],257,1)
+        assert all(type(v) is int for v in opened.e.flat) and opened.e.dtype == object
+
+
+def test_matrix_mask_validation_keeps_last_elements_w_and_claim_order():
+    """输入及U/V/W末元素必须在claim前拒绝，open重新检查被外部改坏的掩码。"""
+    owner = MatrixBeaverMultiplier(TwoPartySharing(257))
+    triples = owner.create_triple(2,3,rng=random.Random(62))
+    x, z = AdditiveShare(np.ones((2,3),dtype=object)), AdditiveShare(np.ones((3,1),dtype=object))
+    lifecycle = triples[0]._lifecycle
+    for target in ('matrix','vector','u','v','w'):
+        source = x if target == 'matrix' else z if target == 'vector' else getattr(triples[0],target)
+        for value,error in ((True,TypeError),(1.,TypeError),(-1,ValueError),(257,ValueError)):
+            bad = source.value.copy()
+            bad.flat[-1] = value
+            operand = AdditiveShare(bad)
+            a,b,t = (operand,z,triples[0]) if target == 'matrix' else (x,operand,triples[0]) if target == 'vector' else (
+                x,z,replace(triples[0],**{target:operand}))
+            with pytest.raises(error):
+                owner.mask_inputs(a,b,t)
+            assert lifecycle.masked_parties == set()
+    masks = [owner.mask_inputs(x,z,t) for t in triples]
+    for party in (0,1):
+        for name in ('e','f'):
+            array = getattr(masks[party],name).value
+            old = array.flat[-1]
+            for value,error in ((True,TypeError),(1.,TypeError),(-1,ValueError),(257,ValueError)):
+                array.flat[-1] = value
+                with pytest.raises(error):
+                    owner.open_masked_differences(*masks)
+                assert not lifecycle.opened and lifecycle.masked_parties == {0,1}
+            array.flat[-1] = old
+    for second in (masks[0],replace(masks[1],party_index=True)):
+        with pytest.raises(ValueError):
+            owner.open_masked_differences(masks[0],second)
+        assert not lifecycle.opened
+    with pytest.raises(ValueError):
+        MatrixBeaverMultiplier(owner.sharing).open_masked_differences(*masks)
+    owner.open_masked_differences(*masks)
+    with pytest.raises(ValueError):
+        owner.mask_inputs(x,z,triples[0])
+
+
+def test_matrix_standard_masks_avoid_generic_copies_and_keep_failed_claims(monkeypatch):
+    """原内核计算不重走通用复制；计算异常不重试或回滚材料状态。"""
+    sharing = TwoPartySharing(257)
+    owner = MatrixBeaverMultiplier(sharing)
+    triples = owner.create_triple(2,3,rng=random.Random(70))
+    failed_triple = owner.create_triple(2,3,rng=random.Random(71))[0]
+    x, z = AdditiveShare(np.zeros((2,3),dtype=object)), AdditiveShare(np.full((3,1),256,dtype=object))
+    expected_e = [_matrix_mask_oracle(x.value,t.u.value,257,-1) for t in triples]
+    expected_f = [_matrix_mask_oracle(z.value,t.v.value,257,-1) for t in triples]
+    def forbidden(*args):
+        pytest.fail('标准矩阵计算不应重新生成通用校验副本或在异常后fallback')
+    monkeypatch.setattr(TwoPartySharing,'_validated_share_values',forbidden)
+    masks = [owner.mask_inputs(x,z,t) for t in triples]
+    for p in (0,1):
+        assert masks[p].e.value.tolist() == expected_e[p] and masks[p].f.value.tolist() == expected_f[p]
+    opened = owner.open_masked_differences(*masks)
+    assert opened.e.tolist() == _matrix_mask_oracle(expected_e[0],expected_e[1],257,1)
+    assert opened.f.tolist() == _matrix_mask_oracle(expected_f[0],expected_f[1],257,1)
+    assert triples[0]._lifecycle.opened and triples[0]._lifecycle.masked_parties == {0,1}
+    # 先准备另一个尚未打开的操作；后面的失败哨兵只作用于局部计算。
+    next_triples = owner.create_triple(2,3,rng=random.Random(72))
+    next_masks = [owner.mask_inputs(x,z,t) for t in next_triples]
+    combine = TwoPartySharing._combine_values
+    marker = RuntimeError('test second local calculation failed')
+    calls = []
+    def fail_second(self,a,b,operation):
+        calls.append(None)
+        if len(calls) == 2:
+            raise marker
+        return combine(self,a,b,operation)
+    monkeypatch.setattr(TwoPartySharing,'_combine_values',fail_second)
+    with pytest.raises(RuntimeError) as caught:
+        owner.mask_inputs(x,z,failed_triple)
+    assert caught.value is marker and len(calls) == 2
+    assert failed_triple._lifecycle.masked_parties == {0} and not failed_triple._lifecycle.consumed
+    with pytest.raises(ValueError):
+        owner.mask_inputs(x,z,failed_triple)
+    calls.clear()
+    with pytest.raises(RuntimeError) as caught:
+        owner.open_masked_differences(*next_masks)
+    assert caught.value is marker and len(calls) == 2
+    assert not next_triples[0]._lifecycle.opened and next_triples[0]._lifecycle.masked_parties == {0,1}
+
+
 @pytest.mark.parametrize('rows,inner', [(1, 1), (2, 3), (5, 6)])
 def test_matrix_product_independent_integer_oracle_and_one_public_cross_term(rows, inner):
     q = 2**127 - 1

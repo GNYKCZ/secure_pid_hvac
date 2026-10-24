@@ -33,6 +33,14 @@ def matrix_values(value, shape, modulus):
     return array
 
 
+def _standard_share_arrays(sharing, *shares):
+    """仅分流当前已校验操作数；非标准表示/子类继续走原通用接口。"""
+    return type(sharing) is TwoPartySharing and all(
+        type(share) is AdditiveShare and type(share.value) is np.ndarray
+        and share.value.dtype == object and all(type(item) is int for item in share.value.flat)
+        for share in shares)
+
+
 def matrix_vector(left, right, modulus):
     """明确的任意精度mod-q乘加，绝不借用逐元素multiply_public。"""
     rows, inner = left.shape
@@ -109,9 +117,15 @@ class MatrixBeaverMultiplier:
         matrix_values(matrix, us, self.sharing.modulus)
         matrix_values(vector, vs, self.sharing.modulus)
         triple._lifecycle.claim_masking(triple.party_index)
-        return MatrixMaskedShare(self.sharing.subtract(matrix, triple.u),
-                                 self.sharing.subtract(vector, triple.v),
-                                 triple.party_index, triple._lifecycle)
+        # 保留原校验/claim顺序，只省去通用入口对标准数组的重复校验副本。
+        # 原内核仍新建结果、逐项用Python整数模减；异常不回退、不归还已领取材料。
+        if _standard_share_arrays(self.sharing, matrix, triple.u, vector, triple.v):
+            e = AdditiveShare(self.sharing._combine_values(matrix.value, triple.u.value, lambda a,b: a-b))
+            f = AdditiveShare(self.sharing._combine_values(vector.value, triple.v.value, lambda a,b: a-b))
+        else:
+            e = self.sharing.subtract(matrix, triple.u)
+            f = self.sharing.subtract(vector, triple.v)
+        return MatrixMaskedShare(e, f, triple.party_index, triple._lifecycle)
 
     def open_masked_differences(self, first, second):
         """仅重构掩码，互补方与相同本地操作令牌必需。"""
@@ -129,8 +143,13 @@ class MatrixBeaverMultiplier:
         for item in (first, second):
             matrix_values(item.e, us, self.sharing.modulus)
             matrix_values(item.f, vs, self.sharing.modulus)
-        e = self.sharing.reconstruct(first.e, second.e)
-        f = self.sharing.reconstruct(first.f, second.f)
+        # 对端及本方每次都重新完整校验，资格判断不缓存先前调用的有效性。
+        if _standard_share_arrays(self.sharing, first.e, second.e, first.f, second.f):
+            e = self.sharing._combine_values(first.e.value, second.e.value, lambda a,b: a+b)
+            f = self.sharing._combine_values(first.f.value, second.f.value, lambda a,b: a+b)
+        else:
+            e = self.sharing.reconstruct(first.e, second.e)
+            f = self.sharing.reconstruct(first.f, second.f)
         if e.ndim != 2 or f.shape != (e.shape[1], 1):
             raise ValueError("矩阵公开mask尺寸错误")
         lifecycle.claim_opening()
