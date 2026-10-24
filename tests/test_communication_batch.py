@@ -1254,6 +1254,269 @@ def test_session_recovery_rejects_foreign_role_and_noncanonical_last_material():
         recovery.restore(replace(material, product_resources=(*material.product_resources[:-1], last)))
 
 
+def _peer_snapshot_test_plan(dimensions=(4,2,1), ell=32, step=0, *, matrix=True):
+    """只生成测试输入；副本/摘要期望另由标准库推导。"""
+    from secure_control.protocol import Client, messages
+
+    ledger = messages.ControllerScaleLedger(ell,ell,ell,ell,ell,ell,2*ell,ell,2*ell,2*ell)
+    return Client._resource_plan(messages.ControllerLayout(*dimensions,ledger),
+        '会话"\\', f'轮次-{step}',step,
+        encoding_profile='control-dynamic-matrix-v1' if matrix else 'control-batch-v1')
+
+
+def _peer_snapshot_test_port(plan, role='P1'):
+    from secure_control.protocol.messages import MatrixStepResourcePlan
+
+    port = LocalhostProtocol3PeerPort(None,role,8*1024*1024,1.,batch_enabled=True,
+        wire_profile='control-dynamic-matrix-v1' if type(plan) is MatrixStepResourcePlan else 'control-batch-v1')
+    port.bind(plan.session_id)
+    return port
+
+
+@pytest.mark.parametrize('dimensions,ell,step', [((1,2,1),1,0), ((2,1,3),7,1), ((4,2,1),32,2**80+3)])
+def test_matrix_peer_snapshot_matches_deepcopy_all_fields_and_old_digest(monkeypatch, dimensions, ell, step):
+    """标准库副本与旧JSON字节作为oracle，遍历全部记录、字段及原生相等语义。"""
+    import hashlib
+    import json
+    from copy import deepcopy
+    from dataclasses import asdict, fields, is_dataclass
+
+    from secure_control.execution import _localhost_peer as peer
+
+    plan = _peer_snapshot_test_plan(dimensions,ell,step)
+    expected = deepcopy(plan)
+    encoded = b'matrix-dynamic-plan-v1\0'+json.dumps(asdict(plan),sort_keys=True,
+        separators=(',',':'),ensure_ascii=False,allow_nan=False).encode()
+    digests = []
+    original_digest = peer.public_step_plan_sha256
+    def digest(value):
+        digests.append(value)
+        return original_digest(value)
+    monkeypatch.setattr(peer,'public_step_plan_sha256',digest)
+    ports = [_peer_snapshot_test_port(plan,r) for r in ('P1','P2')]
+    def inspect(original,actual,reference,seen=None):
+        seen = {} if seen is None else seen
+        assert type(actual) is type(reference) is type(original)
+        if is_dataclass(original):
+            assert actual is not original and actual is not reference
+            if id(original) in seen:
+                assert actual is seen[id(original)]
+                return
+            seen[id(original)] = actual
+            for f in fields(original):
+                inspect(getattr(original,f.name),getattr(actual,f.name),getattr(reference,f.name),seen)
+        elif type(original) is tuple:
+            assert len(actual) == len(reference)
+            for a,b,c in zip(original,actual,reference,strict=True):
+                inspect(a,b,c,seen)
+        else:
+            assert actual == reference
+    for port in ports:
+        port._v3_last_step = step-1
+        port.set_batch_round(plan,modulus=257,run_id='run',epoch_id='epoch',physical_step=77)
+        snapshot = port._batch_context[0]
+        inspect(plan,snapshot,expected)
+        assert asdict(snapshot) == asdict(expected)
+        assert port._batch_digest == hashlib.sha256(encoded).hexdigest()
+        assert port._batch_identity(deepcopy(expected)) == ('run','epoch',77,257)
+        assert port._v3_last_step == step and port._v3_phase == 'prepared'
+    assert len(digests) == 2
+    def changed_plans(value):
+        if is_dataclass(value):
+            for f in fields(value):
+                for changed in changed_plans(getattr(value,f.name)):
+                    copy = deepcopy(value)
+                    object.__setattr__(copy,f.name,changed)
+                    yield copy
+        elif type(value) is tuple:
+            for i,item in enumerate(value):
+                for changed in changed_plans(item):
+                    yield value[:i]+(changed,)+value[i+1:]
+            if len(value)>1:
+                yield value[::-1]
+        else:
+            yield value+1 if type(value) is int else value+'变' if type(value) is str else 0
+    for changed in changed_plans(expected):
+        if changed != expected:
+            with pytest.raises(ValueError):
+                ports[0]._batch_identity(changed)
+    # 原生equality仍把0.0/False视作0，本候选不能私自升级为严格类型比较。
+    equal = deepcopy(expected)
+    object.__setattr__(equal.state_truncation_resources[0],'index',(False,))
+    assert equal == expected
+    assert ports[0]._batch_identity(equal) == ('run','epoch',77,257)
+    # 修改副本的嵌套节点不影响原对象、另一角色或同一角色的下一次安装。
+    old = ports[0]._batch_context[0]
+    object.__setattr__(old.state_truncation_resources[-1],'resource_id','snapshot-only')
+    assert plan == expected and ports[1]._batch_context[0] == expected
+    ports[0]._v3_phase = 'truncated'
+    ports[0]._v3_last_step = step-1
+    ports[0].set_batch_round(plan,modulus=257)
+    inspect(plan,ports[0]._batch_context[0],expected)
+    assert ports[0]._batch_context[0] is not old
+    assert ports[0]._batch_context[0].scale_ledger is not ports[1]._batch_context[0].scale_ledger
+    assert len(digests) == 3
+
+
+def test_matrix_peer_snapshot_fast_copy_preserves_aliases_without_constructors(monkeypatch):
+    """快照不是共享原对象；局部memo保留图别名，不调用构造或通用deepcopy。"""
+    from copy import deepcopy
+
+    from secure_control.execution import _localhost_peer as peer
+    from secure_control.protocol import messages
+
+    plan = _peer_snapshot_test_plan()
+    # 原安装入口不重验构造契约，重复引用图也必须按deepcopy语义复制。
+    item = plan.state_truncation_resources[0]
+    object.__setattr__(plan,'state_truncation_resources',(item,item))
+    expected = deepcopy(plan)
+    def forbidden(*args,**kwargs):
+        pytest.fail('规范矩阵快照不应调用通用deepcopy或重新运行构造校验')
+    monkeypatch.setattr(peer,'deepcopy',forbidden)
+    monkeypatch.setattr(messages.MatrixStepResourcePlan,'__post_init__',forbidden)
+    port = _peer_snapshot_test_port(plan)
+    port.set_batch_round(plan,modulus=257)
+    snapshot = port._batch_context[0]
+    assert snapshot == expected and type(snapshot) is type(plan) and snapshot is not plan
+    assert snapshot.state_truncation_resources[0] is snapshot.state_truncation_resources[1]
+    assert snapshot.state_truncation_resources[0] is not item
+    assert snapshot.scale_ledger is not plan.scale_ledger
+    assert port._batch_identity(expected) == (None,plan.session_id,None,257)
+    assert port._send_sequence == port._receive_sequence == 1 and port._v3_phase == 'prepared'
+
+
+def test_peer_snapshot_nonstandard_graphs_keep_deepcopy_dispatch(monkeypatch):
+    """标量/特殊叶子/可变序列与子类均保留旧复制行为和表示。"""
+    from copy import deepcopy
+    from dataclasses import asdict, fields
+
+    import numpy as np
+
+    from secure_control.execution import _localhost_peer as peer
+    from secure_control.protocol import messages
+
+    class IntChild(int):
+        pass
+    class MetadataChild(messages.ResourceMetadata):
+        pass
+    class ScalarPlanChild(messages.StepResourcePlan):
+        pass
+    scalar = _peer_snapshot_test_plan(matrix=False)
+    plans = [scalar,ScalarPlanChild(**{f.name:getattr(scalar,f.name) for f in fields(scalar)})]
+    for value in ([0],(np.int64(0),),(IntChild(0),)):
+        plan = _peer_snapshot_test_plan()
+        object.__setattr__(plan.state_truncation_resources[0],'index',value)
+        plans.append(plan)
+    plan = _peer_snapshot_test_plan()
+    item = plan.state_truncation_resources[0]
+    object.__setattr__(plan,'state_truncation_resources',(MetadataChild(**asdict(item)),*plan.state_truncation_resources[1:]))
+    plans.append(plan)
+    copied = []
+    def recorded(value):
+        copied.append(value)
+        return deepcopy(value)
+    monkeypatch.setattr(peer,'deepcopy',recorded)
+    for plan in plans:
+        port = _peer_snapshot_test_port(plan)
+        before = len(copied)
+        try:
+            expected_digest = messages.public_step_plan_sha256(plan)
+        except TypeError:
+            # NumPy整数保持原摘要TypeError，context赋值已完成、phase尚未推进。
+            with pytest.raises(TypeError):
+                port.set_batch_round(plan,modulus=257)
+            assert not hasattr(port,'_v3_phase')
+        else:
+            port.set_batch_round(plan,modulus=257)
+            assert port._batch_digest == expected_digest
+        assert len(copied) == before+1 and copied[-1] is plan
+        assert port._batch_context[0] == deepcopy(plan) and port._batch_context[0] is not plan
+        first = plan.state_truncation_resources[0]
+        assert type(port._batch_context[0].state_truncation_resources[0].index) is type(first.index)
+
+
+def test_peer_snapshot_failures_preserve_old_install_state_and_preconditions(monkeypatch):
+    """旧deepcopy为安装oracle：缺字段/循环/失败及前置拒绝的赋值阶段不变。"""
+    from copy import deepcopy
+
+    from secure_control.execution import _localhost_peer as peer
+
+    snapshot = peer._snapshot_public_plan
+    valid = _peer_snapshot_test_plan()
+    broken = []
+    missing = deepcopy(valid)
+    object.__delattr__(missing.state_truncation_resources[-1],'index')
+    broken.append(missing)
+    cyclic = deepcopy(valid)
+    loop = []
+    loop.append(loop)
+    object.__setattr__(cyclic.state_truncation_resources[-1],'index',loop)
+    broken.append(cyclic)
+    for plan in broken:
+        states = []
+        for copier in (deepcopy,snapshot):
+            monkeypatch.setattr(peer,'_snapshot_public_plan',copier)
+            port = _peer_snapshot_test_port(plan)
+            with pytest.raises((AttributeError,RecursionError)) as caught:
+                port.set_batch_round(plan,modulus=257)
+            states.append((type(caught.value),port._batch_context is not None,
+                hasattr(port,'_batch_digest'),hasattr(port,'_v3_phase'),hasattr(port,'_v3_last_step'),
+                port._send_sequence,port._receive_sequence))
+        assert states[0] == states[1]
+    monkeypatch.setattr(peer,'_snapshot_public_plan',snapshot)
+    marker = RuntimeError('test digest failed')
+    def fail_hash(value):
+        raise marker
+    monkeypatch.setattr(peer,'public_step_plan_sha256',fail_hash)
+    port = _peer_snapshot_test_port(valid)
+    with pytest.raises(RuntimeError) as caught:
+        port.set_batch_round(valid,modulus=257)
+    assert caught.value is marker and port._batch_context[0] == valid
+    assert not hasattr(port,'_batch_digest') and not hasattr(port,'_v3_phase')
+    def forbidden(*args,**kwargs):
+        pytest.fail('前置拒绝不能开始复制或hash')
+    monkeypatch.setattr(peer,'_snapshot_public_plan',forbidden)
+    monkeypatch.setattr(peer,'public_step_plan_sha256',forbidden)
+    for kind in ('session','disabled','profile','modulus','step','phase'):
+        port = _peer_snapshot_test_port(valid)
+        if kind == 'session':
+            port._session_id = 'other'
+        elif kind == 'disabled':
+            port._batch_enabled = False
+        elif kind == 'profile':
+            port._wire_profile = 'control-batch-v1'
+        elif kind == 'step':
+            port._v3_last_step = 0
+        elif kind == 'phase':
+            port._v3_phase = 'prepared'
+        with pytest.raises(ValueError):
+            port.set_batch_round(valid,modulus=True if kind == 'modulus' else 257)
+        assert port._batch_context is None and port._send_sequence == port._receive_sequence == 1
+
+
+def test_matrix_peer_snapshot_copy_error_is_not_retried_or_installed(monkeypatch):
+    """资格成功后复制异常直接传播，不能改走deepcopy、hash或推进阶段。"""
+    from secure_control.execution import _localhost_peer as peer
+
+    plan = _peer_snapshot_test_plan()
+    marker = RuntimeError('test snapshot storage copy failed')
+    class FailingFields(dict):
+        def __getitem__(self,kind):
+            raise marker
+    # 只替换peer本地字段表引用；资格函数继续读取未改的messages字段表。
+    monkeypatch.setattr(peer,'_PUBLIC_PLAN_JSON_FIELDS',FailingFields())
+    def forbidden(*args,**kwargs):
+        pytest.fail('复制实际失败后不能fallback或hash')
+    monkeypatch.setattr(peer,'deepcopy',forbidden)
+    monkeypatch.setattr(peer,'public_step_plan_sha256',forbidden)
+    port = _peer_snapshot_test_port(plan)
+    with pytest.raises(RuntimeError) as caught:
+        port.set_batch_round(plan,modulus=257)
+    assert caught.value is marker and port._batch_context is None
+    assert not hasattr(port,'_batch_digest') and not hasattr(port,'_v3_phase')
+    assert port._send_sequence == port._receive_sequence == 1
+
+
 def test_peer_plan_digest_is_cached_without_accepting_mutated_installed_plan(monkeypatch):
     from test_two_party_protocol import make_stack
 

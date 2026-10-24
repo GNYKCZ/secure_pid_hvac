@@ -8,6 +8,7 @@ from copy import deepcopy
 from typing import Literal
 
 from secure_control.protocol.messages import (
+    _PUBLIC_PLAN_JSON_FIELDS,
     MatrixMaskPayload,
     MatrixStepResourcePlan,
     P2TruncationPayload,
@@ -15,6 +16,7 @@ from secure_control.protocol.messages import (
     Protocol3BatchPayload,
     ResourceMetadata,
     StepResourcePlan,
+    _deeply_immutable_public_plan,
     public_step_plan_sha256,
 )
 
@@ -45,6 +47,38 @@ from .localhost_transport import (
 
 Address = tuple[str, int]
 Role = Literal["P1", "P2"]
+
+
+def _snapshot_public_plan(plan):
+    """仅为规范矩阵图复制独立记录；其他表示保留标准库深复制语义。"""
+    if type(plan) is not MatrixStepResourcePlan:
+        return deepcopy(plan)
+    try:
+        standard = _deeply_immutable_public_plan(plan)
+    except AttributeError:
+        # 缺字段不具备快路资格；仍由原复制/摘要路径决定失败类别及赋值阶段。
+        standard = False
+    if not standard:
+        return deepcopy(plan)
+    memo = {}
+    def clone(value):
+        kind = type(value)
+        if kind in (int, str, type(None)):
+            return value
+        key = id(value)
+        if key in memo:
+            return memo[key]
+        if kind is tuple:
+            copied = tuple(clone(item) for item in value)
+            memo[key] = copied
+            return copied
+        # 资格已限定有限已知记录；按现有字段表复制存储，不重跑构造/校验。
+        copied = object.__new__(kind)
+        memo[key] = copied
+        for name in _PUBLIC_PLAN_JSON_FIELDS[kind]:
+            object.__setattr__(copied, name, clone(getattr(value, name)))
+        return copied
+    return clone(plan)
 
 
 class LocalhostProtocol3PeerPort:
@@ -103,7 +137,7 @@ class LocalhostProtocol3PeerPort:
                 not plan.truncation_count or getattr(self, "_v3_last_step", -1)+1 != plan.step
                 or getattr(self, "_v3_phase", "truncated") != "truncated"):
             raise ValueError("局部暂存 peer 需要连续新鲜且前轮完整的动态截断轮次。")
-        self._batch_context = (deepcopy(plan), run_id, epoch_id or plan.session_id,
+        self._batch_context = (_snapshot_public_plan(plan), run_id, epoch_id or plan.session_id,
                                physical_step, modulus)
         # 独立快照保留每次调用的变化检测；摘要仅计算一次，不信任调用者的对象 identity。
         self._batch_digest = public_step_plan_sha256(plan)
