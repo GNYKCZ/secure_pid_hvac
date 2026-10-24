@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from typing import Protocol, runtime_checkable
 
@@ -27,6 +28,7 @@ from secure_control.crypto.matrix_beaver import (
     MatrixTripleShare,
     matrix_values,
 )
+from secure_control.crypto.seeded_material import SeededContext, expand_party
 from secure_control.crypto.truncation import _MaskLifecycle
 
 from .evidence import ProtocolStepSnapshot, copy_share
@@ -1051,6 +1053,80 @@ class _OnlineMaterialRecovery:
             self._sharing, ell=offline.layout.scale_ledger.state,
             security_parameter=security_parameter, modulus_evidence=modulus_evidence,
         )
+        self._seeded_installed = False
+        self._seeded_key = self._seeded_context = self._seeded_slot = None
+        self._seeded_next = 0
+        self.seeded_statistics = {"prepared_count":0,"prepare_ns":0,"cpu_ns":0}
+
+    def install_seeded(self, context, key):
+        """每个新session只安装一次；首槽准备完成后才允许ready。"""
+        layout = self._offline.layout
+        if (self._seeded_installed or type(context) is not SeededContext
+                or type(key) is not bytes or len(key) != 32
+                or (context.session_id,context.party,context.modulus,context.dimensions,context.ledger,
+                    context.security_parameter) != (
+                    self._offline.session_id,self._offline.recipient,self._sharing.modulus,
+                    (layout.state_dimension,layout.input_dimension,layout.output_dimension),
+                    tuple(getattr(layout.scale_ledger,k) for k in layout.scale_ledger.__dataclass_fields__),
+                    self._truncation.security_parameter)):
+            raise ValueError("种子会话身份/重复初始化错误")
+        self._seeded_installed = True
+        self._seeded_key,self._seeded_context = key,context
+        self.prepare_seeded()
+
+    def prepare_seeded(self):
+        """现有会话线程最多准备一槽；不创建endpoint/lifecycle，不越过数值horizon。"""
+        if self._seeded_key is None or self._seeded_slot is not None:
+            raise RuntimeError("种子槽已准备或会话已失效")
+        horizon = self._offline.range_contract.horizon_steps
+        if self._seeded_next >= 1 << 64 or horizon is not None and self._seeded_next >= horizon:
+            return False
+        start,cpu = time.perf_counter_ns(),time.process_time_ns()
+        try:
+            self._seeded_slot = expand_party(self._seeded_key,self._seeded_context,self._seeded_next)
+        except Exception:
+            self.seeded_statistics["prepare_errors"] = self.seeded_statistics.get("prepare_errors",0)+1
+            self.close_seeded()
+            raise
+        finally:
+            self.seeded_statistics["prepare_ns"] += time.perf_counter_ns()-start
+            self.seeded_statistics["cpu_ns"] += time.process_time_ns()-cpu
+        self.seeded_statistics["prepared_count"] += 1
+        return True
+
+    def close_seeded(self):
+        """释放秘密引用和未用槽；Python内存释放不承诺可靠擦除，不能用旧seed重装。"""
+        self._seeded_key = self._seeded_context = self._seeded_slot = None
+
+    def claim_seeded(self, inp, plan, corrections):
+        """先烧毁当前裸槽再绑定当前round；原restore随后独占签发全新生命周期。"""
+        slot,context = self._seeded_slot,self._seeded_context
+        self._seeded_slot = None
+        step,self._seeded_next = self._seeded_next,self._seeded_next+1
+        try:
+            if (slot is None or context is None or type(plan) is not MatrixStepResourcePlan
+                    or (inp.recipient,inp.session_id,inp.round_id,inp.step) != (
+                        context.party,context.session_id,plan.round_id,step)
+                    or (plan.session_id,plan.step) != (context.session_id,step)
+                    or type(corrections) is not tuple
+                    or len(corrections) != (0 if context.party == 0 else
+                        plan.product_resources[0].rows+2*plan.truncation_count)
+                    or any(type(v) is not int or not 0 <= v < context.modulus for v in corrections)):
+                raise ValueError("种子槽缺失/错步/校正身份或长度错误")
+            if context.party == 0:
+                w,pairs = slot.w,slot.truncations
+            else:
+                rows = plan.product_resources[0].rows
+                w = np.array(corrections[:rows],dtype=object).reshape(rows,1)
+                pairs = tuple(zip(corrections[rows::2],corrections[rows+1::2],strict=True))
+            return PartyOnlineMaterial(inp,plan,
+                (MatrixProductMaterial(context.party,plan.product_resources[0],
+                    AdditiveShare(slot.u),AdditiveShare(slot.v),AdditiveShare(w)),),
+                tuple(TruncationResourceMaterial(context.party,meta,AdditiveShare(r),AdditiveShare(rp))
+                    for meta,(r,rp) in zip(plan.state_truncation_resources,pairs,strict=True)))
+        except Exception:
+            self.close_seeded()
+            raise
 
     def restore(self, material: PartyOnlineMaterial) -> PartyOnlineRound:
         if not isinstance(material, PartyOnlineMaterial):

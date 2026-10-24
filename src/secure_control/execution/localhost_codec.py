@@ -22,6 +22,7 @@ from secure_control.crypto import (
     PrimeModulusEvidence,
     PrimeModulusVerification,
 )
+from secure_control.crypto.seeded_material import SEEDED_PROFILE
 from secure_control.protocol import ControllerRangeVerification, ControllerScaleLedger
 from secure_control.protocol.arithmetic import (
     ScalarGate,
@@ -62,7 +63,8 @@ _COMPACT_PROFILE = "control-dynamic-compact-v1"
 _COMPACT_PROFILE_V2 = "control-dynamic-compact-v2"
 _COMPACT_PROFILE_V3 = "control-dynamic-compact-v3"
 _MATRIX_PROFILE = "control-dynamic-matrix-v1"
-_CLIENT_AUTH_PROFILES = (_COMPACT_PROFILE_V3, _MATRIX_PROFILE)
+_MATRIX_PROFILES = (_MATRIX_PROFILE, SEEDED_PROFILE)
+_CLIENT_AUTH_PROFILES = (_COMPACT_PROFILE_V3, *_MATRIX_PROFILES)
 _COMPACT_PROFILES = (_COMPACT_PROFILE, _COMPACT_PROFILE_V2, *_CLIENT_AUTH_PROFILES)
 _COMPACT_ADVANCE_PROFILES = (_COMPACT_PROFILE_V2, *_CLIENT_AUTH_PROFILES)
 _COMPACT_MAX_VALUES = 512 * 1024
@@ -74,6 +76,7 @@ _OPERATIONS = {
     "offline",
     "online",
     "online_stage",
+    "seed_init",
     "preload_init",
     "preload_block",
     "preload_seal",
@@ -225,6 +228,26 @@ class _CompactHelloPayload:
 
 
 @dataclass(frozen=True, slots=True)
+class _SeedInitPayload:
+    """只发送给对应角色的一把秘密密钥；repr不公开key，ready沿原None回执。"""
+
+    run_id: str
+    epoch_id: str
+    party: int
+    context_sha256: str
+    key: bytes = field(repr=False)
+    version: str = SEEDED_PROFILE
+
+    def __post_init__(self):
+        _text(self.run_id,"run_id")
+        _text(self.epoch_id,"epoch_id")
+        _required_sha256(self.context_sha256,"context_sha256")
+        if (type(self.party) is not int or self.party not in (0,1)
+                or type(self.key) is not bytes or len(self.key) != 32 or self.version != SEEDED_PROFILE):
+            raise LocalhostCodecError("种子初始化角色/版本/密钥长度错误")
+
+
+@dataclass(frozen=True, slots=True)
 class _CompactOnlinePayload:
     """原输入 DTO 与 worker 数值块；计划由接收方的认证布局恢复。"""
 
@@ -243,7 +266,7 @@ class _CompactOnlinePayload:
         _text(self.run_id, "run_id")
         _text(self.epoch_id, "epoch_id")
         _required_sha256(self.plan_sha256, "plan_sha256")
-        _check_compact_bytes(self.values)
+        _check_compact_bytes(self.values,empty=self.version == SEEDED_PROFILE and self.input_message.recipient == 0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -588,6 +611,7 @@ WirePayload = (
     | _CompactHelloPayload
     | _CompactOnlinePayload
     | _CompactBatchPayload
+    | _SeedInitPayload
     | None
 )
 
@@ -878,6 +902,10 @@ def _decode_preloaded_values(data: bytes, inp: InputShareMessage,
 
 
 def _encode_value(value: object) -> object:
+    if type(value) is _SeedInitPayload:
+        return {"type":"seed_init", "run_id":value.run_id,"epoch_id":value.epoch_id,
+            "party":value.party,"context_sha256":value.context_sha256,
+            "key":base64.b64encode(value.key).decode("ascii"),"version":value.version}
     if type(value) in (MatrixLocalStageReceipt, MatrixCommitAuthorization):
         return {"type": "matrix_local_stage_receipt" if type(value) is MatrixLocalStageReceipt
                 else "matrix_commit_authorization", **asdict(value)}
@@ -1276,6 +1304,10 @@ def _typed_union(value, classes):
 def _decode_value(value: object) -> object:
     mapping = _mapping(value, "wire value")
     kind = mapping.get("type")
+    if kind == "seed_init":
+        _exact_fields(mapping,{"type",*_SeedInitPayload.__dataclass_fields__},kind)
+        return _SeedInitPayload(mapping["run_id"],mapping["epoch_id"],mapping["party"],
+            mapping["context_sha256"],_decode_compact_base64(mapping["key"]),mapping["version"])
     if kind in ("matrix_local_stage_receipt", "matrix_commit_authorization"):
         cls = MatrixLocalStageReceipt if kind == "matrix_local_stage_receipt" else MatrixCommitAuthorization
         _exact_fields(mapping, {"type", *cls.__dataclass_fields__}, kind)
@@ -1792,7 +1824,7 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
         ("reply", "shutdown"): {("Client", "Supervisor")} | to_client,
         ("error", "shutdown"): {("Client", "Supervisor")} | to_client,
     }
-    for operation in ("preload_init", "preload_block", "preload_seal", "activate", "activate_stage", "online_stage"):
+    for operation in ("preload_init", "preload_block", "preload_seal", "activate", "activate_stage", "online_stage", "seed_init"):
         allowed[("request", operation)] = to_party
         allowed[("reply", operation)] = to_client
         allowed[("error", operation)] = to_client
@@ -1827,6 +1859,8 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
                     (PartyStageResult,) if message.operation == "activate_stage" else (type(None),))
     elif message.operation == "online_stage":
         expected = (_CompactOnlinePayload,) if message.kind == "request" else (PartyStageResult,)
+    elif message.operation == "seed_init":
+        expected = (_SeedInitPayload,) if message.kind == "request" else (type(None),)
     elif key == ("request", "step"):
         expected = (np.ndarray,)
     elif key == ("reply", "step"):
@@ -1880,6 +1914,11 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
             inp.session_id, inp.round_id, inp.step, None,
         ) or type(inp.recipient) is not int or inp.recipient != (0 if message.recipient == "P1" else 1):
             raise LocalhostCodecError("紧凑信封与输入身份或方向不匹配")
+    if isinstance(payload,_SeedInitPayload) and (
+            message.sender != "Client" or message.recipient != ("P1" if payload.party == 0 else "P2")
+            or message.session_id is None or message.round_id is not None
+            or message.step is not None or message.resource_id is not None):
+        raise LocalhostCodecError("种子初始化信封身份或方向错误")
     if isinstance(payload, _EncodedOnlinePayload):
         inp, plan = payload.input_message, payload.plan
         if (type(payload.fragment) is not bytes or not payload.fragment.startswith(b',"plan":')

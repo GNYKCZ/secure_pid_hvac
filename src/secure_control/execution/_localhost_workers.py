@@ -294,10 +294,15 @@ def _validate_party_reply(response: WireEnvelope, request: WireEnvelope) -> None
     ):
         raise ValueError("单方回执的方向、顺序或 round identity 不匹配。")
     if response.kind == "error" and isinstance(response.payload, RemoteErrorPayload):
-        raise RuntimeError(
+        error = RuntimeError(
             f"{response.sender}.{response.operation} 失败："
             f"{response.payload.error_type}: {response.payload.message}"
         )
+        if (response.payload.error_type == "_SeededPreparationFailed"
+                and getattr(request.payload,"version",None) == "control-dynamic-matrix-seeded-v1"):
+            # 错误只属于当前请求的下一槽准备，不把先前已ACK的轮次改成失败。
+            error.phase = "MATERIAL_PREPARE_NEXT"
+        raise error
     if response.kind != "reply":
         raise ValueError("单方未返回 reply 或受限 error。")
 

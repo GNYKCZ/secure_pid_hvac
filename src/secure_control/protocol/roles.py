@@ -34,6 +34,7 @@ from secure_control.crypto import (
     SecureTruncation,
     TwoPartySharing,
 )
+from secure_control.crypto.seeded_material import SEEDED_PROFILE, SeededContext
 
 from .evidence import (
     CombinedShareStepAudit,
@@ -1344,7 +1345,7 @@ class Client:
         }
         products: list[ResourceMetadata] = []
         ledger = layout.scale_ledger
-        matrix = encoding_profile == "control-dynamic-matrix-v1"
+        matrix = encoding_profile in ("control-dynamic-matrix-v1", SEEDED_PROFILE)
         if matrix:
             from secure_control.crypto.matrix_beaver import matrix_shape
             if any(type(v) is not int or v < 1 for v in
@@ -1427,6 +1428,14 @@ class Client:
         domain = epoch.to_bytes(16, "big")
         seed = hashlib.sha256(b"secure_control.protocol.online_material.v1" + domain + source_seed)
         return random.Random(int.from_bytes(seed.digest(), "big"))
+
+
+def _seeded_context(layout, run_id, session_id, epoch, party, modulus, security_parameter):
+    """protocol按既有公开layout/ledger构造唯一种子域，绝不包含秘密控制参数。"""
+    return SeededContext(run_id,session_id,epoch,party,modulus,
+        (layout.state_dimension,layout.input_dimension,layout.output_dimension),
+        tuple(getattr(layout.scale_ledger,k) for k in layout.scale_ledger.__dataclass_fields__),
+        security_parameter)
 
 
 class _PreparedResourceOwner:

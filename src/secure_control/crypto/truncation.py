@@ -232,13 +232,22 @@ class SecureTruncation:
         return self.sharing.share(self.validate_message(message), rng=rng)
 
     def create_auxiliary(
-        self, *, rng: random.Random | None = None
+        self, *, rng: random.Random | None = None, first_shares=None
     ) -> tuple[TruncationAuxiliaryShare, TruncationAuxiliaryShare]:
         """生成并共享一次性的 ``r`` 与 ``r'``，其范围严格遵循 Protocol 2。"""
+        if first_shares is not None:
+            if type(first_shares) is not tuple or len(first_shares) != 2:
+                raise TypeError("指定第一份截断分享需要两个标量份额")
+            first_shares = tuple(self._scalar_share(v,"first_share") for v in first_shares)
         r = self._sample_centered(self.kappa - self.ell + self.security_parameter, rng)
         r_prime = self._sample_centered(self.ell, rng)
-        r_shares = self.sharing.share(r, rng=rng)
-        r_prime_shares = self.sharing.share(r_prime, rng=rng)
+        if first_shares is None:
+            r_shares = self.sharing.share(r, rng=rng)
+            r_prime_shares = self.sharing.share(r_prime, rng=rng)
+        else:
+            # Protocol 2有界明文分布保持；只替换均匀的第一份分享，第二份为精确校正。
+            r_shares = (first_shares[0],AdditiveShare((r-first_shares[0].value)%self.sharing.modulus))
+            r_prime_shares = (first_shares[1],AdditiveShare((r_prime-first_shares[1].value)%self.sharing.modulus))
         lifecycle = _MaskLifecycle(self)
         self._created_masks += 1
         return (
