@@ -1,5 +1,237 @@
 # 独立三角色连续 LAN 实验（Issues #86、#84、#75、#92）
 
+## 两机约10ms成批响应的单项候选（D132-10，先准备）
+
+[D132-10设计](https://github.com/GNYKCZ/secure_pid_hvac/issues/132#issuecomment-6395303831)
+选择的主线是查明并消除链路的周期等待，首候选仅为实际物理网卡的
+`*InterruptModeration`。**10ms相位集中是线索，不是已证明的网卡根因。**
+本轮A阶段只复核已有文件、读取本机状态并准备步骤；没有修改网卡或新增性能组的授权。
+下述备份、变更、恢复和两机对照均属于待批准的B阶段，不在A执行。
+D8/D9代理运行额度均已用完，不能从历史账本恢复，也不能用本机loopback替代两机。
+
+### 已有证据与候选边界
+
+完整4366/1849步实测的工作mean为10.6005/11.0766ms，p99为23.0738/25.5385ms；
+>20ms有87/36步，其中84/34步不含维护。single_exchange占工作总时长92.59%/93.61%，
+它包含服务端处理和等待，不能叫纯网络RTT。采样前等待额外偏差mean仅0.2237/0.2072ms。
+最新最慢1719步work80.0720ms、single_exchange79.0402ms；仅优化记录或采样唤醒不足以解释它。
+4366步运行最终`MaterialWorkerFailure/CLEANUP`单独保留，不能把此前4366个确认步判成算术失败，
+也不能把整次运行说成无退出错误。1849步记录正常停止。
+
+对每份文件的全部整数ns，先减该字段首值，再计算
+`R(P)=abs(mean(exp(2πj*(t_i-t_0)/P)))`，固定`P=10000000ns`。
+不可先取整ms、把绝对大整数先转float，或跨机直接减未同步时钟。
+固定相位合成序列R=1、均匀相位序列R≈0；整数整体平移应不改变R。
+
+| 原始记录 | 完成时刻R10 | 采样起点R10 |
+|---|---:|---:|
+| 两机4366步 | 0.8066 | 0.0302 |
+| 两机1849步 | 0.8369 | 0.0253 |
+| D9历史loopback v1/v2 | 0.0261 / 0.0307 | 0.0244 / 0.0148 |
+
+历史loopback环境不同，只作参考。R不是p值，不能据此认定NIC、Wi-Fi或15.625ms时钟为根因。
+源码已设置并读回TCP_NODELAY、合并frame头/body、先发两路请求再接收；不再将其当新优化。
+旧raw没有逐条socket选项证明；当前连接列表也不能显示TCP_NODELAY或证明实测时链路状态。
+
+[微软驱动说明](https://learn.microsoft.com/en-us/windows-hardware/drivers/network/interrupt-moderation)
+描述了中断合并等待更多包或超时的机制；
+[低延迟调优建议](https://learn.microsoft.com/en-us/windows-server/networking/technologies/network-subsystem/net-sub-performance-tuning-nics)
+说明关闭它可能降低延迟并增加CPU成本，常规网卡处理延迟通常是微秒级。这些机制不证明本次10ms来自该项。
+若额外0–10ms等待确能移除，典型工作降至6–8ms、节省3–5ms只是条件估计；不能承诺消除80ms尾部。
+
+### A：两端各自在本地只读核对
+
+先记录A运行Client/plant/GUI、B运行P1/P2的实际角色分布和启动参数，核实双方代码SHA与
+`insecure_tcp / control-dynamic-matrix-preauthorized-v2`、observer、20ms模型、400步段、worker16。
+2026-10-25本端只读快照：路由至192.168.31.116，源192.168.31.253，
+物理接口GUID`F8A879DA-A82C-4BB5-A747-EEF804D3411B`、名称“以太网 2”、
+Realtek PCIe 2.5GbE、1Gbps、驱动1125.27.50.920（2025-09-20）；当前属性映射为
+`0=Disabled / 1=Enabled`，当前`1`。Wi-Fi断开。RSC配置启用但当前OperationalState=false；
+RSC/节能项仅记录，不调整。该快照不证明实测期间相同；
+**对端GUID、驱动、实际连接方式和SHA仍unknown，必须在B现场取得。**
+不远程登录、扫描、ping或启动控制来填补unknown。
+
+以下在每台机器的仓库根目录执行。对端IPv4按现场填写；当前A目标为192.168.31.116，
+B应先核实A是否仍为192.168.31.253。`Find-NetRoute`只读本机路由，不发送试验流量。
+
+```powershell
+git rev-parse HEAD
+uv run python -c "from secure_control.execution.lan_config import load_lan_config; pairs=[('Client','configs/lab-client-cart-pole-demo.example.yaml'),('P1','configs/lab-p1-cart-pole-demo.example.yaml'),('P2','configs/lab-p2-cart-pole-demo.example.yaml')]; [print(r,c.transport,c.wire_profile,c.topology.digest) for r,p in pairs for c in [load_lan_config(p,r)]]"
+$d10PeerIpv4 = Read-Host '输入本机控制链路的对端IPv4'
+$d10NicGuid = $null
+$d10NicGuid = & {
+    $ErrorActionPreference = 'Stop'
+    if ([Net.IPAddress]::Parse($d10PeerIpv4).AddressFamily -ne 'InterNetwork') { throw '需要IPv4' }
+    $route = @(Find-NetRoute -RemoteIPAddress $d10PeerIpv4 -ErrorAction Stop)
+    $indexes = @($route | Select-Object -ExpandProperty InterfaceIndex -Unique)
+    if ($indexes.Count -ne 1) { throw '路由接口不唯一，停止' }
+    $cards = @(Get-NetAdapter -Physical | Where-Object ifIndex -eq $indexes[0])
+    if ($cards.Count -ne 1) { throw '路由未指向唯一物理网卡，停止，不猜接口' }
+    $card = $cards[0]
+    $items = @(Get-NetAdapterAdvancedProperty -Name $card.Name -AllProperties |
+        Where-Object { $_.RegistryKeyword -ceq '*InterruptModeration' -and
+            [guid](([string]$_.InstanceID -split '::',2)[0]) -eq [guid]$card.InterfaceGuid })
+    if ($items.Count -ne 1) { throw 'Unsupported：没有唯一原始属性' }
+    $p = $items[0]
+    $values, $labels = @($p.ValidRegistryValues), @($p.ValidDisplayValues)
+    if ($values.Count -eq 0 -or $values.Count -ne $labels.Count) { throw '支持值映射不可核实，停止' }
+    $route | Select-Object InterfaceIndex,IPAddress,DestinationPrefix,NextHop | Format-Table | Out-Host
+    $card | Select-Object Name,InterfaceGuid,ifIndex,InterfaceDescription,Status,LinkSpeed,DriverVersion,DriverDate | Format-List | Out-Host
+    $p | Select-Object RegistryKeyword,RegistryValue,DisplayValue,InstanceID | Format-List | Out-Host
+    for ($i=0; $i -lt $values.Count; $i++) {
+        [pscustomobject]@{ Raw=$values[$i]; DriverLabel=$labels[$i] } | Format-Table | Out-Host
+    }
+    try { Get-NetAdapterRsc -Name $card.Name | Format-List | Out-Host }
+    catch { Write-Host ('RSC unknown: ' + $_.Exception.GetType().Name) }
+    try { Get-NetAdapterPowerManagement -Name $card.Name | Format-List | Out-Host }
+    catch { Write-Host ('PowerManagement unknown: ' + $_.Exception.GetType().Name) }
+    [guid]$card.InterfaceGuid
+}
+try {
+    $d10Connections = @(Get-NetTCPConnection -State Established -ErrorAction Stop |
+        Where-Object RemoteAddress -eq $d10PeerIpv4)
+    $d10Connections | Select-Object LocalAddress,LocalPort,RemoteAddress,RemotePort,OwningProcess
+    if ($d10Connections.Count -eq 0) { Write-Host '当前无可核实控制连接' }
+} catch { Write-Host ('Current connections unknown: ' + $_.Exception.GetType().Name) }
+```
+
+没有对应连接就记录“当前无可核实控制连接”，不主动建立。B上P1↔P2若确为同机loopback，
+不对该loopback另选物理网卡；若角色实际分布不同，逐连接核对路由后交设计确认。
+物理GUID从路由解析，中文别名只用于当前查询；不把A的GUID复制到B。
+支持值由驱动的`ValidRegistryValues/ValidDisplayValues`配对读取，见
+[Get-NetAdapterAdvancedProperty](https://learn.microsoft.com/en-us/powershell/module/netadapter/get-netadapteradvancedproperty)。
+读取失败、权限不足或元数据不完整均停止并记录unknown，不创建不存在的驱动属性。
+
+### B1：获批后，停止角色并一次保存原值
+
+**当前未授权执行B。** 获批后，在两端各自本地管理员PowerShell中先让全部实验角色正常停止，
+核对退出摘要；不要在唯一远程连接中改网卡。变更和恢复都可能断网。
+两端各重新执行A只读块，保留同一会话中的`$d10NicGuid/$d10PeerIpv4`，紧接着执行备份块。
+备份不是本轮A的状态快照：必须在实际B开始前读取原值。它只保存这一项，不保存秘密或重置整张网卡。
+
+```powershell
+& {
+    $ErrorActionPreference = 'Stop'
+    $cards = @(Get-NetAdapter -Physical | Where-Object { [guid]$_.InterfaceGuid -eq $d10NicGuid })
+    if ($cards.Count -ne 1) { throw '接口GUID不唯一' }
+    $card = $cards[0]
+    $indexes = @(Find-NetRoute -RemoteIPAddress $d10PeerIpv4 | Select-Object -ExpandProperty InterfaceIndex -Unique)
+    if ($indexes.Count -ne 1 -or $indexes[0] -ne $card.ifIndex) { throw '路由变化，重新核对' }
+    $items = @(Get-NetAdapterAdvancedProperty -Name $card.Name -AllProperties |
+        Where-Object { $_.RegistryKeyword -ceq '*InterruptModeration' -and
+            [guid](([string]$_.InstanceID -split '::',2)[0]) -eq [guid]$card.InterfaceGuid })
+    if ($items.Count -ne 1 -or [string]::IsNullOrWhiteSpace($card.DriverVersion)) { throw '设备属性/驱动不可确认' }
+    $p = $items[0]
+    $values, $labels, $old = @($p.ValidRegistryValues), @($p.ValidDisplayValues), @($p.RegistryValue)
+    if ($values.Count -eq 0 -or $values.Count -ne $labels.Count -or $old.Count -ne 1) { throw '原值或支持映射不完整' }
+    $disabled = @(0..($labels.Count-1) | Where-Object { $labels[$_] -cin @('Disabled','禁用','已禁用') })
+    if ($disabled.Count -ne 1 -or $old[0] -notin $values) { throw '没有唯一可核实的Disabled映射，不猜0' }
+    $target = [string]$values[$disabled[0]]
+    if ([string]$old[0] -ceq $target) { throw 'AlreadyDisabled：没有本次启用到禁用的候选，不启动对照' }
+    $enabled = @(0..($labels.Count-1) | Where-Object { $values[$_] -ceq $old[0] -and $labels[$_] -cin @('Enabled','启用','已启用') })
+    if ($enabled.Count -ne 1) { throw '当前值未被驱动标为Enabled，停止核查' }
+    $repo = (git rev-parse --show-toplevel).Trim()
+    $dir = Join-Path $repo '.tmp'
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)) { throw '先准备仓库内忽略的.tmp目录' }
+    $file = Join-Path $dir ('d132-10-nic-' + $d10NicGuid.ToString('N') + '.json')
+    $snapshot = [ordered]@{ Version=1; Machine=[Environment]::MachineName;
+        Guid=$d10NicGuid.ToString(); DriverVersion=$card.DriverVersion; Description=$card.InterfaceDescription;
+        Peer=$d10PeerIpv4; Keyword='*InterruptModeration'; OldRaw=@([string]$old[0]); DisabledRaw=$target;
+        SupportedRaw=$values; SupportedLabels=$labels; CodeHead=(git rev-parse HEAD).Trim();
+        CapturedUtc=[DateTime]::UtcNow.ToString('o') }
+    $stream = [IO.File]::Open($file,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+    try {
+        $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($snapshot | ConvertTo-Json -Depth 5))
+        $stream.Write($bytes,0,$bytes.Length)
+    } finally { $stream.Dispose() }
+    Write-Host "原值已保存：$file；不覆盖已有备份。"
+}
+```
+
+先在原设置下进行获批的baseline一次；结束且三个角色均正常停止后，才允许candidate操作。
+若原组功能/连接/不确定提交/退出失败，停止本轮，不改网卡、不启动候选或补跑。
+已有文件不能删除/覆盖来绕过一次备份；若原值或支持标签不是上述可核实形式，人工核对驱动文档后再交审，
+不按属性中文名或其他设备经验推断数值。
+
+### B2/B3：同一个精确属性的candidate或restore
+
+获批且角色停止后，在设备本地执行以下块。第一次选择`candidate`，完成读回后才运行获批候选一次；
+候选完成或失败后，先停止全部角色，再重新执行同一块选择`restore`。
+恢复用文件中的原值，不是出厂默认；禁止用`Reset-NetAdapterAdvancedProperty`代替。
+重启PowerShell后也能从备份恢复，不依赖旧进程变量。
+
+```powershell
+& {
+    $ErrorActionPreference = 'Stop'
+    $action = Read-Host '仅输入candidate或restore；必须已获批且角色已停止'
+    if ($action -cnotin @('candidate','restore')) { throw '操作无效' }
+    $file = Read-Host '输入本机本次原值备份JSON的完整路径'
+    $s = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json
+    if (($s.Version -isnot [int] -and $s.Version -isnot [long]) -or $s.Version -ne 1 -or
+        $s.Machine -cne [Environment]::MachineName -or $s.Keyword -cne '*InterruptModeration') { throw '备份身份不匹配' }
+    $cards = @(Get-NetAdapter -Physical | Where-Object { [guid]$_.InterfaceGuid -eq [guid]$s.Guid })
+    if ($cards.Count -ne 1 -or $cards[0].DriverVersion -cne $s.DriverVersion) { throw '设备/驱动变化，停止；不得换接口恢复' }
+    $card = $cards[0]
+    $items = @(Get-NetAdapterAdvancedProperty -Name $card.Name -AllProperties |
+        Where-Object { $_.RegistryKeyword -ceq '*InterruptModeration' -and
+            [guid](([string]$_.InstanceID -split '::',2)[0]) -eq [guid]$card.InterfaceGuid })
+    if ($items.Count -ne 1) { throw 'Unsupported/RestoreFailed：属性不唯一' }
+    $p = $items[0]
+    $old, $current, $valid = @($s.OldRaw), @($p.RegistryValue), @($p.ValidRegistryValues)
+    if ($old.Count -ne 1 -or $current.Count -ne 1 -or $old[0] -notin $valid -or $s.DisabledRaw -notin $valid) { throw '支持值/原值改变，停止' }
+    if ($action -ceq 'candidate') {
+        $indexes = @(Find-NetRoute -RemoteIPAddress $s.Peer | Select-Object -ExpandProperty InterfaceIndex -Unique)
+        if ($indexes.Count -ne 1 -or $indexes[0] -ne $card.ifIndex -or (git rev-parse HEAD).Trim() -cne $s.CodeHead) { throw '路由/代码变化，停止候选' }
+        if ([string]$current[0] -cne [string]$old[0]) { throw '当前值已变化，停止候选，不重做baseline' }
+        $target = [string]$s.DisabledRaw
+    } else {
+        # 恢复不要求路由仍可用；网络断开时仍只凭同设备GUID/驱动和已存原值恢复。
+        if ([string]$current[0] -cne [string]$old[0] -and [string]$current[0] -cne [string]$s.DisabledRaw) { throw 'RestoreFailed：检测到本次范围外属性值' }
+        $target = [string]$old[0]
+    }
+    if ([string]$current[0] -cne $target) {
+        Set-NetAdapterAdvancedProperty -InputObject $p -RegistryValue @($target) -PassThru -Confirm -ErrorAction Stop | Out-Host
+    }
+    $afterCard = @(Get-NetAdapter -Physical | Where-Object { [guid]$_.InterfaceGuid -eq [guid]$s.Guid })
+    if ($afterCard.Count -ne 1) { throw 'ReadbackMismatch：接口未恢复，不能测试' }
+    $after = @(Get-NetAdapterAdvancedProperty -Name $afterCard[0].Name -AllProperties |
+        Where-Object { $_.RegistryKeyword -ceq '*InterruptModeration' -and
+            [guid](([string]$_.InstanceID -split '::',2)[0]) -eq [guid]$s.Guid })
+    if ($after.Count -ne 1 -or @($after[0].RegistryValue).Count -ne 1 -or [string]$after[0].RegistryValue[0] -cne $target) { throw 'ReadbackMismatch：不得测试或反复写值' }
+    $afterCard | Select-Object InterfaceGuid,Status,LinkSpeed,DriverVersion | Format-List | Out-Host
+    $after[0] | Select-Object RegistryKeyword,RegistryValue,DisplayValue | Format-List | Out-Host
+    Write-Host "$action 注册表读回完成；还须确认链路、路由及驱动重启/生效状态。"
+}
+```
+
+命令使用真实CIM属性对象的`-InputObject`，只改这一项；没有同关RSC、EEE、省电、checksum/LSO等。
+[Set-NetAdapterAdvancedProperty](https://learn.microsoft.com/en-us/powershell/module/netadapter/set-netadapteradvancedproperty)
+说明很多属性需要网卡重启。本方案不传`-NoRestart`，允许cmdlet按需重启适配器；
+不承诺写入或注册表读回就代表驱动即时采用新值。链路未Up、路由未恢复、驱动要求系统重启、
+PermissionDenied或ReadbackMismatch时记录NeedsRestart/失败并停止，不自动多次重启或开始控制。
+若需要操作系统重启，按厂商说明另行确认，在本地完成后重新只读核对；恢复也有同样断网/生效限制。
+即使设置命令报错，也保留备份，核对是否部分写入并按restore处理，不重置整张网卡。
+
+### B阶段运行与判断清单（当前NOT RUN）
+
+批准范围须包含两端具体物理GUID的单项设置/恢复，以及原设置baseline、candidate各仅一次、
+各≤1000周期且≤60秒的新独立预算。三角色同一冻结SHA、两机拓扑/连接方式、v2、正常GC、
+20ms模型、400步段、worker16、原controller和相同GUI/headless方式保持。
+每组后停止角色，再操作网卡；完成或失败后恢复两端原值并读回。用户明确选择保留候选时另行记录，
+不能默认为永久调优。对端不可用或任一前提unknown则NOT RUN，不用本机冒充。
+
+`--performance-sample-limit 1000`只限保存容量，不会硬停控制。
+正式执行前必须用原runner的RunControl/on_step及外层限时约束确认≤1000/60秒，
+独立登记启动前扣减的账本；没有可核实的限停方式就不开始。
+本A阶段不新增或运行两机harness，不把手动晚停、startup timeout或容量上限冒充硬限时。
+
+完整主表保留mean/p50/p95/p99/max、>15/20ms次数/比例、R10和固定相位分布、全部维护/失败/退出，
+正常GC与逐角色/总CPU；DPC/中断开销不由process_time覆盖时写unknown，不宣称CPU零代价。
+目标是work mean至少下降20%、p99和>20ms比例不劣且无功能/退出失败，才称本轮明确改善；
+另列p99<20ms、全程工作<15ms目标，不偷偷换时钟、筛样本或改成strict模式。
+R10和耗时都下降才支持该单项的贡献；仍不证明全部尾部根因。结果不利就恢复并报告反证后停止，
+不自动轮流关RSC/省电/全部offload、忙等、调优全局timer/优先级/GC或改安全协议。
+
 ## 无证书动态演示的显式选择
 
 D132-9增加 `control-dynamic-matrix-preauthorized-v2`，复用下述单次往返计算路径，
