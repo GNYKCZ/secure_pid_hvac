@@ -1,5 +1,98 @@
 # 倒立摆动画 Client：三角色快速操作
 
+## 紧凑表示候选（D132-9）
+
+在已有单次往返架构上，新增显式 `wire_profile: control-dynamic-matrix-preauthorized-v2`。
+选择时要同时修改 A 的 `lab-client-cart-pole-demo.example.yaml`、B 的
+`lab-p1-cart-pole-demo.example.yaml` 和 `lab-p2-cart-pole-demo.example.yaml` 三份角色配置；
+启动顺序和下节命令保持。仓库演示文件仍默认 matrix-v1，不自动切换候选。
+三角色须使用支持 v2 的同一份代码和相同 profile；v1/v2 混用在安装秘密材料之前拒绝。
+`matrix-v1`、`seeded-v1`、`preauthorized-v1/v2` 属于不同表示，不能仅按尾部数字判断新旧。
+
+v2 不改变计算和施力顺序：完整许可仅在两份 Client 请求中发送，后缀、双方实际 READY 和
+最终提交回执用当前步许可的规范公开 SHA256 引用绑定。每方最多一份当前许可，退休或关闭即释放；
+没有历史查询、补取、重试或降级。引用不是签名，也不为 `insecure_tcp` 增加身份认证。
+输出直接编码原定宽整数 residues，仅一层 Base64。两份有效提交先登记，再检查输出类型、
+Base64、长度、范围和尺度；坏输出仍保留已知双提交，物理确认不增加，并终止会话。
+
+前缀准备的 `prefix_preparation` 沿用总次数、总时长、CPU 和最大时长，新增有界
+`max_identity`、`last_identity`、`first_error_identity`，均只含 `global_step`、
+`segment_index`、`origin`。origin 为 `startup`、`ordinary` 或 `segment_advance`，
+便于定位最大值和第一失败；不新增逐步消息或写盘。不变公开上下文摘要在会话安装时计算一次，
+关闭时清空，不能跨 epoch/profile 复用。
+
+本轮软件阶段只验证静态消息字节、短功能/故障会话和回归，不代表实际耗时改善。
+D132-8 历史性能额度已用完；D132-9 新旧性能对照尚未运行，须另行批准。
+真实两机的 15 ms 工作目标和 20 ms 周期验收仍待实测。
+
+## 显式候选：单次跨机往返及前缀准备（D132-8）
+
+本候选须在A的Client、B的P1/P2三份角色配置中都显式设置
+`wire_profile: control-dynamic-matrix-preauthorized-v1`。旧默认与旧seeded路径保留，
+使用同一版本代码、原两测量observer配置、同一拓扑以及原无证书transport。
+仍由B先启动P1/P2，A启动Client，原GUI/headless共用同一实现。例如：
+
+```powershell
+# B：两个终端，先分别启动
+uv run python scripts/run_continuous_p1.py configs/lab-p1-cart-pole-demo.example.yaml
+uv run python scripts/run_continuous_p2.py configs/lab-p2-cart-pole-demo.example.yaml
+# A：三份配置已显式选择同一候选；输出文件须为新的路径
+uv run python scripts/run_cart_pole_client.py configs/lab-client-cart-pole-demo.example.yaml --headless-continuous --non-realtime --recording light --segment-steps 400 --performance samples --performance-sample-limit 1000 --performance-output results/lan_continuous/performance/preauthorized-demo.json
+```
+
+去掉`--headless-continuous`使用原GUI；样本容量1000不是运行步数上限，手动停止后保存报告。
+省略`--non-realtime`仍执行原20ms绝对周期截止，非实时模式则保留原剩余周期等待；
+不支持静态反馈、预送、full、完整路线或混合profile，不自动回退。不要混淆profile版本和transport：
+`insecure_tcp`无需证书，也没有信道保密或主动攻击者认证。
+
+### 提交和失败契约
+
+原seeded普通步骤需两层Client往返：暂存输出→Client检查→授权提交→双ACK。
+新候选以仅限本步的`StepAdvancePermit`请求，P1/P2各自全部算术及暂存完成后交换`ReadyReceipt`，
+核对同一run/session/epoch/segment/global_step/round/随机permit/公开计划及状态版本，
+本地实际提交后才返回`CommittedStepReply`。permit不是旧`MatrixCommitAuthorization`，
+peer READY和原Client已检查输出的见证分开登记。READY不携带秘密份额或其hash。
+
+Client先收齐并核实真实双提交回执、登记已知提交数，再解析独立输出子块、按原尺度重构并检查，
+最后通过本机原截止/取消检查后交场景施力。只收一份回执属于partial/unknown，不能宣称双方未提交；
+两份提交有效但输出坏掉/迟到时，已知提交数可以大于物理确认数，报告`FAILED_AFTER_COMMIT`或原超期分类。
+所有这类失败均终止整组会话，不回滚、不追赶、不重试。不能用READY证明崩溃下两方原子提交。
+下一permit只在前一步物理确认后发出；A的绝对性能计时钟不会作为B的绝对截止传输。
+
+### 唯一数学和一次性准备
+
+`M=[[A,B],[C,D]]`，`z=[x;v]`，每步仍新鲜`W=UV mod q`。打开`E=M-U`及`F=[Fx;Fv]=z-V`，
+单方提前计算`Li=Ui+[i=0]E`、`Hi=E Vi+Li[:,:n]Fx`，在线只计算
+`ti=Wi+Hi+Li[:,n:]Fv mod q`。**W不进入H**，P2的W和截断校正仍随本步原请求到达，不增加Client预送往返。
+原状态前n行聚合后仍按原Protocol2截断一次；输出使用本步开始的旧状态，q/ell/lambda、误差及20ms模型不变。
+纯整数逐份额oracle与不同维度/模边界验证位于`tests/test_preauthorized_matrix.py`。
+
+每方仅一个准备槽，固定本方矩阵布局只缓存一次；首槽归startup，同段下一槽在当前final发送后由原会话线程准备，
+满段停止提前准备，收到两路原复合advance后准备下一槽，成本归维护。Client的seed-init/advance均先发送两路再接收，避免互等。
+首个前缀发送即领取原triple的owner/token；绑定round、补当前输入、finish全程保留同一生命周期，
+不能通过原mask API再领取。取消/错身份/准备失败烧毁能力，跨段全局种子索引不归零，不越数值horizon或u64。
+同段提前准备可先于Client施力确认，但只产生可丢弃的掩码前缀，不是下一步提交授权。
+
+PRF沿用D132-7规范，公开上下文的scheme改为本候选完整profile，以隔离新旧用途。
+理想模型每步U/V独立均匀，分时公开的(E,Fx,Fv)拼接等同原(E,F)，不会增加未遮蔽秘密；
+Li/Hi仅本方保存，不上wire/报告。代数展开后结果与原三元组逐份额相同，再沿用原Trunc误差。
+真实流仍依赖隐藏角色密钥下HMAC的PRF假设及原半诚实、不串谋、可信dealer边界；
+这不是恶意安全、无dealer、前向保密或生产密码认证。无证书抓包泄漏seed会暴露整epoch派生材料，Python不保证可靠清零/常数时间。
+
+### 统计和收益范围
+
+普通成功步跨A/B从8→4应用帧、两层→一层因果往返；P1/P2增加两个READY帧和两个提前前缀帧，
+完整方案总帧仍可能11，不把总帧或字节变化直接换算为毫秒收益。
+Client以`single_exchange`计入分发、peer计算/READY、真实commit及等待，再独立记录`reconstruct`；
+旧stage/commit在候选中不适用，缺失而非伪造0。正常GUI/headless使用原collector，旧报告仍可读。
+服务器结束摘要保留`prefix_preparation`的count/sum/max/CPU/首错/末值、`ready_commit`的有界sum/max和当前/最慢步。
+startup、维护、最后未使用槽、worker成本及全部方向字节都必须报告；嵌套计时不可重复相加。
+
+软件通过不等于真实两机提速；本轮获批同head旧seeded/新候选各一次、每组≤1000周期且≤60s的本机对照，
+须先软件及独立审查通过，首次功能失败停止、旧失败跳过新，无补跑/N2/10000或微基准。
+本机完整工作p50比当次seeded增加>0.5ms须标明显本地代价，不称净优化通过；否则也不证明两机收益。
+AC7/8两机归因、严格20ms及约15ms工作资格继续单独验收。
+
 ## 显式候选：种子＋校正（D132-7）
 
 旧默认和下文原矩阵演示保持。选用本候选时，A的Client、B的P1/P2三个角色配置都显式设置

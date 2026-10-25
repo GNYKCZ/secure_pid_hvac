@@ -24,6 +24,7 @@ from secure_control.crypto import (
     PublicMaskedDifferences,
     TruncationAuxiliaryShare,
 )
+from secure_control.crypto.seeded_material import PREAUTHORIZED_PROFILES
 
 _PROTOCOL3_TERM_ORDER = ("C", "D", "A", "B")
 
@@ -627,12 +628,19 @@ class _ResourceLifecycle:
     """绑定同一逻辑资源的两份局部材料，阻止跨会话、跨轮次或失败后的重放。"""
 
     # 每个逻辑资源仍拥有独立状态；固定字段只省实例字典，保留弱引用。
-    __slots__ = ("__weakref__", "claimed_by", "client_attested", "status")
+    __slots__ = ("__weakref__", "claimed_by", "client_attested", "peer_ready", "status")
 
     def __init__(self) -> None:
         self.claimed_by: set[int] = set()
         self.status = "prepared"
         self.client_attested = False
+        self.peer_ready = False
+
+    def accept_peer_ready(self, party):
+        if self.status != "prepared" or self.claimed_by != {party}:
+            raise ValueError("资源本方未领取或已失效")
+        self.peer_ready = True
+        self.status = "consumed"
 
     def claim(self, party: PartyIndex) -> None:
         """登记某一角色开始使用资源；每轮仅允许 P1/P2 各一次。"""
@@ -1162,6 +1170,85 @@ class MatrixClientStepResult:
     step: int
     matrix_products: int
     truncations: int
+
+
+@dataclass(frozen=True, slots=True)
+class StepAdvancePermit:
+    """可信Client仅授权当前步；不证明算术完成或输出已经检查。"""
+
+    run_id: str
+    session_id: str
+    controller_epoch: str
+    segment_index: int
+    global_step: int
+    round_id: str
+    permit_id: str
+    plan_sha256: str
+    expected_state_version: int
+    previous_physically_confirmed_count: int
+    policy: str = "commit_after_both_ready"
+    version: str = "control-dynamic-matrix-preauthorized-v1"
+
+    def __post_init__(self):
+        if (type(self.version) is not str or self.version not in PREAUTHORIZED_PROFILES
+                or self.policy != "commit_after_both_ready"
+                or any(type(v) is not str or not 1 <= len(v) <= 256 for v in
+                       (self.run_id, self.session_id, self.controller_epoch, self.round_id))
+                or type(self.permit_id) is not str or len(self.permit_id) != 32
+                or any(c not in "0123456789abcdef" for c in self.permit_id)
+                or any(type(v) is not int or v < 0 for v in (self.segment_index,
+                    self.global_step, self.expected_state_version, self.previous_physically_confirmed_count))
+                or self.global_step >= 1 << 64
+                or self.expected_state_version != self.global_step
+                or self.previous_physically_confirmed_count != self.global_step):
+            raise ValueError("单步预授权身份/版本/物理前缀错误")
+        _validate_stage_counts(self.plan_sha256, 1, 0)
+
+
+@dataclass(frozen=True, slots=True)
+class ReadyReceipt:
+    """本方实际暂存事实；不含对方秘密份额或其摘要。"""
+
+    permit: StepAdvancePermit
+    party: int
+    truncations: int
+    matrix_products: int = 1
+    scope: str = "local_staged"
+
+    def __post_init__(self):
+        if (type(self.permit) is not StepAdvancePermit
+                or type(self.party) is not int or self.party not in (0, 1)
+                or type(self.matrix_products) is not int or self.matrix_products != 1
+                or type(self.truncations) is not int or self.truncations < 1
+                or self.scope != "local_staged"):
+            raise ValueError("READY角色/计数/范围错误")
+
+
+@dataclass(frozen=True, slots=True)
+class CommittedStepReply:
+    """真实提交后的回执；输出子块延迟解码，坏输出不能抹掉提交事实。"""
+
+    ready: ReadyReceipt
+    peer_ready: ReadyReceipt
+    state_version: int
+    cumulative_committed_count: int
+    output: bytes = field(repr=False)
+    commit_status: str = "committed"
+
+    def __post_init__(self):
+        _validate_committed_step_facts(self.ready, self.peer_ready, self.state_version,
+                                       self.cumulative_committed_count, self.commit_status)
+        if type(self.output) is not bytes or not 1 <= len(self.output) <= 512*1024:
+            raise ValueError("最终回执输出必须是有界bytes")
+
+
+def _validate_committed_step_facts(ready, peer_ready, state_version, count, status):
+    """v1及codec内v2共用提交事实约束；不以输出有效性推断真实提交。"""
+    if (type(ready) is not ReadyReceipt or type(peer_ready) is not ReadyReceipt
+            or peer_ready.permit != ready.permit or peer_ready.party != 1-ready.party
+            or peer_ready.truncations != ready.truncations or status != "committed"
+            or any(type(v) is not int or v != ready.permit.global_step+1 for v in (state_version, count))):
+        raise ValueError("最终回执缺少匹配的双方READY或真实提交版本")
 
 
 Protocol3Operation = Literal[

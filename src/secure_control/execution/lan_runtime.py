@@ -24,7 +24,11 @@ from secure_control.crypto import (
     TwoPartySharing,
     verify_prime_modulus,
 )
-from secure_control.crypto.seeded_material import SEEDED_PROFILE
+from secure_control.crypto.seeded_material import (
+    PREAUTHORIZED_PROFILE_V2,
+    PREAUTHORIZED_PROFILES,
+    SEEDED_PROFILES,
+)
 from secure_control.protocol import P1, P2, Client, ControllerRangeContract
 from secure_control.protocol.coordinator import (
     DirectProtocol3PartyEndpoint,
@@ -35,8 +39,10 @@ from secure_control.protocol.coordinator import (
     stage_protocol3_batch,
 )
 from secure_control.protocol.messages import (
+    CommittedStepReply,
     ControlShareMessage,
     InputShareMessage,
+    MatrixClientStepResult,
     PartyOfflineMaterial,
     PartyOnlineMaterial,
     PartyOnlineRound,
@@ -44,6 +50,7 @@ from secure_control.protocol.messages import (
     ProductResourceMaterial,
     Protocol3EndpointCommand,
     Protocol3StageReceipt,
+    StepAdvancePermit,
     TruncationResourceMaterial,
     _EncodedInputRound,
     local_receipt_type,
@@ -92,12 +99,17 @@ from .localhost_codec import (
     SegmentEndPayload,
     SegmentEndReceipt,
     WireEnvelope,
+    _CommittedReplyV2,
+    _compact_committed_reply,
     _CompactHelloPayload,
     _CompactOnlinePayload,
     _decode_integer_residues,
     _decode_preloaded_values,
     _EncodedOnlinePayload,
+    _PermitContext,
+    _PreauthorizedOnlinePayload,
     _SeedInitPayload,
+    decode_wire_value,
     encode_wire_value,
 )
 from .localhost_transport import deadline_after, receive_envelope, send_envelope
@@ -514,7 +526,7 @@ class LanContinuousRuntime:
         if wire_profile in _MATRIX_PROFILES:
             # 在联网和材料分配之前验证本profile支持的公开尺度/形状。
             _matrix_layout_preflight(spec, fixed_point)
-            if wire_profile == SEEDED_PROFILE and fixed_point.modulus.bit_length() > 256:
+            if wire_profile in SEEDED_PROFILES and fixed_point.modulus.bit_length() > 256:
                 raise ValueError("种子首版只支持不超过256位模数")
         if wire_profile in _CLIENT_AUTH_PROFILES and not (
                 spec.state_dimension and (spec.scale_metadata.A if spec.scale_metadata is not None
@@ -773,6 +785,10 @@ class LanContinuousRuntime:
             if deadline is None:
                 # 旧有限/非实时调用保留原先从 online 分发开始计算保护 timeout 的语义。
                 deadline = deadline_after(self.config.step_timeout)
+            if self._wire_profile in PREAUTHORIZED_PROFILES:
+                if not encoded_current:
+                    raise ValueError("预授权必须使用同profile专属工人")
+                return self._step_preauthorized(current, plan, deadline, deadline_ns)
             online_started = time.perf_counter_ns()
             endpoints: list[_ClientPartyEndpoint] = []
             compact = self._wire_profile in _COMPACT_PROFILES
@@ -899,6 +915,75 @@ class LanContinuousRuntime:
             else:
                 for key, value in endpoint.commit_timings.items():
                     self._last_phase_ns[f"p{party + 1}_commit_{key}"] = value
+
+    def _step_preauthorized(self, current, plan, deadline, deadline_ns):
+        """单次因果往返；先核实并记账提交事实，再解析独立输出子块。"""
+        permit = StepAdvancePermit(self.setup_run_id, self.session_id, self.setup.controller_epoch,
+            self._step//self._segment_capacity, self._step, plan.round_id, secrets.token_hex(16),
+            public_step_plan_sha256(plan), self._step, self._step, version=self._wire_profile)
+        context = _PermitContext(permit) if self._wire_profile == PREAUTHORIZED_PROFILE_V2 else None
+        payloads = tuple(_PreauthorizedOnlinePayload(_CompactOnlinePayload(inp, permit.run_id,
+            permit.controller_epoch, permit.plan_sha256, fragment, self._wire_profile), permit)
+            for inp, fragment in zip((current.p1_input, current.p2_input), current.prepared.fragments, strict=True))
+        prepared = _prepare_requests(payloads, "online_permit", self.session_id, plan.round_id,
+                                     plan.step, self._sequences, _FRAME_LIMIT)
+        self._material_pool.observe_current_encoded(sum(len(r[1]) for r in prepared)
+                                                   +sum(len(v) for v in current.prepared.fragments))
+        observation = {f"P{p+1}": {"request_state": "not_sent", "valid_ack_received": False}
+                       for p in (0, 1)}
+        self.last_commit_observation = {"session_id": self.session_id, "round_id": plan.round_id,
+                                        "step": plan.step, "parties": observation}
+        check_deadline(deadline_ns, "ENCODING")
+        started = time.perf_counter_ns()
+        replies = []
+        try:
+            for p, (sock, (_, encoded)) in enumerate(zip(self._sockets, prepared, strict=True)):
+                self._round_started = True
+                observation[f"P{p+1}"]["request_state"] = "uncertain"
+                localhost_transport.send_frame(sock, encoded, deadline=deadline, limit=_FRAME_LIMIT)
+                observation[f"P{p+1}"]["request_state"] = "sent"
+            for p, (sock, (request, _)) in enumerate(zip(self._sockets, prepared, strict=True)):
+                response = receive_envelope(sock, deadline=deadline, limit=_FRAME_LIMIT)
+                _validate_party_reply(response, request)
+                reply = response.payload
+                if context is not None:
+                    if type(reply) is not _CommittedReplyV2:
+                        raise ValueError("v2禁止旧嵌套提交回复")
+                    own, _ = reply.committed_facts(context)
+                else:
+                    if type(reply) is not CommittedStepReply or reply.ready.permit != permit:
+                        raise ValueError("v1最终回执类型/许可错误")
+                    own = reply.ready
+                if own.party != p or own.truncations != plan.truncation_count:
+                    raise ValueError("最终双提交回执与本次permit/资源不匹配")
+                replies.append(reply)
+                observation[f"P{p+1}"]["valid_ack_received"] = True
+            # 两份真实回执有效即计提交；之后的输出/截止失败也不能抹掉这一步。
+            self._step += 1
+            self._products += 1
+            self._truncations += plan.truncation_count
+            self._sequences = [v+1 for v in self._sequences]
+        finally:
+            self._last_phase_ns["single_exchange"] = time.perf_counter_ns()-started
+        started = time.perf_counter_ns()
+        try:
+            check_deadline(deadline_ns, "AFTER_COMMIT")
+            shares = tuple(reply.restore_output(context, plan, self.fixed_point.modulus) if context is not None
+                           else decode_wire_value(reply.output) for reply in replies)
+            if any(type(v) is not ControlShareMessage for v in shares):
+                raise ValueError("提交后的输出子块类型错误")
+            output = np.asarray(self.client.reconstruct_control(*shares), dtype=float)
+            if output.shape != plan.output_shape or not np.isfinite(output).all():
+                raise ValueError("提交后输出shape/有限性错误")
+            check_deadline(deadline_ns, "RECONSTRUCT")
+            self._last_result = MatrixClientStepResult(output, plan.round_id, plan.step, 1, plan.truncation_count)
+            return np.array(output, dtype=float, copy=True)
+        except Exception as error:
+            if not hasattr(error, "phase"):
+                error.phase = "RECONSTRUCT_AFTER_COMMIT"
+            raise
+        finally:
+            self._last_phase_ns["reconstruct"] = time.perf_counter_ns()-started
 
     def begin_segment(self, begin: SegmentBeginPayload, *, deadline_ns: int | None = None) -> None:
         """v2 保留同一 controller/session 与全局 step，只确认新的逻辑段。"""
@@ -1153,11 +1238,16 @@ class LanSegmentedRuntime:
         if self._wire_profile in _MATRIX_PROFILES:
             layout = self.spec
             n, m, p = layout.state_dimension, layout.input_dimension, layout.output_dimension
-            return {"matrix_products_consumed": self._products,
-                    "scalar_equivalent_products": self._products*(n+p)*(n+m),
-                    "multiplication_material_elements": self._products*((n+p)*(n+m)+n+m+n+p),
-                    "truncations_consumed": self._truncations}
-        return {"products_consumed": self._products, "truncations_consumed": self._truncations}
+            products = (self._segment._products if self._wire_profile in PREAUTHORIZED_PROFILES
+                        and self._segment is not None else self._products)
+            truncations = (self._segment._truncations if self._wire_profile in PREAUTHORIZED_PROFILES
+                           and self._segment is not None else self._truncations)
+            return {"matrix_products_consumed": products,
+                    "scalar_equivalent_products": products*(n+p)*(n+m),
+                    "multiplication_material_elements": products*((n+p)*(n+m)+n+m+n+p),
+                    "truncations_consumed": truncations}
+        return {"products_consumed": self._products,
+                "truncations_consumed": self._truncations}
 
     def snapshot(self) -> LanLifecycleSnapshot:
         """错误出口可读取的不可变公开进度，不穿透 protocol 对象。"""
@@ -1171,7 +1261,9 @@ class LanSegmentedRuntime:
             self.controller_epoch, self.segment_index, self.global_start,
             self._attempted_round, round_id,
             self.protocol_committed_count, self.confirmed_step_count,
-            self._products, self._truncations, self._last_closed_segment_count,
+            (segment._products if self._wire_profile in PREAUTHORIZED_PROFILES and segment is not None else self._products),
+            (segment._truncations if self._wire_profile in PREAUTHORIZED_PROFILES and segment is not None else self._truncations),
+            self._last_closed_segment_count,
         )
 
     @property
@@ -1202,14 +1294,15 @@ class LanSegmentedRuntime:
                 segment._material_pool = _MaterialWorkerPool(segment.client, segment.distribution,
                     run_id=self.run_id, epoch=self.controller_epoch, start=segment._step, slots=slots,
                     **({"encoding_profile": self._wire_profile} if self._wire_profile in _COMPACT_PROFILES else {}))
-                if self._wire_profile == SEEDED_PROFILE:
+                if self._wire_profile in SEEDED_PROFILES:
                     started,total = time.perf_counter_ns(),0
                     pool = segment._material_pool
+                    pending = []
                     for party,sock in enumerate(segment._sockets):
                         context = _seeded_context(pool.spec.layout,self.run_id,segment.session_id,
-                            self.controller_epoch,party,pool.spec.modulus,pool.spec.security_parameter)
+                            self.controller_epoch,party,pool.spec.modulus,pool.spec.security_parameter,self._wire_profile)
                         payload = _SeedInitPayload(self.run_id,self.controller_epoch,party,
-                            context.digest().hex(),pool.seed_for_party(party))
+                            context.digest().hex(),pool.seed_for_party(party),self._wire_profile)
                         role = "P1" if party == 0 else "P2"
                         seq = segment._sequences[party]
                         # 只累计字节长度，绝不将秘密信封写进公开材料汇总。
@@ -1219,13 +1312,26 @@ class LanSegmentedRuntime:
                         total += len(localhost_transport.encode_envelope(WireEnvelope(
                             SCHEMA_VERSION,"reply",role,"Client",seq,"seed_init",segment.session_id,
                             None,None,None,None)))
-                        _request(sock,role,seq,"seed_init",segment.session_id,
-                            self.config.startup_timeout,payload)
-                        segment._sequences[party] += 1
+                        request = _request(sock,role,seq,"seed_init",segment.session_id,
+                            self.config.startup_timeout,payload,
+                            send_only=self._wire_profile in PREAUTHORIZED_PROFILES)
+                        if self._wire_profile in PREAUTHORIZED_PROFILES:
+                            pending.append(request)
+                        else:
+                            segment._sequences[party] += 1
+                    if self._wire_profile in PREAUTHORIZED_PROFILES:
+                        deadline = deadline_after(self.config.startup_timeout)
+                        for party,(sock,request) in enumerate(zip(segment._sockets,pending,strict=True)):
+                            _receive_reply(sock,request,deadline=deadline)
+                            segment._sequences[party] += 1
                     pool.release_seeds()
                     pool.observe_seed_init(time.perf_counter_ns()-started,total)
             except Exception as error:
                 segment._material_statistics = getattr(error, "_public_material_summary", {})
+                if self._wire_profile in PREAUTHORIZED_PROFILES:
+                    segment._failed = True
+                    self.phase = "FAILED"
+                    self.close()
                 raise
         else:
             segment._material_pool = _OnlineResourcePool(segment.client, segment.distribution,
@@ -1296,7 +1402,9 @@ class LanSegmentedRuntime:
             self.phase = "AWAITING_PLANT"
             return self._pending
         except Exception:
-            self.phase = "UNCERTAIN" if self._segment._round_started else "FAILED"
+            self.phase = ("FAILED_AFTER_COMMIT" if self._wire_profile in PREAUTHORIZED_PROFILES
+                          and self.protocol_committed_count > self.confirmed_step_count else
+                          "UNCERTAIN" if self._segment._round_started else "FAILED")
             self.close()
             raise
 
@@ -1440,7 +1548,7 @@ class LanSegmentedRuntime:
         """故障清理只关闭连接，不能产生正常停止结果。"""
         if self._advance_begin is not None and self.phase != "STOPPED":
             self.phase = "UNCERTAIN"
-        if self.phase not in {"STOPPED", "SWITCHED", "FAILED", "UNCERTAIN", "CANCELLED"}:
+        if self.phase not in {"STOPPED", "SWITCHED", "FAILED", "FAILED_AFTER_COMMIT", "UNCERTAIN", "CANCELLED"}:
             self.phase = "FAILED"
         if self._segment is not None:
             self._segment.close()
@@ -1528,7 +1636,7 @@ def _restore_compact_online(value, *, layout, session, round_id, step, modulus, 
     inp = value.input_message
     if (inp.session_id, inp.round_id, inp.step, inp.recipient) != (session, round_id, step, party):
         raise ValueError("紧凑材料当前输入身份不匹配")
-    if wire_profile == SEEDED_PROFILE:
+    if wire_profile in SEEDED_PROFILES:
         if seeded_recovery is None:
             raise ValueError("种子在线材料没有完成初始化")
         count = 0 if party == 0 else plan.product_resources[0].rows+2*plan.truncation_count
@@ -1700,16 +1808,23 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
             modulus_evidence=modulus_evidence,
         )
         _party_reply(client_socket, offline_request, None, config.startup_timeout)
+        if expected_wire_profile in PREAUTHORIZED_PROFILES:
+            peer_port = LocalhostProtocol3PeerPort(peer_socket, role, _FRAME_LIMIT,
+                config.step_timeout, batch_enabled=batch, wire_profile=expected_wire_profile)
+            peer_port.bind(session)
         sequence = 4
-        if expected_wire_profile == SEEDED_PROFILE:
+        if expected_wire_profile in SEEDED_PROFILES:
             request = _party_receive(client_socket,role,sequence,"seed_init",session,config.startup_timeout)
             seed = request.payload
             context = _seeded_context(material.layout,hello.run_id,session,setup.controller_epoch,
-                party,fixed.modulus,setup.security_parameter)
-            if (type(seed) is not _SeedInitPayload or (seed.run_id,seed.epoch_id,seed.party,seed.context_sha256) != (
-                    hello.run_id,setup.controller_epoch,party,context.digest().hex())):
+                party,fixed.modulus,setup.security_parameter,expected_wire_profile)
+            if (type(seed) is not _SeedInitPayload or (seed.run_id,seed.epoch_id,seed.party,seed.context_sha256,seed.version) != (
+                    hello.run_id,setup.controller_epoch,party,context.digest().hex(),expected_wire_profile)):
                 raise ValueError("种子初始化公开绑定错误")
             recovery.install_seeded(context,seed.key)
+            if expected_wire_profile in PREAUTHORIZED_PROFILES:
+                peer_port.set_round_deadline(deadline_after(config.startup_timeout))
+                recovery.prepare_prefix(role_object, peer_port, hello.segment_index, "startup")
             _party_reply(client_socket,request,None,config.startup_timeout)
             sequence += 1
             del seed,request
@@ -1740,16 +1855,19 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
             _party_reply(client_socket, request, receipt, config.startup_timeout,
                          deadline=startup_deadline)
             sequence += 1
-        peer_port = LocalhostProtocol3PeerPort(
-            peer_socket, role, _FRAME_LIMIT, config.step_timeout, batch_enabled=batch,
-            wire_profile=expected_wire_profile,
-        )
-        peer_port.bind(session)
+        if peer_port is None:
+            peer_port = LocalhostProtocol3PeerPort(
+                peer_socket, role, _FRAME_LIMIT, config.step_timeout, batch_enabled=batch,
+                wire_profile=expected_wire_profile,
+            )
+            peer_port.bind(session)
         steps = (setup.segment_capacity if v2 else
                  1 if hello.mode == "lan-single-step-v1" else setup.horizon_steps)
         segmented = isinstance(hello, LanSegmentedHelloPayload)
         products = truncations = committed = 0
         global_committed = 0
+        ready_commit_statistics = {"count": 0, "ready_sum_ns": 0, "ready_max_ns": 0,
+            "commit_sum_ns": 0, "commit_max_ns": 0, "last": None, "slowest": None}
         last_round = None
         awaiting_begin = False
         while True:
@@ -1812,6 +1930,10 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                         hello.run_id, begin.segment_index, begin.global_start, session, "lan-segmented-v2")
                     committed = 0
                     last_round = None
+                    if expected_wire_profile in PREAUTHORIZED_PROFILES:
+                        peer_port.set_round_deadline(deadline_after(config.shutdown_timeout))
+                        if recovery.prepare_seeded():
+                            recovery.prepare_prefix(role_object, peer_port, hello.segment_index, "segment_advance")
                     _party_reply(client_socket, online_request, SegmentAdvanceReceipt(receipt, begin),
                                  config.shutdown_timeout)
                     sequence += 1
@@ -1841,14 +1963,19 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                     summary["material_summary"] = {"material_mode": "control-preloaded-v1",
                         "budget": preload_store.budget, "claimed": preload_store.next_slot,
                         "committed": preload_store.committed, "exported_count": preload_store.loaded}
-                if expected_wire_profile == SEEDED_PROFILE:
+                if expected_wire_profile in SEEDED_PROFILES:
                     summary["seeded_material"] = {**recovery.seeded_statistics,
                         "next_prepare_error":seeded_prepare_error,"next_step":global_committed,
                         "claimed_count":recovery._seeded_next}
+                    if expected_wire_profile in PREAUTHORIZED_PROFILES:
+                        summary["prefix_preparation"] = dict(recovery.prefix_statistics)
+                        summary["ready_commit"] = ready_commit_statistics
                 return summary, tail
             fused = compact_hello is not None or preload_hello is not None and preload_hello.stage_mode == "fused"
             operation = ("online_stage" if compact_hello is not None else
                          "activate_stage" if fused else "activate" if preload_store is not None else "online")
+            if expected_wire_profile in PREAUTHORIZED_PROFILES:
+                operation = "online_permit"
             _check_request(online_request, role, sequence, operation, session)
             expected_step = global_committed if v2 else committed
             if committed >= steps:
@@ -1858,6 +1985,16 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                 raise ValueError("LAN online step 必须连续递增。")
             online_material = (preload_store.claim(online_request.payload)
                                if preload_store is not None else online_request.payload)
+            permit = None
+            if expected_wire_profile in PREAUTHORIZED_PROFILES:
+                if type(online_material) is not _PreauthorizedOnlinePayload:
+                    raise ValueError("预授权请求类型错误")
+                permit, online_material = online_material.permit, online_material.online
+                if (permit.run_id,permit.controller_epoch,permit.segment_index,permit.global_step,
+                        permit.previous_physically_confirmed_count, permit.version) != (
+                        hello.run_id,setup.controller_epoch,hello.segment_index,global_committed,global_committed,
+                        expected_wire_profile):
+                    raise ValueError("预授权与本方实际提交/物理前缀不一致")
             if compact_hello is not None:
                 if seeded_prepare_error is not None:
                     error = _SeededPreparationFailed("本方ACK后下一槽准备失败，禁止开始新轮")
@@ -1869,14 +2006,21 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                     wire_profile=expected_wire_profile,seeded_recovery=recovery)
             if not isinstance(online_material, PartyOnlineMaterial):
                 raise TypeError("在线单方材料类型错误。")
-            online = recovery.restore(online_material)
+            prefix = None
+            if expected_wire_profile in PREAUTHORIZED_PROFILES:
+                online, prefix = recovery.restore_preauthorized(online_material, permit, role_object)
+            else:
+                online = recovery.restore(online_material)
             staged: list[ControlShareMessage] = []
             endpoint = LocalProtocol3PartyEndpoint(
                 role_object, online,
                 lambda message, collected=staged: _capture_stage_share(message, collected),
-                completion_strategy=("client_authorized" if expected_wire_profile in _CLIENT_AUTH_PROFILES
+                completion_strategy=("peer_ready" if expected_wire_profile in PREAUTHORIZED_PROFILES else
+                                     "client_authorized" if expected_wire_profile in _CLIENT_AUTH_PROFILES
                                      else "peer_barriers"),
             )
+            if prefix is not None:
+                endpoint.install_permit(permit, prefix)
             if (endpoint.plan.round_id, endpoint.plan.step) != (
                 online_request.round_id, expected_step
             ):
@@ -1893,11 +2037,55 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                                    if hello.mode == "lan-full-v3"
                                    and isinstance(tail, _ScalarRunTail) else None),
                 )
+            permit_context = (peer_port.install_permit(permit)
+                              if expected_wire_profile == PREAUTHORIZED_PROFILE_V2 else None)
             direct = DirectProtocol3PartyEndpoint(endpoint, peer_port)
             activation_result = None
             receipt_type = (local_receipt_type(endpoint.plan) if expected_wire_profile in _CLIENT_AUTH_PROFILES
                             else Protocol3StageReceipt)
             commit_operation = "commit_staged" if expected_wire_profile in _CLIENT_AUTH_PROFILES else "commit"
+            if expected_wire_profile in PREAUTHORIZED_PROFILES:
+                stage_protocol3_batch(endpoint, peer_port)
+                own_ready = endpoint.ready_receipt()
+                ready_started = time.perf_counter_ns()
+                peer_ready = peer_port.exchange_ready(own_ready)
+                ready_ns = time.perf_counter_ns()-ready_started
+                commit_started = time.perf_counter_ns()
+                endpoint.commit_ready(peer_ready)
+                commit_ns = time.perf_counter_ns()-commit_started
+                stats = ready_commit_statistics
+                stats["count"] += 1
+                sample = {"global_step": global_committed, "ready_ns": ready_ns, "commit_ns": commit_ns}
+                stats["last"] = sample
+                if stats["slowest"] is None or ready_ns+commit_ns > stats["slowest"]["ready_ns"]+stats["slowest"]["commit_ns"]:
+                    stats["slowest"] = sample
+                for name, elapsed in (("ready", ready_ns), ("commit", commit_ns)):
+                    stats[name+"_sum_ns"] += elapsed
+                    stats[name+"_max_ns"] = max(stats[name+"_max_ns"], elapsed)
+                committed += 1
+                global_committed += 1
+                products += 1
+                truncations += endpoint.plan.truncation_count
+                last_round = endpoint.plan.round_id
+                if len(staged) != 1:
+                    raise ValueError("实际staged输出必须恰为一份")
+                reply = (_compact_committed_reply(permit_context, own_ready, peer_ready, role_object.state_version,
+                    global_committed, staged[0], endpoint.plan, fixed.modulus) if permit_context is not None else
+                    CommittedStepReply(own_ready, peer_ready, role_object.state_version,
+                                       global_committed, encode_wire_value(staged[0])))
+                _party_reply(client_socket, online_request, reply, config.step_timeout, deadline=step_deadline)
+                if permit_context is not None:
+                    peer_port.retire_permit()
+                sequence += 1
+                # 满段不得提前打开下一段；继续维护收到两路请求后才准备。
+                if committed < steps:
+                    try:
+                        peer_port.set_round_deadline(deadline_after(config.step_timeout))
+                        if recovery.prepare_seeded():
+                            recovery.prepare_prefix(role_object, peer_port, hello.segment_index)
+                    except Exception as error:  # noqa: BLE001 - 已提交前步不回滚，只终止下一请求
+                        seeded_prepare_error = type(error).__name__
+                continue
             if fused:
                 receipt = stage_protocol3_batch(endpoint, peer_port)
                 if type(receipt) is not receipt_type or len(staged) != 1:
@@ -1948,7 +2136,7 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                     products += len(endpoint.plan.product_resources)
                     truncations += len(endpoint.plan.state_truncation_resources)
                     last_round = endpoint.plan.round_id
-                    if expected_wire_profile == SEEDED_PROFILE:
+                    if expected_wire_profile in SEEDED_PROFILES:
                         # ACK已发送、前步事实不回滚；准备成本可阻塞下一请求，计入其真实墙钟延迟。
                         try:
                             recovery.prepare_seeded()

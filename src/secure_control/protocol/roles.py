@@ -34,7 +34,7 @@ from secure_control.crypto import (
     SecureTruncation,
     TwoPartySharing,
 )
-from secure_control.crypto.seeded_material import SEEDED_PROFILE, SeededContext
+from secure_control.crypto.seeded_material import SEEDED_PROFILE, SEEDED_PROFILES, SeededContext
 
 from .evidence import (
     CombinedShareStepAudit,
@@ -1345,7 +1345,7 @@ class Client:
         }
         products: list[ResourceMetadata] = []
         ledger = layout.scale_ledger
-        matrix = encoding_profile in ("control-dynamic-matrix-v1", SEEDED_PROFILE)
+        matrix = encoding_profile in ("control-dynamic-matrix-v1", *SEEDED_PROFILES)
         if matrix:
             from secure_control.crypto.matrix_beaver import matrix_shape
             if any(type(v) is not int or v < 1 for v in
@@ -1430,12 +1430,12 @@ class Client:
         return random.Random(int.from_bytes(seed.digest(), "big"))
 
 
-def _seeded_context(layout, run_id, session_id, epoch, party, modulus, security_parameter):
+def _seeded_context(layout, run_id, session_id, epoch, party, modulus, security_parameter, profile=SEEDED_PROFILE):
     """protocol按既有公开layout/ledger构造唯一种子域，绝不包含秘密控制参数。"""
     return SeededContext(run_id,session_id,epoch,party,modulus,
         (layout.state_dimension,layout.input_dimension,layout.output_dimension),
         tuple(getattr(layout.scale_ledger,k) for k in layout.scale_ledger.__dataclass_fields__),
-        security_parameter)
+        security_parameter, profile)
 
 
 class _PreparedResourceOwner:
@@ -1742,6 +1742,7 @@ class _Server:
     _controller: ControllerShare
     _state: AdditiveShare
     _layout: ControllerLayout
+    state_version: int = 0
 
     @property
     def controller_share(self) -> ControllerShare:
@@ -1865,6 +1866,7 @@ class _Server:
         if values.shape != (self._layout.state_dimension,):
             raise ValueError("下一状态 share 的 shape 与 controller state dimension 不匹配。")
         self._state = state
+        self.state_version += 1
 
     def _validate_product_resource(self, resource: ProductResourceShare) -> None:
         """确认 triple 只属于当前角色、矩阵乘法 metadata 与资源尺度正确。"""

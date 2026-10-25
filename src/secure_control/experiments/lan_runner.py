@@ -15,6 +15,7 @@ from pathlib import Path
 from threading import Event
 from time import perf_counter, perf_counter_ns, sleep
 
+from secure_control.crypto.seeded_material import PREAUTHORIZED_PROFILES
 from secure_control.execution.cycle_timing import (
     AbsoluteCycleClock,
     CycleDeadlineExceeded,
@@ -505,6 +506,10 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                 attempt["round_id"] = identity.round_id
                 attempt["durations"].update(runtime.cycle_phase_ns)
             progress("AWAITING_PLANT")
+            if wire_profile in PREAUTHORIZED_PROFILES and session.cancelled.is_set():
+                error = RuntimeError("提交后Client取消，禁止施力或继续会话")
+                error.phase = "CANCELLED_AFTER_COMMIT"
+                raise error
             check_deadline(deadline_ns, "BEFORE_DEVICE")
             started = perf_counter_ns()
             if attempt is not None:

@@ -2,6 +2,19 @@
 
 ## 无证书动态演示的显式选择
 
+D132-9增加 `control-dynamic-matrix-preauthorized-v2`，复用下述单次往返计算路径，
+仅压缩重复许可与输出编码。完整许可每步10份降为2份，其他消息严格绑定当前一步的公开引用；
+双有效提交先记账、输出检查后才施力。三角色必须同时显式选择v2，禁止混装、回退或重试。
+v1、seeded与默认均保留；三份配置、失败语义和准备摘要字段见
+[D132-9候选](cart_pole_interactive.md#紧凑表示候选d132-9)。本轮软件验证不能证明尾部或两机性能改善，
+新增性能运行尚未获授权。
+
+D132-8新增显式`control-dynamic-matrix-preauthorized-v1`，需三角色同时选择。
+它将普通Client往返缩为一次，并提前准备固定矩阵/已提交状态前缀；服务器按本步permit先提交，
+Client核实双提交并检查输出后才施力。失败可能已提交而未施力，必须废弃会话。
+旧默认及seeded保持；启用、启动命令、安全/失败与完整成本说明见
+[D132-8候选](cart_pole_interactive.md#显式候选单次跨机往返及前缀准备d132-8)。
+
 普通角色配置支持可选 `wire_profile: control-dynamic-matrix-v1`（本次两机推荐）或旧
 `control-dynamic-compact-v2`，省略仍为 `control-batch-v1`。三角色必须显式选择同一版本，不自动升级。
 P1/P2脚本将选择传给原协议owner，Client专用持续入口也使用同一协议，错配失败不回退。

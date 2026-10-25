@@ -70,6 +70,33 @@ def test_zero_endpoint_validation_and_observer_failure_are_explicit():
     assert result["observations"] == 1
 
 
+def test_single_exchange_is_distinct_and_legacy_report_metric_set_remains_readable(tmp_path):
+    from secure_control.experiments.live_timing import (
+        export_timing,
+        load_timing_report,
+        validate_timing_report,
+    )
+
+    collector = LiveTimingCollector("samples", sample_limit=1)
+    collector.record(observation(phase_durations_ns={"single_exchange": 4_000_000,
+                                                    "reconstruct": 200_000}))
+    report = collector.report()
+    assert report["raw"]["samples"][0]["phase_durations_ns"] == {
+        "single_exchange": 4_000_000, "reconstruct": 200_000}
+    assert report["metrics"]["stage"]["count"] == report["metrics"]["commit"]["count"] == 0
+    assert report["metrics"]["single_exchange"]["sum_ns"] == 4_000_000
+    target = tmp_path/'new.json'
+    export_timing(collector, target, {}, {"status": "stopped"})
+    assert load_timing_report(target)["metrics"]["single_exchange"]["count"] == 1
+    legacy = LiveTimingCollector("samples", sample_limit=1)
+    legacy.record(observation())
+    old_target = tmp_path/'old.json'
+    export_timing(legacy, old_target, {}, {"status": "stopped"})
+    old = load_timing_report(old_target)
+    del old["metrics"]["single_exchange"]
+    assert validate_timing_report(old) is old
+
+
 @pytest.mark.parametrize("count", [0, 1, 256, 257, 10001])
 def test_full_range_oracle_and_fixed_storage(count):
     """仅驱动公开整数汇总器，不启动控制器/网络/worker，不属于控制性能长测。"""

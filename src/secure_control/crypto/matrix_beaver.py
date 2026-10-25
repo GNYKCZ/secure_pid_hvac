@@ -170,3 +170,71 @@ class MatrixBeaverMultiplier:
             value = (value + matrix_vector(e, f, q)) % q
         triple._lifecycle.claim_finish(triple.party_index)
         return AdditiveShare(value)
+
+
+class MatrixPrefix:
+    """单方一次性能力：首次前缀领取原triple，后缀仍消费同一owner/token。"""
+
+    def __init__(self, multiplier, triple, matrix, state):
+        us, _, _ = multiplier._validate(triple)
+        q = multiplier.sharing.modulus
+        matrix_values(matrix, us, q)
+        state_array = np.asarray(state.value, dtype=object)
+        n = state_array.shape[0] if state_array.ndim == 2 else 0
+        if not 0 < n < triple.inner:
+            raise ValueError("前缀状态维度错误")
+        matrix_values(state, (n, 1), q)
+        triple._lifecycle.claim_masking(triple.party_index)
+        self.owner, self.triple, self.n = multiplier, triple, n
+        self.e_share = (matrix.value-triple.u.value) % q
+        self.fx_share = (state_array-triple.v.value[:n]) % q
+        self.phase = "prefix_sent"
+
+    def open_prefix(self, peer_e, peer_fx):
+        if self.phase != "prefix_sent":
+            raise ValueError("前缀只能打开一次")
+        self.phase = "terminal"
+        t, q = self.triple, self.owner.sharing.modulus
+        matrix_values(peer_e, (t.rows, t.inner), q)
+        matrix_values(peer_fx, (self.n, 1), q)
+        t._lifecycle.claim_masking(1-t.party_index)
+        e = (self.e_share+peer_e.value) % q
+        fx = (self.fx_share+peer_fx.value) % q
+        self.l = (t.u.value+(e if t.party_index == 0 else 0)) % q
+        self.h = (matrix_vector(e, t.v.value, q)+matrix_vector(self.l[:, :self.n], fx, q)) % q
+        self.phase = "prefix_opened"
+
+    def bind(self, w):
+        if self.phase != "prefix_opened":
+            raise ValueError("前缀已绑定或废弃")
+        self.phase = "terminal"
+        t = self.triple
+        matrix_values(w, (t.rows, 1), self.owner.sharing.modulus)
+        self.triple = MatrixTripleShare(t.u, t.v, w, t.party_index, t.rows, t.inner, t._lifecycle)
+        self.phase = "bound"
+        return self.triple
+
+    def mask_suffix(self, value):
+        if self.phase != "bound":
+            raise ValueError("后缀只能开始一次")
+        self.phase = "suffix_sent"
+        q, t = self.owner.sharing.modulus, self.triple
+        matrix_values(value, (t.inner-self.n, 1), q)
+        self.fv_share = (value.value-t.v.value[self.n:]) % q
+        return AdditiveShare(self.fv_share)
+
+    def finish(self, peer_fv):
+        if self.phase != "suffix_sent":
+            raise ValueError("后缀未开始或已完成")
+        self.phase = "terminal"
+        t, q = self.triple, self.owner.sharing.modulus
+        matrix_values(peer_fv, (t.inner-self.n, 1), q)
+        fv = (self.fv_share+peer_fv.value) % q
+        t._lifecycle.claim_opening()
+        value = (t.w.value+self.h+matrix_vector(self.l[:, self.n:], fv, q)) % q
+        t._lifecycle.claim_finish(t.party_index)
+        self.phase = "locally_finished"
+        return AdditiveShare(value)
+
+    def abort(self):
+        self.phase = "terminal"

@@ -201,11 +201,15 @@ def test_compact_advance_already_expired_budget_closes_without_send(compact_adva
     assert runtime.confirmed_step_count == 400 and not runtime.last_segment_receipts
 
 
-@pytest.mark.parametrize("expected", ["control-batch-v1", "control-dynamic-compact-v1"])
-def test_party_rejects_mixed_compact_hello_before_offline_or_peer(monkeypatch, expected):
+@pytest.mark.parametrize("expected,received", [("control-batch-v1", "control-dynamic-compact-v2"),
+    ("control-dynamic-compact-v1", "control-dynamic-compact-v2"),
+    ("control-dynamic-matrix-preauthorized-v1", "control-dynamic-matrix-preauthorized-v2"),
+    ("control-dynamic-matrix-preauthorized-v2", "control-dynamic-matrix-preauthorized-v1"),
+    ("control-dynamic-matrix-seeded-v1", "control-dynamic-matrix-preauthorized-v2")])
+def test_party_rejects_mixed_compact_hello_before_offline_or_peer(monkeypatch, expected, received):
     from secure_control.execution import localhost_codec as codec
     hello = codec._CompactHelloPayload(codec.BatchHelloPayload(codec.LanSegmentedHelloPayload(
-        "a"*64, "b"*64, "run", 0, 0, None, "lan-segmented-v2")), codec._COMPACT_PROFILE_V2)
+        "a"*64, "b"*64, "run", 0, 0, None, "lan-segmented-v2")), received)
     closed = []
     monkeypatch.setattr(lan_runtime, "accept_role", lambda *a: SimpleNamespace(close=lambda: closed.append(True)))
     monkeypatch.setattr(lan_runtime, "_accept_hello", lambda *a: ("session", hello))

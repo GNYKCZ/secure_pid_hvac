@@ -22,6 +22,7 @@ class _TripleLifecycle:
         "masked_parties",
         "opened",
         "owner",
+        "peer_ready_parties",
     )
 
     def __init__(self, owner: object) -> None:
@@ -31,6 +32,14 @@ class _TripleLifecycle:
         self.finished_parties: set[int] = set()
         self.consumed = False
         self.client_attested_parties: set[int] = set()
+        self.peer_ready_parties: set[int] = set()
+
+    def accept_peer_ready(self, party: int) -> None:
+        """protocol核验READY后的独立见证；不伪造Client已检查。"""
+        if self.consumed or self.finished_parties != {party} or not self.opened:
+            raise ValueError("Beaver本方未完成或见证已消费")
+        self.peer_ready_parties.add(1-party)
+        self.consumed = True
 
     def attest_peer_finish(self, party: int) -> None:
         """Client 确认双方完成；不把远端完成加入本地观察集合。"""

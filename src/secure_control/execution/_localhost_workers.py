@@ -13,6 +13,7 @@ import numpy as np
 
 from secure_control.core import ControllerSpec
 from secure_control.crypto import FixedPointContext, PrimeModulusEvidence, TwoPartySharing
+from secure_control.crypto.seeded_material import SEEDED_PROFILES
 from secure_control.protocol import P1, P2, Client, ControllerRangeContract
 from secure_control.protocol.coordinator import (
     DirectProtocol3PartyEndpoint,
@@ -299,7 +300,7 @@ def _validate_party_reply(response: WireEnvelope, request: WireEnvelope) -> None
             f"{response.payload.error_type}: {response.payload.message}"
         )
         if (response.payload.error_type == "_SeededPreparationFailed"
-                and getattr(request.payload,"version",None) == "control-dynamic-matrix-seeded-v1"):
+                and getattr(getattr(request.payload,"online",request.payload),"version",None) in SEEDED_PROFILES):
             # 错误只属于当前请求的下一槽准备，不把先前已ACK的轮次改成失败。
             error.phase = "MATERIAL_PREPARE_NEXT"
         raise error

@@ -93,7 +93,9 @@ def test_all_lan_tcp_links_enable_nodelay_and_close_failed_options(deployment, m
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize("wire", ["control-dynamic-compact-v2", "control-dynamic-matrix-v1"])
+@pytest.mark.parametrize("wire", ["control-dynamic-compact-v2", "control-dynamic-matrix-v1",
+    "control-dynamic-matrix-seeded-v1", "control-dynamic-matrix-preauthorized-v1",
+    "control-dynamic-matrix-preauthorized-v2"])
 def test_optional_wire_profile_is_strict_and_independent_of_transport(tmp_path, wire):
     import yaml
     from lan_test_support import loopback_deployment
