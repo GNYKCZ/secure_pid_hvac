@@ -1,5 +1,13 @@
 # 倒立摆动画 Client：三角色快速操作
 
+## Client 就绪驱动收发（D132-11）
+
+动态无证书 preauthorized-v2 持续演示可在 **Client 配置副本**中显式设置
+`client_io: ready-v1`；省略仍为 `blocking-v1`。服务器不添加此键，也不升级 wire。
+GUI/headless 共用原 runtime，双提交、输出检查及确认施力顺序保持。
+启用与失败规则见 [双连接候选说明](lan_continuous.md#client-双连接就绪驱动候选d132-11)。
+本轮仅软件验证，性能 NOT RUN；网卡调优暂停，没有默认开启新对照实验。
+
 ## 紧凑表示候选（D132-9）
 
 在已有单次往返架构上，新增显式 `wire_profile: control-dynamic-matrix-preauthorized-v2`。

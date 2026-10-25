@@ -1,5 +1,41 @@
 # 独立三角色连续 LAN 实验（Issues #86、#84、#75、#92）
 
+## Client 双连接就绪驱动候选（D132-11）
+
+这是显式选择的软件候选，默认仍为 `client_io: blocking-v1`。
+在你选定的 **Client 配置副本**中加入顶层一行 `client_io: ready-v1`；
+该副本还必须是 `transport: insecure_tcp`、
+`wire_profile: control-dynamic-matrix-preauthorized-v2` 和动态持续 experiment。
+P1/P2 保持原 v2 配置，不添加 `client_io`（服务器配置出现此键会拒绝）。
+启动仍使用原 GUI 或 headless 持续入口，仅把 Client 配置路径换为该副本，例如：
+
+```powershell
+uv run python scripts/run_cart_pole_client.py configs/lab-client-cart-pole-ready.local.yaml --headless-continuous --non-realtime --recording light --segment-steps 400
+```
+
+上面的 `.local.yaml` 是用户准备的配置副本，不是仓库自带文件。保留三角色原有相同拓扑、
+experiment 和 v2 wire；无需改 IP、端口、证书或网卡设置来启用此策略。
+省略 `client_io` 或设为 `blocking-v1` 使用原路径。非法枚举、TLS/旧 wire、
+静态/有限/完整路线及预送组合会拒绝，不会静默降级。四份用户现有 YAML 不自动修改。
+
+`ready-v1` 在原 Client 线程公平推进两条连接，P1 背压不会阻塞 P2 开始发送；
+两份请求完整发出后才按可用数据接收。每条完整回复立即验证真实提交事实，按角色保存；
+P2 先到后 P1 超时仍保留 P2 已知提交。双有效提交先记账，随后输出检查、截止检查，最后才允许施力。
+帧头/正文已有数据时直接继续，只有两路均无法推进才共同等待；不增加线程、进程或忙等。
+同一期限覆盖两路全部分片与业务检查，退出尝试恢复两条 socket 模式；恢复失败终止会话。
+失败不重发、不回退、不回滚已知提交。
+
+本地策略不进入 permit、拓扑摘要或 wire，不改变服务器协议、数学、材料或普通步的四帧/一次因果往返。
+`single_exchange` 起终点保持，包含发送、等待、解帧与提交核验，不是纯网络耗时。
+结果 metadata 与紧凑持续终态记录 `client_io`；历史结果缺字段表示未记录，不能推定使用新策略。
+本轮不增加逐步事件/落盘或扩大 raw 结构；行为证据由独立 I/O 模型和真实短功能会话提供。
+
+**性能 NOT RUN。** 这是软件候选，不保证消除实测约 10 ms 相位现象或 80 ms 尖峰，
+不能按两条连接推断耗时减半。新增两机有界对照须另行明确授权，不能把 sample-limit 当限步。
+[D132-10 网卡方案](https://github.com/GNYKCZ/secure_pid_hvac/pull/141)保留草稿历史、目前暂停，
+两端均未改设置、两组未运行；其额度不移给本候选，D10 的 6–8 ms 条件估计不适用于本轮。
+完整契约见 [D132-11 设计](https://github.com/GNYKCZ/secure_pid_hvac/issues/132#issuecomment-6395838844)。
+
 ## 无证书动态演示的显式选择
 
 D132-9增加 `control-dynamic-matrix-preauthorized-v2`，复用下述单次往返计算路径，

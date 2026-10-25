@@ -177,6 +177,130 @@ def receive_frame(sock: socket.socket, *, deadline: float, limit: int) -> bytes:
     return _receive_exact(sock, length, deadline)
 
 
+def _exchange_two_frames(sockets, payloads, *, deadline, limit, on_request, on_reply):
+    """原线程推进两路各一请求/回复；回调只报告字节事实，不解释业务授权。"""
+    if len(sockets) != 2 or len(payloads) != 2 or sockets[0] is sockets[1]:
+        raise ValueError("双连接交换需要两条独立socket及两份payload。")
+    # 两路都先检查，避免第二份非法时第一份已经发出。
+    for payload in payloads:
+        _validate_frame_payload(payload, limit)
+    outgoing = [memoryview(_HEADER.pack(len(p)) + p) for p in payloads]
+    incoming = [bytearray(), bytearray()]
+    targets, headers, complete, attempted = [4, 4], [False, False], [False, False], [False, False]
+    previous = [sock.gettimeout() for sock in sockets]
+    primary = None
+
+    def budget():
+        remaining = remaining_seconds(deadline)
+        if remaining <= 0:
+            raise LocalhostTransportTimeout("双连接交换超过原绝对deadline。")
+        return remaining
+
+    def wait(readers, writers):
+        try:
+            ready_r, ready_w, errors = select.select(readers, writers, [], budget())
+        except TimeoutError as error:
+            raise LocalhostTransportTimeout("双连接就绪等待超时。") from error
+        except OSError as error:
+            raise LocalhostTransportDisconnected("双连接就绪等待失败。") from error
+        budget()
+        if errors or any(s not in readers for s in ready_r) or any(s not in writers for s in ready_w):
+            raise LocalhostTransportProtocolError("双连接就绪结果不属于当前通道。")
+
+    try:
+        budget()
+        for sock in sockets:
+            sock.settimeout(0.)
+        stalled = 0
+        while any(outgoing):
+            progressed = False
+            for p, sock in enumerate(sockets):
+                if not outgoing[p]:
+                    continue
+                budget()
+                if not attempted[p]:
+                    on_request(p, "uncertain")
+                    attempted[p] = True
+                budget()
+                try:
+                    count = sock.send(outgoing[p])
+                except BlockingIOError:
+                    continue
+                except TimeoutError as error:
+                    raise LocalhostTransportTimeout("双连接发送超时。") from error
+                except OSError as error:
+                    raise LocalhostTransportDisconnected("双连接发送失败。") from error
+                if count <= 0:
+                    raise LocalhostTransportDisconnected("发送完整请求前连接关闭。")
+                outgoing[p] = outgoing[p][count:]
+                progressed = True
+                if not outgoing[p]:
+                    on_request(p, "sent")
+                budget()
+            stalled = 0 if progressed else stalled + 1
+            if stalled >= 8:
+                raise LocalhostTransportError("双连接发送连续8次无进展。")
+            if not progressed:
+                wait([], [s for p, s in enumerate(sockets) if outgoing[p]])
+
+        # 两份请求全部交给socket后才接收，不改变原协议阶段顺序。
+        stalled = 0
+        while not all(complete):
+            progressed = False
+            for p, sock in enumerate(sockets):
+                if complete[p]:
+                    continue
+                budget()
+                try:
+                    chunk = sock.recv(targets[p] - len(incoming[p]))
+                except BlockingIOError:
+                    continue
+                except TimeoutError as error:
+                    raise LocalhostTransportTimeout("双连接接收超时。") from error
+                except OSError as error:
+                    raise LocalhostTransportDisconnected("双连接接收失败。") from error
+                if not chunk:
+                    raise LocalhostTransportDisconnected("完整回复到达前连接关闭。")
+                incoming[p].extend(chunk)
+                progressed = True
+                if len(incoming[p]) == targets[p]:
+                    if not headers[p]:
+                        (targets[p],) = _HEADER.unpack(incoming[p])
+                        if not 0 < targets[p] <= limit:
+                            raise LocalhostTransportProtocolError("frame声明长度为空或超限。")
+                        incoming[p].clear()
+                        headers[p] = True
+                    else:
+                        budget()
+                        on_reply(p, bytes(incoming[p]))
+                        complete[p] = True
+                budget()
+            stalled = 0 if progressed else stalled + 1
+            if stalled >= 8:
+                raise LocalhostTransportError("双连接接收连续8次无进展。")
+            if not progressed:
+                wait([s for p, s in enumerate(sockets) if not complete[p]], [])
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        restoration = None
+        for sock, mode in zip(sockets, previous, strict=True):
+            try:
+                sock.settimeout(mode)
+            except BaseException as error:  # noqa: BLE001 - 继续恢复另一通道，循环后保留首错抛出。
+                # 第一条恢复失败也必须尝试第二条；绝不覆盖已经发生的首错。
+                if primary is not None:
+                    BaseException.add_note(primary, "双连接交换恢复socket模式失败。")
+                elif restoration is None:
+                    restoration = error
+                else:
+                    BaseException.add_note(restoration, "另一条socket模式恢复也失败。")
+        if primary is None and restoration is not None:
+            raise restoration
+    budget()
+
+
 def _exchange_frame(sock, payload: bytes, *, deadline, limit: int) -> bytes:
     """单 owner 同时推进各一帧；只在双方均无进展时等待原绝对期限。"""
     _validate_frame_payload(payload, limit)

@@ -121,6 +121,43 @@ NAMES = {
     "P2": "p2.secure-control.test",
 }
 
+
+def test_client_io_schema_is_local_explicit_and_rejects_unsupported_roles(tmp_path):
+    import yaml
+    from lan_test_support import loopback_deployment
+
+    paths = loopback_deployment(tmp_path)
+    for role, path in paths.items():
+        assert load_lan_config(path, role).client_io == 'blocking-v1'
+        original = yaml.safe_load(path.read_text(encoding='utf8'))
+        for value in ('blocking-v1', 'ready-v1', False, None, [], 'unknown'):
+            data = {**original, 'client_io':value,
+                    'wire_profile':'control-dynamic-matrix-preauthorized-v2'}
+            if role == 'Client':
+                data.pop('controller', None)
+                data['experiment'] = original.get('experiment', original.get('controller'))
+            path.write_text(yaml.safe_dump(data), encoding='utf8')
+            if role == 'Client' and value in ('blocking-v1', 'ready-v1'):
+                assert load_lan_config(path, role).client_io == value
+            else:
+                with pytest.raises(ValueError):
+                    load_lan_config(path, role)
+        if role == 'Client':
+            data['client_io'] = 'ready-v1'
+            data['wire_profile'] = 'control-dynamic-matrix-preauthorized-v1'
+            path.write_text(yaml.safe_dump(data), encoding='utf8')
+            with pytest.raises(ValueError, match='ready-v1'):
+                load_lan_config(path, role)
+    from dataclasses import replace
+    # 直接构造/replace也不能绕过TLS或controller-only限制。
+    data = yaml.safe_load(paths['Client'].read_text(encoding='utf8'))
+    data['wire_profile'] = 'control-dynamic-matrix-preauthorized-v2'
+    paths['Client'].write_text(yaml.safe_dump(data), encoding='utf8')
+    config = load_lan_config(paths['Client'], 'Client')
+    for changes in ({'transport':'mutual_tls'}, {'experiment_config':None}, {'client_io':True}):
+        with pytest.raises(ValueError):
+            replace(config, **changes)
+
 # 故障进程仍使用仓库原有 LAN 入口、真实 TLS socket 与独立 PID；只在该进程内
 # 替换一个发送/回执边界。生产代码不提供故障开关或 TLS 隐式明文回退。
 _FAULT_BOOTSTRAP = r"""

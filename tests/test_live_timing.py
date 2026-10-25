@@ -8,6 +8,22 @@ from secure_control.execution.cycle_timing import StepTimingObservation
 from secure_control.experiments.live_timing import LiveTimingCollector
 
 
+@pytest.mark.parametrize('client_io', ['blocking-v1', 'ready-v1'])
+def test_timing_metadata_records_local_io_strategy_without_changing_wire(client_io):
+    from types import SimpleNamespace
+
+    from secure_control.experiments.communication_benchmark import _config, _ports
+    from secure_control.experiments.live_timing import timing_metadata
+    profile = 'control-dynamic-matrix-preauthorized-v2'
+    config = replace(_config('Client', _ports()), wire_profile=profile, client_io=client_io)
+    prepared = SimpleNamespace(scene=SimpleNamespace(period=.02), segment_capacity=2,
+                               effective_config={'public': 'fixture'})
+    metadata = timing_metadata(config, prepared, non_realtime=True, mode='summary')
+    assert metadata['client_io'] == client_io and metadata['wire_profile'] == profile
+    assert metadata['topology_digest'] == config.topology.digest
+    assert metadata['peer_head'] == metadata['peer_network'] == 'unknown'
+
+
 def observation(k=0, work=15_000_000, **kwargs):
     """手写时刻差作 oracle，不通过被测统计计算期望。"""
     start = 1_000_000_000 + k * 30_000_000

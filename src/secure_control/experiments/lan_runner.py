@@ -644,7 +644,7 @@ def _run_prepared_segmented(config, experiment, *, control, session,
         if (non_realtime or configured_compact) and outcome is not None:
             # close 后再取工人清退事实，不以构造 return 时的旧快照声称清理完成。
             material = runtime.material_summary if runtime is not None else {}
-            outcome.update(transport=config.transport, wire_profile=wire_profile,
+            outcome.update(transport=config.transport, wire_profile=wire_profile, client_io=config.client_io,
                 material_source="worker" if material_candidate == "worker" else "inline",
                 timing_mode=("non_realtime_demo" if non_realtime else "absolute" if dynamic_realtime else "unpaced"),
                 model_period_s=experiment.scene.period,

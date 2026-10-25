@@ -109,6 +109,7 @@ from .localhost_codec import (
     _PermitContext,
     _PreauthorizedOnlinePayload,
     _SeedInitPayload,
+    decode_envelope,
     decode_wire_value,
     encode_wire_value,
 )
@@ -523,6 +524,12 @@ class LanContinuousRuntime:
         ):
             raise ValueError("紧凑动态候选仅允许显式批量 v2 且不预送")
         self._wire_profile = wire_profile
+        if config.client_io == "ready-v1" and not (
+            wire_profile == PREAUTHORIZED_PROFILE_V2 and batch and not preload_steps
+            and _segment_hello is not None and _segment_hello.mode == "lan-segmented-v2"
+            and spec.state_dimension
+        ):
+            raise ValueError("ready-v1 仅支持动态持续v2普通步，不支持预送/完整路线。")
         if wire_profile in _MATRIX_PROFILES:
             # 在联网和材料分配之前验证本profile支持的公开尺度/形状。
             _matrix_layout_preflight(spec, fixed_point)
@@ -935,34 +942,48 @@ class LanContinuousRuntime:
                                         "step": plan.step, "parties": observation}
         check_deadline(deadline_ns, "ENCODING")
         started = time.perf_counter_ns()
-        replies = []
+        replies = [None, None]
+
+        def accept_reply(p, response):
+            # 收齐一方就核实真实commit；另一方迟到/断线不能抹掉此事实。
+            _validate_party_reply(response, prepared[p][0])
+            reply = response.payload
+            if context is not None:
+                if type(reply) is not _CommittedReplyV2:
+                    raise ValueError("v2禁止旧嵌套提交回复")
+                own, _ = reply.committed_facts(context)
+            else:
+                if type(reply) is not CommittedStepReply or reply.ready.permit != permit:
+                    raise ValueError("v1最终回执类型/许可错误")
+                own = reply.ready
+            if own.party != p or own.truncations != plan.truncation_count:
+                raise ValueError("最终双提交回执与本次permit/资源不匹配")
+            replies[p] = reply
+            observation[f"P{p+1}"]["valid_ack_received"] = True
+            if all(r is not None for r in replies):
+                # 在恢复socket模式/输出解析之前记双提交，后续失败不能回滚它。
+                self._step += 1
+                self._products += 1
+                self._truncations += plan.truncation_count
+                self._sequences = [v+1 for v in self._sequences]
+
+        def request_state(p, state):
+            self._round_started = True
+            observation[f"P{p+1}"]["request_state"] = state
+
         try:
-            for p, (sock, (_, encoded)) in enumerate(zip(self._sockets, prepared, strict=True)):
-                self._round_started = True
-                observation[f"P{p+1}"]["request_state"] = "uncertain"
-                localhost_transport.send_frame(sock, encoded, deadline=deadline, limit=_FRAME_LIMIT)
-                observation[f"P{p+1}"]["request_state"] = "sent"
-            for p, (sock, (request, _)) in enumerate(zip(self._sockets, prepared, strict=True)):
-                response = receive_envelope(sock, deadline=deadline, limit=_FRAME_LIMIT)
-                _validate_party_reply(response, request)
-                reply = response.payload
-                if context is not None:
-                    if type(reply) is not _CommittedReplyV2:
-                        raise ValueError("v2禁止旧嵌套提交回复")
-                    own, _ = reply.committed_facts(context)
-                else:
-                    if type(reply) is not CommittedStepReply or reply.ready.permit != permit:
-                        raise ValueError("v1最终回执类型/许可错误")
-                    own = reply.ready
-                if own.party != p or own.truncations != plan.truncation_count:
-                    raise ValueError("最终双提交回执与本次permit/资源不匹配")
-                replies.append(reply)
-                observation[f"P{p+1}"]["valid_ack_received"] = True
-            # 两份真实回执有效即计提交；之后的输出/截止失败也不能抹掉这一步。
-            self._step += 1
-            self._products += 1
-            self._truncations += plan.truncation_count
-            self._sequences = [v+1 for v in self._sequences]
+            if self.config.client_io == "ready-v1":
+                localhost_transport._exchange_two_frames(self._sockets,
+                    tuple(encoded for _, encoded in prepared), deadline=deadline, limit=_FRAME_LIMIT,
+                    on_request=request_state,
+                    on_reply=lambda p, data: accept_reply(p, decode_envelope(data)))
+            else:
+                for p, (sock, (_, encoded)) in enumerate(zip(self._sockets, prepared, strict=True)):
+                    request_state(p, "uncertain")
+                    localhost_transport.send_frame(sock, encoded, deadline=deadline, limit=_FRAME_LIMIT)
+                    request_state(p, "sent")
+                for p, sock in enumerate(self._sockets):
+                    accept_reply(p, receive_envelope(sock, deadline=deadline, limit=_FRAME_LIMIT))
         finally:
             self._last_phase_ns["single_exchange"] = time.perf_counter_ns()-started
         started = time.perf_counter_ns()

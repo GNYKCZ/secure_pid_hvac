@@ -480,6 +480,7 @@ def timing_metadata(config, prepared, *, non_realtime, mode):
         "platform": platform.platform(),
         "transport": config.transport,
         "wire_profile": config.wire_profile,
+        "client_io": config.client_io,
         "timing_mode": "non_realtime_demo" if non_realtime else "absolute",
         "model_period_s": prepared.scene.period,
         "segment_steps": prepared.segment_capacity,
