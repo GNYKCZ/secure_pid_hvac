@@ -13,7 +13,9 @@ from .secret_sharing import AdditiveShare
 
 SEEDED_PROFILE = "control-dynamic-matrix-seeded-v1"
 PREAUTHORIZED_PROFILE = "control-dynamic-matrix-preauthorized-v1"
-SEEDED_PROFILES = (SEEDED_PROFILE, PREAUTHORIZED_PROFILE)
+PREAUTHORIZED_PROFILE_V2 = "control-dynamic-matrix-preauthorized-v2"
+PREAUTHORIZED_PROFILES = (PREAUTHORIZED_PROFILE, PREAUTHORIZED_PROFILE_V2)
+SEEDED_PROFILES = (SEEDED_PROFILE, *PREAUTHORIZED_PROFILES)
 _DOMAIN = b"secure-control.seeded-material.v1\0"
 _LABELS = (b"U", b"V", b"W", b"r", b"r-prime")
 

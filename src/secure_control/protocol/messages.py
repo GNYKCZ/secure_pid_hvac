@@ -24,6 +24,7 @@ from secure_control.crypto import (
     PublicMaskedDifferences,
     TruncationAuxiliaryShare,
 )
+from secure_control.crypto.seeded_material import PREAUTHORIZED_PROFILES
 
 _PROTOCOL3_TERM_ORDER = ("C", "D", "A", "B")
 
@@ -1189,7 +1190,7 @@ class StepAdvancePermit:
     version: str = "control-dynamic-matrix-preauthorized-v1"
 
     def __post_init__(self):
-        if (self.version != "control-dynamic-matrix-preauthorized-v1"
+        if (type(self.version) is not str or self.version not in PREAUTHORIZED_PROFILES
                 or self.policy != "commit_after_both_ready"
                 or any(type(v) is not str or not 1 <= len(v) <= 256 for v in
                        (self.run_id, self.session_id, self.controller_epoch, self.round_id))
@@ -1235,15 +1236,19 @@ class CommittedStepReply:
     commit_status: str = "committed"
 
     def __post_init__(self):
-        if (type(self.ready) is not ReadyReceipt or type(self.peer_ready) is not ReadyReceipt
-                or self.peer_ready.permit != self.ready.permit
-                or self.peer_ready.party != 1-self.ready.party
-                or self.peer_ready.truncations != self.ready.truncations
-                or self.commit_status != "committed"
-                or any(type(v) is not int or v != self.ready.permit.global_step+1
-                       for v in (self.state_version, self.cumulative_committed_count))
-                or type(self.output) is not bytes or not 1 <= len(self.output) <= 512*1024):
-            raise ValueError("最终回执缺少匹配的双方READY或真实提交版本")
+        _validate_committed_step_facts(self.ready, self.peer_ready, self.state_version,
+                                       self.cumulative_committed_count, self.commit_status)
+        if type(self.output) is not bytes or not 1 <= len(self.output) <= 512*1024:
+            raise ValueError("最终回执输出必须是有界bytes")
+
+
+def _validate_committed_step_facts(ready, peer_ready, state_version, count, status):
+    """v1及codec内v2共用提交事实约束；不以输出有效性推断真实提交。"""
+    if (type(ready) is not ReadyReceipt or type(peer_ready) is not ReadyReceipt
+            or peer_ready.permit != ready.permit or peer_ready.party != 1-ready.party
+            or peer_ready.truncations != ready.truncations or status != "committed"
+            or any(type(v) is not int or v != ready.permit.global_step+1 for v in (state_version, count))):
+        raise ValueError("最终回执缺少匹配的双方READY或真实提交版本")
 
 
 Protocol3Operation = Literal[

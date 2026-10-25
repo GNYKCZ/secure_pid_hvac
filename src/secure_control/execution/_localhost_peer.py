@@ -8,7 +8,7 @@ from copy import deepcopy
 from typing import Literal
 
 from secure_control.crypto import AdditiveShare
-from secure_control.crypto.seeded_material import PREAUTHORIZED_PROFILE
+from secure_control.crypto.seeded_material import PREAUTHORIZED_PROFILE_V2, PREAUTHORIZED_PROFILES
 from secure_control.protocol.messages import (
     _PUBLIC_PLAN_JSON_FIELDS,
     MatrixMaskPayload,
@@ -36,8 +36,11 @@ from .localhost_codec import (
     _decode_residues,
     _encode_integer_residues,
     _encode_residues,
+    _PermitContext,
     _PrefixPayload,
+    _ReadyReference,
     _SuffixPayload,
+    _SuffixReference,
     decode_envelope,
     encode_envelope,
 )
@@ -115,6 +118,7 @@ class LocalhostProtocol3PeerPort:
             raise ValueError("peer 编码 profile 无效")
         self._wire_profile = wire_profile
         self._batch_context: tuple[StepResourcePlan, str | None, str, int | None, int] | None = None
+        self._permit_context: _PermitContext | None = None
 
     def bind(self, session_id: str) -> None:
         if self._session_id is not None or not isinstance(session_id, str) or not session_id:
@@ -140,8 +144,8 @@ class LocalhostProtocol3PeerPort:
             raise ValueError("批量 peer 模数无效")
         if self._wire_profile in _CLIENT_AUTH_PROFILES and (
                 not plan.truncation_count or getattr(self, "_v3_last_step", -1)+1 != plan.step
-                or getattr(self, "_v3_phase", "ready" if self._wire_profile == PREAUTHORIZED_PROFILE else "truncated")
-                    != ("ready" if self._wire_profile == PREAUTHORIZED_PROFILE else "truncated")):
+                or getattr(self, "_v3_phase", "ready" if self._wire_profile in PREAUTHORIZED_PROFILES else "truncated")
+                    != ("ready" if self._wire_profile in PREAUTHORIZED_PROFILES else "truncated")):
             raise ValueError("局部暂存 peer 需要连续新鲜且前轮完整的动态截断轮次。")
         self._batch_context = (_snapshot_public_plan(plan), run_id, epoch_id or plan.session_id,
                                physical_step, modulus)
@@ -173,7 +177,7 @@ class LocalhostProtocol3PeerPort:
         return incoming
 
     def _exchange_preauthorized(self, operation, payload, session, round_id, step):
-        if self._wire_profile != PREAUTHORIZED_PROFILE or session != self._session_id:
+        if self._wire_profile not in PREAUTHORIZED_PROFILES or session != self._session_id:
             raise ValueError("前缀/预授权需要显式同一session")
         outgoing = WireEnvelope(SCHEMA_VERSION, "request", self._role, self._peer,
             self._send_sequence, operation, session, round_id, step, None, payload)
@@ -188,10 +192,34 @@ class LocalhostProtocol3PeerPort:
         self._receive_sequence += 1
         return incoming.payload
 
+    def install_permit(self, permit):
+        """v2仅安装当前已验证完整许可；退休前不接受另一许可，不保存历史引用。"""
+        if (self._wire_profile != PREAUTHORIZED_PROFILE_V2 or self._permit_context is not None
+                or self._batch_context is None or getattr(self, "_v3_phase", None) != "prepared"
+                or permit.version != self._wire_profile
+                or (permit.session_id, permit.round_id, permit.global_step, permit.plan_sha256) != (
+                    self._session_id, self._batch_context[0].round_id,
+                    self._batch_context[0].step, self._batch_digest)):
+            raise ValueError("缺少当前轮次或重复/错误v2许可安装")
+        self._permit_context = _PermitContext(permit)
+        return self._permit_context
+
+    def retire_permit(self):
+        """当前最终回复完成后丢弃引用，下一步必须重新安装完整许可。"""
+        if self._wire_profile != PREAUTHORIZED_PROFILE_V2 or self._v3_phase != "ready":
+            raise ValueError("许可只能在实际READY完成后退休")
+        self._permit_context = None
+
+    def _current_permit(self, permit):
+        context = self._permit_context
+        if context is None or context.permit != permit:
+            raise ValueError("缺少当前一步许可上下文")
+        return context
+
     def exchange_prefix(self, identity, e, fx, modulus):
         import numpy as np
         if (getattr(self, "_prefix_next", 0) != identity[4]
-                or getattr(self, "_v3_phase", "ready") != "ready"):
+                or getattr(self, "_v3_phase", "ready") != "ready" or self._permit_context is not None):
             raise ValueError("前缀错步或上一轮尚未完成")
         self._prefix_next = identity[4]+1
         values = [int(v) for arr in (e, fx) for v in arr.flat]
@@ -212,10 +240,19 @@ class LocalhostProtocol3PeerPort:
         self._batch_identity(plan)
         self._v3_phase = "in_flight"
         q = self._batch_context[4]
-        payload = _SuffixPayload(permit, 0 if self._role == "P1" else 1,
-            _encode_integer_residues(tuple(int(v) for v in value.value.flat), value.value.size, q))
+        party = 0 if self._role == "P1" else 1
+        data = _encode_integer_residues(tuple(int(v) for v in value.value.flat), value.value.size, q)
+        context = self._current_permit(permit) if self._wire_profile == PREAUTHORIZED_PROFILE_V2 else None
+        payload = (_SuffixReference(context.permit_ref, party, data) if context is not None else
+                   _SuffixPayload(permit, party, data))
         incoming = self._exchange_preauthorized("peer_suffix", payload, plan.session_id, plan.round_id, plan.step)
-        if (type(incoming) is not _SuffixPayload or incoming.permit != permit or incoming.party != 1-payload.party):
+        if context is not None:
+            if type(incoming) is not _SuffixReference:
+                raise ValueError("v2后缀禁止旧嵌套许可")
+            context.check(incoming.permit_ref)
+        elif type(incoming) is not _SuffixPayload or incoming.permit != permit:
+            raise ValueError("v1后缀禁止引用/错误许可")
+        if incoming.party != 1-payload.party:
             raise ValueError("后缀permit/角色不匹配")
         values = _decode_integer_residues(incoming.values, plan.input_shape[0], q)
         self._v3_phase = "products"
@@ -226,8 +263,14 @@ class LocalhostProtocol3PeerPort:
         if type(ready) is not ReadyReceipt:
             raise ValueError("需要局部READY")
         p = ready.permit
+        context = self._current_permit(p) if self._wire_profile == PREAUTHORIZED_PROFILE_V2 else None
+        payload = context.compact_ready(ready) if context is not None else ready
         self._v3_phase = "in_flight"
-        incoming = self._exchange_preauthorized("peer_ready", ready, p.session_id, p.round_id, p.global_step)
+        incoming = self._exchange_preauthorized("peer_ready", payload, p.session_id, p.round_id, p.global_step)
+        if context is not None:
+            incoming = context.restore_ready(incoming)
+        elif type(incoming) is _ReadyReference:
+            raise ValueError("v1不接受READY引用")
         if (type(incoming) is not ReadyReceipt or incoming.permit != p
                 or incoming.party != 1-ready.party or incoming.truncations != ready.truncations):
             raise ValueError("对方READY不匹配")
@@ -486,6 +529,7 @@ class LocalhostProtocol3PeerPort:
         return value
 
     def close(self) -> None:
+        self._permit_context = None
         try:
             self._connection.shutdown(socket.SHUT_RDWR)
         except OSError:

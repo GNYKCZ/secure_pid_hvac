@@ -8,6 +8,7 @@ import json
 import re
 from dataclasses import asdict, dataclass, field
 from fractions import Fraction
+from hashlib import sha256
 from math import isfinite, prod
 from numbers import Integral
 from types import MappingProxyType
@@ -24,6 +25,8 @@ from secure_control.crypto import (
 )
 from secure_control.crypto.seeded_material import (
     PREAUTHORIZED_PROFILE,
+    PREAUTHORIZED_PROFILE_V2,
+    PREAUTHORIZED_PROFILES,
     SEEDED_PROFILE,
     SEEDED_PROFILES,
 )
@@ -63,6 +66,7 @@ from secure_control.protocol.messages import (
     StepResourcePlan,
     TruncationMaskPayload,
     TruncationResourceMaterial,
+    _validate_committed_step_facts,
 )
 
 SCHEMA_VERSION = 3
@@ -286,7 +290,8 @@ class _PreauthorizedOnlinePayload:
         if (type(self.online) is not _CompactOnlinePayload or type(self.permit) is not StepAdvancePermit
                 or type(self.online.input_message.recipient) is not int
                 or self.online.input_message.recipient not in (0, 1)
-                or self.online.version != PREAUTHORIZED_PROFILE
+                or self.online.version not in PREAUTHORIZED_PROFILES
+                or self.online.version != self.permit.version
                 or (self.online.run_id, self.online.epoch_id, self.online.plan_sha256,
                     self.online.input_message.session_id, self.online.input_message.round_id,
                     self.online.input_message.step) != (self.permit.run_id, self.permit.controller_epoch,
@@ -319,10 +324,161 @@ class _SuffixPayload:
     values: bytes = field(repr=False)
 
     def __post_init__(self):
-        if (type(self.permit) is not StepAdvancePermit
+        if (type(self.permit) is not StepAdvancePermit or self.permit.version != PREAUTHORIZED_PROFILE
                 or type(self.party) is not int or self.party not in (0, 1)):
             raise ValueError("后缀公开身份无效")
         _check_compact_bytes(self.values)
+
+
+@dataclass(frozen=True, slots=True)
+class _ReadyFacts:
+    """v2省略重复许可后的实际READY事实；身份只能由当前许可恢复。"""
+
+    party: int
+    truncations: int
+    matrix_products: int = 1
+    scope: str = "local_staged"
+
+    def __post_init__(self):
+        if (type(self.party) is not int or self.party not in (0, 1)
+                or type(self.truncations) is not int or self.truncations < 1
+                or type(self.matrix_products) is not int or self.matrix_products != 1
+                or self.scope != "local_staged"):
+            raise LocalhostCodecError("紧凑READY事实错误")
+
+
+@dataclass(frozen=True, slots=True)
+class _ReadyReference:
+    """实际READY事实与当前许可的公开绑定。"""
+
+    permit_ref: str
+    ready: _ReadyFacts
+
+    def __post_init__(self):
+        _required_sha256(self.permit_ref, "permit_ref")
+        if type(self.ready) is not _ReadyFacts:
+            raise LocalhostCodecError("紧凑READY类型错误")
+
+
+@dataclass(frozen=True, slots=True)
+class _SuffixReference:
+    """后缀数值仍为原定宽块，仅省略已安装的完整许可。"""
+
+    permit_ref: str
+    party: int
+    values: bytes = field(repr=False)
+
+    def __post_init__(self):
+        _required_sha256(self.permit_ref, "permit_ref")
+        if type(self.party) is not int or self.party not in (0, 1):
+            raise LocalhostCodecError("紧凑后缀角色错误")
+        _check_compact_bytes(self.values)
+
+
+@dataclass(frozen=True, slots=True)
+class _PermitContext:
+    """至多当前一步的公开许可；规范摘要只在安装时计算，无远程补取或历史表。"""
+
+    permit: StepAdvancePermit
+    permit_ref: str = field(init=False)
+
+    def __post_init__(self):
+        p = self.permit
+        if type(p) is not StepAdvancePermit or p.version != PREAUTHORIZED_PROFILE_V2:
+            raise LocalhostCodecError("引用需要完整v2许可")
+        p.__post_init__()
+        canonical = [p.version, p.run_id, p.session_id, p.controller_epoch, p.segment_index,
+            p.global_step, p.round_id, p.permit_id, p.plan_sha256, p.expected_state_version,
+            p.previous_physically_confirmed_count, p.policy]
+        encoded = json.dumps(canonical, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        object.__setattr__(self, "permit_ref", sha256(b"secure-control.preauthorized-permit.v2\0"+encoded).hexdigest())
+
+    def check(self, reference):
+        """每帧重新比较完整规范引用，不按permit_id或缓存命中放行。"""
+        if reference != self.permit_ref or type(reference) is not str:
+            raise LocalhostCodecError("引用与当前一步许可不匹配")
+
+    def compact_ready(self, ready):
+        """仅压缩调用者提供的真实READY，不创造另一方完成事实。"""
+        if type(ready) is not ReadyReceipt or ready.permit != self.permit:
+            raise LocalhostCodecError("不能为另一许可生成READY引用")
+        return _ReadyReference(self.permit_ref, _ReadyFacts(ready.party, ready.truncations,
+                                                         ready.matrix_products, ready.scope))
+
+    def restore_ready(self, reference):
+        """引用匹配当前槽后恢复原语义DTO，保留角色/计数校验。"""
+        if type(reference) is not _ReadyReference:
+            raise LocalhostCodecError("需要v2 READY引用")
+        self.check(reference.permit_ref)
+        r = reference.ready
+        return ReadyReceipt(self.permit, r.party, r.truncations, r.matrix_products, r.scope)
+
+
+@dataclass(frozen=True, slots=True)
+class _CommittedReplyV2:
+    """codec内部的两阶段回执；输出仅为有界JSON子值，第一阶段绝不解码数值。"""
+
+    permit_ref: str
+    ready: _ReadyFacts
+    peer_ready: _ReadyFacts
+    state_version: int
+    cumulative_committed_count: int
+    output_fractional_bits_json: bytes = field(repr=False)
+    output_values_json: bytes = field(repr=False)
+    commit_status: str = "committed"
+
+    def __post_init__(self):
+        _required_sha256(self.permit_ref, "permit_ref")
+        if (type(self.ready) is not _ReadyFacts or type(self.peer_ready) is not _ReadyFacts
+                or self.peer_ready.party != 1-self.ready.party
+                or self.peer_ready.truncations != self.ready.truncations or self.commit_status != "committed"
+                or type(self.state_version) is not int or self.state_version < 1
+                or type(self.cumulative_committed_count) is not int
+                or self.cumulative_committed_count != self.state_version):
+            raise LocalhostCodecError("紧凑提交事实错误")
+        for raw in (self.output_fractional_bits_json, self.output_values_json):
+            if type(raw) is not bytes or not 1 <= len(raw) <= 2*_COMPACT_MAX_VALUES:
+                raise LocalhostCodecError("延迟输出超过有界载荷预算")
+
+    def committed_facts(self, context):
+        """只核验当前许可和双提交，不检查任何输出字段。"""
+        context.check(self.permit_ref)
+        own, peer = (context.restore_ready(_ReadyReference(self.permit_ref, r))
+                     for r in (self.ready, self.peer_ready))
+        _validate_committed_step_facts(own, peer, self.state_version,
+                                       self.cumulative_committed_count, self.commit_status)
+        return own, peer
+
+    def restore_output(self, context, plan, modulus):
+        """只能在Client登记双提交后调用；恢复原任意精度整数份额及独立尺度。"""
+        p = context.permit
+        scale = _load_json(self.output_fractional_bits_json)
+        if type(scale) is not int or scale != plan.scale_ledger.output:
+            raise LocalhostCodecError("提交后输出尺度错误")
+        data = _decode_compact_base64(_load_json(self.output_values_json))
+        values = _decode_integer_residues(data, plan.output_shape[0], modulus)
+        return ControlShareMessage(self.ready.party, p.session_id, p.round_id, p.global_step,
+                                   scale, AdditiveShare(np.array(values, dtype=object)))
+
+
+def _compact_committed_reply(context, ready, peer_ready, state_version, count, output, plan, modulus):
+    """从实际staged DTO取值；拒绝错误身份/shape，不能覆盖坏DTO的元数据来修好它。"""
+    _validate_committed_step_facts(ready, peer_ready, state_version, count, "committed")
+    own, peer = context.compact_ready(ready), context.compact_ready(peer_ready)
+    p = context.permit
+    if (type(output) is not ControlShareMessage or type(output.sender) is not int
+            or type(output.session_id) is not str or type(output.round_id) is not str
+            or (output.sender, output.session_id, output.round_id, output.step) != (
+                ready.party, p.session_id, p.round_id, p.global_step)
+            or type(output.step) is not int or type(output.fractional_bits) is not int
+            or output.fractional_bits != plan.scale_ledger.output
+            or type(output.value) is not AdditiveShare
+            or not isinstance(output.value.value, np.ndarray) or output.value.value.shape != plan.output_shape):
+        raise LocalhostCodecError("实际staged输出身份/尺度/shape错误")
+    # 不flatten/转float；编码器逐元素拒绝bool、float、负数及q以上值。
+    data = _encode_integer_residues(output.value.value, plan.output_shape[0], modulus)
+    return _CommittedReplyV2(context.permit_ref, own.ready, peer.ready, state_version, count,
+        _canonical_json(output.fractional_bits), _canonical_json(base64.b64encode(data).decode("ascii")))
 
 
 @dataclass(frozen=True, slots=True)
@@ -670,6 +826,7 @@ WirePayload = (
     | _SeedInitPayload
     | StepAdvancePermit | ReadyReceipt | CommittedStepReply
     | _PreauthorizedOnlinePayload | _PrefixPayload | _SuffixPayload
+    | _SuffixReference | _ReadyReference | _CommittedReplyV2
     | None
 )
 
@@ -960,9 +1117,22 @@ def _decode_preloaded_values(data: bytes, inp: InputShareMessage,
 
 
 def _encode_value(value: object) -> object:
+    if type(value) in (_SuffixReference, _ReadyReference, _CommittedReplyV2):
+        result = {"type": type(value).__name__}
+        for name in value.__dataclass_fields__:
+            item = getattr(value, name)
+            if name in ("output_fractional_bits_json", "output_values_json"):
+                result[name.removesuffix("_json")] = _load_json(item)
+            else:
+                result[name] = (asdict(item) if type(item) is _ReadyFacts else
+                    base64.b64encode(item).decode("ascii") if type(item) is bytes else item)
+        return result
     preauthorized_types = (StepAdvancePermit, ReadyReceipt, CommittedStepReply,
                           _PreauthorizedOnlinePayload, _PrefixPayload, _SuffixPayload)
     if type(value) in preauthorized_types:
+        if type(value) in (ReadyReceipt, CommittedStepReply) and (
+                value.ready.permit if type(value) is CommittedStepReply else value.permit).version != PREAUTHORIZED_PROFILE:
+            raise LocalhostCodecError("v2不接受旧嵌套READY/输出格式")
         result = {"type": type(value).__name__}
         for name in value.__dataclass_fields__:
             item = getattr(value, name)
@@ -1371,6 +1541,24 @@ def _typed_union(value, classes):
 def _decode_value(value: object) -> object:
     mapping = _mapping(value, "wire value")
     kind = mapping.get("type")
+    reference_types = {c.__name__: c for c in (_SuffixReference, _ReadyReference, _CommittedReplyV2)}
+    if type(kind) is str and kind in reference_types:
+        cls = reference_types[kind]
+        names = {name.removesuffix("_json") for name in cls.__dataclass_fields__}
+        _exact_fields(mapping, {"type", *names}, kind)
+        args = {}
+        for name in cls.__dataclass_fields__:
+            item = mapping[name.removesuffix("_json")]
+            if name in ("output_fractional_bits_json", "output_values_json"):
+                # 类型、Base64、尺度及residue延至双提交记账之后；这里只保留有界不可变JSON。
+                item = _canonical_json(item)
+            elif name in ("ready", "peer_ready"):
+                _exact_fields(_mapping(item, name), set(_ReadyFacts.__dataclass_fields__), name)
+                item = _ReadyFacts(**item)
+            elif name == "values":
+                item = _decode_compact_base64(item)
+            args[name] = item
+        return cls(**args)
     preauthorized_types = {c.__name__: c for c in (StepAdvancePermit, ReadyReceipt,
         CommittedStepReply, _PreauthorizedOnlinePayload, _PrefixPayload, _SuffixPayload)}
     if type(kind) is str and kind in preauthorized_types:
@@ -1388,7 +1576,11 @@ def _decode_value(value: object) -> object:
             if type(args["identity"]) is not list:
                 raise LocalhostCodecError("前缀身份必须为数组")
             args["identity"] = tuple(args["identity"])
-        return cls(**args)
+        result = cls(**args)
+        if cls in (ReadyReceipt, CommittedStepReply) and (
+                result.ready.permit if cls is CommittedStepReply else result.permit).version != PREAUTHORIZED_PROFILE:
+            raise LocalhostCodecError("v2禁止旧嵌套READY/输出格式")
+        return result
     if kind == "seed_init":
         _exact_fields(mapping,{"type",*_SeedInitPayload.__dataclass_fields__},kind)
         return _SeedInitPayload(mapping["run_id"],mapping["epoch_id"],mapping["party"],
@@ -1951,13 +2143,13 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
     elif message.operation == "online_stage":
         expected = (_CompactOnlinePayload,) if message.kind == "request" else (PartyStageResult,)
     elif message.operation == "online_permit":
-        expected = (_PreauthorizedOnlinePayload,) if message.kind == "request" else (CommittedStepReply,)
+        expected = (_PreauthorizedOnlinePayload,) if message.kind == "request" else (CommittedStepReply, _CommittedReplyV2)
     elif message.operation == "peer_prefix":
         expected = (_PrefixPayload,)
     elif message.operation == "peer_suffix":
-        expected = (_SuffixPayload,)
+        expected = (_SuffixPayload, _SuffixReference)
     elif message.operation == "peer_ready":
-        expected = (ReadyReceipt,)
+        expected = (ReadyReceipt, _ReadyReference)
     elif message.operation == "seed_init":
         expected = (_SeedInitPayload,) if message.kind == "request" else (type(None),)
     elif key == ("request", "step"):
@@ -2018,6 +2210,11 @@ def _validate_payload_contract(message: WireEnvelope) -> None:
         wire_party = message.recipient if type(payload) is _PreauthorizedOnlinePayload else message.sender
         if wire_party != ("P1" if party == 0 else "P2"):
             raise LocalhostCodecError("预授权信封角色错误")
+    if type(payload) in (_SuffixReference, _ReadyReference, _CommittedReplyV2):
+        party = payload.party if type(payload) is _SuffixReference else payload.ready.party
+        if (message.sender != ("P1" if party == 0 else "P2") or message.resource_id is not None
+                or message.session_id is None or message.round_id is None or type(message.step) is not int):
+            raise LocalhostCodecError("v2引用信封身份/角色错误")
     if isinstance(payload, _PrefixPayload) and (
             (message.session_id, message.round_id, message.step, message.resource_id) != (
                 payload.identity[1], None, payload.identity[4], None)

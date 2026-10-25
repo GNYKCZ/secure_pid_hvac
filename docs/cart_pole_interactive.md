@@ -1,5 +1,30 @@
 # 倒立摆动画 Client：三角色快速操作
 
+## 紧凑表示候选（D132-9）
+
+在已有单次往返架构上，新增显式 `wire_profile: control-dynamic-matrix-preauthorized-v2`。
+选择时要同时修改 A 的 `lab-client-cart-pole-demo.example.yaml`、B 的
+`lab-p1-cart-pole-demo.example.yaml` 和 `lab-p2-cart-pole-demo.example.yaml` 三份角色配置；
+启动顺序和下节命令保持。仓库演示文件仍默认 matrix-v1，不自动切换候选。
+三角色须使用支持 v2 的同一份代码和相同 profile；v1/v2 混用在安装秘密材料之前拒绝。
+`matrix-v1`、`seeded-v1`、`preauthorized-v1/v2` 属于不同表示，不能仅按尾部数字判断新旧。
+
+v2 不改变计算和施力顺序：完整许可仅在两份 Client 请求中发送，后缀、双方实际 READY 和
+最终提交回执用当前步许可的规范公开 SHA256 引用绑定。每方最多一份当前许可，退休或关闭即释放；
+没有历史查询、补取、重试或降级。引用不是签名，也不为 `insecure_tcp` 增加身份认证。
+输出直接编码原定宽整数 residues，仅一层 Base64。两份有效提交先登记，再检查输出类型、
+Base64、长度、范围和尺度；坏输出仍保留已知双提交，物理确认不增加，并终止会话。
+
+前缀准备的 `prefix_preparation` 沿用总次数、总时长、CPU 和最大时长，新增有界
+`max_identity`、`last_identity`、`first_error_identity`，均只含 `global_step`、
+`segment_index`、`origin`。origin 为 `startup`、`ordinary` 或 `segment_advance`，
+便于定位最大值和第一失败；不新增逐步消息或写盘。不变公开上下文摘要在会话安装时计算一次，
+关闭时清空，不能跨 epoch/profile 复用。
+
+本轮软件阶段只验证静态消息字节、短功能/故障会话和回归，不代表实际耗时改善。
+D132-8 历史性能额度已用完；D132-9 新旧性能对照尚未运行，须另行批准。
+真实两机的 15 ms 工作目标和 20 ms 周期验收仍待实测。
+
 ## 显式候选：单次跨机往返及前缀准备（D132-8）
 
 本候选须在A的Client、B的P1/P2三份角色配置中都显式设置

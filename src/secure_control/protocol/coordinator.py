@@ -30,7 +30,11 @@ from secure_control.crypto.matrix_beaver import (
     MatrixTripleShare,
     matrix_values,
 )
-from secure_control.crypto.seeded_material import SeededContext, expand_party
+from secure_control.crypto.seeded_material import (
+    PREAUTHORIZED_PROFILES,
+    SeededContext,
+    expand_party,
+)
 from secure_control.crypto.truncation import _MaskLifecycle
 
 from .evidence import ProtocolStepSnapshot, copy_share
@@ -1110,16 +1114,22 @@ class _OnlineMaterialRecovery:
         self._seeded_next = 0
         self.seeded_statistics = {"prepared_count":0,"prepare_ns":0,"cpu_ns":0}
         self._prefix = None
+        self._prefix_context_sha256 = None
         self.prefix_statistics = {"count": 0, "sum_ns": 0, "max_ns": 0, "cpu_ns": 0,
-                                  "first_error": None, "last_ns": None}
+                                  "first_error": None, "last_ns": None, "max_identity": None,
+                                  "last_identity": None, "first_error_identity": None}
 
-    def prepare_prefix(self, role, peer, segment_index):
+    def prepare_prefix(self, role, peer, segment_index, origin="ordinary"):
         """唯一protocol准备owner；首次外发前领取，失败从不重建同一token。"""
         start, cpu = time.perf_counter_ns(), time.process_time_ns()
         prefix = None
+        location = {"global_step": self._seeded_next, "segment_index": segment_index, "origin": origin}
         try:
             slot, context = self._seeded_slot, self._seeded_context
             if (self._prefix is not None or slot is None or context is None
+                    or self._prefix_context_sha256 is None
+                    or type(segment_index) is not int or segment_index < 0
+                    or origin not in ("startup", "ordinary", "segment_advance")
                     or role.state_version != self._seeded_next):
                 raise ValueError("前缀缺槽/错状态版本/重复准备")
             q = self._sharing.modulus
@@ -1135,7 +1145,7 @@ class _OnlineMaterialRecovery:
             prefix = MatrixPrefix(owner, triple, self._fixed_matrix,
                                   AdditiveShare(role.state_share.value.reshape(n, 1)))
             identity = (context.run_id, context.session_id, context.epoch, segment_index,
-                        self._seeded_next, role.state_version, replace(context, party=0).digest().hex())
+                        self._seeded_next, role.state_version, self._prefix_context_sha256)
             e, fx = peer.exchange_prefix(identity, prefix.e_share, prefix.fx_share, q)
             prefix.open_prefix(e, fx)
             self._prefix = (prefix, self._seeded_next, role.state_version, segment_index)
@@ -1144,6 +1154,7 @@ class _OnlineMaterialRecovery:
                 prefix.abort()
             if self.prefix_statistics["first_error"] is None:
                 self.prefix_statistics["first_error"] = type(error).__name__
+                self.prefix_statistics["first_error_identity"] = location
             self.close_seeded()
             raise
         finally:
@@ -1151,8 +1162,10 @@ class _OnlineMaterialRecovery:
             s = self.prefix_statistics
             s["count"] += 1
             s["sum_ns"] += elapsed
-            s["max_ns"] = max(s["max_ns"], elapsed)
+            if s["max_identity"] is None or elapsed > s["max_ns"]:
+                s["max_ns"], s["max_identity"] = elapsed, location
             s["last_ns"] = elapsed
+            s["last_identity"] = location
             s["cpu_ns"] += time.process_time_ns()-cpu
 
     def restore_preauthorized(self, material, permit, role):
@@ -1161,6 +1174,7 @@ class _OnlineMaterialRecovery:
             if (saved is None or type(permit) is not StepAdvancePermit
                     or saved[1:] != (permit.global_step, role.state_version, permit.segment_index)
                     or self._seeded_context is None
+                    or permit.version != self._seeded_context.profile
                     or (permit.session_id,permit.round_id,permit.global_step,permit.plan_sha256) != (
                         material.plan.session_id,material.plan.round_id,material.plan.step,
                         public_step_plan_sha256(material.plan))
@@ -1193,6 +1207,8 @@ class _OnlineMaterialRecovery:
             raise ValueError("种子会话身份/重复初始化错误")
         self._seeded_installed = True
         self._seeded_key,self._seeded_context = key,context
+        if context.profile in PREAUTHORIZED_PROFILES:
+            self._prefix_context_sha256 = replace(context, party=0).digest().hex()
         self.prepare_seeded()
 
     def prepare_seeded(self):
@@ -1218,6 +1234,7 @@ class _OnlineMaterialRecovery:
     def close_seeded(self):
         """释放秘密引用和未用槽；Python内存释放不承诺可靠擦除，不能用旧seed重装。"""
         self._seeded_key = self._seeded_context = self._seeded_slot = None
+        self._prefix_context_sha256 = None
         if self._prefix is not None:
             self._prefix[0].abort()
             self._prefix = None
