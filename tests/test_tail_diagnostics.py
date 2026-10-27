@@ -199,8 +199,13 @@ def test_parent_deadline_reaps_only_owned_processes_without_real_spawn(monkeypat
     assert all(not p.is_alive() for p in processes)
 
 
-def test_analyze_cli_accepts_synthetic_two_domains_and_rejects_forced_single_axis(tmp_path):
+@pytest.mark.parametrize('drop', [None,'request_send','work'])
+def test_analyze_cli_accepts_synthetic_two_domains_and_rejects_forced_single_axis(tmp_path,drop):
     records,domains = fixture_records(dual=True)
+    if drop:
+        client = records[0]
+        client['events'] = [r for r in client['events'] if r[1]//2 != PHASES[drop]]
+        recount(client)
     import hashlib
     files = []
     for record in records:
@@ -209,14 +214,17 @@ def test_analyze_cli_accepts_synthetic_two_domains_and_rejects_forced_single_axi
         files.append({'path':path.name,'sha256':hashlib.sha256(path.read_bytes()).hexdigest()})
     manifest = tmp_path/'manifest.json'
     manifest.write_text(json.dumps({'schema':SCHEMA,'diagnostic_id':'same','source_head':'a'*40,
-                                    'diagnostic_complete':True,'files':files,
+                                    'diagnostic_complete':True,'expected_step_count':2,'files':files,
                                     'clock_domains':domains}),encoding='utf8')
     script = Path(__file__).resolve().parents[1]/'scripts/run_control_tail_diagnostic.py'
     command = [sys.executable,str(script),'analyze',str(manifest),'--output',str(tmp_path/'analysis.json')]
     result = subprocess.run(command,capture_output=True,text=True,check=False)
     assert result.returncode == 0,result.stderr
     data = json.loads((tmp_path/'analysis.json').read_text(encoding='utf8'))
-    assert data['diagnostic_complete'] and len(set(data['clock_axes'].values())) == 2
+    assert data['diagnostic_complete'] is (drop is None)
+    assert len(set(data['clock_axes'].values())) == 2
+    if drop:
+        assert data['missing_evidence']
     result = subprocess.run(command+['--same-host'],capture_output=True,text=True,check=False)
     assert result.returncode != 0
 
@@ -250,6 +258,9 @@ def fixture_records(*, gc_event=True, dual=False, auxiliary=False, future=False)
             event('exchange',1,319,1)
             event('work',1,320,1)
             for step,base in ((0,100),(1,300)):
+                for phase in ('material_claim','material_bind'):
+                    event(phase,0,base,step,step)
+                    event(phase,1,base+1,step,step)
                 event('request_send',0,base+1,step,aux=0)
                 event('request_send',1,base+2,step,aux=0)
                 event('request_send',0,base+3,step,aux=1)
@@ -260,7 +271,7 @@ def fixture_records(*, gc_event=True, dual=False, auxiliary=False, future=False)
                     for party in (0,1):
                         event(phase,0,base+offset,step,aux=party)
                 for phase in ('double_commit','output_checked','applied'):
-                    event(phase,0,base+19,step)
+                    event(phase,0,base+(97 if step == 0 else 19),step)
         elif role == 'P1':
             event('matrix',0,115)
             event('suffix',0,120)
@@ -289,13 +300,16 @@ def fixture_records(*, gc_event=True, dual=False, auxiliary=False, future=False)
                 event(phase,0,left)
                 event(phase,1,right)
             if role == 'P2':
-                event('suffix',0,110)
-                event('suffix',1,115)
+                event('suffix',0,175)
+                event('suffix',1,180)
             for phase,left,right in (('request_receive',301,305),('restore',305,306),
                 ('matrix',306,312),('suffix',307,310),('truncation',312,313),
                 ('ready',313,314),('commit',314,315),('final_send',315,316)):
                 event(phase,0,left,1)
                 event(phase,1,right,1)
+        if role in ('P1','P2'):
+            event('stage',0,191)
+            event('stage',0,313,1)
         data['events'].sort(key=lambda r:r[4])
         for seq,row in enumerate(data['events']):
             row[0] = seq
@@ -312,7 +326,7 @@ def fixture_records(*, gc_event=True, dual=False, auxiliary=False, future=False)
 
 def test_known_slow_party_and_gc_contributor_without_double_count():
     records,domains = fixture_records()
-    result = analyze_records(records,clock_domains=domains,targets=(0,))
+    result = analyze_records(records,expected_steps=range(2),clock_domains=domains,targets=(0,))
     step = result['steps'][0]
     assert result['diagnostic_complete']
     assert step['located_phase'] == {'role':'P2','phase':'matrix'}
@@ -323,17 +337,78 @@ def test_known_slow_party_and_gc_contributor_without_double_count():
     assert p1['wall_ns'] == 70 and p1['exclusive_wall_ns'] == 10
 
 
+def recount(record):
+    """独立删改oracle后修正格式计数，确保负例只测试语义而不是坏格式。"""
+    record['events'].sort(key=lambda r:r[4])
+    for index,row in enumerate(record['events']):
+        row[0] = index
+    record['gc_count'] = sum(r[1] in (900,901) for r in record['events'])
+    record['event_count'] = len(record['events'])-record['gc_count']
+
+
+@pytest.mark.parametrize('critical', [False,True])
+@pytest.mark.parametrize('reverse', [False,True])
+def test_slack_gc_cannot_replace_slow_party_or_depend_on_record_order(critical,reverse):
+    records,domains = fixture_records(gc_event=critical)
+    p1 = records[1]
+    # P1 11.6–11.7ms GC被12–18ms等待余量吸收；P2 17.5ms才进入suffix。
+    # 可选P2 13–17ms GC期间P1已经等待它，用作有依赖关系的正例。
+    p1['events'].extend([[0,900,0,-1,116,0,p1['main_thread_id'],4*PHASES['matrix']],
+                         [0,901,0,-1,117,0,p1['main_thread_id'],4*PHASES['matrix']]])
+    for record in records:
+        for row in record['events']:
+            row[4] *= 100_000
+        recount(record)
+    if reverse:
+        records.reverse()
+    result = analyze_records(records,clock_domains=domains,expected_steps=range(2),targets=(0,))
+    step = result['steps'][0]
+    assert result['diagnostic_complete'] and step['work_ns'] == 10_000_000
+    assert step['located_phase'] == {'role':'P2','phase':'matrix'}
+    assert step['evidence_level'] == ('Contributor observed' if critical else 'Located')
+    assert {r['role'] for r in step['gc_dependency_contributions']} == ({'P2'} if critical else set())
+    assert any(r['role']=='P1' for r in step['gc'])
+
+
+@pytest.mark.parametrize('samples_present', [False,True])
+@pytest.mark.parametrize('drop', ['request_send','material_claim','material_bind','stage','one_work','all_work','entire_step'])
+def test_complete_event_groups_or_whole_steps_cannot_disappear(drop,samples_present):
+    records,domains = fixture_records()
+    for record in records:
+        if drop == 'entire_step':
+            record['events'] = [r for r in record['events'] if r[2] != 1 and r[3] != 1]
+        elif drop in ('one_work','all_work') and record['role']=='Client':
+            record['events'] = [r for r in record['events'] if not
+                (r[1]//2 in (PHASES['sample'],PHASES['work']) and (drop=='all_work' or r[2]==1))]
+        elif drop == 'stage' and record['role'] in ('P1','P2'):
+            record['events'] = [r for r in record['events'] if r[1]//2 != PHASES['stage']]
+        elif drop not in ('one_work','all_work','stage','entire_step') and record['role']=='Client':
+            record['events'] = [r for r in record['events'] if r[1]//2 != PHASES[drop]]
+        recount(record)
+    samples = [{'global_step':s,'round_id':f'round{s}','actual_sample_start_ns':a,
+        'control_applied_ns':b-1,'work_completed_ns':b,'work_elapsed_ns':b-a,'control_latency_ns':b-1-a}
+        for s,a,b in ((0,100,200),(1,300,320))] if samples_present else []
+    result = analyze_records(records,clock_domains=domains,samples=samples,expected_steps=range(2))
+    assert not result['diagnostic_complete'] and result['missing_evidence']
+
+
+def test_undeclared_control_range_cannot_prove_complete_recording():
+    records,domains = fixture_records()
+    result = analyze_records(records,clock_domains=domains)
+    assert not result['diagnostic_complete'] and 'not declared' in result['missing_evidence'][0]
+
+
 @pytest.mark.parametrize('auxiliary,future', [(True,False),(False,True)])
 def test_auxiliary_or_next_material_gc_is_not_claimed_as_current_control_pause(auxiliary,future):
     records,domains = fixture_records(auxiliary=auxiliary,future=future)
-    step = analyze_records(records,clock_domains=domains,targets=(0,))['steps'][0]
+    step = analyze_records(records,expected_steps=range(2),clock_domains=domains,targets=(0,))['steps'][0]
     assert step['evidence_level'] == 'Located'
     assert step['gc'] and not step['fixable_mechanism_confirmed']
 
 
 def test_cpu_zero_is_not_network_proof_and_dual_host_cannot_be_forced_to_one_axis():
     records,domains = fixture_records(gc_event=False,dual=True)
-    result = analyze_records(records,clock_domains=domains,targets=(0,))
+    result = analyze_records(records,expected_steps=range(2),clock_domains=domains,targets=(0,))
     assert result['clock_axes'] == {'Client':'A','P1':'B','P2':'B','worker':'A'}
     assert set(result['steps'][0]['timeline_by_domain']) == {'A','B'}
     assert result['steps'][0]['evidence_level'] == 'Located'
@@ -341,9 +416,9 @@ def test_cpu_zero_is_not_network_proof_and_dual_host_cannot_be_forced_to_one_axi
         assert 'client_work_overlap_ns' not in row
         assert 'zero does not identify network' in row['cpu_note']
     with pytest.raises(ValueError,match='不同clock'):
-        analyze_records(records,clock_domains=domains,same_host=True)
+        analyze_records(records,expected_steps=range(2),clock_domains=domains,same_host=True)
     with pytest.raises(ValueError,match='spawn证明'):
-        analyze_records(fixture_records()[0],same_host=True)
+        analyze_records(fixture_records()[0],same_host=True,expected_steps=range(2))
 
 
 @pytest.mark.parametrize('fault',['session','round','step_bool','duplicate_seq','overflow','missing_end','missing_gc_end'])
@@ -369,14 +444,15 @@ def test_incomplete_or_wrong_identity_is_rejected_or_marked_without_invented_end
         record['event_count'] = len(record['events'])-record['gc_count']
     if fault in ('session','round','step_bool','duplicate_seq'):
         with pytest.raises(ValueError):
-            analyze_records(changed,clock_domains=domains)
+            analyze_records(changed,expected_steps=range(2),clock_domains=domains)
     else:
-        result = analyze_records(changed,clock_domains=domains,targets=(0,))
+        result = analyze_records(changed,expected_steps=range(2),clock_domains=domains,targets=(0,))
         assert not result['diagnostic_complete']
         assert result['steps'][0]['evidence_level'] != 'Contributor observed'
 
 
-@pytest.mark.parametrize('fault', [None,'lost_sample','missing_phase','wrong_round'])
+@pytest.mark.parametrize('fault', [None,'lost_sample','missing_phase','wrong_round',
+                                   'missing_send','missing_claim','missing_stage','missing_work'])
 def test_launcher_separates_control_success_from_incomplete_observation(tmp_path,monkeypatch,fault):
     from dataclasses import asdict
 
@@ -393,6 +469,11 @@ def test_launcher_separates_control_success_from_incomplete_observation(tmp_path
                 for seq,row in enumerate(record['events']):
                     row[0] = seq
                 record['event_count'] = len(record['events'])-record['gc_count']
+            phase = {'missing_send':'request_send','missing_claim':'material_claim',
+                     'missing_stage':'stage','missing_work':'work'}.get(fault)
+            if phase and (record['role']=='Client' or phase=='stage' and record['role']=='P2'):
+                record['events'] = [r for r in record['events'] if r[1]//2 != PHASES[phase]]
+                recount(record)
             (Path(ctx.output_directory)/f"{record['role']}.json").write_text(json.dumps(record),encoding='utf8')
         samples = [{'global_step':step,'round_id':f'round{step}','status':'confirmed',
             'actual_sample_start_ns':begin,'control_applied_ns':end-1,'work_completed_ns':end,

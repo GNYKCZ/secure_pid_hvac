@@ -195,7 +195,7 @@ def run_local(output, *, expected_head, software_review, steps=400):
     complete = functional and timing_complete and verified and not errors and source_unchanged and all(
         r.get('diagnostic_complete') is True for r in records.values())
     manifest = {'schema':SCHEMA,'diagnostic_id':diagnostic_id,'source_head':head,
-        'diagnostic_complete':complete,'functional_complete':functional,'clock_domains':{
+        'diagnostic_complete':complete,'functional_complete':functional,'expected_step_count':steps,'clock_domains':{
             domain:{'local_spawn_verified':verified,'launcher_pid':os.getpid(),'members':members,
                     'wall_clock':records.get('Client',{}).get('clock',{}).get('wall')}},
         'files':files,'control_samples':samples,'group':group,'export_errors':errors,
@@ -205,7 +205,7 @@ def run_local(output, *, expected_head, software_review, steps=400):
     from secure_control.experiments.tail_diagnostic_analysis import analyze_records
     try:
         validation = analyze_records(list(records.values()),clock_domains=manifest['clock_domains'],
-                                     samples=samples,same_host=True,targets=())
+                                     samples=samples,same_host=True,targets=(),expected_steps=range(steps))
         complete = complete and validation['diagnostic_complete']
     except Exception as error:  # noqa: BLE001 - 观察数据失败只降低证据等级，保留原控制结果。
         errors.append({'role':'analysis','error_type':type(error).__name__})

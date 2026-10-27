@@ -43,7 +43,12 @@ GC回调记录start/stop/generation及活动控制阶段/线程/材料目标，�
 并行/GC重叠用同域区间并集，不重复相加；startup/stop/cleanup GC不计入真实控制窗口。
 CPU记账可能量化，0不能证明网络等待；应用首次read/send完成也不是硬件到包时间。
 证据分`Located`、`Contributor observed`、`Fixable mechanism confirmed`、
-`Unresolved system/link wait`；仅有GC重叠不确认可修复根因，下一槽/辅助线程GC不冒充当前控制停顿。
+`Unresolved system/link wait`；GC重叠保留为事实，不替换按独占阶段得到的主定位。
+只有主慢方矩阵GC期间对方已进入suffix等待、且慢方在GC后才进入同域交换时，
+才记录该可核验依赖链的贡献；其他重叠保留未知，不确认可修复根因。
+下一槽/辅助线程GC不冒充当前控制停顿。manifest声明`expected_step_count`，
+同一分析器核对每步两路发送、材料claim/bind、服务器stage等必要事件；
+缺整步/工作端点或未声明范围均标不完整，原因写入`missing_evidence`，不补造端点。
 带观察的时间不与D11无探针结果直接比较净提速；观察可能改变GC触发步号，未复现就如实停止。
 第399步为最终停止，与旧1000步继续维护不同。`plan.json`、`ledger.json`、四角色文件和
 `manifest.json`保留源码/配置/时钟/退出/保存/hash事实；任何缺端点、满缓冲或保存失败均不造零。

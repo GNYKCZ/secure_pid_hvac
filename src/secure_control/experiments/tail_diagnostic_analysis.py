@@ -159,7 +159,7 @@ def _axes(records, domains, same_host):
     return axes
 
 
-def analyze_records(records, *, clock_domains=None, samples=(), same_host=False, targets=(285,290), slow_ns=5_000_000):
+def analyze_records(records, *, clock_domains=None, samples=(), same_host=False, targets=(285,290), slow_ns=5_000_000, expected_steps=None):
     """同一分析入口处理本机或合成/未来双机数据；不启动任何控制或网络。"""
     if not records or len(records) > 4 or len({r['role'] for r in records}) != len(records):
         raise ValueError('角色重复或记录数量无效')
@@ -185,6 +185,22 @@ def analyze_records(records, *, clock_domains=None, samples=(), same_host=False,
     complete = (len(records) == 4 and all(r.get('protocol') is not None for r in records)
                 and all(v['complete'] for v in decoded.values())
                 and all(axes[r['role']] == r['context']['clock_domain_id'] for r in records))
+    missing = []
+    observed_steps = {row[2] for r in records if r['role'] != 'worker' for row in r['events']
+                      if row[2] >= 0 and row[1]//2 not in
+                      (PHASES['startup'],PHASES['control'],PHASES['stop'],PHASES['cleanup'])}
+    if expected_steps is not None:
+        if (not isinstance(expected_steps,(list,tuple,range)) or not expected_steps
+                or any(type(s) is not int or not 0 <= s < 400 for s in expected_steps)
+                or list(expected_steps) != list(range(len(expected_steps)))):
+            raise ValueError('声明的控制步骤范围无效')
+        required_steps = set(expected_steps)
+        if not observed_steps <= required_steps:
+            missing.append('observed control step outside declared range')
+    else:
+        # 未声明范围的离线旧产物只可推导已观察范围，不能证明全程没有整步丢失。
+        required_steps = set(range(max(observed_steps)+1)) if observed_steps else set()
+        missing.append('expected control step range not declared')
     by_step, sample_points = {}, {}
     for point in decoded.get('Client',{}).get('points',[]):
         step = point['global_step']
@@ -194,10 +210,16 @@ def analyze_records(records, *, clock_domains=None, samples=(), same_host=False,
             sample_points[step] = point['wall_ns']
         elif point['phase'] == 'work' and step in sample_points:
             by_step[step] = (sample_points[step],point['wall_ns'])
+    work_points = [p['global_step'] for p in decoded.get('Client',{}).get('points',[]) if p['phase'] == 'work']
+    if (not required_steps or set(by_step) != required_steps or set(sample_points) != required_steps
+            or sorted(work_points) != sorted(required_steps)):
+        missing.append('Client sample/work pairs do not cover declared control steps')
+    sample_ids = []
     for sample in samples:
         step = sample['global_step']
         if type(step) is not int or not 0 <= step < 400 or sample.get('round_id') != rounds.get(str(step)):
             raise ValueError('原工作样本身份错误')
+        sample_ids.append(step)
         if sample.get('work_completed_ns') is not None:
             begin,applied,finish = (sample.get(k) for k in ('actual_sample_start_ns','control_applied_ns','work_completed_ns'))
             if (any(type(v) is not int for v in (begin,applied,finish)) or not begin <= applied <= finish
@@ -210,23 +232,39 @@ def analyze_records(records, *, clock_domains=None, samples=(), same_host=False,
               sample['work_completed_ns'] < by_step[step][1]):
             # 钩子在既有端点内，不能把观察事件搬到工作区间外制造归因。
             raise ValueError('诊断工作端点不在原始控制端点内')
-    for step in by_step:
+    if samples and sorted(sample_ids) != sorted(required_steps):
+        missing.append('original samples do not cover declared control steps exactly once')
+    for step in sorted(required_steps):
         for role in ('P1','P2'):
             spans = decoded.get(role,{}).get('spans',[])
             if any(not any(s['global_step'] == step and s['phase'] == phase for s in spans)
                    for phase in ('request_receive','restore','matrix','suffix','truncation','ready','commit','final_send')):
                 complete = False
+                missing.append(f'{role} step {step}: missing required server span')
+            if not any(p['global_step'] == step and p['phase'] == 'stage' for p in decoded.get(role,{}).get('points',[])):
+                missing.append(f'{role} step {step}: missing stage')
         for phase in ('worker_generate','worker_ipc'):
             if not any(s['material_step'] == step and s['phase'] == phase for s in decoded.get('worker',{}).get('spans',[])):
                 complete = False
+                missing.append(f'worker material {step}: missing {phase}')
         points = decoded.get('Client',{}).get('points',[])
+        spans = decoded.get('Client',{}).get('spans',[])
+        for phase in ('material_claim','material_bind','exchange'):
+            if not any(s['global_step'] == step and s['phase'] == phase for s in spans):
+                missing.append(f'Client step {step}: missing {phase}')
+        for party in (0,1):
+            if not any(s['global_step'] == step and s['phase'] == 'request_send' and s['aux'] == party for s in spans):
+                missing.append(f'Client step {step}: missing request_send P{party+1}')
         for phase in ('reply_read','reply_frame','commit_fact'):
             for party in (0,1):
                 if not any(p['global_step'] == step and p['phase'] == phase and p['aux'] == party for p in points):
                     complete = False
+                    missing.append(f'Client step {step}: missing {phase} P{party+1}')
         for phase in ('double_commit','output_checked','applied'):
             if not any(p['global_step'] == step and p['phase'] == phase for p in points):
                 complete = False
+                missing.append(f'Client step {step}: missing {phase}')
+    complete = complete and not missing
     chosen = {s for s in targets if s in by_step}
     if by_step:
         chosen.add(max(by_step,key=lambda s:by_step[s][1]-by_step[s][0]))
@@ -271,24 +309,41 @@ def analyze_records(records, *, clock_domains=None, samples=(), same_host=False,
                         'client_window_comparable':axis == client_axis})
         local_spans = [r for r in timeline if r['phase'] in ('material_bind','material_claim',
             'restore','matrix','suffix','truncation','ready','commit','final_send')]
-        location = max(local_spans,key=lambda r:r.get('exclusive_client_work_overlap_ns',r['exclusive_wall_ns']),default=None)
-        contribution = [e for e in gc_rows if e['role'] != 'worker' and e['on_control_thread']
+        location = max(local_spans,key=lambda r:(r.get('exclusive_client_work_overlap_ns',r['exclusive_wall_ns']),
+                                               r['role'],r['phase']),default=None)
+        overlap_candidates = [e for e in gc_rows if e['role'] != 'worker' and e['on_control_thread']
                         and e['current_online_phase'] and e['global_step'] == step
                         and e['material_step'] in (None,step) and e['overlap_ns'] > 0]
+        # GC局部重叠不等于阻塞链贡献。仅确认慢方矩阵GC期间另一方已经等其suffix，
+        # 且慢方在GC结束后才进入该交换的同域可核验子集；未知链路保守留作重叠事实。
+        contribution = []
+        for event in overlap_candidates:
+            if (location is None or event['role'] != location['role'] or location['phase'] != 'matrix'
+                    or event['control_phase'] != 'matrix' or not event['client_window_comparable']):
+                continue
+            if not location['start_ns'] <= event['start_ns'] < event['end_ns'] <= location['end_ns']:
+                continue
+            peer = 'P2' if event['role'] == 'P1' else 'P1' if event['role'] == 'P2' else None
+            own_suffix = [s for s in timeline if s['role'] == event['role'] and s['phase'] == 'suffix']
+            waits = [s for s in timeline if s['role'] == peer and s['phase'] == 'suffix'
+                     and s['clock_domain_id'] == event['clock_domain_id']]
+            if any(w['start_ns'] <= event['start_ns'] < event['end_ns'] <= s['start_ns'] <= w['end_ns']
+                   for s in own_suffix for w in waits):
+                contribution.append(event)
         level = ('Contributor observed' if complete and contribution else
                  'Located' if location is not None else 'Unresolved system/link wait')
         neighbors = [s for s,(a,b) in by_step.items() if s != step and b-a <= slow_ns]
         neighbor = min(neighbors,key=lambda s:(abs(s-step),s)) if neighbors else None
         result.append({'global_step':step,'work_ns':end-start,'clock_domain_id':client_axis,
             'normal_neighbor_step':neighbor,'normal_neighbor_work_ns':None if neighbor is None else by_step[neighbor][1]-by_step[neighbor][0],
-            'evidence_level':level,'located_phase':({'role':contribution[0]['role'],'phase':contribution[0]['control_phase']}
-                if complete and contribution else None if location is None else {'role':location['role'],'phase':location['phase']}),
+            'evidence_level':level,'located_phase':(None if location is None else {'role':location['role'],'phase':location['phase']}),
+            'gc_dependency_contributions':contribution if complete else [],
             'fixable_mechanism_confirmed':False,'gc':gc_rows,'timeline_by_domain':domains,
             'gc_overlap_union_by_domain_ns':{axis:_union([(e['clipped_start_ns'],e['clipped_end_ns'])
                 for e in gc_rows if e['clock_domain_id'] == axis]) for axis in domains},
             'unknown':'GC overlap is not a complete root-cause proof; scheduling/network attribution needs additional evidence; nested/parallel spans are not summed'})
     return {'schema':SCHEMA,'diagnostic_id':contexts[0]['diagnostic_id'],'source_head':contexts[0]['source_head'],
-        'diagnostic_complete':complete,'clock_axes':axes,'steps':result,
+        'diagnostic_complete':complete,'clock_axes':axes,'steps':result,'missing_evidence':missing,
         'all_work_steps':sorted(by_step),'incomplete_roles':[k for k,v in decoded.items() if not v['complete']],
         'requested_steps_unavailable':[s for s in targets if s not in by_step],
         'scope':'diagnostic observation only; not a performance comparison or strict realtime qualification'}
@@ -296,13 +351,20 @@ def analyze_records(records, *, clock_domains=None, samples=(), same_host=False,
 
 def analyze_manifests(paths, *, same_host=False):
     """核对各角色文件hash后读入；目录组合不提供跨主机时钟同步。"""
-    records, domains, samples, manifests_complete = [], {}, [], True
+    records, domains, samples, manifests_complete, expected = [], {}, [], True, None
     for name in paths:
         path = Path(name)
         manifest = json.loads(path.read_text(encoding='utf8'))
         if manifest.get('schema') != SCHEMA:
             raise ValueError('manifest schema错误')
         manifests_complete = manifests_complete and manifest.get('diagnostic_complete') is True
+        count = manifest.get('expected_step_count')
+        if type(count) is not int or not 1 <= count <= 400:
+            manifests_complete = False
+        elif expected is not None and expected != count:
+            raise ValueError('manifest声明的控制范围不一致')
+        else:
+            expected = count
         for entry in manifest['files']:
             target = (path.parent/entry['path']).resolve()
             if target.parent != path.parent.resolve():
@@ -320,6 +382,7 @@ def analyze_manifests(paths, *, same_host=False):
                 raise ValueError('clock domain证明冲突')
             domains[key] = value
         samples.extend(manifest.get('control_samples',[]))
-    result = analyze_records(records,clock_domains=domains,samples=samples,same_host=same_host)
+    result = analyze_records(records,clock_domains=domains,samples=samples,same_host=same_host,
+                             expected_steps=None if expected is None else range(expected))
     result['diagnostic_complete'] = result['diagnostic_complete'] and manifests_complete
     return result
