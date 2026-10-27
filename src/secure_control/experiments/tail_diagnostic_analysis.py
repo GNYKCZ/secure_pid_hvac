@@ -120,7 +120,8 @@ def _decode(record):
         complete = False
     gcs.extend(open_gc.values())
     return {'spans':spans,'points':points,'gc':gcs,'complete':complete,
-            'open_span_count':len(open_spans),'open_gc_count':len(open_gc)}
+            'open_span_count':len(open_spans),'open_gc_count':len(open_gc),
+            'unfinished_spans':list(open_spans.values())}
 
 
 def _axes(records, domains, same_host):
@@ -159,7 +160,7 @@ def _axes(records, domains, same_host):
     return axes
 
 
-def analyze_records(records, *, clock_domains=None, samples=(), same_host=False, targets=(285,290), slow_ns=5_000_000, expected_steps=None):
+def analyze_records(records, *, clock_domains=None, samples=(), same_host=False, targets=(285,290), slow_ns=5_000_000, expected_steps=None, detail_neighbors=False, partial=False):
     """同一分析入口处理本机或合成/未来双机数据；不启动任何控制或网络。"""
     if not records or len(records) > 4 or len({r['role'] for r in records}) != len(records):
         raise ValueError('角色重复或记录数量无效')
@@ -214,10 +215,22 @@ def analyze_records(records, *, clock_domains=None, samples=(), same_host=False,
     if (not required_steps or set(by_step) != required_steps or set(sample_points) != required_steps
             or sorted(work_points) != sorted(required_steps)):
         missing.append('Client sample/work pairs do not cover declared control steps')
-    sample_ids = []
+    sample_ids, unknown_round_steps = [], []
     for sample in samples:
         step = sample['global_step']
-        if type(step) is not int or not 0 <= step < 400 or sample.get('round_id') != rounds.get(str(step)):
+        if type(step) is not int or not 0 <= step < 400:
+            raise ValueError('原工作样本身份错误')
+        # 输入/采样失败可能早于runtime.step，而worker已预生成同槽round。
+        # 只保留显式partial的未完成失败行；绝不从材料身份填造Client已尝试事务。
+        unknown_failure = (partial and sample.get('round_id') is None
+            and sample.get('status') in ('failed','uncertain','cancelled','stopped_before_commit','miss_before_apply')
+            and all(sample.get(k) is None for k in
+                    ('control_applied_ns','work_completed_ns','control_latency_ns','work_elapsed_ns')))
+        if unknown_failure:
+            unknown_round_steps.append(step)
+            missing.append(f'Client step {step}: failure round identity unknown')
+            complete = False
+        elif sample.get('round_id') is None or sample['round_id'] != rounds.get(str(step)):
             raise ValueError('原工作样本身份错误')
         sample_ids.append(step)
         if sample.get('work_completed_ns') is not None:
@@ -235,6 +248,9 @@ def analyze_records(records, *, clock_domains=None, samples=(), same_host=False,
     if samples and sorted(sample_ids) != sorted(required_steps):
         missing.append('original samples do not cover declared control steps exactly once')
     for step in sorted(required_steps):
+        for record in records:
+            if str(step) not in record['rounds']:
+                missing.append(f"{record['role']} step {step}: missing own round identity")
         for role in ('P1','P2'):
             spans = decoded.get(role,{}).get('spans',[])
             if any(not any(s['global_step'] == step and s['phase'] == phase for s in spans)
@@ -269,6 +285,14 @@ def analyze_records(records, *, clock_domains=None, samples=(), same_host=False,
     if by_step:
         chosen.add(max(by_step,key=lambda s:by_step[s][1]-by_step[s][0]))
         chosen.update(s for s,(start,end) in by_step.items() if end-start > slow_ns)
+    if detail_neighbors:
+        original_work = {s['global_step']:s['work_elapsed_ns'] for s in samples
+                         if s.get('work_elapsed_ns') is not None}
+        ranked_work = {s:original_work.get(s,b-a) for s,(a,b) in by_step.items()}
+        chosen.update(s for s,v in ranked_work.items() if v > slow_ns)
+        chosen.update(sorted(ranked_work,key=ranked_work.get,reverse=True)[:8])
+        for step in tuple(chosen):
+            chosen.update(s for s in (step-1,step+1) if s in by_step)
     result = []
     for step in sorted(chosen):
         start,end = by_step[step]
@@ -342,21 +366,59 @@ def analyze_records(records, *, clock_domains=None, samples=(), same_host=False,
             'gc_overlap_union_by_domain_ns':{axis:_union([(e['clipped_start_ns'],e['clipped_end_ns'])
                 for e in gc_rows if e['clock_domain_id'] == axis]) for axis in domains},
             'unknown':'GC overlap is not a complete root-cause proof; scheduling/network attribution needs additional evidence; nested/parallel spans are not summed'})
+        if detail_neighbors:
+            # 仅B本地域核对双方依赖；不要求B时钟与Client可比较。
+            dependency = []
+            for event in gc_rows:
+                if (not event['on_control_thread'] or event['control_phase'] != 'matrix'
+                        or event['global_step'] != step or event['material_step'] not in (None,step)):
+                    continue
+                peer = {'P1':'P2','P2':'P1'}.get(event['role'])
+                own = [s for s in timeline if s['role']==event['role'] and s['phase']=='suffix']
+                waits = [s for s in timeline if s['role']==peer and s['phase']=='suffix'
+                         and s['clock_domain_id']==event['clock_domain_id']]
+                matrix = [s for s in timeline if s['role']==event['role'] and s['phase']=='matrix']
+                if any(m['start_ns'] <= event['start_ns'] < event['end_ns'] <= m['end_ns']
+                       and w['start_ns'] <= event['start_ns'] < event['end_ns'] <= s['start_ns'] <= w['end_ns']
+                       for m in matrix for s in own for w in waits):
+                    dependency.append(event)
+            result[-1]['server_local_gc_dependencies'] = dependency if complete else []
+            result[-1]['client_points'] = [p for p in decoded.get('Client',{}).get('points',[])
+                                           if p['global_step']==step]
+            result[-1]['original_work_ns'] = original_work.get(step)
+            result[-1]['related_preparation_by_domain'] = {
+                axes[r['role']]+':'+r['role']:[s for s in decoded[r['role']]['spans']
+                    if s['phase'] in ('seed','prefix','prefix_peer') and
+                    (s['global_step'] in (step-1,step) or s['material_step'] in (step,step+1)
+                     or s['global_step'] is None and s['material_step'] is None)] for r in records}
+    work = sorted(s['work_elapsed_ns'] for s in samples if s.get('work_elapsed_ns') is not None) if samples else sorted(b-a for a,b in by_step.values())
+    distribution = {'count':len(work),'mean_ns':sum(work)/len(work) if work else None,
+        'max_ns':max(work,default=None),'above_20ms':sum(v>20_000_000 for v in work),
+        'quantiles_ns':{label:work[math.ceil(len(work)*p)-1] if work else None
+                        for label,p in (('p50',.5),('p95',.95),('p99',.99))},
+        'scope':('original completed Client work samples' if samples else 'diagnostic sample/work pairs')+
+                '; failures listed separately; not pure network latency'}
     return {'schema':SCHEMA,'diagnostic_id':contexts[0]['diagnostic_id'],'source_head':contexts[0]['source_head'],
         'diagnostic_complete':complete,'clock_axes':axes,'steps':result,'missing_evidence':missing,
         'all_work_steps':sorted(by_step),'incomplete_roles':[k for k,v in decoded.items() if not v['complete']],
         'requested_steps_unavailable':[s for s in targets if s not in by_step],
+        'work_distribution':distribution,
+        'unfinished_spans':{r:d['unfinished_spans'] for r,d in decoded.items()},
+        'failure_samples':[s for s in samples if s.get('status') != 'confirmed'],
+        'unknown_sample_round_steps':unknown_round_steps,
         'scope':'diagnostic observation only; not a performance comparison or strict realtime qualification'}
 
 
-def analyze_manifests(paths, *, same_host=False):
+def analyze_manifests(paths, *, same_host=False, partial=False):
     """核对各角色文件hash后读入；目录组合不提供跨主机时钟同步。"""
     records, domains, samples, manifests_complete, expected = [], {}, [], True, None
+    loaded, file_errors = [], []
     for name in paths:
         path = Path(name)
         manifest = json.loads(path.read_text(encoding='utf8'))
         if manifest.get('schema') != SCHEMA:
             raise ValueError('manifest schema错误')
+        loaded.append(manifest)
         manifests_complete = manifests_complete and manifest.get('diagnostic_complete') is True
         count = manifest.get('expected_step_count')
         if type(count) is not int or not 1 <= count <= 400:
@@ -369,20 +431,91 @@ def analyze_manifests(paths, *, same_host=False):
             target = (path.parent/entry['path']).resolve()
             if target.parent != path.parent.resolve():
                 raise ValueError('角色文件路径越出产物目录')
-            raw = target.read_bytes()
+            try:
+                raw = target.read_bytes()
+            except FileNotFoundError:
+                if not partial:
+                    raise
+                file_errors.append({'path':entry['path'],'error_type':'FileNotFoundError'})
+                manifests_complete = False
+                continue
             if hashlib.sha256(raw).hexdigest() != entry['sha256']:
                 raise ValueError('角色文件hash不符')
             record = json.loads(raw)
             if (record['context']['diagnostic_id'] != manifest.get('diagnostic_id')
                     or record['context']['source_head'] != manifest.get('source_head')):
                 raise ValueError('manifest与角色身份/SHA不符')
+            if manifest.get('side') in ('client','pair'):
+                allowed = {'Client','worker'} if manifest['side']=='client' else {'P1','P2'}
+                if (record['role'] not in allowed or entry['path'] != record['role']+'.json'
+                        or record['context']['clock_domain_id'] != manifest.get('plan',{}).get('clock_domain_id')):
+                    raise ValueError('角色文件与本端计划/时钟域不符')
             records.append(record)
         for key,value in manifest.get('clock_domains',{}).items():
             if key in domains and domains[key] != value:
                 raise ValueError('clock domain证明冲突')
             domains[key] = value
         samples.extend(manifest.get('control_samples',[]))
+    identities = {(m.get('diagnostic_id'),m.get('source_head')) for m in loaded}
+    if len(identities) != 1:
+        raise ValueError('manifest诊断ID/源码不一致')
+    two_host = any(m.get('side') in ('client','pair') for m in loaded)
+    if two_host:
+        if len(loaded) > 2 or len({m.get('side') for m in loaded}) != len(loaded):
+            raise ValueError('两机manifest角色重复')
+        if {m.get('side') for m in loaded} != {'client','pair'}:
+            manifests_complete = False
+        common, topology, review = set(), set(), set()
+        for m in loaded:
+            plan = m.get('plan',{})
+            if (plan.get('side') != m['side'] or plan.get('source_head') != m['source_head']
+                    or plan.get('diagnostic_id') != m['diagnostic_id']
+                    or plan.get('maximum_steps') != m.get('expected_step_count')
+                    or plan.get('mode') != 'non_realtime_diagnostic'):
+                raise ValueError('两机计划与manifest不符')
+            encoded = json.dumps(plan,ensure_ascii=False,allow_nan=False,separators=(',',':')).encode('utf8')
+            if hashlib.sha256(encoded).hexdigest() != m.get('plan_sha256'):
+                raise ValueError('两机计划hash不符')
+            common.add(json.dumps(plan['common_source_sha256'],sort_keys=True))
+            topology.add(plan['topology_digest'])
+            review.add(plan['software_review'])
+            allowed = {'Client','worker'} if m['side']=='client' else {'P1','P2'}
+            member_roles = {r['role'] for r in records if r['context']['clock_domain_id']==plan['clock_domain_id']}
+            if not member_roles <= allowed:
+                raise ValueError('两机角色与本地成员不符')
+            if member_roles != allowed:
+                manifests_complete = False
+            for r in records:
+                if r['role'] not in allowed:
+                    continue
+                if r['context'].get('topology_digest') != plan['topology_digest']:
+                    raise ValueError('角色拓扑与冻结计划不符')
+            expected_roles = {'Client'} if m['side']=='client' else {'P1','P2'}
+            configs = plan['configurations']
+            if ({c['role'] for c in configs} != expected_roles or len(configs)!=len(expected_roles)
+                    or any(c['wire_profile'] != plan['profile'] or c['transport'] != 'insecure_tcp'
+                           or c['topology_digest'] != plan['topology_digest'] for c in configs)):
+                raise ValueError('配置/协议与两机计划不符')
+        if len(common)!=1 or len(topology)!=1 or len(review)!=1:
+            raise ValueError('两机源码内容/拓扑/审查版本不一致')
+        if len({m['plan']['clock_domain_id'] for m in loaded}) != len(loaded):
+            raise ValueError('两机必须使用独立时钟域')
+    if not records:
+        if not partial:
+            raise ValueError('没有角色记录')
+        return {'schema':SCHEMA,'diagnostic_complete':False,'steps':[],
+            'missing_evidence':['no role records'],'file_errors':file_errors,'manifests':loaded,
+            'scope':'partial diagnostic; no clock/latency conclusion'}
     result = analyze_records(records,clock_domains=domains,samples=samples,same_host=same_host,
-                             expected_steps=None if expected is None else range(expected))
+                             expected_steps=None if expected is None else range(expected),
+                             targets=() if two_host else (285,290),
+                             slow_ns=20_000_000 if two_host else 5_000_000,detail_neighbors=two_host,
+                             partial=partial)
     result['diagnostic_complete'] = result['diagnostic_complete'] and manifests_complete
+    result['file_errors'] = file_errors
+    if two_host:
+        result['mode'] = 'non_realtime_diagnostic'
+        result['manifests_complete'] = manifests_complete
+        result['functional_outcomes'] = [{'side':m['side'],'functional_complete':m['functional_complete'],
+                                        'group':m['group']} for m in loaded]
     return result

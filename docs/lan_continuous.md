@@ -44,7 +44,75 @@ D13已有结果继续标记Work实测、未独立结果复核。
 软件引用图检查能验证不再产生这两类临时闭包环，但不证明它们解释全部gen2扫描成本。
 本阶段没有新增性能运行；长期最慢耗时及双机收益需另行验证，不能据此宣布GC尖峰已解决。
 
-## 有界慢步骤诊断（D132-12）
+## 两机慢步骤诊断（D132-15）
+
+依据[本轮设计与授权](https://github.com/GNYKCZ/secure_pid_hvac/issues/132#issuecomment-6443216455)，
+新增显式 `pair`（B端P1/P2）与 `client`（A端Client/原worker）子命令。
+两端使用同一个已通过本轮独立审查的源码HEAD、审查链接、诊断ID与步数。
+运行前退出旧Client动画和旧P1/P2；本入口是无窗口采集，普通演示入口保持原行为。
+使用现有三个 `lab-*-cart-pole-demo.example.yaml`，不会替换实际IP/端口或改配置；
+它们必须匹配同一个部署拓扑，Client为ready-v1，双方均无证书preauthorized-v2。
+下载的示例已经保存B地址192.168.31.116；地址变化时按部署说明同步修改同一个拓扑文件。
+
+软件独审通过后，在两机各自仓库根目录准备同样的三个变量（交付消息给出精确值）：
+
+```powershell
+$diagnosticHead = Read-Host '输入本轮独审覆盖的完整40位HEAD，两机相同'
+$diagnosticReview = Read-Host '输入本轮独立审查评论链接，两机相同'
+$diagnosticId = 'issue132-d15-two-host-once'
+```
+
+先在B端执行一次（不要另开普通P1/P2）：
+
+```powershell
+uv run python scripts/run_control_tail_diagnostic.py pair results/tail_diagnostics/d15-B --diagnostic-id $diagnosticId --expected-head $diagnosticHead --software-review $diagnosticReview
+```
+
+接着在A端执行一次：
+
+```powershell
+uv run python scripts/run_control_tail_diagnostic.py client results/tail_diagnostics/d15-A --diagnostic-id $diagnosticId --expected-head $diagnosticHead --software-review $diagnosticReview
+```
+
+默认最多400次attempt（软件测试可选`--steps 1…400`，两端一致），400次确认即按原停止协议退出，
+没有401次控制或跨段继续维护。非实时诊断保留20ms模型，报告标记`non_realtime_diagnostic`，
+>20ms只用于挑出慢步；真正连接/协议/材料等失败首错即停、不重试不确定事务。
+Client首个采样开始后的活动窗口最多30秒；每端从启动准备至退出预算180秒，B等待人工启动A也计入。
+监督在总预算177秒开始清退，仅对本次spawn得到的PID树操作，为清退预留余量；
+操作系统调度/文件系统可能超出预算，真实超时或强退一律记不完整，不宣称硬实时保证。
+
+`plan.json`先冻结实际HEAD、源码文件hash、脏状态、角色配置公开语义、部署摘要与本地时钟域。
+`results/tail_diagnostics/session-诊断ID-本端.ledger.json`在启动角色前扣至0：
+同一ID本端只启动一次，换输出目录也拒绝。B未连接、失败或没复现尖峰也不自动补跑；
+不删除账本、不换ID绕过本轮一次授权，不消耗旧D10—D14额度。两端账本互不通信，
+离线合并核验，无分布式exactly-once保证。
+
+退出后将B端整个`results/tail_diagnostics/d15-B`目录复制到A端同一路径，保留文件原字节，再只读分析：
+
+```powershell
+uv run python scripts/run_control_tail_diagnostic.py analyze results/tail_diagnostics/d15-A/manifest.json results/tail_diagnostics/d15-B/manifest.json --partial --output results/tail_diagnostics/d15-analysis.json
+```
+
+不要加`--same-host`：A的Client/worker与B的P1/P2由各端真实spawn证明分别合轴，
+两机绝对ns不能相减。双方HEAD/源码内容、拓扑、协议run/session/epoch及round不符会拒绝合并。
+跨机源码文本摘要仅归一化`.py/.toml/.lock`的CRLF/LF换行差异；本机冻结/产物hash仍核对原字节。
+每端manifest包含实际退出/强退信息、原角色trace与A全部≤400条计时；
+`--partial`允许缺文件/失败前缀并明确不完整，坏hash或混配仍拒绝，不伪造未结束端点。
+若Client在输入阶段失败、尚无本步round身份，partial保留原失败行和成功前缀，
+单列`unknown_sample_round_steps`；worker预生成的材料round不替代Client事务身份。
+已知round冲突仍拒绝，身份未知不能提升为完整证据；未显式partial的分析仍严格拒绝空round。
+强杀可能来不及保存子进程trace，不能承诺强退仍完整。诊断原始产物与账本不提交Git。
+
+报告覆盖全部完成步分布、失败样本、最慢8步、全部>20ms步及邻步；
+A列应用send span和reply/frame/commit/output/applied点，B列各阶段及剔除嵌套后的时间、
+本地suffix互等、GC交集和前后prefix/seed准备关系。B本地域GC依赖只表明局部等待贡献，
+不能证明它与A的某一绝对时间重叠。不同主机只按步骤/round作因果关联；
+Client总等候减服务器处理不能命名为纯网络延迟。应用收发不是网卡包时间，CPU零值不是网络证据。
+每业务进程仍983040B、总计≤4MiB；GC/原阈值/启动清理与业务wire不变，退出才写盘。
+观察可能改变分配与尖峰位置，本组不能当无观察净提速对照或严格20ms资格。
+未复现如实报告，不补跑；抓包、原生跟踪、新修复/重测均不在本次范围内。
+
+## 有界慢步骤诊断（D132-12，历史本机入口）
 
 普通GUI/headless默认不启用该诊断，不分配事件缓冲、不安装GC回调。
 显式入口 `scripts/run_control_tail_diagnostic.py` 提供 `local` 与只读 `analyze`，
