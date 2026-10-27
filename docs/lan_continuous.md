@@ -98,6 +98,9 @@ uv run python scripts/run_control_tail_diagnostic.py analyze results/tail_diagno
 跨机源码文本摘要仅归一化`.py/.toml/.lock`的CRLF/LF换行差异；本机冻结/产物hash仍核对原字节。
 每端manifest包含实际退出/强退信息、原角色trace与A全部≤400条计时；
 `--partial`允许缺文件/失败前缀并明确不完整，坏hash或混配仍拒绝，不伪造未结束端点。
+若Client在输入阶段失败、尚无本步round身份，partial保留原失败行和成功前缀，
+单列`unknown_sample_round_steps`；worker预生成的材料round不替代Client事务身份。
+已知round冲突仍拒绝，身份未知不能提升为完整证据；未显式partial的分析仍严格拒绝空round。
 强杀可能来不及保存子进程trace，不能承诺强退仍完整。诊断原始产物与账本不提交Git。
 
 报告覆盖全部完成步分布、失败样本、最慢8步、全部>20ms步及邻步；

@@ -848,3 +848,65 @@ def test_two_host_partial_never_becomes_complete_or_invents_endpoints(tmp_path,f
     if fault=='unfinished':
         assert result['unfinished_spans']['Client'][0]['phase']=='exchange'
     assert all(not s['fixable_mechanism_confirmed'] for s in result['steps'])
+
+
+@pytest.mark.parametrize('prepared',[False,True])
+@pytest.mark.parametrize('failure_phase',['SAMPLE_START','INPUT','ROUND_IN_FLIGHT'])
+@pytest.mark.parametrize('identity',[None,'round1','wrong-round'])
+def test_rv003_partial_failure_round_unknown_preserves_prefix(tmp_path,prepared,failure_phase,identity):
+    """失败行属于Client事实；worker预生成身份不能替Client补造本步事务。"""
+    import hashlib
+
+    from secure_control.experiments.tail_diagnostic_analysis import analyze_manifests
+    paths = two_host_manifests(tmp_path)
+    for path in paths:
+        manifest = json.loads(path.read_text())
+        manifest['diagnostic_complete'] = False
+        manifest['functional_complete'] = False
+        for entry in manifest['files']:
+            role_path = path.parent/entry['path']
+            record = json.loads(role_path.read_text())
+            # 第0步完整；第1步仅Client可能采样，或已发送但未完成，没有work端点。
+            if record['role']=='Client':
+                record['events'] = [r for r in record['events'] if r[2]!=1 or
+                    failure_phase!='SAMPLE_START' and r[1]==PHASES['sample']*2 or
+                    failure_phase=='ROUND_IN_FLIGHT' and r[1]==PHASES['exchange']*2]
+                record['rounds'].pop('1',None)
+            elif record['role'] in ('P1','P2'):
+                record['events'] = [r for r in record['events'] if r[2]!=1]
+                record['rounds'].pop('1',None)
+            elif not prepared:
+                record['rounds'].pop('1',None)
+                record['events'] = [r for r in record['events'] if r[3]!=1]
+            if record['role']=='Client' and identity=='round1':
+                record['rounds']['1']='round1'
+            record['diagnostic_complete']=False
+            recount(record)
+            raw=json.dumps(record).encode()
+            role_path.write_bytes(raw)
+            entry['sha256']=hashlib.sha256(raw).hexdigest()
+        if manifest['side']=='client':
+            manifest['control_samples']=[
+                {'global_step':0,'round_id':'round0','status':'confirmed',
+                 'actual_sample_start_ns':100,'control_applied_ns':199,'work_completed_ns':200,
+                 'control_latency_ns':99,'work_elapsed_ns':100},
+                {'global_step':1,'round_id':identity,'status':'failed','failure_phase':failure_phase,
+                 'actual_sample_start_ns':None if failure_phase=='SAMPLE_START' else 300,
+                 'control_applied_ns':None,'work_completed_ns':None,
+                 'control_latency_ns':None,'work_elapsed_ns':None}]
+        path.write_text(json.dumps(manifest))
+    if identity=='wrong-round':
+        with pytest.raises(ValueError,match='身份'):
+            analyze_manifests(paths,partial=True)
+        return
+    result=analyze_manifests(paths,partial=True)
+    assert not result['diagnostic_complete'] and result['all_work_steps']==[0]
+    assert result['work_distribution']['count']==1 and result['work_distribution']['mean_ns']==100
+    failure=result['failure_samples'][0]
+    assert failure['round_id']==identity and failure['work_completed_ns'] is None
+    assert failure['control_applied_ns'] is None and failure['failure_phase']==failure_phase
+    if identity is None:
+        assert result['unknown_sample_round_steps']==[1]
+        with pytest.raises(ValueError,match='身份'):
+            analyze_manifests(paths)
+    assert all(not s['fixable_mechanism_confirmed'] for s in result['steps'])

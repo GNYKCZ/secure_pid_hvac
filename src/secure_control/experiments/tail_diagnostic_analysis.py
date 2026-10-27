@@ -160,7 +160,7 @@ def _axes(records, domains, same_host):
     return axes
 
 
-def analyze_records(records, *, clock_domains=None, samples=(), same_host=False, targets=(285,290), slow_ns=5_000_000, expected_steps=None, detail_neighbors=False):
+def analyze_records(records, *, clock_domains=None, samples=(), same_host=False, targets=(285,290), slow_ns=5_000_000, expected_steps=None, detail_neighbors=False, partial=False):
     """同一分析入口处理本机或合成/未来双机数据；不启动任何控制或网络。"""
     if not records or len(records) > 4 or len({r['role'] for r in records}) != len(records):
         raise ValueError('角色重复或记录数量无效')
@@ -215,10 +215,22 @@ def analyze_records(records, *, clock_domains=None, samples=(), same_host=False,
     if (not required_steps or set(by_step) != required_steps or set(sample_points) != required_steps
             or sorted(work_points) != sorted(required_steps)):
         missing.append('Client sample/work pairs do not cover declared control steps')
-    sample_ids = []
+    sample_ids, unknown_round_steps = [], []
     for sample in samples:
         step = sample['global_step']
-        if type(step) is not int or not 0 <= step < 400 or sample.get('round_id') != rounds.get(str(step)):
+        if type(step) is not int or not 0 <= step < 400:
+            raise ValueError('原工作样本身份错误')
+        # 输入/采样失败可能早于runtime.step，而worker已预生成同槽round。
+        # 只保留显式partial的未完成失败行；绝不从材料身份填造Client已尝试事务。
+        unknown_failure = (partial and sample.get('round_id') is None
+            and sample.get('status') in ('failed','uncertain','cancelled','stopped_before_commit','miss_before_apply')
+            and all(sample.get(k) is None for k in
+                    ('control_applied_ns','work_completed_ns','control_latency_ns','work_elapsed_ns')))
+        if unknown_failure:
+            unknown_round_steps.append(step)
+            missing.append(f'Client step {step}: failure round identity unknown')
+            complete = False
+        elif sample.get('round_id') is None or sample['round_id'] != rounds.get(str(step)):
             raise ValueError('原工作样本身份错误')
         sample_ids.append(step)
         if sample.get('work_completed_ns') is not None:
@@ -393,6 +405,7 @@ def analyze_records(records, *, clock_domains=None, samples=(), same_host=False,
         'work_distribution':distribution,
         'unfinished_spans':{r:d['unfinished_spans'] for r,d in decoded.items()},
         'failure_samples':[s for s in samples if s.get('status') != 'confirmed'],
+        'unknown_sample_round_steps':unknown_round_steps,
         'scope':'diagnostic observation only; not a performance comparison or strict realtime qualification'}
 
 
@@ -496,7 +509,8 @@ def analyze_manifests(paths, *, same_host=False, partial=False):
     result = analyze_records(records,clock_domains=domains,samples=samples,same_host=same_host,
                              expected_steps=None if expected is None else range(expected),
                              targets=() if two_host else (285,290),
-                             slow_ns=20_000_000 if two_host else 5_000_000,detail_neighbors=two_host)
+                             slow_ns=20_000_000 if two_host else 5_000_000,detail_neighbors=two_host,
+                             partial=partial)
     result['diagnostic_complete'] = result['diagnostic_complete'] and manifests_complete
     result['file_errors'] = file_errors
     if two_host:
