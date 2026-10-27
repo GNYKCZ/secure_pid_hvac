@@ -60,7 +60,7 @@ from secure_control.protocol.messages import (
 )
 from secure_control.protocol.roles import _seeded_context
 
-from . import localhost_transport
+from . import localhost_transport, tail_diagnostics
 from ._inputs import normalize_step_input
 from ._localhost_peer import LocalhostProtocol3PeerPort
 from ._localhost_workers import (
@@ -109,6 +109,7 @@ from .localhost_codec import (
     _PermitContext,
     _PreauthorizedOnlinePayload,
     _SeedInitPayload,
+    decode_envelope,
     decode_wire_value,
     encode_wire_value,
 )
@@ -523,6 +524,12 @@ class LanContinuousRuntime:
         ):
             raise ValueError("紧凑动态候选仅允许显式批量 v2 且不预送")
         self._wire_profile = wire_profile
+        if config.client_io == "ready-v1" and not (
+            wire_profile == PREAUTHORIZED_PROFILE_V2 and batch and not preload_steps
+            and _segment_hello is not None and _segment_hello.mode == "lan-segmented-v2"
+            and spec.state_dimension
+        ):
+            raise ValueError("ready-v1 仅支持动态持续v2普通步，不支持预送/完整路线。")
         if wire_profile in _MATRIX_PROFILES:
             # 在联网和材料分配之前验证本profile支持的公开尺度/形状。
             _matrix_layout_preflight(spec, fixed_point)
@@ -631,6 +638,10 @@ class LanContinuousRuntime:
                     modulus_evidence,
                 )
             self.setup = setup
+            diagnostic = tail_diagnostics.current()
+            if diagnostic is not None:
+                diagnostic.bind_protocol(getattr(base_hello,'run_id',None), self.session_id,
+                                         getattr(setup,'controller_epoch',None))
             for party, sock in enumerate(self._sockets):
                 role = "P1" if party == 0 else "P2"
                 _request(sock, role, 2, "lan_setup", self.session_id,
@@ -751,10 +762,15 @@ class LanContinuousRuntime:
         endpoints = []
         self._last_phase_ns = {}
         self.last_commit_observation = None
+        diagnostic = tail_diagnostics.current()
+        if diagnostic is not None:
+            diagnostic.control_step(self._step)
         try:
             deadline = (network_deadline(self.config.step_timeout, deadline_ns)
                         if deadline_ns is not None else None)
             started = time.perf_counter_ns()
+            if diagnostic is not None:
+                diagnostic.emit('material_bind',0,self._step,self._step)
             check_deadline(deadline_ns, "MATERIAL_BIND")
             value = normalize_step_input(v, self.spec.input_dimension)
             if self._preload_steps:
@@ -775,6 +791,8 @@ class LanContinuousRuntime:
                     current = self.client.bind_online_input(self.distribution, prepared, value,
                                                             step=self._step)
             self._last_phase_ns["material_bind"] = time.perf_counter_ns() - started
+            if diagnostic is not None:
+                diagnostic.emit('material_bind',1,self._step,self._step)
             check_deadline(deadline_ns, "MATERIAL_BIND")
             encoded_current = isinstance(current, _EncodedInputRound)
             plan = (current.prepared.plan if encoded_current else
@@ -918,6 +936,9 @@ class LanContinuousRuntime:
 
     def _step_preauthorized(self, current, plan, deadline, deadline_ns):
         """单次因果往返；先核实并记账提交事实，再解析独立输出子块。"""
+        diagnostic = tail_diagnostics.current()
+        if diagnostic is not None:
+            diagnostic.bind_round(plan.step,plan.round_id)
         permit = StepAdvancePermit(self.setup_run_id, self.session_id, self.setup.controller_epoch,
             self._step//self._segment_capacity, self._step, plan.round_id, secrets.token_hex(16),
             public_step_plan_sha256(plan), self._step, self._step, version=self._wire_profile)
@@ -935,36 +956,60 @@ class LanContinuousRuntime:
                                         "step": plan.step, "parties": observation}
         check_deadline(deadline_ns, "ENCODING")
         started = time.perf_counter_ns()
-        replies = []
+        replies = [None, None]
+        if diagnostic is not None:
+            diagnostic.emit('exchange',0,plan.step)
+
+        def accept_reply(p, response):
+            # 收齐一方就核实真实commit；另一方迟到/断线不能抹掉此事实。
+            _validate_party_reply(response, prepared[p][0])
+            reply = response.payload
+            if context is not None:
+                if type(reply) is not _CommittedReplyV2:
+                    raise ValueError("v2禁止旧嵌套提交回复")
+                own, _ = reply.committed_facts(context)
+            else:
+                if type(reply) is not CommittedStepReply or reply.ready.permit != permit:
+                    raise ValueError("v1最终回执类型/许可错误")
+                own = reply.ready
+            if own.party != p or own.truncations != plan.truncation_count:
+                raise ValueError("最终双提交回执与本次permit/资源不匹配")
+            replies[p] = reply
+            observation[f"P{p+1}"]["valid_ack_received"] = True
+            if diagnostic is not None:
+                diagnostic.emit('commit_fact',0,plan.step,aux=p)
+            if all(r is not None for r in replies):
+                # 在恢复socket模式/输出解析之前记双提交，后续失败不能回滚它。
+                self._step += 1
+                self._products += 1
+                self._truncations += plan.truncation_count
+                self._sequences = [v+1 for v in self._sequences]
+                if diagnostic is not None:
+                    diagnostic.emit('double_commit',0,plan.step)
+
+        def request_state(p, state):
+            self._round_started = True
+            observation[f"P{p+1}"]["request_state"] = state
+            if diagnostic is not None:
+                diagnostic.emit('request_send',0 if state == 'uncertain' else 1,plan.step,aux=p)
+
         try:
-            for p, (sock, (_, encoded)) in enumerate(zip(self._sockets, prepared, strict=True)):
-                self._round_started = True
-                observation[f"P{p+1}"]["request_state"] = "uncertain"
-                localhost_transport.send_frame(sock, encoded, deadline=deadline, limit=_FRAME_LIMIT)
-                observation[f"P{p+1}"]["request_state"] = "sent"
-            for p, (sock, (request, _)) in enumerate(zip(self._sockets, prepared, strict=True)):
-                response = receive_envelope(sock, deadline=deadline, limit=_FRAME_LIMIT)
-                _validate_party_reply(response, request)
-                reply = response.payload
-                if context is not None:
-                    if type(reply) is not _CommittedReplyV2:
-                        raise ValueError("v2禁止旧嵌套提交回复")
-                    own, _ = reply.committed_facts(context)
-                else:
-                    if type(reply) is not CommittedStepReply or reply.ready.permit != permit:
-                        raise ValueError("v1最终回执类型/许可错误")
-                    own = reply.ready
-                if own.party != p or own.truncations != plan.truncation_count:
-                    raise ValueError("最终双提交回执与本次permit/资源不匹配")
-                replies.append(reply)
-                observation[f"P{p+1}"]["valid_ack_received"] = True
-            # 两份真实回执有效即计提交；之后的输出/截止失败也不能抹掉这一步。
-            self._step += 1
-            self._products += 1
-            self._truncations += plan.truncation_count
-            self._sequences = [v+1 for v in self._sequences]
+            if self.config.client_io == "ready-v1":
+                localhost_transport._exchange_two_frames(self._sockets,
+                    tuple(encoded for _, encoded in prepared), deadline=deadline, limit=_FRAME_LIMIT,
+                    on_request=request_state,
+                    on_reply=lambda p, data: accept_reply(p, decode_envelope(data)), observer=diagnostic)
+            else:
+                for p, (sock, (_, encoded)) in enumerate(zip(self._sockets, prepared, strict=True)):
+                    request_state(p, "uncertain")
+                    localhost_transport.send_frame(sock, encoded, deadline=deadline, limit=_FRAME_LIMIT)
+                    request_state(p, "sent")
+                for p, sock in enumerate(self._sockets):
+                    accept_reply(p, receive_envelope(sock, deadline=deadline, limit=_FRAME_LIMIT))
         finally:
             self._last_phase_ns["single_exchange"] = time.perf_counter_ns()-started
+        if diagnostic is not None:
+            diagnostic.emit('exchange',1,plan.step)
         started = time.perf_counter_ns()
         try:
             check_deadline(deadline_ns, "AFTER_COMMIT")
@@ -976,6 +1021,8 @@ class LanContinuousRuntime:
             if output.shape != plan.output_shape or not np.isfinite(output).all():
                 raise ValueError("提交后输出shape/有限性错误")
             check_deadline(deadline_ns, "RECONSTRUCT")
+            if diagnostic is not None:
+                diagnostic.emit('output_checked',0,plan.step)
             self._last_result = MatrixClientStepResult(output, plan.round_id, plan.step, 1, plan.truncation_count)
             return np.array(output, dtype=float, copy=True)
         except Exception as error:
@@ -1419,6 +1466,9 @@ class LanSegmentedRuntime:
         self._pending = None
         self._attempted_round = None
         self.phase = "RUNNING"
+        diagnostic = tail_diagnostics.current()
+        if diagnostic is not None:
+            diagnostic.emit('applied',0,identity.global_step)
 
     def end_segment(self, *, switch_epoch: bool = False,
                     deadline_ns: int | None = None) -> SegmentRecord:
@@ -1658,6 +1708,7 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
     endpoint = None
     compact_hello = None
     recovery = None
+    diagnostic = tail_diagnostics.current()
     seeded_prepare_error = None
     try:
         startup_deadline = deadline_after(config.startup_timeout)
@@ -1806,7 +1857,11 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
         recovery = _OnlineMaterialRecovery(
             offline, modulus=fixed.modulus, security_parameter=setup.security_parameter,
             modulus_evidence=modulus_evidence,
+            observer=diagnostic,
         )
+        if diagnostic is not None:
+            diagnostic.bind_protocol(getattr(hello,'run_id',None),session,
+                                     getattr(setup,'controller_epoch',None))
         _party_reply(client_socket, offline_request, None, config.startup_timeout)
         if expected_wire_profile in PREAUTHORIZED_PROFILES:
             peer_port = LocalhostProtocol3PeerPort(peer_socket, role, _FRAME_LIMIT,
@@ -1874,9 +1929,19 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
             # 首轮也允许等待 Client 先完成纯场景预检；每轮操作有独立总 deadline。
             if not segmented and committed == steps:
                 break
+            if diagnostic is not None:
+                diagnostic.emit('request_receive',0,-1)
             online_request = receive_envelope(
                 client_socket, deadline=deadline_after(config.idle_timeout), limit=_FRAME_LIMIT
             )
+            if diagnostic is not None:
+                request_step = online_request.step if online_request.operation == 'online_permit' else -1
+                if request_step != -1:
+                    diagnostic.control_step(request_step)
+                    diagnostic.bind_round(request_step,online_request.round_id)
+                diagnostic.emit('request_receive',1,request_step)
+                if online_request.operation in ('segment_end','shutdown'):
+                    diagnostic.stop_control()
             if v2 and awaiting_begin:
                 _check_request(online_request, role, sequence, "segment_begin", session)
                 begin = online_request.payload
@@ -1985,6 +2050,8 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                 raise ValueError("LAN online step 必须连续递增。")
             online_material = (preload_store.claim(online_request.payload)
                                if preload_store is not None else online_request.payload)
+            if diagnostic is not None:
+                diagnostic.emit('restore',0,expected_step)
             permit = None
             if expected_wire_profile in PREAUTHORIZED_PROFILES:
                 if type(online_material) is not _PreauthorizedOnlinePayload:
@@ -2039,19 +2106,28 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                 )
             permit_context = (peer_port.install_permit(permit)
                               if expected_wire_profile == PREAUTHORIZED_PROFILE_V2 else None)
+            if diagnostic is not None:
+                diagnostic.emit('restore',1,expected_step)
             direct = DirectProtocol3PartyEndpoint(endpoint, peer_port)
             activation_result = None
             receipt_type = (local_receipt_type(endpoint.plan) if expected_wire_profile in _CLIENT_AUTH_PROFILES
                             else Protocol3StageReceipt)
             commit_operation = "commit_staged" if expected_wire_profile in _CLIENT_AUTH_PROFILES else "commit"
             if expected_wire_profile in PREAUTHORIZED_PROFILES:
-                stage_protocol3_batch(endpoint, peer_port)
+                if diagnostic is None:
+                    stage_protocol3_batch(endpoint, peer_port)
+                else:
+                    stage_protocol3_batch(endpoint, peer_port, observer=diagnostic)
                 own_ready = endpoint.ready_receipt()
                 ready_started = time.perf_counter_ns()
                 peer_ready = peer_port.exchange_ready(own_ready)
                 ready_ns = time.perf_counter_ns()-ready_started
                 commit_started = time.perf_counter_ns()
+                if diagnostic is not None:
+                    diagnostic.emit('commit',0,endpoint.plan.step)
                 endpoint.commit_ready(peer_ready)
+                if diagnostic is not None:
+                    diagnostic.emit('commit',1,endpoint.plan.step)
                 commit_ns = time.perf_counter_ns()-commit_started
                 stats = ready_commit_statistics
                 stats["count"] += 1
@@ -2073,7 +2149,11 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                     global_committed, staged[0], endpoint.plan, fixed.modulus) if permit_context is not None else
                     CommittedStepReply(own_ready, peer_ready, role_object.state_version,
                                        global_committed, encode_wire_value(staged[0])))
+                if diagnostic is not None:
+                    diagnostic.emit('final_send',0,endpoint.plan.step)
                 _party_reply(client_socket, online_request, reply, config.step_timeout, deadline=step_deadline)
+                if diagnostic is not None:
+                    diagnostic.emit('final_send',1,endpoint.plan.step)
                 if permit_context is not None:
                     peer_port.retire_permit()
                 sequence += 1

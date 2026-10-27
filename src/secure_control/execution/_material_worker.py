@@ -28,6 +28,7 @@ from .localhost_codec import (
     _load_json,
     _preloaded_values_size,
 )
+from .tail_diagnostics import TailRecorder, current
 
 _SLOT_LIMIT = 512 * 1024
 _RSS_LIMIT = 256 * 1024 * 1024
@@ -171,7 +172,7 @@ def _unpack(spec, packet, step):
     return plan, fragments, head
 
 
-def _worker_main(spec, credit, output):
+def _worker_main(spec, credit, output, diagnostic_context=None):
     """唯一生产者；只使用新的安全随机源，累计前缀不依赖材料总步数。"""
     report = {"pid": os.getpid(), "generated": 0, "error_type": None,
               "encoding_profile": spec.encoding_profile,
@@ -179,9 +180,14 @@ def _worker_main(spec, credit, output):
               "gc_begin": None, "gc_end": None, "process_cpu_ns": 0}
     cpu_started = time.process_time_ns()
     next_step, allowed, stop = spec.start, spec.start, False
+    diagnostic = TailRecorder(diagnostic_context,'worker').start() if diagnostic_context is not None else None
+    if diagnostic is not None:
+        diagnostic.bind_protocol(spec.run_id,spec.session_id,spec.epoch)
     def command(packet):
         nonlocal allowed, stop
         if packet == b"S":
+            if diagnostic is not None:
+                diagnostic.stop_control()
             stop = True
             return
         if len(packet) != 10 or packet[:1] != b"C" or packet[-1:] not in (b"0", b"1"):
@@ -192,6 +198,8 @@ def _worker_main(spec, credit, output):
         allowed = prefix
         if packet[-1:] == b"1" and report["gc_begin"] is None:
             report["gc_begin"] = _gc_snapshot()
+            if diagnostic is not None:
+                diagnostic.begin_control()
     def sample(moment):
         value = {"moment": moment, "generated": report["generated"], **_memory()}
         report["memory"].append(value)
@@ -226,7 +234,12 @@ def _worker_main(spec, credit, output):
             if spec.horizon is not None and next_step >= spec.horizon:
                 raise ValueError("工人越过已证明范围")
             started, cpu = time.perf_counter_ns(), time.process_time_ns()
+            if diagnostic is not None:
+                diagnostic.material_context(next_step)
+                diagnostic.emit('worker_generate',0,-1,next_step)
             plan = Client._resource_plan(spec.layout, spec.session_id, "round-" + secrets.token_hex(16), next_step, encoding_profile=spec.encoding_profile)
+            if diagnostic is not None:
+                diagnostic.bind_round(next_step,plan.round_id)
             if spec.encoding_profile in SEEDED_PROFILES:
                 values = dealer_corrections(keys,contexts,next_step,truncation)
                 fragments = (b"",_encode_integer_residues(values,len(values),spec.modulus))
@@ -237,7 +250,13 @@ def _worker_main(spec, credit, output):
                 del resources
             packet = _package(spec, plan, fragments, time.perf_counter_ns() - started,
                               time.process_time_ns() - cpu)
+            if diagnostic is not None:
+                diagnostic.emit('worker_generate',1,-1,next_step)
+                diagnostic.emit('worker_ipc',0,-1,next_step,aux=len(packet))
             output.send_bytes(packet)
+            if diagnostic is not None:
+                diagnostic.emit('worker_ipc',1,-1,next_step,aux=len(packet))
+                diagnostic.material_context()
             del fragments, packet, plan
             next_step += 1
             report["generated"] += 1
@@ -246,6 +265,8 @@ def _worker_main(spec, credit, output):
     except Exception as error:  # noqa: BLE001 - 不输出材料或异常文本
         report["error_type"] = type(error).__name__
     finally:
+        if diagnostic is not None:
+            diagnostic.begin_cleanup()
         keys,contexts = None,None
         report["gc_end"] = _gc_snapshot() if report["gc_begin"] is not None else None
         report["process_cpu_ns"] = time.process_time_ns() - cpu_started
@@ -263,6 +284,8 @@ def _worker_main(spec, credit, output):
             report["error_type"] = type(error).__name__  # 父进程将缺最终汇总视为清理失败。
         credit.close()
         output.close()
+        if diagnostic is not None:
+            diagnostic.save('failed' if report['error_type'] else 'closed')
 
 
 class _MaterialWorkerPool:
@@ -298,7 +321,9 @@ class _MaterialWorkerPool:
         context = mp.get_context("spawn")
         worker_credit, self._credit = context.Pipe(duplex=False)
         self._output, worker_output = context.Pipe(duplex=False)
-        self._process = context.Process(target=_worker_main, args=(self.spec, worker_credit, worker_output),
+        diagnostic = current()
+        self._process = context.Process(target=_worker_main, args=(self.spec, worker_credit, worker_output,
+                                        diagnostic.context if diagnostic is not None else None),
                                         name="local-material-worker")
         self._receiver = Thread(target=self._receive, name="material-receiver")
         self._notifier = Thread(target=self._notify, name="material-credit")
@@ -329,8 +354,11 @@ class _MaterialWorkerPool:
             self._condition.notify_all()
 
     def _receive(self):
+        diagnostic = current()
         try:
             while True:
+                if diagnostic is not None:
+                    diagnostic.material_context()
                 packet = self._output.recv_bytes(_SLOT_LIMIT // 3)
                 if packet[:1] == b"K":
                     if (self.spec.encoding_profile not in SEEDED_PROFILES or len(packet) != 65
@@ -351,6 +379,8 @@ class _MaterialWorkerPool:
                             raise RuntimeError("工人提前终止")
                     return
                 plan, fragments, header = _unpack(self.spec, packet, self._received)
+                if diagnostic is not None:
+                    diagnostic.material_context(self._received)
                 with self._condition:
                     stats = self._stats
                     stats["ipc_bytes"] += len(packet)
@@ -373,6 +403,9 @@ class _MaterialWorkerPool:
                     self._condition.notify_all()
         except Exception as error:  # noqa: BLE001 - 通道失败只公开类别
             self._fail(error)
+        finally:
+            if diagnostic is not None:
+                diagnostic.material_context()
 
     def _notify(self):
         last, sent_begin = None, False
@@ -419,6 +452,9 @@ class _MaterialWorkerPool:
 
     def take(self, step):
         """领取当前原始能力后释放一份额度；库存短缺立刻失败。"""
+        diagnostic = current()
+        if diagnostic is not None:
+            diagnostic.emit('material_claim',0,step,step)
         with self._condition:
             if self._stop or self._error or not self._process.is_alive() or not self._queue:
                 raise RuntimeError("本地材料工人失败或库存短缺")
@@ -433,6 +469,8 @@ class _MaterialWorkerPool:
             self._allowed += 1
             self._stats["current_round_bytes_high_water"] = max(self._stats["current_round_bytes_high_water"], size)
             self._condition.notify_all()
+            if diagnostic is not None:
+                diagnostic.emit('material_claim',1,step,step)
             return capability
 
     def snapshot(self):

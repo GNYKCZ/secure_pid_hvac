@@ -454,17 +454,116 @@ def _party(config, ports, queue, fault=None, profile=PREAUTHORIZED_PROFILE):
     _party_job(config, ports, 0, True, ResultQueue(), wire_profile=profile)
 
 
+@pytest.mark.parametrize('fault', ['missing_p1', 'bad_p1_ack', 'bad_p2_ack', 'bad_output', 'restore', None])
+def test_ready_runtime_preserves_p2_first_facts_and_double_commit_before_output(monkeypatch, fault):
+    from types import SimpleNamespace
+
+    from secure_control.execution import lan_runtime
+    from secure_control.execution import localhost_codec as c
+    from secure_control.execution import localhost_transport as t
+    from secure_control.protocol import Client
+    frames = _wire_fixture(PREAUTHORIZED_PROFILE_V2)
+    inputs = [f.payload.online for f in frames if f.kind == 'request' and f.sender == 'Client']
+    selected = frames[0].payload.permit
+    q = 2**256-189
+    layout = c.ControllerLayout(4, 2, 1, c.ControllerScaleLedger(32,32,32,32,32,32,64,32,64,64))
+    plan = Client._resource_plan(layout, selected.session_id, selected.round_id, 400,
+                                 encoding_profile=PREAUTHORIZED_PROFILE_V2)
+    runtime = lan_runtime.LanContinuousRuntime.__new__(lan_runtime.LanContinuousRuntime)
+    runtime.config = SimpleNamespace(client_io='ready-v1')
+    runtime._wire_profile = PREAUTHORIZED_PROFILE_V2
+    runtime.setup_run_id, runtime.session_id = selected.run_id, selected.session_id
+    runtime.setup = SimpleNamespace(controller_epoch=selected.controller_epoch)
+    runtime._step, runtime._segment_capacity, runtime._sequences = 400, 400, [1234, 1234]
+    runtime._products = runtime._truncations = 0
+    runtime._last_phase_ns = {}
+    runtime._last_result = None
+    runtime._material_pool = SimpleNamespace(observe_current_encoded=lambda count: None)
+    runtime._sockets = [object(), object()]
+    runtime.fixed_point = SimpleNamespace(modulus=q)
+    reconstructed = []
+    def reconstruct(*shares):
+        reconstructed.append(tuple(v.sender for v in shares))
+        return [0.]
+    runtime.client = SimpleNamespace(reconstruct_control=reconstruct)
+    current = SimpleNamespace(p1_input=inputs[0].input_message, p2_input=inputs[1].input_message,
+                              prepared=SimpleNamespace(fragments=tuple(v.values for v in inputs)))
+    order = []
+    def exchange(sockets, payloads, *, on_request, on_reply, **kwargs):
+        for p in (0, 1):
+            on_request(p, 'uncertain')
+            on_request(p, 'sent')
+        for p in (1, 0):
+            if p == 0 and fault == 'missing_p1':
+                raise t.LocalhostTransportTimeout('missing P1')
+            request = c.decode_envelope(payloads[p])
+            permit = request.payload.permit
+            context = c._PermitContext(permit)
+            output = c.ControlShareMessage(p, permit.session_id, permit.round_id, 400, 64,
+                                          AdditiveShare(np.array([0], dtype=object)))
+            value = c._compact_committed_reply(context, ReadyReceipt(permit, p, 4),
+                ReadyReceipt(permit, 1-p, 4), 401, 401, output, plan, q)
+            if fault == 'bad_output':
+                wire = json.loads(c.encode_wire_value(value))
+                wire['output_values'] = '!!!!'
+                value = c.decode_wire_value(json.dumps(wire).encode())
+            response = replace(request, kind='reply', sender=request.recipient,
+                               recipient='Client', payload=value)
+            if fault == ('bad_p1_ack' if p == 0 else 'bad_p2_ack'):
+                response = replace(response, sequence=9999)
+            on_reply(p, c.encode_envelope(response))
+            order.append(p)
+        if fault == 'restore':
+            raise OSError('restore failed after both verified')
+    monkeypatch.setattr(t, '_exchange_two_frames', exchange)
+    if fault:
+        with pytest.raises((ValueError, OSError, t.LocalhostTransportError)):
+            runtime._step_preauthorized(current, plan, t.deadline_after(2), None)
+    else:
+        np.testing.assert_array_equal(runtime._step_preauthorized(current, plan, t.deadline_after(2), None), [0.])
+    parties = runtime.last_commit_observation['parties']
+    assert parties['P2']['valid_ack_received'] == (fault != 'bad_p2_ack')
+    double = fault in ('bad_output', 'restore', None)
+    assert parties['P1']['valid_ack_received'] == double
+    assert runtime._step == 400 + int(double)
+    assert runtime._products == int(double) and runtime._truncations == 4*int(double)
+    assert reconstructed == ([(0, 1)] if fault is None else [])
+    assert runtime._sequences == ([1235, 1235] if double else [1234, 1234])
+    assert order[:1] == ([] if fault == 'bad_p2_ack' else [1])
+
+
+@pytest.mark.parametrize('mode,preload,batch,dynamic', [
+    ('lan-full-v3', 0, True, True), ('lan-segmented-v2', 1, True, True),
+    ('lan-segmented-v2', 0, False, True), ('lan-segmented-v2', 0, True, False)])
+def test_ready_runtime_rejects_unsupported_paths_before_network(monkeypatch, mode, preload, batch, dynamic):
+    from types import SimpleNamespace
+
+    from secure_control.execution import lan_runtime
+    from secure_control.experiments.communication_benchmark import _config, _ports
+    config = replace(_config('Client', _ports()), wire_profile=PREAUTHORIZED_PROFILE_V2, client_io='ready-v1')
+    def unexpected(*args, **kwargs):
+        pytest.fail('非法组合不得拨号')
+    monkeypatch.setattr(lan_runtime, 'connect_role', unexpected)
+    with pytest.raises(ValueError):
+        lan_runtime.LanContinuousRuntime(config, SimpleNamespace(state_dimension=int(dynamic)),
+            None, None, 0, None, _segment_hello=SimpleNamespace(mode=mode),
+            preload_steps=preload, batch=batch, wire_profile=PREAUTHORIZED_PROFILE_V2)
+
+
 _SESSION_FAULTS = [None, 'lost_final', 'bad_output', 'late_after_commit', 'partial_send',
                   'stage_failed', 'ready_missing', 'ready_mismatch', 'after_ready_exit', 'first_prefix']
 _V2_OUTPUT_FAULTS = ['bad_base64', 'null_output', 'bool_scale', 'wrong_length', 'out_of_range',
                      'wrong_output_type', 'noncanonical_base64']
 
 
-@pytest.mark.parametrize('profile,fault,segment_steps',
-    [(PREAUTHORIZED_PROFILE, f, s) for f in _SESSION_FAULTS for s in (1, 2)]
-    +[(PREAUTHORIZED_PROFILE_V2, f, 2) for f in _SESSION_FAULTS+_V2_OUTPUT_FAULTS]
-    +[(PREAUTHORIZED_PROFILE_V2, None, 1)])
-def test_real_short_sessions_single_exchange_and_failure_accounting(monkeypatch, segment_steps, fault, profile):
+@pytest.mark.parametrize('profile,fault,segment_steps,client_io',
+    [(PREAUTHORIZED_PROFILE, f, s, 'blocking-v1') for f in _SESSION_FAULTS for s in (1, 2)]
+    +[(PREAUTHORIZED_PROFILE_V2, f, 2, 'blocking-v1') for f in _SESSION_FAULTS+_V2_OUTPUT_FAULTS]
+    +[(PREAUTHORIZED_PROFILE_V2, None, 1, 'blocking-v1')]
+    +[(PREAUTHORIZED_PROFILE_V2, f, s, 'ready-v1') for s in (1, 2)
+      for f in (None, 'bad_output', 'late_after_commit', 'partial_send', 'stage_failed',
+                'ready_missing', 'ready_mismatch', 'first_prefix', *_V2_OUTPUT_FAULTS)])
+def test_real_short_sessions_single_exchange_and_failure_accounting(monkeypatch, segment_steps, fault, profile, client_io):
     from secure_control.execution import lan_runtime, localhost_transport
     from secure_control.execution.localhost_codec import decode_envelope
     from secure_control.experiments.communication_benchmark import _config, _ports
@@ -481,7 +580,8 @@ def test_real_short_sessions_single_exchange_and_failure_accounting(monkeypatch,
                                               segment_steps, InteractiveSession())
         for party in parties:
             party.start()
-        runtime = lan_runtime.LanSegmentedRuntime(_config('Client', ports), prepared.spec, prepared.context,
+        selected = replace(_config('Client', ports), wire_profile=profile, client_io=client_io)
+        runtime = lan_runtime.LanSegmentedRuntime(selected, prepared.spec, prepared.context,
             prepared.contract, prepared.security_parameter, prepared.evidence, control=lan_runtime.RunControl(),
             segment_capacity=segment_steps, wire_profile=profile)
         if fault == 'first_prefix':
@@ -506,6 +606,8 @@ def test_real_short_sessions_single_exchange_and_failure_accounting(monkeypatch,
         received = []
         def receive(sock, **kwargs):
             response = original_receive(sock, **kwargs)
+            return intercept(response)
+        def intercept(response):
             received.append(response.operation)
             if response.operation == 'online_permit' and response.sender == 'P2':
                 if fault == 'lost_final':
@@ -530,6 +632,19 @@ def test_real_short_sessions_single_exchange_and_failure_accounting(monkeypatch,
                     return replace(response, payload=decode_wire_value(json.dumps(value).encode()))
             return response
         monkeypatch.setattr(lan_runtime, 'receive_envelope', receive)
+        original_exchange = localhost_transport._exchange_two_frames
+        def exchange(sockets, payloads, *, on_request, on_reply, **kwargs):
+            def request(p, state):
+                on_request(p, state)
+                if state == 'uncertain':
+                    sent.append('online_permit')
+                    if fault == 'partial_send' and p == 1:
+                        raise OSError('test second request send failure')
+            def reply(p, data):
+                from secure_control.execution.localhost_codec import encode_envelope
+                on_reply(p, encode_envelope(intercept(decode_envelope(data))))
+            return original_exchange(sockets, payloads, on_request=request, on_reply=reply, **kwargs)
+        monkeypatch.setattr(localhost_transport, '_exchange_two_frames', exchange)
         if fault == 'late_after_commit':
             original_check = lan_runtime.check_deadline
             def check(deadline, phase):
@@ -561,7 +676,11 @@ def test_real_short_sessions_single_exchange_and_failure_accounting(monkeypatch,
                     runtime.next_segment()
                 sent.clear()
                 received.clear()
-                result = runtime.step(np.zeros(2))
+                if client_io == 'ready-v1':
+                    import time
+                    result = runtime.step(np.zeros(2), deadline_ns=time.perf_counter_ns()+3_000_000_000)
+                else:
+                    result = runtime.step(np.zeros(2))
                 assert sent == ['online_permit', 'online_permit']
                 assert received == ['online_permit', 'online_permit']
                 assert runtime.protocol_committed_count == step+1
@@ -667,10 +786,11 @@ def test_seed_profile_domains_are_distinct_and_mixed_contexts_are_rejected():
                 (c, replace(c, party=1, profile=profile)), 0, client.truncation)
 
 
-@pytest.mark.parametrize('profile', PREAUTHORIZED_PROFILES)
+@pytest.mark.parametrize('profile,client_io', [(p, 'blocking-v1') for p in PREAUTHORIZED_PROFILES]
+                         + [(PREAUTHORIZED_PROFILE_V2, 'ready-v1')])
 @pytest.mark.parametrize('fault', ['cancel_after_commit', 'plant_failure'])
-def test_original_headless_runner_never_counts_failed_or_cancelled_physical_step(monkeypatch, fault, profile):
-    from secure_control.execution import lan_runtime
+def test_original_headless_runner_never_counts_failed_or_cancelled_physical_step(monkeypatch, fault, profile, client_io):
+    from secure_control.execution import lan_runtime, localhost_transport
     from secure_control.experiments.communication_benchmark import _config, _ports
     from secure_control.experiments.lan_continuous_profile import load_segmented_experiment
     from secure_control.experiments.lan_runner import _run_prepared_segmented
@@ -682,7 +802,7 @@ def test_original_headless_runner_never_counts_failed_or_cancelled_physical_step
     queue = ctx.Queue()
     parties = [ctx.Process(target=_party, args=(_config(role, ports), ports, queue, None, profile)) for role in ('P1', 'P2')]
     session = InteractiveSession()
-    selected = replace(_config('Client', ports), wire_profile=profile)
+    selected = replace(_config('Client', ports), wire_profile=profile, client_io=client_io)
     prepared = load_segmented_experiment(selected.experiment_config, 2, session)
     advance_calls = []
     original_advance = prepared.scene.advance
@@ -699,6 +819,17 @@ def test_original_headless_runner_never_counts_failed_or_cancelled_physical_step
             session.cancelled.set()
         return result
     monkeypatch.setattr(lan_runtime, 'receive_envelope', receive)
+    original_exchange = localhost_transport._exchange_two_frames
+    # 直接在第二个已验证回调后取消；观察来自原runtime，不生成提交事实。
+    def exchange(sockets, payloads, *, on_reply, **kwargs):
+        completed = set()
+        def reply(p, data):
+            on_reply(p, data)
+            completed.add(p)
+            if fault == 'cancel_after_commit' and len(completed) == 2:
+                session.cancelled.set()
+        return original_exchange(sockets, payloads, on_reply=reply, **kwargs)
+    monkeypatch.setattr(localhost_transport, '_exchange_two_frames', exchange)
     collector = LiveTimingCollector('samples', sample_limit=2)
     try:
         for party in parties:

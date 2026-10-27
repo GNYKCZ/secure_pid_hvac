@@ -1,5 +1,94 @@
 # 独立三角色连续 LAN 实验（Issues #86、#84、#75、#92）
 
+## 有界慢步骤诊断（D132-12）
+
+普通GUI/headless默认不启用该诊断，不分配事件缓冲、不安装GC回调。
+显式入口 `scripts/run_control_tail_diagnostic.py` 提供 `local` 与只读 `analyze`，
+复用原Client/P1/P2和原供料worker，未新增记录进程/线程或网络消息。
+当前一次400步定位已获用户批准，必须先完成本轮软件独审；旧D11审查不覆盖本轮新head。
+依据：[D12设计](https://github.com/GNYKCZ/secure_pid_hvac/issues/132#issuecomment-6435523226)、
+[一次运行批准](https://github.com/GNYKCZ/secure_pid_hvac/issues/132#issuecomment-6435583866)。
+
+软件独审通过并冻结head后，本机命令为（输出目录必须不存在）：
+
+```powershell
+$diagnosticHead = git rev-parse HEAD
+$diagnosticReview = Read-Host '输入覆盖该head的D12独立审查评论链接'
+uv run python scripts/run_control_tail_diagnostic.py local results/tail_diagnostics/d12-local --expected-head $diagnosticHead --software-review $diagnosticReview
+uv run python scripts/run_control_tail_diagnostic.py analyze results/tail_diagnostics/d12-local/manifest.json --same-host --output results/tail_diagnostics/d12-local/analysis.json
+```
+
+`local`固定ready-v1、原preauthorized-v2/insecure_tcp、两测量observer、20ms模型、
+非实时headless、段400和worker16；用隔离的127.0.0.1配置，不读取/修改用户LAN拓扑。
+默认最多400个确认步（软件短测试可显式选1…400），第400次确认后请求原RunControl停止，
+不发起401；sample容量不是停止条件。>5ms只是离线筛选标签，不能在102先停而漏285/290。
+每次仅一组，24秒父收集和有界自身PID树清退，为30秒组上限留余量；实际超时、强退、
+未知提交、导出失败均保留为失败/不完整，代码等待预算不是操作系统硬实时保证。
+账本在任何角色启动前扣减；目录/角色文件/manifest拒覆盖，没有补跑/热身/恢复入口。
+本次批准不含第二组、双机现场、native trace、未知修复或新性能资格。
+
+每进程预分配12288×64B普通事件、2048×64B GC事件及64KiB身份表，
+数字缓冲合计983040B≤1MiB，四进程≤4MiB；满容量不覆盖旧事件，标丢失序号及不完整。
+热路径只写固定数字边界，不逐条JSON/写盘/排序，不记录share、seed内容、秘密状态/参数或摘要。
+控制步与材料目标步分开；已有辅助线程保留native ID。协议层只接受可选公开callable。
+GC回调记录start/stop/generation及活动控制阶段/线程/材料目标，不改变enabled/700/10/10，
+不额外collect或枚举对象，保留原启动清理和其他GC回调，退出只移除本次回调。
+
+角色文件使用`control-tail-diagnostic-v1`。实际本机spawn收据、父子PID和时钟实现核对通过，
+才允许同域拼时间线；同hostname/相同人工标签不构成证明。不同域严格分轴，
+未来A上的Client/worker与B上的P1/P2可以通过同一`analyze`入口关联协议身份/步骤，
+不能直接相减两端ns或把Client减server叫纯网络。当前真实双机启动/运行仍不在范围内。
+
+分析保留285/290、实际最慢及>5ms步骤和相邻正常对照。父子span列exclusive时间，
+并行/GC重叠用同域区间并集，不重复相加；startup/stop/cleanup GC不计入真实控制窗口。
+CPU记账可能量化，0不能证明网络等待；应用首次read/send完成也不是硬件到包时间。
+证据分`Located`、`Contributor observed`、`Fixable mechanism confirmed`、
+`Unresolved system/link wait`；GC重叠保留为事实，不替换按独占阶段得到的主定位。
+只有主慢方矩阵GC期间对方已进入suffix等待、且慢方在GC后才进入同域交换时，
+才记录该可核验依赖链的贡献；其他重叠保留未知，不确认可修复根因。
+下一槽/辅助线程GC不冒充当前控制停顿。manifest声明`expected_step_count`，
+同一分析器核对每步两路发送、材料claim/bind、服务器stage等必要事件；
+缺整步/工作端点或未声明范围均标不完整，原因写入`missing_evidence`，不补造端点。
+带观察的时间不与D11无探针结果直接比较净提速；观察可能改变GC触发步号，未复现就如实停止。
+第399步为最终停止，与旧1000步继续维护不同。`plan.json`、`ledger.json`、四角色文件和
+`manifest.json`保留源码/配置/时钟/退出/保存/hash事实；任何缺端点、满缓冲或保存失败均不造零。
+
+## Client 双连接就绪驱动候选（D132-11）
+
+这是显式选择的软件候选，默认仍为 `client_io: blocking-v1`。
+在你选定的 **Client 配置副本**中加入顶层一行 `client_io: ready-v1`；
+该副本还必须是 `transport: insecure_tcp`、
+`wire_profile: control-dynamic-matrix-preauthorized-v2` 和动态持续 experiment。
+P1/P2 保持原 v2 配置，不添加 `client_io`（服务器配置出现此键会拒绝）。
+启动仍使用原 GUI 或 headless 持续入口，仅把 Client 配置路径换为该副本，例如：
+
+```powershell
+uv run python scripts/run_cart_pole_client.py configs/lab-client-cart-pole-ready.local.yaml --headless-continuous --non-realtime --recording light --segment-steps 400
+```
+
+上面的 `.local.yaml` 是用户准备的配置副本，不是仓库自带文件。保留三角色原有相同拓扑、
+experiment 和 v2 wire；无需改 IP、端口、证书或网卡设置来启用此策略。
+省略 `client_io` 或设为 `blocking-v1` 使用原路径。非法枚举、TLS/旧 wire、
+静态/有限/完整路线及预送组合会拒绝，不会静默降级。四份用户现有 YAML 不自动修改。
+
+`ready-v1` 在原 Client 线程公平推进两条连接，P1 背压不会阻塞 P2 开始发送；
+两份请求完整发出后才按可用数据接收。每条完整回复立即验证真实提交事实，按角色保存；
+P2 先到后 P1 超时仍保留 P2 已知提交。双有效提交先记账，随后输出检查、截止检查，最后才允许施力。
+帧头/正文已有数据时直接继续，只有两路均无法推进才共同等待；不增加线程、进程或忙等。
+同一期限覆盖两路全部分片与业务检查，退出尝试恢复两条 socket 模式；恢复失败终止会话。
+失败不重发、不回退、不回滚已知提交。
+
+本地策略不进入 permit、拓扑摘要或 wire，不改变服务器协议、数学、材料或普通步的四帧/一次因果往返。
+`single_exchange` 起终点保持，包含发送、等待、解帧与提交核验，不是纯网络耗时。
+结果 metadata 与紧凑持续终态记录 `client_io`；历史结果缺字段表示未记录，不能推定使用新策略。
+本轮不增加逐步事件/落盘或扩大 raw 结构；行为证据由独立 I/O 模型和真实短功能会话提供。
+
+**性能 NOT RUN。** 这是软件候选，不保证消除实测约 10 ms 相位现象或 80 ms 尖峰，
+不能按两条连接推断耗时减半。新增两机有界对照须另行明确授权，不能把 sample-limit 当限步。
+[D132-10 网卡方案](https://github.com/GNYKCZ/secure_pid_hvac/pull/141)保留草稿历史、目前暂停，
+两端均未改设置、两组未运行；其额度不移给本候选，D10 的 6–8 ms 条件估计不适用于本轮。
+完整契约见 [D132-11 设计](https://github.com/GNYKCZ/secure_pid_hvac/issues/132#issuecomment-6395838844)。
+
 ## 无证书动态演示的显式选择
 
 D132-9增加 `control-dynamic-matrix-preauthorized-v2`，复用下述单次往返计算路径，

@@ -18,6 +18,7 @@ from time import perf_counter_ns
 from uuid import uuid4
 
 from secure_control.execution.cycle_timing import StepTimingObservation
+from secure_control.execution.tail_diagnostics import current as current_tail_diagnostic
 
 PHASES = (
     "input",
@@ -300,6 +301,9 @@ class LiveTimingCollector:
             # 显示上一份已提交观察；本次统计仍逐步记录，不受显示合并影响。
             self.publish()
             endpoint = self.completion_clock() if self.completion_clock else perf_counter_ns()
+            diagnostic = current_tail_diagnostic()
+            if diagnostic is not None and row.work_completed_ns is not None:
+                diagnostic.emit('work',1,row.global_step,wall_ns=endpoint)
             row = replace(
                 row,
                 observation_ns=row.observation_ns + endpoint - started,
@@ -480,6 +484,7 @@ def timing_metadata(config, prepared, *, non_realtime, mode):
         "platform": platform.platform(),
         "transport": config.transport,
         "wire_profile": config.wire_profile,
+        "client_io": config.client_io,
         "timing_mode": "non_realtime_demo" if non_realtime else "absolute",
         "model_period_s": prepared.scene.period,
         "segment_steps": prepared.segment_capacity,

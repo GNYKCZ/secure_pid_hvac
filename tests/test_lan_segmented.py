@@ -157,7 +157,8 @@ def test_compact_advance_local_failure_keeps_both_known_seals(compact_advance, m
     experiment = SimpleNamespace(spec=SimpleNamespace(state_dimension=1), context=None,
         contract=None, security_parameter=8, evidence=None, segment_capacity=400,
         recheck_sources=source, scene=SimpleNamespace(period=.02))
-    result = lan_runner._run_prepared_segmented(SimpleNamespace(transport="fixture", wire_profile=runtime._wire_profile), experiment,
+    result = lan_runner._run_prepared_segmented(SimpleNamespace(transport="fixture", wire_profile=runtime._wire_profile,
+                                                               client_io="blocking-v1"), experiment,
         control=runtime.control, session=InteractiveSession(), realtime=False,
         on_segment=lambda _packet: callback("seal"), on_segment_ready=lambda _packet: callback("release"),
         **({} if configured else {"_wire_profile":runtime._wire_profile}))

@@ -78,6 +78,249 @@ from secure_control.simulation.telemetry import (
 _DEFAULT_TRANSPORT = LocalhostTransportConfig()
 
 
+class _ReadySocket:
+    """双通道独立字节模型；背压解除由另一通道的实际发送决定。"""
+
+    def __init__(self, incoming=b'', *, chunk=1):
+        self.incoming = bytearray(incoming)
+        self.sent = bytearray()
+        self.chunk = chunk
+        self.timeout = 3.
+        self.modes = []
+        self.block_send = lambda: False
+        self.block_recv = lambda: False
+        self.eof = False
+        self.restore_error = False
+
+    def gettimeout(self):
+        return self.timeout
+
+    def settimeout(self, value):
+        self.modes.append(value)
+        if value == 3. and self.restore_error:
+            raise OSError('restore test')
+        self.timeout = value
+
+    def send(self, data):
+        if self.block_send():
+            raise BlockingIOError
+        count = min(len(data), self.chunk)
+        self.sent.extend(data[:count])
+        return count
+
+    def recv(self, count):
+        if self.block_recv():
+            raise BlockingIOError
+        if not self.incoming:
+            if self.eof:
+                return b''
+            raise BlockingIOError
+        count = min(count, self.chunk, len(self.incoming))
+        result = bytes(self.incoming[:count])
+        del self.incoming[:count]
+        return result
+
+
+def test_two_ready_frames_backpressure_arrival_order_and_no_header_wait(monkeypatch):
+    from secure_control.execution import localhost_transport as t
+
+    frame = lambda payload: struct.pack('!I', len(payload)) + payload
+    sockets = [_ReadySocket(frame(b'p1') + frame(b'next')), _ReadySocket(frame(b'p2'))]
+    sockets[0].block_send = lambda: not sockets[1].sent
+    events, replies = [], []
+    sockets[0].block_recv = lambda: not replies
+    def no_wait(*args):
+        pytest.fail('已有字节可推进时不能额外select')
+    monkeypatch.setattr(t.select, 'select', no_wait)
+    t._exchange_two_frames(sockets, (b'a', b'b'), deadline=deadline_after(2), limit=20,
+        on_request=lambda p, state: events.append((p, state)),
+        on_reply=lambda p, payload: replies.append((p, payload)))
+    assert replies == [(1, b'p2'), (0, b'p1')]
+    assert events.index((1, 'sent')) < events.index((0, 'sent'))
+    assert [bytes(s.sent) for s in sockets] == [frame(b'a'), frame(b'b')]
+    assert sockets[0].incoming == frame(b'next')
+    assert all(s.modes == [0., 3.] for s in sockets)
+
+
+def test_two_ready_frames_preserve_first_reply_when_other_times_out(monkeypatch):
+    from secure_control.execution import localhost_transport as t
+
+    sockets = [_ReadySocket(), _ReadySocket(b'\0\0\0\x02p2', chunk=99)]
+    replies, waits = [], []
+    def wait(readers, writers, exceptional, timeout):
+        waits.append((readers[:], writers[:], timeout))
+        raise t.LocalhostTransportTimeout('test missing P1')
+    monkeypatch.setattr(t.select, 'select', wait)
+    with pytest.raises(t.LocalhostTransportTimeout):
+        t._exchange_two_frames(sockets, (b'a', b'b'), deadline=deadline_after(2), limit=20,
+            on_request=lambda *args: None, on_reply=lambda p, data: replies.append((p, data)))
+    assert replies == [(1, b'p2')]
+    assert len(waits) == 1 and waits[0][0] == [sockets[0]] and not waits[0][1]
+    assert 0 < waits[0][2] <= 2
+    assert all(s.timeout == 3. for s in sockets)
+
+
+@pytest.mark.parametrize('case', ['empty', 'oversize', 'eof_header', 'eof_body',
+    'empty_ready', 'false_ready', 'send_zero', 'validation', 'restore', 'primary_restore', 'setup'])
+def test_two_ready_frames_failures_restore_both_and_preserve_primary(monkeypatch, case):
+    from secure_control.execution import localhost_transport as t
+
+    sockets = [_ReadySocket(b'\0\0\0\x01x', chunk=99) for _ in range(2)]
+    primary = ValueError('business verification')
+    seen, waits = [], []
+    expected = t.LocalhostTransportError
+    if case in ('empty', 'oversize'):
+        sockets[0].incoming = bytearray(struct.pack('!I', 0 if case == 'empty' else 21))
+        expected = t.LocalhostTransportProtocolError
+    if case in ('eof_header', 'eof_body'):
+        sockets[0].incoming = bytearray(b'\0\0' if case == 'eof_header' else b'\0\0\0\x02x')
+        sockets[0].eof = True
+        expected = t.LocalhostTransportDisconnected
+    if case in ('empty_ready', 'false_ready'):
+        sockets[0].incoming.clear()
+    if case == 'send_zero':
+        sockets[0].send = lambda data: 0
+        expected = t.LocalhostTransportDisconnected
+    if case in ('restore', 'primary_restore'):
+        for sock in sockets:
+            sock.restore_error = True
+        expected = OSError if case == 'restore' else ValueError
+    if case == 'setup':
+        def set_mode(value):
+            sockets[1].modes.append(value)
+            if value == 0.:
+                raise primary
+        sockets[1].settimeout = set_mode
+        expected = ValueError
+    if case == 'validation':
+        expected = ValueError
+    def receive(p, data):
+        seen.append(p)
+        if case in ('validation', 'primary_restore'):
+            raise primary
+    def select(readers, writers, exceptional, timeout):
+        waits.append((readers[:], writers[:], timeout))
+        return (readers if case == 'false_ready' else []), [], []
+    monkeypatch.setattr(t.select, 'select', select)
+    with pytest.raises(expected) as caught:
+        t._exchange_two_frames(sockets, (b'a', b'b'), deadline=deadline_after(2), limit=20,
+            on_request=lambda *args: None, on_reply=receive)
+    assert all(s.modes[-1] == 3. for s in sockets)
+    if case in ('validation', 'primary_restore', 'setup'):
+        assert caught.value is primary
+    if case == 'primary_restore':
+        assert len(primary.__notes__) == 2
+    if case in ('empty_ready', 'false_ready'):
+        assert 0 < len(waits) <= 8 and seen == [1]
+        assert all(readers == [sockets[0]] and not writers and timeout > 0
+                   for readers, writers, timeout in waits)
+    if case == 'restore':
+        assert seen == [0, 1] and len(caught.value.__notes__) == 1
+
+
+@pytest.mark.parametrize('clock_domain', ['monotonic', 'qpc'])
+@pytest.mark.parametrize('stage', ['send', 'receive', 'validation', 'restoration'])
+def test_two_ready_frames_share_deadline_through_validation_and_restore(monkeypatch, clock_domain, stage):
+    from secure_control.execution import cycle_timing as clock
+    from secure_control.execution import localhost_transport as t
+
+    now = [0]
+    monkeypatch.setattr(clock.time, 'monotonic', lambda: 100 + now[0])
+    monkeypatch.setattr(clock.time, 'perf_counter_ns', lambda: int((200+now[0])*1e9))
+    deadline = 101. if clock_domain == 'monotonic' else clock._CycleDeadline(201_000_000_000)
+    sockets = [_ReadySocket(b'\0\0\0\x01x', chunk=99) for _ in range(2)]
+    states, seen = [], []
+    def request(p, state):
+        states.append((p, state))
+        if stage == 'send' and state == 'sent':
+            now[0] = 2
+    original_recv = sockets[0].recv
+    def recv(count):
+        value = original_recv(count)
+        if stage == 'receive':
+            now[0] = 2
+        return value
+    sockets[0].recv = recv
+    original_mode = sockets[1].settimeout
+    def mode(value):
+        original_mode(value)
+        if stage == 'restoration' and value == 3.:
+            now[0] = 2
+    sockets[1].settimeout = mode
+    def receive(p, data):
+        seen.append(p)
+        if stage == 'validation':
+            now[0] = 2
+    with pytest.raises(t.LocalhostTransportTimeout):
+        t._exchange_two_frames(sockets, (b'a', b'b'), deadline=deadline, limit=20,
+            on_request=request, on_reply=receive)
+    assert all(s.timeout == 3. for s in sockets)
+    assert seen == ([0] if stage == 'validation' else [0, 1] if stage == 'restoration' else [])
+    if stage == 'send':
+        assert states == [(0, 'uncertain'), (0, 'sent')]
+
+
+def test_two_ready_frames_real_sockets_fragmentation_and_mode_restoration():
+    from secure_control.execution import localhost_transport as t
+
+    clients, servers = [], []
+    threads = []
+    def serve(sock, payload):
+        try:
+            assert t.receive_frame(sock, deadline=deadline_after(3), limit=20) == b'request'
+            for value in struct.pack('!I', len(payload))+payload:
+                sock.sendall(bytes([value]))
+        finally:
+            sock.close()
+    try:
+        for p in range(2):
+            listener = t.create_listener('127.0.0.1', 0)
+            try:
+                clients.append(t.connect_loopback(listener.getsockname(), deadline=deadline_after(3)))
+                servers.append(t.accept_loopback(listener, deadline=deadline_after(3)))
+            finally:
+                listener.close()
+            clients[-1].settimeout(None if p == 0 else .7)
+            thread = threading.Thread(target=serve, args=(servers[-1], f'p{p}'.encode()))
+            threads.append(thread)
+            thread.start()
+        replies = {}
+        t._exchange_two_frames(clients, (b'request', b'request'), deadline=deadline_after(3), limit=20,
+            on_request=lambda *args: None, on_reply=lambda p, data: replies.update({p: data}))
+        assert replies == {0:b'p0', 1:b'p1'}
+        assert [s.gettimeout() for s in clients] == [None, .7]
+    finally:
+        for sock in clients+servers:
+            sock.close()
+        for thread in threads:
+            thread.join(3)
+            assert not thread.is_alive()
+
+
+def test_two_ready_frames_joint_write_wait_excludes_finished_and_prevalidates_both(monkeypatch):
+    from secure_control.execution import localhost_transport as t
+
+    sockets = [_ReadySocket(b'\0\0\0\x01x', chunk=99) for _ in range(2)]
+    for sock in sockets:
+        sock.block_send = lambda: True
+    states = []
+    with pytest.raises(t.LocalhostTransportProtocolError):
+        t._exchange_two_frames(sockets, (b'a', b''), deadline=deadline_after(2), limit=20,
+            on_request=lambda *args: states.append(args), on_reply=lambda *args: None)
+    assert not states and all(not s.sent and not s.modes for s in sockets)
+    waits = []
+    def select(readers, writers, errors, timeout):
+        waits.append((readers[:], writers[:], timeout))
+        sockets[1 if len(waits) == 1 else 0].block_send = lambda: False
+        return [], writers, []
+    monkeypatch.setattr(t.select, 'select', select)
+    t._exchange_two_frames(sockets, (b'a', b'b'), deadline=deadline_after(2), limit=20,
+        on_request=lambda *args: states.append(args), on_reply=lambda *args: None)
+    assert [w[1] for w in waits] == [sockets, [sockets[0]]]
+    assert all(not r and 0 < timeout <= 2 for r, _, timeout in waits)
+    assert states.index((1, 'sent')) < states.index((0, 'sent'))
+
+
 def test_loopback_tcp_options_restore_after_benchmark_and_close_failed_owner(monkeypatch):
     from contextlib import nullcontext
 

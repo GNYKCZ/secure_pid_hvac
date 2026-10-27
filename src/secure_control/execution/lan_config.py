@@ -73,6 +73,18 @@ class LanConfig:
     idle_timeout: float = 30.0
     transport: Literal["mutual_tls", "insecure_tcp"] = "mutual_tls"
     wire_profile: str = "control-batch-v1"
+    client_io: str = "blocking-v1"
+
+    def __post_init__(self):
+        """Client本地I/O策略不进入拓扑或wire；非法组合在联网前拒绝。"""
+        if type(self.client_io) is not str or self.client_io not in ("blocking-v1", "ready-v1"):
+            raise ValueError("client_io 只能是 blocking-v1 或 ready-v1。")
+        if self.client_io == "ready-v1" and not (
+            self.role == "Client" and self.transport == "insecure_tcp"
+            and self.wire_profile == "control-dynamic-matrix-preauthorized-v2"
+            and self.experiment_config is not None
+        ):
+            raise ValueError("ready-v1 仅支持Client/insecure_tcp/preauthorized-v2持续实验。")
 
 
 def load_lan_config(path: str | Path, role: Role) -> LanConfig:
@@ -101,6 +113,8 @@ def load_lan_config(path: str | Path, role: Role) -> LanConfig:
         fields.add("transport")
     if role == "Client":
         fields.add("controller" if "controller" in data else "experiment")
+        if "client_io" in data:
+            fields.add("client_io")
     _fields(data, fields)
     if data["role"] != role:
         raise ValueError("角色配置与命令角色不匹配。")
@@ -147,7 +161,7 @@ def load_lan_config(path: str | Path, role: Role) -> LanConfig:
         raise ValueError("Client experiment 配置不存在。")
     idle = _timeout(timeouts.get("idle", timeouts["step"]), "idle")
     return LanConfig(role, topology, ca, certificate, private_key, *seconds, controller,
-                     experiment, idle, transport, wire_profile)
+                     experiment, idle, transport, wire_profile, data.get("client_io", "blocking-v1"))
 
 
 def _load_yaml(path: Path) -> dict[str, object]:
