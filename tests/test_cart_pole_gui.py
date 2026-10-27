@@ -124,6 +124,39 @@ def test_live_performance_throttle_reuses_canvas_and_export_failure_keeps_contro
     assert '保存失败' in window.location.get() and '结束统计' in window.performance_text.get()
 
 
+@pytest.mark.parametrize('work,planned,expected', [
+    (15_000_000,True,'剩余5.000ms'),(20_000_000,True,'已到截止，不算准时'),
+    (21_000_000,True,'超期1.000ms'),(None,True,'周期余量 未完成'),
+    (15_000_000,False,'周期余量 不适用'),
+])
+def test_performance_display_uses_same_derived_endpoints_without_another_clock(work,planned,expected):
+    from types import SimpleNamespace
+
+    from test_live_timing import observation
+
+    from secure_control.experiments.live_timing import LiveTimingCollector, timing_mode_label
+
+    window=CartPoleWindow.__new__(CartPoleWindow)
+    text=['']
+    window.performance_text=SimpleNamespace(set=lambda value:text.__setitem__(0,value))
+    window.performance_canvas=SimpleNamespace(coords=lambda *args:None)
+    window._performance_curve=None
+    window._timing_label=timing_mode_label(not planned)
+    row=observation(scheduled_start_ns=1_000_000_000 if planned else None,
+                    deadline_ns=1_020_000_000 if planned else None)
+    from dataclasses import replace
+    row=replace(row,work_completed_ns=None if work is None else 1_000_000_000+work,
+                status='miss_after_apply' if work is None else 'confirmed')
+    collector=LiveTimingCollector('samples',sample_limit=1)
+    collector.record(row)
+    # 使用v1形态也能即时派生显示，不能重写原报告。
+    latest=collector.report()['recent'][0]
+    latest.pop('cycle_remaining_ns');latest.pop('cycle_overrun_ns')
+    window._show_performance({'latest':latest,'observations':1,'trend':[(0,work)],'statistics_complete':True})
+    assert expected in text[0] and window._timing_label in text[0]
+    assert ('采样迟到 0.000ms' if planned else '采样迟到 不适用') in text[0]
+
+
 @pytest.mark.integration
 @pytest.mark.gui
 @_isolated_tk_test
@@ -246,7 +279,7 @@ def test_dynamic_recording_windows_keep_light_frame_and_full_verified_reader(tmp
     assert calls == ["verified-run"] and window._terminal == ("complete", verified)
 
     window = gui.CartPoleWindow(tk_root, paths["Client"], non_realtime=True)
-    assert any("非实时仿真" in str(w.cget("text")) for w in tk_root.winfo_children() if isinstance(w, tk.Label))
+    assert any("非实时演示：无周期截止" in str(w.cget("text")) for w in tk_root.winfo_children() if isinstance(w, tk.Label))
     def demo(config, **kwargs):
         assert kwargs["non_realtime"] is True and kwargs["recording_mode"] == "light"
         return {"recording_mode": "light", "status": "stopped", "confirmed_step_count": 3,

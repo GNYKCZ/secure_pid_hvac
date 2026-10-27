@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="倒立摆 Client：默认持续动画与停止保存")
+    parser = argparse.ArgumentParser(description="倒立摆 Client：默认持续动画与停止保存；动态持续默认复用绝对节拍，超期按原契约停止")
     parser.add_argument("config", nargs="?", type=Path,
                         default=Path(__file__).resolve().parents[1]
                         / "configs/lab-client-cart-pole.example.yaml")
@@ -23,7 +23,7 @@ if __name__ == "__main__":
     parser.add_argument("--recording", choices=("light", "full"),
                         help="仅动态持续：默认light不保存完整轨迹；full可靠留证并支持回放")
     parser.add_argument("--non-realtime", action="store_true",
-                        help="仅动态持续light：无周期截止的非实时仿真，模型步长保持不变")
+                        help="仅动态持续light：非实时演示，无周期截止，按上次实际采样+模型周期等待；省略则用已有绝对节拍，模型步长均不变")
     parser.add_argument("--performance",choices=("off","summary","samples"),
                         help="动态持续light默认summary；off关闭；samples有界保存首N次观察")
     parser.add_argument("--performance-output",type=Path,help="退出后保存的新性能JSON文件，不能覆盖")

@@ -98,8 +98,10 @@ class CartPoleWindow:
                   f"θ={initial[2]:+.4f} rad / {math.degrees(initial[2]):+.2f}°"
         )
         self.detail = tk.StringVar(value="初态尚无控制区间 · 目标 p=0 m, θ=0 rad")
-        if non_realtime:
-            tk.Label(root, text=f"非实时仿真，模型步长 {self.prepared.scene.period * 1000:g} ms；无周期性能指标").pack()
+        from secure_control.experiments.live_timing import timing_mode_label
+        self._timing_label = timing_mode_label(non_realtime)
+        if dynamic:
+            tk.Label(root, text=f"{self._timing_label}；模型步长 {self.prepared.scene.period * 1000:g} ms").pack()
         tk.Label(root, textvariable=self.phase, font=("Arial", 15, "bold")).pack(pady=8)
         self.canvas = tk.Canvas(root, width=820, height=340, bg="white")
         self.canvas.pack()
@@ -426,6 +428,7 @@ class CartPoleWindow:
                         f">20ms参考线 {work['above_20ms']}步" if work and work["count"] else "结束统计：无完整工作端点/统计不可用")
                     if not statistics["statistics_complete"]:
                         self.performance_text.set(self.performance_text.get()+f"；统计不完整：{statistics['observation_error']}")
+                    self.performance_text.set(self.performance_text.get()+f"；{self._timing_label}")
             elif kind == "complete" and not self._closing:
                 if self.mode == "segmented":
                     self._verified = value
@@ -468,10 +471,25 @@ class CartPoleWindow:
         row = performance["latest"]
         if row is None:
             return
+        from secure_control.experiments.live_timing import timing_derivatives
+        derived = timing_derivatives(row)
         def ms(value):
             return "未完成" if value is None else f"{value/1e6:.3f}ms"
-        self.performance_text.set(f"性能 step={row['global_step']+1}（全程观察{performance['observations']}次）："
+        scheduled = row['scheduled_start_ns'] is not None
+        lateness = ms(derived['lateness_ns']) if scheduled else '不适用'
+        if not scheduled:
+            margin = '不适用'
+        elif derived['cycle_remaining_ns'] is None:
+            margin = '未完成'
+        elif derived['cycle_remaining_ns'] > 0:
+            margin = f"剩余{ms(derived['cycle_remaining_ns'])}"
+        elif derived['cycle_overrun_ns'] > 0:
+            margin = f"超期{ms(derived['cycle_overrun_ns'])}"
+        else:
+            margin = '0ms（已到截止，不算准时）'
+        self.performance_text.set(f"{self._timing_label} · 性能 step={row['global_step']+1}（全程观察{performance['observations']}次）："
             f"施力 {ms(row['control_latency_ns'])} · 完整工作 {ms(row['work_elapsed_ns'])} · "
+            f"采样迟到 {lateness} · 周期余量 {margin} · "
             f"采样间隔 {ms(row['sample_interval_ns'])} · 主动等待 {ms(row['pacing_elapsed_ns'])} · "
             f"{row['status']}；趋势{performance['trend'][0][0]+1}–{performance['trend'][-1][0]+1}步，纵轴0–60ms，超出截顶" +
             ("；统计不完整" if not performance["statistics_complete"] else ""))
