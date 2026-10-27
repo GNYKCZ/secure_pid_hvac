@@ -1,6 +1,7 @@
 """#132：独立整数时间线、全程统计和有界性能报告契约。"""
 
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -9,7 +10,8 @@ from secure_control.experiments.live_timing import LiveTimingCollector
 
 
 @pytest.mark.parametrize('client_io', ['blocking-v1', 'ready-v1'])
-def test_timing_metadata_records_local_io_strategy_without_changing_wire(client_io):
+@pytest.mark.parametrize('non_realtime', [False,True])
+def test_timing_metadata_records_local_io_strategy_without_changing_wire(client_io,non_realtime):
     from types import SimpleNamespace
 
     from secure_control.experiments.communication_benchmark import _config, _ports
@@ -18,10 +20,11 @@ def test_timing_metadata_records_local_io_strategy_without_changing_wire(client_
     config = replace(_config('Client', _ports()), wire_profile=profile, client_io=client_io)
     prepared = SimpleNamespace(scene=SimpleNamespace(period=.02), segment_capacity=2,
                                effective_config={'public': 'fixture'})
-    metadata = timing_metadata(config, prepared, non_realtime=True, mode='summary')
+    metadata = timing_metadata(config, prepared, non_realtime=non_realtime, mode='summary')
     assert metadata['client_io'] == client_io and metadata['wire_profile'] == profile
     assert metadata['topology_digest'] == config.topology.digest
     assert metadata['peer_head'] == metadata['peer_network'] == 'unknown'
+    assert metadata['timing_mode']==('non_realtime_demo' if non_realtime else 'absolute')
 
 
 def observation(k=0, work=15_000_000, **kwargs):
@@ -109,6 +112,12 @@ def test_single_exchange_is_distinct_and_legacy_report_metric_set_remains_readab
     old_target = tmp_path/'old.json'
     export_timing(legacy, old_target, {}, {"status": "stopped"})
     old = load_timing_report(old_target)
+    old['format_version'] = 1
+    for name in ('lateness_ns','cycle_remaining_ns','cycle_overrun_ns'):
+        del old['metrics'][name]
+    for row in (*old['raw']['samples'],*old['recent'],*old['slowest']):
+        row.pop('cycle_remaining_ns',None)
+        row.pop('cycle_overrun_ns',None)
     del old["metrics"]["single_exchange"]
     assert validate_timing_report(old) is old
 
@@ -184,7 +193,8 @@ def test_output_preflight_atomic_export_and_report_tampering(tmp_path, monkeypat
     )
     assert target.read_bytes() == original and not list(tmp_path.glob("*.partial"))
     for change in (
-        lambda r: r.update(format_version=2),
+        lambda r: r.update(format_version=3),
+        lambda r: r['metrics'].pop('cycle_remaining_ns'),
         lambda r: r["raw"].update(omitted=1),
         lambda r: r["recent"][0].update(work_elapsed_ns=0),
         lambda r: r["metrics"]["work_elapsed_ns"]["histogram"]["counts"].__setitem__(150, 2),
@@ -244,3 +254,132 @@ def test_snapshot_copy_throttle_and_callback_failure_rollback(monkeypatch):
     assert all(v["latest"] is None or v["latest"]["attempt_seq"] < v["observations"] for v in views)
     assert views[2]["latest"]["status"] == "miss_after_apply"
     assert corrected.report()["metrics"]["work_elapsed_ns"]["count"] == 0
+
+
+@pytest.mark.parametrize('offset,work,remaining,overrun', [
+    (200_000,5_000_000,14_800_000,0),
+    (100_000,19_900_000,0,0),
+    (0,20_000_001,0,1),
+    (-100_000,5_000_000,15_100_000,0),
+])
+def test_v2_integer_cycle_derivatives_have_exact_boundary_semantics(offset,work,remaining,overrun):
+    from secure_control.experiments.live_timing import CYCLE_METRICS
+
+    scheduled = 1_000_000_000-offset
+    row = observation(work=work,scheduled_start_ns=scheduled,deadline_ns=scheduled+20_000_000)
+    collector = LiveTimingCollector('samples',sample_limit=1)
+    collector.record(row)
+    report = collector.report()
+    sample = report['raw']['samples'][0]
+    assert report['format_version'] == 2
+    assert [sample[k] for k in CYCLE_METRICS] == [max(0,offset),remaining,overrun]
+    for key,expected in zip(CYCLE_METRICS,(max(0,offset),remaining,overrun),strict=True):
+        assert report['metrics'][key]['sum_ns'] == expected
+        assert report['metrics'][key]['missing_count'] == 0
+        assert 'histogram' not in report['metrics'][key]
+
+
+def test_v2_missing_endpoints_demo_and_correction_do_not_invent_cycle_margin():
+    from secure_control.experiments.live_timing import CYCLE_METRICS
+
+    collector = LiveTimingCollector('samples',sample_limit=4)
+    collector.record(observation())  # 演示虽有完整工作，也没有计划或周期余量。
+    scheduled=1_030_000_000
+    success=observation(1,scheduled_start_ns=scheduled-200_000,deadline_ns=scheduled+19_800_000)
+    collector.record(success)
+    assert collector.report()['metrics']['cycle_remaining_ns']['count'] == 1
+    collector.correct_last(replace(success,status='miss_after_apply',work_completed_ns=None))
+    collector.record(StepTimingObservation(2,2,0,status='miss_before_apply',
+        scheduled_start_ns=1_060_000_000,deadline_ns=1_080_000_000))
+    report=collector.report()
+    assert report['metrics']['lateness_ns']['sum_ns']==200_000
+    assert report['metrics']['lateness_ns']['missing_count']==2
+    assert report['status_counts']['confirmed']==1 and report['observations']==3
+    for key in CYCLE_METRICS[1:]:
+        assert report['metrics'][key]['count']==0 and report['metrics'][key]['missing_count']==3
+        assert all(r[key] is None for r in report['recent'])
+
+
+def test_v2_cycle_margin_uses_final_observation_stamp_and_rolls_back_error():
+    from secure_control.experiments.live_timing import CYCLE_METRICS
+
+    ticks=iter((1_000_000_000,1_021_000_000))
+    collector=LiveTimingCollector('samples',sample_limit=1)
+    collector.completion_clock=lambda:next(ticks)
+    collector.record(observation(work=5_000_000,scheduled_start_ns=1_000_000_000,deadline_ns=1_020_000_000))
+    sample=collector.report()['recent'][0]
+    assert sample['work_elapsed_ns']==21_000_000 and sample['cycle_overrun_ns']==1_000_000
+    assert sample['observation_ns']==21_000_000
+    broken=LiveTimingCollector(on_snapshot=lambda _:(_ for _ in ()).throw(RuntimeError()))
+    broken.record(observation(scheduled_start_ns=999_000_000,deadline_ns=1_019_000_000))
+    report=broken.report()
+    assert not report['statistics_complete'] and report['observations']==0
+    assert all(report['metrics'][k]['count']==0 for k in CYCLE_METRICS)
+
+
+def test_v2_strict_reader_rejects_forged_values_and_v1_remains_unmodified(tmp_path):
+    import copy
+
+    from secure_control.experiments.live_timing import (
+        CYCLE_METRICS,
+        export_timing,
+        load_timing_report,
+        validate_timing_report,
+    )
+
+    collector=LiveTimingCollector('samples',sample_limit=2)
+    collector.record(observation(scheduled_start_ns=999_800_000,deadline_ns=1_019_800_000))
+    path=tmp_path/'v2.json'
+    assert export_timing(collector,path,{'timing_mode':'absolute'},{'status':'stopped'})['export']['status']=='saved'
+    original=load_timing_report(path)
+    for change in (
+        lambda r:r['raw']['samples'][0].update(cycle_remaining_ns=0),
+        lambda r:r['recent'][0].update(cycle_overrun_ns=False),
+        lambda r:r['slowest'][0].update(cycle_remaining_ns=None),
+        lambda r:r['metrics']['lateness_ns'].update(missing_count=1),
+        lambda r:r['metrics']['cycle_remaining_ns'].update(sum_ns=3,mean_ns=3,min_ns=3,max_ns=3),
+        lambda r:r['metrics'].pop('single_exchange'),
+        lambda r:r['raw']['samples'][0].update(unknown_field=0),
+        lambda r:r.update(format_version=True),
+        lambda r:r.update(format_version=99),
+        lambda r:r['metrics']['cycle_overrun_ns'].update(sum_ns=2**63),
+        lambda r:r.update(observation_error='ValueError',statistics_complete=True),
+        lambda r:r['metrics']['cycle_overrun_ns'].update(mean_ns=False),
+    ):
+        bad=copy.deepcopy(original)
+        change(bad)
+        with pytest.raises(ValueError):
+            validate_timing_report(bad)
+    legacy=copy.deepcopy(original)
+    legacy['format_version']=1
+    for key in CYCLE_METRICS:del legacy['metrics'][key]
+    del legacy['metrics']['single_exchange']
+    for row in (*legacy['raw']['samples'],*legacy['recent'],*legacy['slowest']):
+        del row['cycle_remaining_ns'],row['cycle_overrun_ns']
+    before=copy.deepcopy(legacy)
+    assert validate_timing_report(legacy) is legacy and legacy==before
+    invalid_v2=copy.deepcopy(legacy)
+    invalid_v2['format_version']=2
+    with pytest.raises(ValueError):
+        validate_timing_report(invalid_v2)  # 不能仅把旧version2非法断言删除。
+    for path in (Path(__file__).resolve().parents[1]/'results/lan_continuous/performance').glob('*.json'):
+        # 真正历史v1文件只读，不能只测试由新报告退化的合成fixture。
+        if path.name in ('80fa6ce41b2f4032ac16ab992634a358.json','4aa7664d3db745c2921a9b08c6b41d04.json'):
+            report=load_timing_report(path)
+            assert report['format_version']==1
+
+
+def test_v2_null_cycle_metrics_constant_capacity_and_overflow():
+    from secure_control.experiments.live_timing import CYCLE_METRICS
+
+    collector=LiveTimingCollector('samples',sample_limit=10_000)
+    initial=(collector.buffer_bytes,len(collector.raw),len(collector.recent))
+    for k in range(257):collector.record(observation(k))
+    assert (collector.buffer_bytes,len(collector.raw),len(collector.recent))==initial
+    assert collector.buffer_bytes<=8*1024*1024
+    assert len(collector.report()['recent'])==256 and len(collector.report()['slowest'])==8
+    assert all(collector.report()['metrics'][key]['missing_count']==257 for key in CYCLE_METRICS)
+    broken=LiveTimingCollector()
+    broken.metrics['lateness_ns'].total=2**63-1
+    broken.record(observation(scheduled_start_ns=999_999_999,deadline_ns=1_019_999_999))
+    assert broken.report()['observation_error']=='ValueError'

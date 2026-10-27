@@ -44,6 +44,32 @@ def test_absolute_clock_keeps_initial_epoch_and_records_oversleep():
         CycleTiming("r", None, None, 0, 0, None, 20, 100, True, 120)
 
 
+def test_absolute_sampling_lateness_does_not_reset_schedule_or_make_long_interval_a_miss():
+    from secure_control.execution.cycle_timing import StepTimingObservation
+    from secure_control.experiments.live_timing import LiveTimingCollector
+
+    now=[0]
+    actual=(0,20_200_000,40_100_000)
+    clock=AbsoluteCycleClock(.02,now=lambda:now[0],sleep=lambda _:None)
+    collector=LiveTimingCollector('samples',sample_limit=3)
+    for step,stamp in enumerate(actual):
+        now[0]=stamp
+        start,deadline=clock.wait(step)
+        assert (start,deadline)==(step*20_000_000,(step+1)*20_000_000)
+        check_deadline(deadline,'sample',now=lambda:now[0])
+        collector.record(StepTimingObservation(step,step,0,actual_sample_start_ns=stamp,
+            control_applied_ns=stamp+2_000_000,work_completed_ns=stamp+3_000_000,
+            scheduled_start_ns=start,deadline_ns=deadline,status='confirmed',
+            sample_interval_ns=None if step==0 else stamp-actual[step-1]))
+    report=collector.report()
+    assert [r['lateness_ns'] for r in report['recent']]==[0,200_000,100_000]
+    assert [r['cycle_remaining_ns'] for r in report['recent']]==[17_000_000,16_800_000,16_900_000]
+    assert report['metrics']['sample_interval_ns']['above_20ms']==1
+    assert report['status_counts']['confirmed']==3
+    with pytest.raises(CycleDeadlineExceeded):
+        check_deadline(60_000_000,'complete',now=lambda:60_000_000)
+
+
 def test_transport_deadlines_keep_legacy_clock_and_use_qpc_for_new_cycles(monkeypatch):
     from secure_control.execution import cycle_timing, lan_transport, localhost_transport
     monkeypatch.setattr(cycle_timing.time, "monotonic", lambda: 100.)
@@ -169,6 +195,9 @@ def test_unique_runner_rejects_late_command_and_keeps_applied_fact(monkeypatch, 
         assert statistics["recent"][0]["work_completed_ns"] is None
         assert statistics["recent"][0]["status"] == ("miss_before_apply" if not applied else "miss_after_apply")
         assert statistics["metrics"]["control_latency_ns"]["count"] == (0 if not applied else 1)
+        assert statistics['metrics']['cycle_remaining_ns']['count']==0
+        assert statistics['metrics']['cycle_overrun_ns']['count']==0
+        assert statistics['recent'][0]['cycle_remaining_ns'] is None
     if late_phase in ("observation","performance_observation"):
         from secure_control.experiments.cart_pole_segmented_evidence import (
             _correct_cycle_tail,

@@ -1,5 +1,39 @@
 # 独立三角色连续 LAN 实验（Issues #86、#84、#75、#92）
 
+## 绝对节拍与演示计时（D132-14）
+
+动态持续light入口省略`--non-realtime`时，复用既有`AbsoluteCycleClock`：
+目标为`t0+kT`，跨段不重设t0；输入、通信、施力、记录及维护共用原周期截止。
+恰到截止也按超期处理。此模式在超期时依原契约停止，不保证Windows准时唤醒。
+显式`--non-realtime`为非实时演示，以前次实际采样加T等待，无周期截止；
+模型T均保持原场景20ms，演示模式的采样间隔偏差可能累计，不能说成算术耗时。
+本次没有改变默认模式、时钟、等待算法、控制或通信协议。
+
+```powershell
+# 已按两机部署说明启动P1/P2后，在Client运行动态持续light绝对节拍：
+uv run python scripts/run_cart_pole_client.py configs/lab-client-cart-pole-demo.example.yaml --headless-continuous --recording light --performance samples
+# 演示模式是在同一命令上显式添加 --non-realtime；sample-limit仅保存容量，不限控制步数。
+```
+
+GUI沿原100ms快照刷新，显示采样迟到、采样至施力、完整工作及周期余量/超期。
+迟到=`max(0,actual_sample_start-scheduled_start)`；余量/超期分别是
+`max(0,deadline-work_completed)`、`max(0,work_completed-deadline)`。
+均用Client既有同域整数端点，不相减不同电脑时钟。
+完整工作仍含维护与已有观察成本，固定末尾统计/写缓冲自身未自计时，但仍受原严格截止复查。
+未完成工作不填失败出口时间，显示“未完成”；演示无计划显示“不适用”，不伪造0。
+余量为0且超期为0表示“已到截止，不算准时”。实际相邻采样间隔可一长一短，
+不能仅凭间隔>20ms判周期失败，也不能凭均值接近20ms保证零迟到。
+
+新保存性能报告`cart_pole_live_timing`的`format_version=2`，新增迟到/余量/超期固定汇总
+（计数、总和、极值、missing_count，无额外直方图），行值从原端点派生。
+新reader严格校验v2；v1保持旧字段/算式并可原样读取，包括缺single_exchange的历史例外，
+不会自动重写旧文件，未知版本拒绝。旧reader不承诺读取v2，分析工具需升级；
+三端控制线格式没有变化。缓冲仍≤8MiB，完整样本≤10000、近期256、最慢8，退出后集中保存。
+`correct_last`会撤销此前临时成功的新增统计，观察失败标partial，不掩盖真实控制状态。
+
+这里只完成软件计时与模式说明，没有新增控制性能运行或双机/长期20ms资格证据。
+D13已有结果继续标记Work实测、未独立结果复核。
+
 ## 公开计划临时对象生命周期（D132-13）
 
 服务器恢复/绑定会校验公开计划并建立独立peer快照。递归校验与复制使用模块私有helper，

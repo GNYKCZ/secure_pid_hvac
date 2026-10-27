@@ -58,6 +58,7 @@ NUMBERS = ("attempt_seq", "global_step", "segment_index", *NUMBERS)
 ROW = struct.Struct("<" + "q" * (len(NUMBERS) + len(PHASES) + len(QUEUES)) + "128s32s64s")
 BIN_NS = 100_000
 BINS = 10_001
+CYCLE_METRICS = ("lateness_ns", "cycle_remaining_ns", "cycle_overrun_ns")
 STATUSES = {
     "confirmed",
     "failed",
@@ -187,7 +188,26 @@ def _pack(row):
     return ROW.pack(*[-1 if v is None else v for v in values], *strings)
 
 
-def _unpack(data):
+def timing_derivatives(row, *, version=2):
+    """只从Client既有整数端点派生；无计划或未完成为null，不创造另一份时钟。"""
+    start, scheduled, deadline, completed = (row[k] for k in
+        ("actual_sample_start_ns", "scheduled_start_ns", "deadline_ns", "work_completed_ns"))
+    values = {key: row[end]-start if row[end] is not None and start is not None else None
+              for key,end in (("control_latency_ns","control_applied_ns"),
+                              ("work_elapsed_ns","work_completed_ns"))}
+    values["lateness_ns"] = max(0,start-scheduled) if start is not None and scheduled is not None else None
+    if version == 2:
+        values["cycle_remaining_ns"] = max(0,deadline-completed) if deadline is not None and completed is not None else None
+        values["cycle_overrun_ns"] = max(0,completed-deadline) if deadline is not None and completed is not None else None
+    return values
+
+
+def timing_mode_label(non_realtime):
+    """启动/界面/终态共用模式说明，不据此改变正式选择。"""
+    return ("非实时演示：无周期截止" if non_realtime else "绝对节拍：超期按原契约停止")
+
+
+def _unpack(data, *, version=2):
     values = ROW.unpack(data)
     row = {k: None if v == -1 else v for k, v in zip(NUMBERS, values, strict=False)}
     offset = len(NUMBERS)
@@ -200,17 +220,7 @@ def _unpack(data):
     }
     for key, value in zip(("round_id", "status", "failure_phase"), values[-3:], strict=True):
         row[key] = value.rstrip(b"\0").decode("utf-8") or None
-    start = row["actual_sample_start_ns"]
-    for key, end in (
-        ("control_latency_ns", "control_applied_ns"),
-        ("work_elapsed_ns", "work_completed_ns"),
-    ):
-        row[key] = row[end] - start if row[end] is not None else None
-    row["lateness_ns"] = (
-        max(0, start - row["scheduled_start_ns"])
-        if start is not None and row["scheduled_start_ns"] is not None
-        else None
-    )
+    row.update(timing_derivatives(row,version=version))
     return row
 
 
@@ -241,6 +251,7 @@ class LiveTimingCollector:
                     "pacing_elapsed_ns",
                     "pacing_excess_ns",
                     "observation_ns",
+                    *CYCLE_METRICS,
                 )
             }
         )
@@ -292,6 +303,7 @@ class LiveTimingCollector:
                     "pacing_elapsed_ns",
                     "pacing_excess_ns",
                     "observation_ns",
+                    "lateness_ns",
                 )
             }
             measurements.update(data["phase_durations_ns"])
@@ -313,7 +325,7 @@ class LiveTimingCollector:
             )
             packed = _pack(row)
             data = _unpack(packed)
-            for key in ("work_elapsed_ns", "observation_ns"):
+            for key in ("work_elapsed_ns", "observation_ns", "cycle_remaining_ns", "cycle_overrun_ns"):
                 if data[key] is not None:
                     saved[0][key] = self.metrics[key].add(data[key])
             slot = self.count % 256
@@ -424,7 +436,7 @@ class LiveTimingCollector:
 
         return {
             "schema": "cart_pole_live_timing",
-            "format_version": 1,
+            "format_version": 2,
             "mode": self.mode,
             "observations": self.count,
             "observation_range": {
@@ -457,7 +469,7 @@ class LiveTimingCollector:
             "waiting_terminal": self.waiting_terminal,
             "lifecycle_ns": dict(self.lifecycle_ns),
             "buffer_bytes": self.buffer_bytes,
-            "observation_boundary": "observation_ns measures assembly/aggregation/UI snapshot up to terminal stamp; fixed final histogram/packing/buffer stores are not self-measured; all remain inside original strict deadline check",
+            "observation_boundary": "observation_ns measures assembly/aggregation/UI snapshot up to terminal stamp; fixed final histogram/cycle-derived aggregation/packing/buffer stores are not self-measured; all remain inside original strict deadline check",
             "phase_semantics": "stage/single_exchange include distribution/server processing/network wait, not pure RTT; preauthorized single_exchange includes READY and commit; old stage/commit absent there; maintenance parent contains maintenance_*; commit contains p1/p2_commit; do not sum nested times",
         }
 
@@ -554,6 +566,7 @@ def export_timing(collector, target, metadata, outcome):
                 pass
     return {
         "mode": collector.mode,
+        "timing_mode": metadata.get("timing_mode"),
         "export": saved,
         "observations": collector.count,
         "statistics_complete": not collector.observation_error,
@@ -596,7 +609,7 @@ def _validate_timing_report(report):
     if (
         report["schema"] != "cart_pole_live_timing"
         or type(report["format_version"]) is not int
-        or report["format_version"] != 1
+        or report["format_version"] not in (1,2)
     ):
         raise ValueError("不支持的性能报告版本。")
 
@@ -619,6 +632,8 @@ def _validate_timing_report(report):
         raise ValueError("性能报告模式/内存无效。")
     if type(report["statistics_complete"]) is not bool:
         raise ValueError("统计完整性不是布尔值。")
+    if report['format_version'] == 2 and (report['statistics_complete'] != (report['observation_error'] is None)):
+        raise ValueError("统计完整性与观察错误矛盾。")
     statuses = report["status_counts"]
     if set(statuses) != STATUSES:
         raise ValueError("报告状态集合无效。")
@@ -637,7 +652,10 @@ def _validate_timing_report(report):
         "pacing_excess_ns",
         "observation_ns",
     }
-    if set(metrics) not in (names, names-{"single_exchange"}):
+    version = report["format_version"]
+    if version == 2:
+        names.update(CYCLE_METRICS)
+    if set(metrics) not in ((names,names-{"single_exchange"}) if version == 1 else (names,)):
         raise ValueError("指标集合无效。")
     for name, metric in metrics.items():
         fields = {
@@ -654,6 +672,9 @@ def _validate_timing_report(report):
             fields |= {"histogram", "quantiles"}
         if set(metric) != fields:
             raise ValueError("指标字段缺失或未知。")
+        if version == 2 and metric['mean_ns'] is not None and (
+                type(metric['mean_ns']) not in (int,float) or not math.isfinite(metric['mean_ns'])):
+            raise ValueError("指标均值类型或范围无效。")
         n = metric["count"]
         for k in ("count", "sum_ns", "above_15ms", "above_20ms"):
             integer(metric[k])
@@ -748,12 +769,38 @@ def _validate_timing_report(report):
             value = StepTimingObservation(
                 **{k: row[k] for k in StepTimingObservation.__dataclass_fields__}
             )
-            if row != _unpack(_pack(value)) or row["attempt_seq"] >= count:
+            if row != _unpack(_pack(value),version=version) or row["attempt_seq"] >= count:
                 raise ValueError("样本端点或派生耗时不符。")
+            if version == 2:
+                for name in CYCLE_METRICS:
+                    if row[name] is not None:
+                        integer(row[name])
     if [r["attempt_seq"] for r in raw["samples"]] != list(range(raw["captured"])):
         raise ValueError("原始样本不是首N次观察。")
     if [r["attempt_seq"] for r in report["recent"]] != list(range(max(0, count - 256), count)):
         raise ValueError("近期样本范围不符。")
+    if version == 2:
+        # 首N/近期可能重叠；每个真实尝试只计一次，并要求重复表示完全一致。
+        known = {}
+        for row in (*raw["samples"],*report["recent"],*report["slowest"],
+                    *([report["first_failure"]] if report["first_failure"] else [])):
+            seq = row["attempt_seq"]
+            if seq in known and row != known[seq]:
+                raise ValueError("同一观察的重复记录矛盾。")
+            known[seq] = row
+        for name in CYCLE_METRICS:
+            values = [r[name] for r in known.values() if r[name] is not None]
+            metric = metrics[name]
+            if (len(values) > metric["count"] or sum(values) > metric["sum_ns"]
+                    or len(known)-len(values) > metric["missing_count"]
+                    or any(v < metric["min_ns"] or v > metric["max_ns"] for v in values)):
+                raise ValueError("派生指标与已保存端点矛盾。")
+            if len(known) == count:
+                expected = _Metric()
+                for value in values:
+                    expected.add(value)
+                if metric != {**expected.report(),"missing_count":count-len(values)}:
+                    raise ValueError("派生指标汇总与全部端点不符。")
     return report
 
 

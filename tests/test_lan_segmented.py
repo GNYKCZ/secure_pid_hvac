@@ -868,7 +868,8 @@ def test_dynamic_v2_keeps_secret_state_in_one_session_across_segments(tmp_path):
 
 @pytest.mark.parametrize("delay_ns", [0, 55_000_000])
 @pytest.mark.parametrize("non_realtime", [True, False])
-@pytest.mark.parametrize("wire", ["control-batch-v1", "control-dynamic-compact-v2", "control-dynamic-matrix-v1"])
+@pytest.mark.parametrize("wire", ["control-batch-v1", "control-dynamic-compact-v2", "control-dynamic-matrix-v1",
+                                  "control-dynamic-matrix-preauthorized-v2"])
 def test_demo_paces_actual_samples_and_slow_steps_do_not_refresh_realtime_deadline(
     tmp_path, monkeypatch, delay_ns, non_realtime, wire,
 ):
@@ -878,7 +879,8 @@ def test_demo_paces_actual_samples_and_slow_steps_do_not_refresh_realtime_deadli
     paths = _plain_deployment(tmp_path)
     from test_cart_pole_lan import _observer_profile_for
     _observer_profile_for(paths)
-    config = replace(load_lan_config(paths["Client"], "Client"), wire_profile=wire)
+    config = replace(load_lan_config(paths["Client"], "Client"), wire_profile=wire,
+                     client_io='ready-v1' if wire=='control-dynamic-matrix-preauthorized-v2' else 'blocking-v1')
     control, session = RunControl(), InteractiveSession()
     prepared = load_segmented_experiment(config.experiment_config, 3, session)
     now, samples, deadlines, initialized, sleeps, closed = [1_000_000_000], [], [], [], [], []
@@ -935,6 +937,15 @@ def test_demo_paces_actual_samples_and_slow_steps_do_not_refresh_realtime_deadli
         control=control, session=session, non_realtime=non_realtime,timing_observer=collector)
     statistics = collector.report()
     assert statistics["statistics_complete"]
+    assert statistics['format_version']==2
+    if non_realtime:
+        assert all(statistics['metrics'][key]['missing_count']==statistics['observations']
+                   for key in ('lateness_ns','cycle_remaining_ns','cycle_overrun_ns'))
+    elif delay_ns:
+        assert statistics['metrics']['cycle_remaining_ns']['count']==0
+    else:
+        assert statistics['metrics']['cycle_remaining_ns']['count']==3
+        assert statistics['metrics']['cycle_remaining_ns']['min_ns']==20_000_000
     if non_realtime:
         assert all(0 < seconds <= .005 for seconds in sleeps)
         if delay_ns:
