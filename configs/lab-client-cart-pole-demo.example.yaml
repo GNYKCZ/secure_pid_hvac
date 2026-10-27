@@ -2,8 +2,9 @@
 # 非实时启动需显式传 --non-realtime --recording light；省略仍保留 20 ms 截止检查。
 role: Client
 transport: insecure_tcp
-wire_profile: control-dynamic-matrix-v1
-topology: local-deployment.example.yaml
+wire_profile: control-dynamic-matrix-preauthorized-v2
+client_io: ready-v1
+topology: lab-cart-pole-demo-deployment.example.yaml
 experiment: cart_pole_observer_lan.example.yaml
 timeouts:
   startup: 180

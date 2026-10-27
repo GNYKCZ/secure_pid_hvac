@@ -732,16 +732,18 @@ print(json.dumps({'result':json.loads(output.getvalue()),'rows':rows,'began':beg
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("wire", ["control-dynamic-compact-v2", "control-dynamic-matrix-v1"])
-@pytest.mark.parametrize("mode", ["normal", "commit_ack_loss", "worker_failure", "cancel", "mismatch",
-                                  "stop_preparing", "stop_advance", "cleanup_failure"])
+@pytest.mark.parametrize("mode,wire", [
+    (mode,wire) for mode in ("normal", "commit_ack_loss", "worker_failure", "cancel", "mismatch",
+                           "stop_preparing", "stop_advance", "cleanup_failure")
+    for wire in ("control-dynamic-compact-v2", "control-dynamic-matrix-v1")
+] + [("normal","control-dynamic-matrix-preauthorized-v2")])
 def test_demo_ordinary_scripts_use_compact_worker_and_stop_without_cycle_claims(tmp_path, mode, wire):
     """真实无证书脚本/worker；短功能用例跨段并覆盖失败，不测性能或声明跨机。"""
     from lan_test_support import start_processes
     from test_lan_single_step import _run_fault
 
     paths = _plain_deployment(tmp_path)
-    shipped_demo = mode == "normal" and wire == "control-dynamic-matrix-v1"
+    shipped_demo = mode == "normal" and wire == "control-dynamic-matrix-preauthorized-v2"
     if not shipped_demo:
         _observer_profile_for(paths)
     for role, path in paths.items():
@@ -753,11 +755,14 @@ def test_demo_ordinary_scripts_use_compact_worker_and_stop_without_cycle_claims(
             selected = load_lan_config(source, role)
             assert selected.transport == "insecure_tcp" and selected.wire_profile == wire
             assert selected.ca is selected.certificate is selected.private_key is None
-            assert template["topology"] == "local-deployment.example.yaml"
+            assert template["topology"] == "lab-cart-pole-demo-deployment.example.yaml"
             template["topology"] = data["topology"]
             if role == "Client":
                 assert template["experiment"] == "cart_pole_observer_lan.example.yaml"
+                assert selected.client_io == "ready-v1"
                 template["experiment"] = str(selected.experiment_config)
+            else:
+                assert 'client_io' not in template
             data = template
         else:
             data["wire_profile"] = "control-batch-v1" if mode == "mismatch" and role == "P2" else wire
@@ -810,7 +815,7 @@ def test_demo_ordinary_scripts_use_compact_worker_and_stop_without_cycle_claims(
             assert result["protocol_committed_count"] == 19 and result["final_segment"]["hello"]["segment_index"] == 3
             assert [row["g"] for row in rows] == list(range(19)) and len({row["session"] for row in rows}) == 1
             assert len({row["round"] for row in rows}) == 19
-            matrix = wire == "control-dynamic-matrix-v1"
+            matrix = wire in ("control-dynamic-matrix-v1","control-dynamic-matrix-preauthorized-v2")
             assert len({r for row in rows for r in row["resources"]}) == 19 * (5 if matrix else 34)
             assert result["resource_counts"] == ({"matrix_products_consumed": 19,
                 "scalar_equivalent_products": 570, "multiplication_material_elements": 779,
