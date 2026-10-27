@@ -52,6 +52,7 @@ from .localhost_transport import (
     receive_envelope,
     send_envelope,
 )
+from .tail_diagnostics import current
 
 Address = tuple[str, int]
 Role = Literal["P1", "P2"]
@@ -179,6 +180,11 @@ class LocalhostProtocol3PeerPort:
     def _exchange_preauthorized(self, operation, payload, session, round_id, step):
         if self._wire_profile not in PREAUTHORIZED_PROFILES or session != self._session_id:
             raise ValueError("前缀/预授权需要显式同一session")
+        diagnostic = current()
+        phase = 'prefix_peer' if operation == 'peer_prefix' else 'suffix' if operation == 'peer_suffix' else 'ready'
+        if diagnostic is not None:
+            diagnostic.emit(phase,0,-1 if operation == 'peer_prefix' else step,
+                            step if operation == 'peer_prefix' else -1)
         outgoing = WireEnvelope(SCHEMA_VERSION, "request", self._role, self._peer,
             self._send_sequence, operation, session, round_id, step, None, payload)
         incoming = decode_envelope(_exchange_frame(self._connection, encode_envelope(outgoing),
@@ -190,6 +196,9 @@ class LocalhostProtocol3PeerPort:
             raise ValueError("预授权peer身份/序号/阶段错误")
         self._send_sequence += 1
         self._receive_sequence += 1
+        if diagnostic is not None:
+            diagnostic.emit(phase,1,-1 if operation == 'peer_prefix' else step,
+                            step if operation == 'peer_prefix' else -1)
         return incoming.payload
 
     def install_permit(self, permit):

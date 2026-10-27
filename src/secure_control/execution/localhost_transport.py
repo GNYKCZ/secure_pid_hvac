@@ -177,7 +177,7 @@ def receive_frame(sock: socket.socket, *, deadline: float, limit: int) -> bytes:
     return _receive_exact(sock, length, deadline)
 
 
-def _exchange_two_frames(sockets, payloads, *, deadline, limit, on_request, on_reply):
+def _exchange_two_frames(sockets, payloads, *, deadline, limit, on_request, on_reply, observer=None):
     """原线程推进两路各一请求/回复；回调只报告字节事实，不解释业务授权。"""
     if len(sockets) != 2 or len(payloads) != 2 or sockets[0] is sockets[1]:
         raise ValueError("双连接交换需要两条独立socket及两份payload。")
@@ -189,6 +189,7 @@ def _exchange_two_frames(sockets, payloads, *, deadline, limit, on_request, on_r
     targets, headers, complete, attempted = [4, 4], [False, False], [False, False], [False, False]
     previous = [sock.gettimeout() for sock in sockets]
     primary = None
+    read_mask = 0
 
     def budget():
         remaining = remaining_seconds(deadline)
@@ -261,6 +262,9 @@ def _exchange_two_frames(sockets, payloads, *, deadline, limit, on_request, on_r
                     raise LocalhostTransportDisconnected("双连接接收失败。") from error
                 if not chunk:
                     raise LocalhostTransportDisconnected("完整回复到达前连接关闭。")
+                if observer is not None and not read_mask & (1 << p):
+                    observer('reply_read', 0, aux=p)
+                    read_mask |= 1 << p
                 incoming[p].extend(chunk)
                 progressed = True
                 if len(incoming[p]) == targets[p]:
@@ -272,6 +276,8 @@ def _exchange_two_frames(sockets, payloads, *, deadline, limit, on_request, on_r
                         headers[p] = True
                     else:
                         budget()
+                        if observer is not None:
+                            observer('reply_frame', 0, aux=p)
                         on_reply(p, bytes(incoming[p]))
                         complete[p] = True
                 budget()

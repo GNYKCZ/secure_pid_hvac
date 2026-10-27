@@ -190,6 +190,8 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                             _material_candidate=None, _wire_profile=None,
                             non_realtime=False, timing_observer=None) -> dict[str, object]:
     """唯一持续循环接收已装配场景；保存/GUI 与 headless 不重复 parse 或创建 plant。"""
+    from secure_control.execution.tail_diagnostics import current
+    diagnostic = current()
     control.bind_stop(session.reject_new)
     wire_profile = _wire_profile if _wire_profile is not None else getattr(config, "wire_profile", "control-batch-v1")
     # 旧实验显式参数仍归原实验 owner；普通角色配置的选择才装配演示 worker。
@@ -417,6 +419,8 @@ def _run_prepared_segmented(config, experiment, *, control, session,
             if session.cancelled.is_set():
                 raise RuntimeError("Client 运行已取消。")
             if control.stop_requested or runtime.segment_full:
+                if diagnostic is not None and control.stop_requested:
+                    diagnostic.stop_control()
                 # 非实时自动维护保持原位置，观察归刚填满的上一控制步。
                 if control.stop_requested:
                     observe_finish()
@@ -477,6 +481,9 @@ def _run_prepared_segmented(config, experiment, *, control, session,
                 before_sample()
             progress("INPUT")
             started = perf_counter_ns()
+            if diagnostic is not None:
+                diagnostic.control_step(runtime.confirmed_step_count)
+                diagnostic.emit('sample',0,runtime.confirmed_step_count,wall_ns=started)
             if timing_observer is not None:
                 observation.update(actual_sample_start_ns=started,
                     sample_interval_ns=started-previous_sample_ns if previous_sample_ns is not None else None)
@@ -630,6 +637,8 @@ def _run_prepared_segmented(config, experiment, *, control, session,
         session.stop_accepting()
         if runtime is not None:
             cleanup_started = perf_counter_ns()
+            if diagnostic is not None:
+                diagnostic.begin_cleanup()
             try:
                 runtime.close()
             except Exception as error:

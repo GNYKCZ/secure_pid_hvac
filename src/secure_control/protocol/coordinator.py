@@ -301,14 +301,30 @@ class Protocol3BatchPeerPort(Protocol):
     def state_complete(self, plan: StepResourcePlan) -> None: ...
 
 
+def _observe_boundary(observer, phase, edge, step=-1, material=-1, aux=0):
+    """仅接受可选公开边界回调；观察异常不能改变协议状态或授权。"""
+    if observer is not None:
+        try:
+            observer(phase,edge,step,material,aux)
+        except Exception as error:  # noqa: BLE001 - 不输出秘密/异常文本，不影响业务。
+            failed = getattr(observer,'observation_failed',None)
+            if callable(failed):
+                try:
+                    failed(error)
+                except Exception:  # noqa: BLE001 - 外部观察器连错误处理也失败时仍不改变协议。
+                    return
+
+
 def stage_protocol3_batch(
     endpoint: LocalProtocol3PartyEndpoint, peer: Protocol3BatchPeerPort,
+    *, observer=None,
 ) -> Protocol3StageReceipt:
     """单方整步阶段；所有产品先聚合，再按原行次序截断并暂存。"""
     if not isinstance(endpoint, LocalProtocol3PartyEndpoint):
         raise TypeError("批量 stage 需要 canonical 单方 endpoint")
     plan = endpoint.plan
     try:
+        _observe_boundary(observer,'matrix',0,plan.step)
         masks = tuple(endpoint.mask_product(item) for item in plan.product_resources)
         incoming = ((peer.exchange_suffix(plan, endpoint._permit, masks[0]),)
                     if endpoint.completion_strategy == "peer_ready" else peer.exchange_products(plan, masks))
@@ -321,7 +337,9 @@ def stage_protocol3_batch(
             for metadata in plan.product_resources:
                 endpoint.complete_product(metadata)
         endpoint.finish_products()
+        _observe_boundary(observer,'matrix',1,plan.step)
         if plan.state_truncation_resources:
+            _observe_boundary(observer,'truncation',0,plan.step)
             for metadata in plan.state_truncation_resources:
                 endpoint.mask_truncation(metadata)
             if endpoint.party == 1:
@@ -340,7 +358,10 @@ def stage_protocol3_batch(
                 peer.state_complete(plan)
                 for metadata in plan.state_truncation_resources:
                     endpoint.complete_truncation(metadata)
-        return endpoint.stage_output()
+            _observe_boundary(observer,'truncation',1,plan.step)
+        receipt = endpoint.stage_output()
+        _observe_boundary(observer,'stage',0,plan.step)
+        return receipt
     except Exception:
         endpoint.abort()
         raise
@@ -1100,7 +1121,8 @@ class _OnlineMaterialRecovery:
 
     def __init__(self, offline: OfflineControllerMessage, *, modulus: int,
                  security_parameter: int,
-                 modulus_evidence: PrimeModulusEvidence | None) -> None:
+                 modulus_evidence: PrimeModulusEvidence | None, observer=None) -> None:
+        self._observer = observer
         self._offline = offline
         self._sharing = TwoPartySharing(modulus)
         self._multiplier = BeaverMultiplier(self._sharing)
@@ -1124,6 +1146,8 @@ class _OnlineMaterialRecovery:
         start, cpu = time.perf_counter_ns(), time.process_time_ns()
         prefix = None
         location = {"global_step": self._seeded_next, "segment_index": segment_index, "origin": origin}
+        origin_code = 0 if origin == 'startup' else 1 if origin == 'ordinary' else 2
+        _observe_boundary(self._observer,'prefix',0,-1,self._seeded_next,origin_code)
         try:
             slot, context = self._seeded_slot, self._seeded_context
             if (self._prefix is not None or slot is None or context is None
@@ -1144,6 +1168,7 @@ class _OnlineMaterialRecovery:
                 self._fixed_matrix.value.flags.writeable = False
             prefix = MatrixPrefix(owner, triple, self._fixed_matrix,
                                   AdditiveShare(role.state_share.value.reshape(n, 1)))
+            _observe_boundary(self._observer,'prefix',1,-1,self._seeded_next,origin_code)
             identity = (context.run_id, context.session_id, context.epoch, segment_index,
                         self._seeded_next, role.state_version, self._prefix_context_sha256)
             e, fx = peer.exchange_prefix(identity, prefix.e_share, prefix.fx_share, q)
@@ -1219,6 +1244,7 @@ class _OnlineMaterialRecovery:
         if self._seeded_next >= 1 << 64 or horizon is not None and self._seeded_next >= horizon:
             return False
         start,cpu = time.perf_counter_ns(),time.process_time_ns()
+        _observe_boundary(self._observer,'seed',0,-1,self._seeded_next)
         try:
             self._seeded_slot = expand_party(self._seeded_key,self._seeded_context,self._seeded_next)
         except Exception:
@@ -1228,6 +1254,7 @@ class _OnlineMaterialRecovery:
         finally:
             self.seeded_statistics["prepare_ns"] += time.perf_counter_ns()-start
             self.seeded_statistics["cpu_ns"] += time.process_time_ns()-cpu
+        _observe_boundary(self._observer,'seed',1,-1,self._seeded_next)
         self.seeded_statistics["prepared_count"] += 1
         return True
 

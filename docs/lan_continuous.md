@@ -1,5 +1,53 @@
 # 独立三角色连续 LAN 实验（Issues #86、#84、#75、#92）
 
+## 有界慢步骤诊断（D132-12）
+
+普通GUI/headless默认不启用该诊断，不分配事件缓冲、不安装GC回调。
+显式入口 `scripts/run_control_tail_diagnostic.py` 提供 `local` 与只读 `analyze`，
+复用原Client/P1/P2和原供料worker，未新增记录进程/线程或网络消息。
+当前一次400步定位已获用户批准，必须先完成本轮软件独审；旧D11审查不覆盖本轮新head。
+依据：[D12设计](https://github.com/GNYKCZ/secure_pid_hvac/issues/132#issuecomment-6435523226)、
+[一次运行批准](https://github.com/GNYKCZ/secure_pid_hvac/issues/132#issuecomment-6435583866)。
+
+软件独审通过并冻结head后，本机命令为（输出目录必须不存在）：
+
+```powershell
+$diagnosticHead = git rev-parse HEAD
+$diagnosticReview = Read-Host '输入覆盖该head的D12独立审查评论链接'
+uv run python scripts/run_control_tail_diagnostic.py local results/tail_diagnostics/d12-local --expected-head $diagnosticHead --software-review $diagnosticReview
+uv run python scripts/run_control_tail_diagnostic.py analyze results/tail_diagnostics/d12-local/manifest.json --same-host --output results/tail_diagnostics/d12-local/analysis.json
+```
+
+`local`固定ready-v1、原preauthorized-v2/insecure_tcp、两测量observer、20ms模型、
+非实时headless、段400和worker16；用隔离的127.0.0.1配置，不读取/修改用户LAN拓扑。
+默认最多400个确认步（软件短测试可显式选1…400），第400次确认后请求原RunControl停止，
+不发起401；sample容量不是停止条件。>5ms只是离线筛选标签，不能在102先停而漏285/290。
+每次仅一组，24秒父收集和有界自身PID树清退，为30秒组上限留余量；实际超时、强退、
+未知提交、导出失败均保留为失败/不完整，代码等待预算不是操作系统硬实时保证。
+账本在任何角色启动前扣减；目录/角色文件/manifest拒覆盖，没有补跑/热身/恢复入口。
+本次批准不含第二组、双机现场、native trace、未知修复或新性能资格。
+
+每进程预分配12288×64B普通事件、2048×64B GC事件及64KiB身份表，
+数字缓冲合计983040B≤1MiB，四进程≤4MiB；满容量不覆盖旧事件，标丢失序号及不完整。
+热路径只写固定数字边界，不逐条JSON/写盘/排序，不记录share、seed内容、秘密状态/参数或摘要。
+控制步与材料目标步分开；已有辅助线程保留native ID。协议层只接受可选公开callable。
+GC回调记录start/stop/generation及活动控制阶段/线程/材料目标，不改变enabled/700/10/10，
+不额外collect或枚举对象，保留原启动清理和其他GC回调，退出只移除本次回调。
+
+角色文件使用`control-tail-diagnostic-v1`。实际本机spawn收据、父子PID和时钟实现核对通过，
+才允许同域拼时间线；同hostname/相同人工标签不构成证明。不同域严格分轴，
+未来A上的Client/worker与B上的P1/P2可以通过同一`analyze`入口关联协议身份/步骤，
+不能直接相减两端ns或把Client减server叫纯网络。当前真实双机启动/运行仍不在范围内。
+
+分析保留285/290、实际最慢及>5ms步骤和相邻正常对照。父子span列exclusive时间，
+并行/GC重叠用同域区间并集，不重复相加；startup/stop/cleanup GC不计入真实控制窗口。
+CPU记账可能量化，0不能证明网络等待；应用首次read/send完成也不是硬件到包时间。
+证据分`Located`、`Contributor observed`、`Fixable mechanism confirmed`、
+`Unresolved system/link wait`；仅有GC重叠不确认可修复根因，下一槽/辅助线程GC不冒充当前控制停顿。
+带观察的时间不与D11无探针结果直接比较净提速；观察可能改变GC触发步号，未复现就如实停止。
+第399步为最终停止，与旧1000步继续维护不同。`plan.json`、`ledger.json`、四角色文件和
+`manifest.json`保留源码/配置/时钟/退出/保存/hash事实；任何缺端点、满缓冲或保存失败均不造零。
+
 ## Client 双连接就绪驱动候选（D132-11）
 
 这是显式选择的软件候选，默认仍为 `client_io: blocking-v1`。
