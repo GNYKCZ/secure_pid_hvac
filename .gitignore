@@ -32,5 +32,6 @@ results/sweeps/*
 results/safety/*
 !results/safety/.gitkeep
 results/diagnostics/*
+results/tail_diagnostics/*
 results/exact_grid/*
 results/lan_continuous/

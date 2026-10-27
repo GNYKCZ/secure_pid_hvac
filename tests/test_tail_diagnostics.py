@@ -545,3 +545,306 @@ def test_observation_preserves_existing_independent_output_oracle_and_failure_se
         saved = recorder.save('stopped' if fault is None else 'failed')
     assert saved['status'] == 'saved' and current() is None and gc.callbacks == callbacks
     assert {p.name for p in tmp_path.glob('*.json')} == {'Client.json','P1.json','P2.json','worker.json'}
+
+
+@pytest.mark.parametrize('side',['client','pair'])
+@pytest.mark.parametrize('failure',[False,True])
+def test_two_host_freezes_actual_config_reserves_id_and_keeps_partial(tmp_path,monkeypatch,side,failure):
+    """纯装配oracle，不启动双机或本机替代实验；同ID换目录仍被账本拒绝。"""
+    from dataclasses import asdict
+
+    from secure_control.experiments import tail_diagnostic_runner as runner
+    root = runner.ROOT
+    monkeypatch.setattr(runner,'ROOT',tmp_path)
+    monkeypatch.setattr(runner.subprocess,'check_output',lambda args,**kw:
+        'a'*40 if 'rev-parse' in args else '')
+    records,_ = fixture_records(dual=True)
+    wanted = {'Client','worker'} if side=='client' else {'P1','P2'}
+    subset = [r for r in records if r['role'] in wanted]
+    configs = [root/'configs'/f'lab-{r}-cart-pole-demo.example.yaml'
+               for r in (['client'] if side=='client' else ['p1','p2'])]
+
+    def collect(loaded,ctx,steps,*,wall_started):
+        assert [c.role for c in loaded] == (['Client'] if side=='client' else ['P1','P2'])
+        assert all(c.topology.p1_peer.host=='192.168.31.116' for c in loaded)
+        reports = []
+        for record in subset:
+            record['context'] = asdict(ctx)
+            if record['role']!='worker':
+                record['parent_pid'] = os.getpid()
+            if failure:
+                record['diagnostic_complete'] = False
+                record['status'] = 'failed'
+            (Path(ctx.output_directory)/f"{record['role']}.json").write_text(json.dumps(record),encoding='utf8')
+            if record['role']!='worker':
+                reports.append({'role':record['role'],'pid':record['pid'],
+                    'status':'failed' if failure else 'stopped'})
+        if side=='client':
+            samples = [{'global_step':s,'round_id':f'round{s}','status':'confirmed',
+                'actual_sample_start_ns':a,'control_applied_ns':b-1,'work_completed_ns':b,
+                'work_elapsed_ns':b-a,'control_latency_ns':b-1-a} for s,a,b in ((0,100,200),(1,300,320))]
+            reports[0].update(timing={'raw':{'samples':samples}},outcome={
+                'confirmed_step_count':2,'protocol_committed_count':2,
+                'material_summary':{'worker_exited':True,'cleanup_failed':False,'worker':{'pid':104}}})
+        return {'wall_s':.1,'roles':reports,'forced_cleanup':[],
+            'owned_pids':[r['pid'] for r in reports],'exitcodes':[0]*len(reports),
+            'members':{r['role']:{'pid':r['pid']} for r in reports},
+            'stop_reason':'first_functional_failure' if failure else None,'activity_elapsed_s':.1}
+
+    monkeypatch.setattr(runner,'_collect_host',collect)
+    kwargs = {'diagnostic_id':'one-session','expected_head':'a'*40,
+        'software_review':'https://software-test.invalid','config_paths':configs,'steps':2}
+    manifest = runner.run_host(side,tmp_path/'first',**kwargs)
+    assert manifest['diagnostic_complete'] is (not failure)
+    assert manifest['mode']=='non_realtime_diagnostic' and not manifest['strict_qualification']
+    assert manifest['clock_domains'][manifest['plan']['clock_domain_id']]['local_spawn_verified']
+    ledger = json.loads((tmp_path/f'results/tail_diagnostics/session-one-session-{side}.ledger.json').read_text())
+    assert ledger['one_two_host']==0 and ledger['status']==('partial' if failure else 'complete')
+    with pytest.raises(FileExistsError):
+        runner.run_host(side,tmp_path/'different',**kwargs)
+    assert not (tmp_path/'different').exists()
+    # ZIP/checkout换行不同不能消耗唯一实测后才发现伪版本冲突；真实代码改变仍拒绝。
+    text = tmp_path/'source.py'
+    text.write_bytes(b'value = 1\r\n')
+    digest = runner._common_sha(text)
+    original = runner._sha(text)
+    text.write_bytes(b'value = 1\n')
+    assert runner._common_sha(text)==digest and runner._sha(text)!=original
+    text.write_bytes(b'value = 2\n')
+    assert runner._common_sha(text)!=digest
+    binary = tmp_path/'raw.bin'
+    binary.write_bytes(b'\r\n')
+    assert runner._common_sha(binary)==runner._sha(binary)
+
+
+@pytest.mark.parametrize('reason',['wall_limit','activity_limit','first_functional_failure','child_exit'])
+def test_two_host_supervision_fake_clock_no_retry_and_only_owned_pid_cleanup(monkeypatch,reason):
+    """监督期限用假时钟驱动；不等待180秒、不运行实际业务进程。"""
+    from secure_control.experiments import tail_diagnostic_runner as runner
+    clock = [0.]
+    killed, started = [], []
+    activity = SimpleNamespace(value=0.)
+    class Process:
+        def __init__(self,**kwargs):
+            self.pid = 100+len(started)
+            self.exitcode = None
+        def start(self):
+            started.append(self.pid)
+        def join(self,timeout):
+            pass
+        def is_alive(self):
+            return self.exitcode is None
+        def terminate(self):
+            self.exitcode = -1
+    class Queue:
+        def get(self,timeout):
+            if reason=='first_functional_failure':
+                return {'role':'P1','status':'failed'}
+            clock[0] = 177 if reason=='wall_limit' else 31
+            if reason=='activity_limit':
+                activity.value = 1
+            elif reason=='child_exit':
+                processes[0].exitcode = 4
+            raise runner.queue.Empty
+        def close(self):
+            pass
+        def cancel_join_thread(self):
+            pass
+    processes = []
+    def make_process(**kwargs):
+        p = Process(**kwargs)
+        processes.append(p)
+        return p
+    spawn = SimpleNamespace(Queue=Queue,Event=lambda:SimpleNamespace(set=lambda:None),
+        Value=lambda *args:activity,Process=make_process)
+    def kill(args,**kwargs):
+        killed.append(args)
+        return SimpleNamespace(returncode=0)
+    original = runner._clear_owned
+    monkeypatch.setattr(runner,'_clear_owned',lambda ps,d,**kw:original(ps,d,_now=lambda:clock[0],_run=kill))
+    group = runner._collect_host([SimpleNamespace(role='P1'),SimpleNamespace(role='P2')],None,400,
+        _mp=SimpleNamespace(get_context=lambda _:spawn),_now=lambda:clock[0])
+    assert group['stop_reason']==reason and len(started)==2
+    assert {int(args[2]) for args in killed} <= set(started)
+    assert all(args[0]=='taskkill' and args[-2:]==['/T','/F'] for args in killed)
+    assert group['wall_s']<=180
+    if reason=='wall_limit':
+        def fail_start(**kwargs):
+            raise OSError('spawn failed')
+        spawn.Process = fail_start
+        partial = runner._collect_host([SimpleNamespace(role='Client')],None,400,
+            _mp=SimpleNamespace(get_context=lambda _:spawn),_now=lambda:clock[0])
+        assert partial['stop_reason']=='launcher_failure' and partial['launcher_error']=='OSError'
+        assert partial['owned_pids']==[] and not partial['roles']
+
+
+def test_configured_client_attempt_400_stops_without_401_and_first_failure_no_retry(tmp_path,monkeypatch):
+    """原runner替身只驱动真实装配回调；成功400次与首失败均只调用一次runner。"""
+    from secure_control.execution.lan_config import load_lan_config
+    from secure_control.experiments import lan_continuous_profile, lan_runner, live_timing
+    from secure_control.experiments import tail_diagnostic_runner as runner
+    config = load_lan_config(runner.ROOT/'configs/lab-client-cart-pole-demo.example.yaml','Client')
+    monkeypatch.setattr(lan_continuous_profile,'load_segmented_experiment',
+        lambda *args:SimpleNamespace(scene=SimpleNamespace(period=.02)))
+    monkeypatch.setattr(live_timing,'timing_metadata',lambda *args,**kw:{})
+    ctx = replace(context(tmp_path),launcher_pid=os.getpid())
+    real_check = runner.subprocess.check_output
+    monkeypatch.setattr(runner.subprocess,'check_output',lambda *args,**kw:'a'*40)
+    calls = []
+    def original(config,prepared,**kwargs):
+        calls.append(1)
+        for step in range(400):
+            assert not kwargs['control'].stop_requested
+            kwargs['before_sample']()
+            kwargs['on_step'](SimpleNamespace(protocol=SimpleNamespace(global_step=step)))
+        assert kwargs['control'].stop_requested
+        return {'status':'stopped'}
+    monkeypatch.setattr(lan_runner,'_run_prepared_segmented',original)
+    reports = []
+    stop = SimpleNamespace(is_set=lambda:False,set=lambda:None)
+    runner._configured_child(config,ctx,SimpleNamespace(put=reports.append),stop,
+        runner.time.perf_counter()+100,400,SimpleNamespace(value=0.))
+    assert calls==[1] and reports[0]['attempt_callbacks']==400
+    assert reports[0]['status']=='stopped'
+    # 下一次只用另一个临时导出目录；这是软件失败替身，不是第二组控制实验。
+    def fail(*args,**kwargs):
+        calls.append(1)
+        kwargs['before_sample']()
+        raise ConnectionError('test')
+    monkeypatch.setattr(lan_runner,'_run_prepared_segmented',fail)
+    failed_output = tmp_path/'failure'
+    failed_output.mkdir()
+    runner._configured_child(config,replace(ctx,output_directory=str(failed_output)),
+        SimpleNamespace(put=reports.append),stop,runner.time.perf_counter()+100,400,
+        SimpleNamespace(value=0.))
+    assert calls==[1,1] and reports[-1]['status']=='failed'
+    assert reports[-1]['error_type']=='ConnectionError'
+    monkeypatch.setattr(runner.subprocess,'check_output',real_check)
+
+
+def two_host_manifests(tmp_path):
+    """独立构造A/B时钟相差一亿ns的原始事件，不从分析输出反推expected。"""
+    import hashlib
+    records,domains = fixture_records(dual=True)
+    paths = []
+    for side,wanted,domain in (('client',{'Client','worker'},'A'),('pair',{'P1','P2'},'B')):
+        output = tmp_path/side
+        output.mkdir()
+        files = []
+        for record in records:
+            if record['role'] not in wanted:
+                continue
+            record['context']['topology_digest'] = 'topology'
+            raw = json.dumps(record).encode()
+            path = output/f"{record['role']}.json"
+            path.write_bytes(raw)
+            files.append({'path':path.name,'sha256':hashlib.sha256(raw).hexdigest()})
+        plan = {'side':side,'source_head':'a'*40,'diagnostic_id':'same','maximum_steps':2,
+            'mode':'non_realtime_diagnostic','clock_domain_id':domain,'topology_digest':'topology',
+            'common_source_sha256':{'src/example.py':'1'*64},'software_review':'https://review.invalid',
+            'profile':'control-dynamic-matrix-preauthorized-v2',
+            'configurations':[{'role':r,'wire_profile':'control-dynamic-matrix-preauthorized-v2',
+                'transport':'insecure_tcp','topology_digest':'topology'} for r in sorted(wanted-{'worker'})]}
+        manifest = {'schema':SCHEMA,'source_head':'a'*40,'diagnostic_id':'same','side':side,
+            'diagnostic_complete':True,'functional_complete':True,'expected_step_count':2,
+            'files':files,'clock_domains':{domain:domains[domain]},'control_samples':[],
+            'plan':plan,'plan_sha256':hashlib.sha256(json.dumps(plan,ensure_ascii=False,
+                allow_nan=False,separators=(',',':')).encode()).hexdigest(),'group':{}}
+        path = output/'manifest.json'
+        path.write_text(json.dumps(manifest),encoding='utf8')
+        paths.append(path)
+    return paths
+
+
+def test_two_host_analysis_top_eight_neighbors_points_and_local_gc_dependencies(tmp_path):
+    from secure_control.experiments.tail_diagnostic_analysis import analyze_manifests
+    paths = two_host_manifests(tmp_path)
+    report = analyze_manifests(paths)
+    assert report['diagnostic_complete'] and report['mode']=='non_realtime_diagnostic'
+    assert report['clock_axes']=={'Client':'A','worker':'A','P1':'B','P2':'B'}
+    assert report['work_distribution']['mean_ns']==60
+    assert [r['global_step'] for r in report['steps']]==[0,1]
+    step = report['steps'][0]
+    assert {e['role'] for e in step['server_local_gc_dependencies']}=={'P2'}
+    assert step['client_points'] and step['normal_neighbor_step']==1
+    assert all('client_work_overlap_ns' not in r for r in step['timeline_by_domain']['B'])
+    assert all('client_window_comparable' not in e or not e['client_window_comparable']
+               for e in step['server_local_gc_dependencies'])
+    assert not step['fixable_mechanism_confirmed']
+    with pytest.raises(ValueError,match='不同clock'):
+        analyze_manifests(paths,same_host=True)
+
+
+@pytest.mark.parametrize('fault',['head','topology','source','role','session','round','plan_hash','domain'])
+def test_two_host_analysis_rejects_mixed_evidence(tmp_path,fault):
+    import hashlib
+
+    from secure_control.experiments.tail_diagnostic_analysis import analyze_manifests
+    paths = two_host_manifests(tmp_path)
+    m = json.loads(paths[1].read_text())
+    if fault=='head':
+        m['source_head'] = 'b'*40
+    elif fault=='topology':
+        m['plan']['topology_digest'] = 'other'
+    elif fault=='source':
+        m['plan']['common_source_sha256']['src/example.py']='2'*64
+    elif fault=='role':
+        m['side']='client'
+        m['plan']['side']='client'
+    elif fault=='domain':
+        m['plan']['clock_domain_id']='A'
+    elif fault in ('session','round'):
+        entry = m['files'][0]
+        p = paths[1].parent/entry['path']
+        record = json.loads(p.read_text())
+        if fault=='session':
+            record['protocol'][1]='other'
+        else:
+            record['rounds']['0']='other'
+        raw = json.dumps(record).encode()
+        p.write_bytes(raw)
+        entry['sha256'] = hashlib.sha256(raw).hexdigest()
+    if fault!='plan_hash':
+        m['plan_sha256']=hashlib.sha256(json.dumps(m['plan'],ensure_ascii=False,
+            allow_nan=False,separators=(',',':')).encode()).hexdigest()
+    else:
+        m['plan']['maximum_steps']=1
+    paths[1].write_text(json.dumps(m))
+    with pytest.raises(ValueError):
+        analyze_manifests(paths)
+
+
+@pytest.mark.parametrize('fault',['missing_file','missing_manifest','unfinished','no_files'])
+def test_two_host_partial_never_becomes_complete_or_invents_endpoints(tmp_path,fault):
+    import hashlib
+
+    from secure_control.experiments.tail_diagnostic_analysis import analyze_manifests
+    paths = two_host_manifests(tmp_path)
+    if fault=='missing_manifest':
+        paths=paths[:1]
+    elif fault=='missing_file':
+        (paths[1].parent/'P1.json').unlink()
+    elif fault=='no_files':
+        for p in paths:
+            m=json.loads(p.read_text())
+            m['files']=[]
+            m['diagnostic_complete']=False
+            p.write_text(json.dumps(m))
+    else:
+        m=json.loads(paths[0].read_text())
+        entry=next(e for e in m['files'] if e['path']=='Client.json')
+        p=paths[0].parent/'Client.json'
+        r=json.loads(p.read_text())
+        r['events']=[row for row in r['events'] if not (row[2]==1 and row[1]==PHASES['exchange']*2+1)]
+        r['diagnostic_complete']=False
+        recount(r)
+        raw=json.dumps(r).encode()
+        p.write_bytes(raw)
+        entry['sha256']=hashlib.sha256(raw).hexdigest()
+        m['diagnostic_complete']=False
+        paths[0].write_text(json.dumps(m))
+    result=analyze_manifests(paths,partial=True)
+    assert not result['diagnostic_complete']
+    if fault=='unfinished':
+        assert result['unfinished_spans']['Client'][0]['phase']=='exchange'
+    assert all(not s['fixable_mechanism_confirmed'] for s in result['steps'])
