@@ -1273,6 +1273,84 @@ def _peer_snapshot_test_port(plan, role='P1'):
     return port
 
 
+@pytest.mark.parametrize('operation', ['immutable','snapshot','cyclic_input'])
+def test_public_plan_helpers_do_not_leave_per_call_recursive_closure_cycles(operation):
+    """检查调用退出时的实际引用图；不collect/禁用GC，也不假定何时触发GC。"""
+    import sys
+    import types
+    import weakref
+
+    from secure_control.execution import _localhost_peer as peer
+    from secure_control.protocol import messages
+
+    plan = _peer_snapshot_test_plan()
+    if operation == 'cyclic_input':
+        object.__setattr__(plan.state_truncation_resources[0],'index',plan)
+    cycles, temporary_functions = [], []
+    filenames = {peer.__file__,messages.__file__}
+    def observe(frame,event,result):
+        if (event != 'return' or frame.f_code.co_filename not in filenames
+                or frame.f_code.co_name not in ('_snapshot_public_plan','_deeply_immutable_public_plan')):
+            return
+        for name,value in frame.f_locals.items():
+            if isinstance(value,types.FunctionType):
+                temporary_functions.append(weakref.ref(value))
+                if value.__closure__ and any(cell.cell_contents is value for cell in value.__closure__):
+                    cycles.append((frame.f_code.co_name,name))
+    previous = sys.getprofile()
+    try:
+        sys.setprofile(observe)
+        if operation == 'snapshot':
+            snapshot = peer._snapshot_public_plan(plan)
+            assert snapshot == plan and snapshot is not plan
+        else:
+            assert messages._deeply_immutable_public_plan(plan) is (operation != 'cyclic_input')
+    finally:
+        sys.setprofile(previous)
+    assert sys.getprofile() is previous
+    assert not cycles,cycles
+    assert all(ref() is None for ref in temporary_functions)
+
+
+def test_peer_public_copy_is_bounded_to_current_round_and_independent_across_setups():
+    """多轮/公开段号/新session与epoch均用独立图；旧引用不成为新快照缓存。"""
+    import weakref
+    from copy import deepcopy
+
+    from secure_control.protocol import Client, messages
+
+    template = _peer_snapshot_test_plan()
+    ledger = template.scale_ledger
+    layout = messages.ControllerLayout(4,2,1,ledger)
+    previous_snapshot = None
+    resources = set()
+    for session,epoch in (('first','epoch-a'),('second','epoch-b')):
+        initial = Client._resource_plan(layout,session,'initial',0,encoding_profile='control-dynamic-matrix-v1')
+        port = _peer_snapshot_test_port(initial)
+        port_ref = weakref.ref(port)
+        for step in range(5):
+            plan = Client._resource_plan(layout,session,f'{session}-round-{step}',step,
+                                         encoding_profile='control-dynamic-matrix-v1')
+            expected = deepcopy(plan)
+            port._v3_phase = 'truncated'
+            port.set_batch_round(plan,modulus=257,run_id='run',epoch_id=epoch,physical_step=step)
+            snapshot = port._batch_context[0]
+            assert snapshot == expected and snapshot is not plan and snapshot is not previous_snapshot
+            assert port._batch_identity(expected) == ('run',epoch,step,257)
+            ids = {m.resource_id for m in (*plan.product_resources,*plan.state_truncation_resources)}
+            assert not resources & ids
+            resources.update(ids)
+            object.__setattr__(snapshot.scale_ledger,'A',-1)
+            assert plan == expected and ledger.A != -1
+            previous_snapshot = snapshot
+        # 失败校验不可把新session安装进旧port。
+        with pytest.raises(ValueError):
+            port.set_batch_round(template,modulus=257,epoch_id='foreign')
+        assert port._batch_context[0] is snapshot
+        del port
+        assert port_ref() is None
+
+
 @pytest.mark.parametrize('dimensions,ell,step', [((1,2,1),1,0), ((2,1,3),7,1), ((4,2,1),32,2**80+3)])
 def test_matrix_peer_snapshot_matches_deepcopy_all_fields_and_old_digest(monkeypatch, dimensions, ell, step):
     """标准库副本与旧JSON字节作为oracle，遍历全部记录、字段及原生相等语义。"""

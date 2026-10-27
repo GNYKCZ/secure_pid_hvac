@@ -58,6 +58,26 @@ Address = tuple[str, int]
 Role = Literal["P1", "P2"]
 
 
+def _clone_public_plan_value(value, memo):
+    """只处理已核验的公开类型图；显式传当前memo，避免临时递归闭包滞留整图。"""
+    kind = type(value)
+    if kind in (int, str, type(None)):
+        return value
+    key = id(value)
+    if key in memo:
+        return memo[key]
+    if kind is tuple:
+        copied = tuple(_clone_public_plan_value(item, memo) for item in value)
+        memo[key] = copied
+        return copied
+    # 资格已限定有限已知记录；按现有字段表复制存储，不重跑构造/校验。
+    copied = object.__new__(kind)
+    memo[key] = copied
+    for name in _PUBLIC_PLAN_JSON_FIELDS[kind]:
+        object.__setattr__(copied, name, _clone_public_plan_value(getattr(value, name), memo))
+    return copied
+
+
 def _snapshot_public_plan(plan):
     """仅为规范矩阵图复制独立记录；其他表示保留标准库深复制语义。"""
     if type(plan) is not MatrixStepResourcePlan:
@@ -69,25 +89,7 @@ def _snapshot_public_plan(plan):
         standard = False
     if not standard:
         return deepcopy(plan)
-    memo = {}
-    def clone(value):
-        kind = type(value)
-        if kind in (int, str, type(None)):
-            return value
-        key = id(value)
-        if key in memo:
-            return memo[key]
-        if kind is tuple:
-            copied = tuple(clone(item) for item in value)
-            memo[key] = copied
-            return copied
-        # 资格已限定有限已知记录；按现有字段表复制存储，不重跑构造/校验。
-        copied = object.__new__(kind)
-        memo[key] = copied
-        for name in _PUBLIC_PLAN_JSON_FIELDS[kind]:
-            object.__setattr__(copied, name, clone(getattr(value, name)))
-        return copied
-    return clone(plan)
+    return _clone_public_plan_value(plan, {})
 
 
 class LocalhostProtocol3PeerPort:
