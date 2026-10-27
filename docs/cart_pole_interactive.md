@@ -210,13 +210,14 @@ B允许A访问TCP 34401/34402；34403只供B本机P2连接P1，A无须监听。
 
 | 机器 / 角色 | 已配好的角色文件 | 固定选择 |
 | --- | --- | --- |
-| A / Client | `configs/lab-client-cart-pole-demo.example.yaml` | 无证书TCP、matrix-v1、两测量动态observer |
-| B / P1 | `configs/lab-p1-cart-pole-demo.example.yaml` | 无证书TCP、matrix-v1 |
-| B / P2 | `configs/lab-p2-cart-pole-demo.example.yaml` | 无证书TCP、matrix-v1 |
+| A / Client | `configs/lab-client-cart-pole-demo.example.yaml` | 无证书TCP、preauthorized-v2、ready-v1、两测量动态observer |
+| B / P1 | `configs/lab-p1-cart-pole-demo.example.yaml` | 无证书TCP、preauthorized-v2 |
+| B / P2 | `configs/lab-p2-cart-pole-demo.example.yaml` | 无证书TCP、preauthorized-v2 |
 
-三份文件共用 `local-deployment.example.yaml`；下载后唯一需要按机器填写的文件就是上述拓扑，
-填好后将**同一份**文件复制到A/B的configs目录。不要把某台机器的私有IP当作所有下载者的默认地址。
-若已有本机拓扑可继续使用，P1/P2同机时peer也可填B的本机可达地址，但A/B文件内容须完全相同。
+三份文件共用专用 `lab-cart-pole-demo-deployment.example.yaml`，已经按本次用户部署填入
+B地址`192.168.31.116`及端口34401/34402/34403。A/B下载同版本即可配对，无需补协议或收发策略。
+这不是地址已探测可达；其他网络或B的IP变化时，更新此专用拓扑并在A/B保持**同一份**内容。
+通用`local-deployment.example.yaml`仍用于其他实验，不需要为此演示修改。
 timeout单位是秒，`step: 30`不是30 ms。
 
 **必须使用下面命令里的完整配置路径。**通用 `lab-p1.example.yaml` / `lab-p2.example.yaml`
@@ -319,7 +320,7 @@ print(report["control_outcome"], report["raw"]["complete"])
 ### 原截止模式的已有摘要
 
 先确认三个角色的最终JSON标识实际使用 `insecure_tcp`，Client还应为
-`wire_profile=control-dynamic-matrix-v1`、`material_source=worker`。
+`wire_profile=control-dynamic-matrix-preauthorized-v2`、`material_source=worker`，Client还应为`client_io=ready-v1`。
 控制方程、矩阵材料、双提交和原模型0.02s均保留；取消TLS只影响信道加密/身份认证。
 两台电脑请用同一PR整合后的完整提交，旧PR125或只含矩阵核心的main不能替代此入口整合。
 

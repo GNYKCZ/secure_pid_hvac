@@ -1,0 +1,19 @@
+# A运行Client，B运行P1/P2；按用户当前保存的B地址预配置，未自动探测可达性。
+# 若B地址变化，只修改本文件并在A/B使用同一份；通用实验拓扑不受影响。
+version: 1
+identities:
+  Client: client.secure-control.test
+  P1: p1.secure-control.test
+  P2: p2.secure-control.test
+p1_client:
+  bind: 192.168.31.116
+  host: 192.168.31.116
+  port: 34401
+p2_client:
+  bind: 192.168.31.116
+  host: 192.168.31.116
+  port: 34402
+p1_peer:
+  bind: 192.168.31.116
+  host: 192.168.31.116
+  port: 34403

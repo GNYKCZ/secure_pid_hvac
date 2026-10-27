@@ -4,7 +4,7 @@
 
 | 想做什么 | 运行入口 | 需要看的配置 | 输出 |
 | --- | --- | --- | --- |
-| A运行倒立摆动画Client，B运行P1/P2，无需证书 | 见[三条启动命令](../docs/cart_pole_interactive.md#无证书两机非实时动态演示) | 三份 `lab-*-cart-pole-demo.example.yaml` 已配好matrix-v1和动态observer；只改共用 `local-deployment.example.yaml` 的机器地址 | 持续light演示，停止后摘要；不保存完整轨迹 |
+| A运行倒立摆动画Client，B运行P1/P2，无需证书 | 见[三条启动命令](../docs/cart_pole_interactive.md#无证书两机非实时动态演示) | 三份 `lab-*-cart-pole-demo.example.yaml` 已配好preauthorized-v2、Client ready-v1和动态observer；专用 `lab-cart-pole-demo-deployment.example.yaml` 已填B地址192.168.31.116 | 持续light，退出保存性能报告，不保存完整轨迹 |
 | 一台或三台电脑分别启动 P1、P2、Client，完成一次连续实验 | `scripts/run_continuous_p1.py`、`run_continuous_p2.py`、`run_continuous_client.py` | 通常只改 `paper_pid_lan.example.yaml`；三机时还要改各机内容相同的 `local-deployment.example.yaml` | Client 配置指定的 `results/lan_continuous/<run-id>/control.png` |
 | 一次算完 `ell=32/40/48/56` 并画一张 Fig3 对比图 | `python -m secure_control.experiments.paper_pid_fig3` | `paper_pid_fig3_sweep.yaml`；它引用的论文对象与素数证据是冻结输入 | 新输出目录下的 `fig3.png`、`manifest.json` 和四个 run |
 
@@ -14,7 +14,19 @@
 `lab-p1-cart-pole-demo.example.yaml`、`lab-p2-cart-pole-demo.example.yaml`，
 三份协议已经一致，无需手工补wire或更换experiment。显式指定这三份配置，
 Client传 `--non-realtime --recording light`；省略非实时选项仍是20 ms绝对截止模式。
-所有机器地址由同一拓扑文件管理，填好后复制到A/B，详细步骤见上表。
+专用拓扑 `lab-cart-pole-demo-deployment.example.yaml` 已填用户当前保存的B地址
+`192.168.31.116`，三条端口34401/34402/34403；地址未变化时，A/B下载同版本即可使用。
+这不是已验证可达的保证；若B地址变化，只更新该专用文件并在A/B保持一致。
+通用 `local-deployment.example.yaml` 不属于这组demo配置，不必为此演示修改它。
+
+绝对节拍GUI实测命令（先在B分别启动配套P1/P2）：
+
+```powershell
+uv run python scripts/run_cart_pole_client.py configs/lab-client-cart-pole-demo.example.yaml --recording light --performance samples --performance-sample-limit 10000
+```
+
+此命令不传`--non-realtime`，原20ms截止首次超期会停止；10000仅保存容量，不限运行步数。
+退出后自动以唯一文件名保存到`results/lan_continuous/performance/`，无需指定可能冲突的固定路径。
 
 以下为原batch静态反馈和留证路线，不能混用上述matrix配置：
 倒立摆专用入口仍先启动同一 P1/P2，再运行 `scripts/run_cart_pole_client.py`：
