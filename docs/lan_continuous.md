@@ -44,6 +44,69 @@ D13已有结果继续标记Work实测、未独立结果复核。
 软件引用图检查能验证不再产生这两类临时闭包环，但不证明它们解释全部gen2扫描成本。
 本阶段没有新增性能运行；长期最慢耗时及双机收益需另行验证，不能据此宣布GC尖峰已解决。
 
+## 默认关闭的帧边界与Windows离线关联（D132-16B）
+
+本功能仅是软件前置，依据[16B设计](https://github.com/GNYKCZ/secure_pid_hvac/issues/132#issuecomment-6446474476)。
+普通GUI/headless与原轻量计时均不分配新流缓冲，不查socket地址，不启动ETW/WPR/PktMon。
+只有未来获批专项中，A端诊断命令显式增加`--stream-map`才开启公开帧区间记录；
+该参数本身不授权新控制运行，D15已经用完的账本不能重用。
+
+计数覆盖表：Client的`connect_role`在明文TCP连接建立后、任何hello/setup前注册一次；
+仅注册时读取本地/远端IPv4地址及native PID/TID/注册QPC。
+同一个socket包装器拦截成功`send`/`recv`的实际返回字节，统一累计握手、setup、控制和停止流量，
+包括4字节长度头；部分IO只计实际字节，EWOULDBLOCK/异常/EOF不虚增。
+原`send_frame/_send_exact/receive_frame/_receive_exact`、双路交换与关闭握手均沿同一包装器，
+高层不重复计数。TLS不支持此明文流映射。若绕过到sendall/recv_into/makefile等未支持入口，
+标`unobserved_io_path`；第三条连接/重建、溢出、半帧开始、未知身份也不能冒充已知锚点。
+
+每step两条连接各一固定行，保存请求起始/长度/完成偏移、回复起始/body长度/完成偏移，
+未完成端点为-1。连接前setup偏移不丢弃，不把控制step0当TCP offset0；
+round由原Client.json的step身份表解释。body只按长度跳过，从不保存或复制业务内容；
+完整字节不代表协议已验证、已提交或已施力。
+新增数值缓冲固定65536B（800行×64B），Client原983040B加起来1048576B，四业务进程总≤4MiB。
+这些是诊断数值缓冲预算，不是整个Python进程RSS或原轻量timing的预算。
+没有逐syscall列表、逐步写盘、额外线程或系统会话；结束后集中导出。
+
+独立`Client.stream.json`使用`client-stream-map-v1`，不扩展旧`control-tail-diagnostic-v1`事件/manifest。
+`stream-link.json`显式记录原manifest与sidecar原字节hash；sidecar另绑定原Client.json的hash、
+公开diagnostic_id/head/protocol与round引用。旧D15分析器继续只读旧文件。
+新的`experiments.windows_tail_analysis.read_stream_link`验证链接、身份、容量、重复/重叠区间、
+原角色文件与manifest绑定；坏hash/round/越界直接拒绝，partial保留未知完成端点。
+
+同模块提供`read_etl(path)`窄离线API：Windows x64消费者，文件≤64MiB、最多100000个事件，
+只调用OpenTraceW/ProcessTrace/CloseTrace，设置文件名与RAW_TIMESTAMP|EVENT_RECORD；
+文件头目前只接受64位布局；32位进程的事件指针仍按各条32/64位flags解码，WOW文件头布局未验证则拒绝。
+没有实时session/provider启动API。原始QPC/正PerfFreq/trace终止与loss必须核验，
+回调异常保留为不完整，finally关闭自己的读取句柄；未知事件不静默丢弃后宣称完整。
+必要白名单为classic Process Start/End v2…4、Thread Start/End v2、ReadyThread v2、
+CSwitch v2/v3及TCPIP1074 v0/v1、1033/1300 v0/v1。每条仍用本机TDH核验实际字段名/type/flags，
+不硬套历史AFD结构，不解引用内核地址或Buffer。TCB/进程键只输出本次局部ID。
+字段版本不支持、连接地址/生命周期缺失或端点语义未证实时保留unsupported/unknown。
+跨平台import不加载Windows DLL，普通D15分析仍可运行。
+
+原16A字段查询与合成oracle纳入本次软件核验：本机manifest字段存在、合成EVENT_RECORD解码、
+mock API的头/loss/异常关闭与合成调度/TCP重组只能证明软件，不证明真实ETL事件会按预期出现。
+**没有安全已有真实ETL，本轮端到端NOT RUN，未开始任何新跟踪/控制组。**
+`normalize_schedule`要求Process/Thread完整生命周期，按nativeID解释Ready→Running；
+Running不能认定正在Python recv/GIL，等待原因不能单独指认socket。
+整数QPC换算向下舍入<1ns只说明转换量化，不证明调度精度；跨A/B绝对ns不相减。
+
+`correlate_frame`要求外部明确验证的同一新会话连接/全流seq零点/事件语义锚点，
+以及sidecar可信body长度与偏移。没有这些就返回unknown，不能从首个数据包猜零点。
+TCP覆盖仅表示指定系统事件边界观察到了连续字节，不证明TCP接受、socket可读或硬件到包时间。
+拆/粘包、乱序/重传/appearance重复/重复ACK/回绕/缺段/混流与连接重建有独立反例；
+SYN/FIN或半圈序号歧义不猜测。TCB连接映射候选字段不等于已经验证SeqNo运行语义。
+外部锚点的`verified`是调用方的证据声明，软件不能据此发明真实运行资格，必须随报告附来源。
+
+未来最小专项仍需单独用户批准：只A的ProcessThread/CSwitch/ReadyThread自定义collector候选
+64KiB×128=8MiB，必要TCPIP元数据collector候选64KiB×64=4MiB；
+不照搬内置CPU/Network大profile，不默认抓原始payload。实际buffer数量须查询核验，
+内核工具本身和离线展开JSON不受4MiB业务缓冲限制。候选ETL每份64MiB、总磁盘256MiB，
+预留至少1GiB；新控制≤400attempt/活动30s、原生窗口≤40s/总180s与退出预留均尚未执行。
+有其他跟踪会话/过滤配置则停止本任务，不取消别人会话；WPR仅操作本次唯一instancename，
+PktMon全局归属无法证明则不启动。不得拼接旧B trace与新A会话，未复现不补跑。
+原生event版本/SeqNo语义、header时钟与安全无payload的源头配置通过前，不称ready-to-run。
+
 ## 两机慢步骤诊断（D132-15）
 
 依据[本轮设计与授权](https://github.com/GNYKCZ/secure_pid_hvac/issues/132#issuecomment-6443216455)，

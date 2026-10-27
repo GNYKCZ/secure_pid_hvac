@@ -43,7 +43,13 @@ def connect_role(endpoint: LanEndpoint, config: LanConfig, peer: Role, deadline:
     if config.transport == "mutual_tls":
         return connect_tls(endpoint, config, peer, deadline)
     if config.transport == "insecure_tcp":
-        return _dial(_resolve(endpoint, deadline), deadline)
+        raw = _dial(_resolve(endpoint, deadline), deadline)
+        # 仅显式诊断Client在应用hello前注册，普通路径不查地址/分配缓冲。
+        from .tail_diagnostics import current
+        diagnostic = current()
+        if config.role == 'Client' and diagnostic is not None and diagnostic.streams is not None:
+            return diagnostic.streams.register(raw)
+        return raw
     raise ValueError("未知 LAN transport。")
 
 
