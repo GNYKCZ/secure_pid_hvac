@@ -50,11 +50,11 @@ def e(kind,time,**kw):
 
 def test_ready_late_running_wait_is_hand_computed():
     events=[e('start',0),e('ready',10),e('in',44),e('out',50,next='waiting')]
-    assert scheduling(events,1,2,'born-1')=={'state':'waiting','ready_waits':[34]}
+    assert scheduling({'events':events,'complete':True},1,2,'born-1')=={'state':'waiting','ready_waits':[34]}
 
 
 def test_thread_already_running_does_not_invent_ready_delay():
-    assert scheduling([e('start',0),e('in',5)],1,2,'born-1')=={'state':'running','ready_waits':[]}
+    assert scheduling({'events':[e('start',0),e('in',5)],'complete':True},1,2,'born-1')=={'state':'running','ready_waits':[]}
 
 
 @pytest.mark.parametrize('fault',['missing_start','reuse','lost','backward','ready_while_running'])
@@ -66,7 +66,7 @@ def test_scheduler_unknown_when_lifecycle_or_events_missing(fault):
     if fault=='lost': lost=1
     if fault=='backward': events[-1]['time']=9
     if fault=='ready_while_running': events.append(e('ready',45))
-    assert scheduling(events,1,2,'born-1',lost=lost)=={'state':'unknown','ready_waits':[]}
+    assert scheduling({'events':events,'complete':True},1,2,'born-1',lost=lost)=={'state':'unknown','ready_waits':[]}
 
 
 FLOW=('epoch1','B','A',34401,12345,'receive','TCPIP1074')
@@ -181,7 +181,7 @@ def test_raw_schedule_normalization_requires_process_and_thread_start():
     ]}
     normalized=normalize_schedule(trace)
     life=normalized['events'][0]['life']
-    assert scheduling(normalized['events'],1,2,life)['ready_waits']==[34]
+    assert scheduling(normalized,1,2,life)['ready_waits']==[34]
     trace['events'].pop(0)
     missing=normalize_schedule(trace)
     assert missing['events']==[] and not missing['complete'] and missing['unassociated_events']>0
@@ -201,3 +201,84 @@ def test_frame_offset_anchor_and_unknown_boundary():
     assert result['complete_at']==20 and result['socket_readable']=='unknown'
     anchor['diagnostic_id']='old-run'
     assert correlate_frame(sidecar,0,[],anchor)['boundary']=='unknown'
+
+
+@pytest.mark.parametrize('complete',[True,False])
+def test_rv004_normalized_completeness_reaches_scheduling(complete):
+    def raw(provider,opcode,time,values):
+        return {'provider':provider,'opcode':opcode,'time_ns':time,'values':values}
+    trace={'complete':complete,'events':[
+        raw(PROCESS,1,0,{'ProcessId':1,'UniqueProcessKey':7}),
+        raw(THREAD,1,1,{'ProcessId':1,'TThreadId':2}),
+        raw(THREAD,50,10,{'TThreadId':2}),
+        raw(THREAD,36,44,{'NewThreadId':2,'OldThreadId':0,'OldThreadState':5})]}
+    evidence=normalize_schedule(trace)
+    life=evidence['events'][0]['life']
+    assert len(evidence['events'])==3  # 不完整原始证据仍保留供审计。
+    result=scheduling(evidence,1,2,life)
+    assert result==({'state':'running','ready_waits':[34]} if complete else
+                    {'state':'unknown','ready_waits':[]})
+    assert scheduling(evidence['events'],1,2,life)=={'state':'unknown','ready_waits':[]}
+
+
+@pytest.mark.parametrize('after',[False,True])
+@pytest.mark.parametrize('fault',['identity','time','unrelated','legal_duplicate','retransmit'])
+def test_rv005_formal_frame_consumer_validates_after_first_coverage(after,fault):
+    connection={'epoch':0,'local':['A',123],'remote':['B',34401]}
+    sidecar={'complete':True,'context':{'diagnostic_id':'run','source_head':'a'*40},
+        'protocol':['protocol','session','epoch'],'connections':[connection],
+        'rows':[[0,7,5,12,6,4,14,0]]}
+    anchor={'verified':True,'diagnostic_id':'run','source_head':'a'*40,'protocol':sidecar['protocol'],
+        'connection':connection,'semantic_boundary':'TCPIP1074 verified data sequence',
+        'evidence':'synthetic oracle','sequence_at_application_offset_zero':1000,'flow':FLOW}
+    events=[packet(1006,8 if after else 4,20,'same')]
+    if fault=='identity': events.append(packet(1010,4,21,'same'))
+    if fault=='time': events.append(packet(1010,4,19,'other'))
+    if fault=='unrelated':
+        events.append(packet(9999,1,19,'same',flow=('other',*FLOW[1:])))
+        if not after: events.append(packet(1010,4,22,'remaining'))
+    if fault=='legal_duplicate':
+        events.append(packet(1006,8 if after else 4,21,'same'))
+        if not after: events.append(packet(1010,4,22,'remaining'))
+    if fault=='retransmit': events.append(packet(1006,8,22,'retry'))
+    result=correlate_frame(sidecar,0,events,anchor)
+    if fault in ('identity','time'):
+        assert result['complete_at'] is None and result['boundary']=='unknown'
+    else:
+        assert result['complete_at']==(20 if after else 22)
+    assert result['socket_readable']=='unknown'
+
+
+@pytest.mark.parametrize('fault',[None,'unsupported','callback'])
+def test_rv004_mock_reader_through_normalizer_and_scheduling(tmp_path,fault):
+    """使用真实reader返回对象贯穿消费者，缺标记不能由调用方手动补lost修饰。"""
+    def raw(provider,opcode,time,values):
+        return {'provider':provider,'id':0,'version':2,'opcode':opcode,'ticks':time,
+                'pointer_size':8,'pid':1,'tid':2,'values':values}
+    class API(MockAPI):
+        def __init__(self):
+            super().__init__(fault)
+            self.rows=[raw(PROCESS,1,0,{'ProcessId':1,'UniqueProcessKey':7}),
+                raw(THREAD,1,1,{'ProcessId':1,'TThreadId':2}),
+                raw(THREAD,50,10,{'TThreadId':2}),
+                raw(THREAD,36,44,{'NewThreadId':2,'OldThreadId':0,'OldThreadState':5})]
+        def header(self):
+            return {**super().header(),'frequency':1000000000}
+        def process(self,handle):
+            for index in range(4+(fault is not None)):
+                self.callback(index)
+        def event(self,index):
+            if index<4:
+                return self.rows[index]
+            if fault=='callback':
+                raise ValueError('synthetic decode error')
+            return {'unsupported':('unknown',1,0,0)}
+    path=tmp_path/'mock-only.etl'
+    path.write_bytes(b'not an actual ETL; mock API fixture')
+    api=API()
+    trace=read_etl(path,_api=api)
+    assert trace['complete'] is (fault is None) and api.closed==[123]
+    evidence=normalize_schedule(trace)
+    life=evidence['events'][0]['life']
+    assert scheduling(evidence,1,2,life)==({'state':'running','ready_waits':[34]} if fault is None
+                                          else {'state':'unknown','ready_waits':[]})

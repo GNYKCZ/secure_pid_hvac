@@ -88,6 +88,9 @@ CSwitch v2/v3及TCPIP1074 v0/v1、1033/1300 v0/v1。每条仍用本机TDH核验�
 mock API的头/loss/异常关闭与合成调度/TCP重组只能证明软件，不证明真实ETL事件会按预期出现。
 **没有安全已有真实ETL，本轮端到端NOT RUN，未开始任何新跟踪/控制组。**
 `normalize_schedule`要求Process/Thread完整生命周期，按nativeID解释Ready→Running；
+`scheduling`必须接收完整规范化对象（events及complete），传裸events列表或complete不为True均返回unknown，
+避免把不支持事件/解码错误的跟踪当可靠调度证据。帧覆盖保留首次完成时刻，但会检查全部相关同流事件，
+覆盖后出现身份冲突或倒序也会使结果unknown；不同flow无关事件不污染该帧。
 Running不能认定正在Python recv/GIL，等待原因不能单独指认socket。
 整数QPC换算向下舍入<1ns只说明转换量化，不证明调度精度；跨A/B绝对ns不相减。
 

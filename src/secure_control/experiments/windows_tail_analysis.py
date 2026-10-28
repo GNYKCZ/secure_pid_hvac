@@ -20,8 +20,13 @@ def qpc_ns(ticks, frequency, clock, lost=0):
     return ticks*1_000_000_000//frequency
 
 
-def scheduling(events, pid, tid, lifetime, *, lost=0):
+def scheduling(evidence, pid, tid, lifetime, *, lost=0):
     """规范化生命周期事件的Ready→Running；无法证明前缀时不制造排队时间。"""
+    # 完整性必须与事件一起传递；裸events列表已经丢失来源状态，不能默认为可靠。
+    if (not isinstance(evidence,dict) or evidence.get('complete') is not True
+            or not isinstance(evidence.get('events'),list)):
+        return {'state':'unknown','ready_waits':[]}
+    events = evidence['events']
     starts = [e for e in events if e['kind']=='start' and e['pid']==pid and e['tid']==tid]
     if lost or len(starts)!=1 or starts[0]['life']!=lifetime:
         return {'state':'unknown','ready_waits':[]}
@@ -67,7 +72,7 @@ def byte_coverage(events, flow, anchor, length, *, trusted=False, lost=0):
             or type(length) is not int or not 0<length<2**31
             or not isinstance(flow,tuple) or len(flow)!=7):
         return unknown
-    ranges, seen, previous = [], {}, -1
+    ranges, seen, previous, first_complete = [], {}, -1, None
     for e in events:
         if e['flow'] != flow:
             continue
@@ -99,10 +104,12 @@ def byte_coverage(events, flow, anchor, length, *, trusted=False, lost=0):
             if left > edge:
                 break
             edge = max(edge,right)
-        if edge >= length:
-            return {'boundary':'selected-component byte coverage','complete_at':e['time'],
-                    'socket_readable':'unknown'}
-    return unknown
+        if edge >= length and first_complete is None:
+            first_complete = e['time']
+        # 首次覆盖时刻不等于证据校验结束；同流后续身份冲突/倒序仍会使本结果未知。
+    return unknown if first_complete is None else {
+        'boundary':'selected-component byte coverage','complete_at':first_complete,
+        'socket_readable':'unknown'}
 
 
 def read_stream_link(path):
