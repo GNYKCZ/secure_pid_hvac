@@ -15,6 +15,7 @@ from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
+from secure_control.execution.diagnostic_limits import limits_for
 from secure_control.execution.tail_diagnostics import SCHEMA, DiagnosticContext, TailRecorder
 
 PROFILE = 'control-dynamic-matrix-preauthorized-v2'
@@ -57,6 +58,7 @@ def _role_child(role, ports, context, results, stop, deadline, steps):
 def _configured_child(config, context, results, stop, deadline, steps, activity=None, stream_map=False):
     """仅装配原角色；两机模式保留加载的配置和原业务循环。"""
     role = config.role
+    limits = limits_for(context.window)
     recorder = TailRecorder(context,role,stream_map=stream_map and role == 'Client').start()
     result = {'role':role,'pid':os.getpid(),'parent_pid':os.getppid(),'status':'failed'}
     try:
@@ -71,7 +73,7 @@ def _configured_child(config, context, results, stop, deadline, steps, activity=
             from secure_control.experiments.live_timing import LiveTimingCollector, timing_metadata
             from secure_control.scenarios.cart_pole.interactive import InteractiveSession
             session, control = InteractiveSession(),RunControl()
-            prepared = load_segmented_experiment(config.experiment_config,400,session)
+            prepared = load_segmented_experiment(config.experiment_config,limits.segment_steps,session)
             if activity is not None and prepared.scene.period != .02:
                 raise ValueError('双机诊断保持20ms模型周期')
             collector = LiveTimingCollector('samples',sample_limit=steps)
@@ -82,7 +84,7 @@ def _configured_child(config, context, results, stop, deadline, steps, activity=
                 nonlocal attempts
                 if activity is not None and activity.value == 0:
                     activity.value = time.perf_counter()
-                limit = min(deadline,activity.value+30) if activity is not None else deadline
+                limit = min(deadline,activity.value+limits.activity_s) if activity is not None else deadline
                 if activity is not None and (attempts >= steps or stop.is_set() or time.perf_counter() >= limit):
                     raise TimeoutError('诊断活动/attempt边界停止')
                 _request_stop(control,stop,limit,attempts,steps)
@@ -272,28 +274,36 @@ def _clear_owned(processes, deadline, *, _now=time.perf_counter, _run=subprocess
     return forced
 
 
-def _collect_host(configs, context, steps, *, wall_started=None, stream_map=False, _mp=mp, _now=time.perf_counter):
-    """本机监督实际成员；30秒活动/180秒总窗口，无跨机时钟或额外连接。"""
+def _collect_host(configs, context, steps, *, wall_started=None, stream_map=False, native=None, _mp=mp, _now=time.perf_counter):
+    """按声明窗口监督实际成员；无跨机时钟或额外连接。"""
     started = _now() if wall_started is None else wall_started
+    limits = limits_for(context.window if context is not None else 400)
+    run_deadline = started+limits.wall_s-3
     spawn = _mp.get_context('spawn')
     results, stop, activity = spawn.Queue(), spawn.Event(), spawn.Value('d',0.)
     processes, reports, reason, launcher_error = [], [], None, None
+    native_report = None
     try:
+        if native is not None:
+            native.begin()
         for config in configs:
-            if _now() >= started+177:
+            if _now() >= run_deadline:
                 reason = 'wall_limit'
                 break
             process = spawn.Process(target=_configured_child,
-                args=(config,context,results,stop,started+177,steps,activity,stream_map))
+                args=(config,context,results,stop,run_deadline,steps,activity,stream_map))
             processes.append(process)
             process.start()
         while len(reports) < len(processes):
             now = _now()
-            if now >= started+177 or activity.value and now >= activity.value+30:
-                reason = 'wall_limit' if now >= started+177 else 'activity_limit'
+            if native is not None and now>=native.capture_deadline:
+                reason = 'native_window_limit'
+                break
+            if now >= run_deadline or activity.value and now >= activity.value+limits.activity_s:
+                reason = 'wall_limit' if now >= run_deadline else 'activity_limit'
                 break
             try:
-                report = results.get(timeout=min(.1,max(.001,started+177-now)))
+                report = results.get(timeout=min(.1,max(.001,run_deadline-now)))
             except queue.Empty:
                 if any(p.exitcode is not None and p.exitcode != 0 for p in processes):
                     reason = 'child_exit'
@@ -307,13 +317,23 @@ def _collect_host(configs, context, steps, *, wall_started=None, stream_map=Fals
         reason, launcher_error = 'launcher_failure', type(error).__name__
     finally:
         stop.set()
-        forced = _clear_owned(processes,started+179,_now=_now)
+        cleanup_deadline = started+limits.wall_s-1
+        if native is not None and native.started is not None:
+            # 原生窗口包含退出时间，不能让业务清退一直占用240秒总预算。
+            cleanup_deadline = min(cleanup_deadline,native.capture_deadline)
+        forced = _clear_owned(processes,cleanup_deadline,_now=_now)
+        if native is not None:
+            try:
+                native_report = native.finish()
+            except Exception as error:  # noqa: BLE001 - 保留业务退出和本次采集故障，不重启会话。
+                native_report = {'status':'partial','error_type':type(error).__name__}
         results.close()
         results.cancel_join_thread()
     return {'wall_s':_now()-started,'roles':reports,'forced_cleanup':forced,
         'owned_pids':[p.pid for p in processes],'exitcodes':[p.exitcode for p in processes],
         'members':{c.role:{'pid':p.pid} for c,p in zip(configs,processes,strict=False)},
         'stop_reason':reason,'launcher_error':launcher_error,'activity_start':activity.value or None,
+        **({'native':native_report} if native is not None else {}),
         'activity_elapsed_s':None if not activity.value else _now()-activity.value}
 
 
@@ -325,13 +345,22 @@ def _config_identity(config):
         'timeouts':{name:getattr(config,name+'_timeout') for name in ('startup','step','idle','shutdown')}}
 
 
-def run_host(side, output, *, diagnostic_id, expected_head, software_review, config_paths, steps=400, stream_map=False):
+def run_host(side, output, *, diagnostic_id, expected_head, software_review, config_paths, steps=400, stream_map=False, window=400, native_plan=None):
     """显式两机一次采集；同ID本端账本拒绝换目录重跑，原local入口保持。"""
     wall_started = time.perf_counter()
+    limits = limits_for(window)
+    if window==2000:
+        # D17设计续答：软件候选可审，但原生退出及临时磁盘硬条件尚未满足。
+        # 在ledger、provider和控制子进程之前拒绝，不提供force/ack绕过。
+        raise ValueError('2000步实测封锁：原生停止时限与临时磁盘硬上限尚未验证；仅允许只读准备及软件审查')
     from secure_control.execution.lan_config import load_lan_config
     if type(stream_map) is not bool or stream_map and side != 'client':
         raise ValueError('流映射只可显式用于A端')
-    if side not in ('client','pair') or type(steps) is not int or not 1 <= steps <= 400:
+    if native_plan is not None and (window!=2000 or side!='client'):
+        raise ValueError('原生专项只支持显式A端2000窗口')
+    if window!=400 and side=='client' and (not stream_map or native_plan is None):
+        raise ValueError('2000步专项须同时具备公开stream map和经审查原生准备计划')
+    if side not in ('client','pair') or type(steps) is not int or not 1 <= steps <= limits.window:
         raise ValueError('诊断端或attempt上限无效')
     if not isinstance(diagnostic_id,str) or re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}',diagnostic_id) is None:
         raise ValueError('诊断ID只能使用1至64个字母数字下划线或短横线')
@@ -340,6 +369,8 @@ def run_host(side, output, *, diagnostic_id, expected_head, software_review, con
     head = subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
     if head != expected_head:
         raise ValueError('源码HEAD与计划不符')
+    if native_plan is not None and native_plan.get('source_head')!=head:
+        raise ValueError('原生准备head与本机不一致')
     roles = ('Client',) if side == 'client' else ('P1','P2')
     if len(config_paths) != len(roles):
         raise ValueError('本端配置数量不符')
@@ -359,22 +390,25 @@ def run_host(side, output, *, diagnostic_id, expected_head, software_review, con
     dirty = bool(subprocess.check_output(['git','status','--porcelain'],cwd=ROOT,text=True).strip())
     context = DiagnosticContext(diagnostic_id,uuid4().hex,str(output),head,os.getpid(),
         topology_digest=configs[0].topology.digest,source_dirty=dirty,
-        experiment_sha256=_sha(configs[0].experiment_config) if side == 'client' else '')
+        experiment_sha256=_sha(configs[0].experiment_config) if side == 'client' else '',window=window)
     identities = [_config_identity(c) for c in configs]
     # 共享源码摘要不含机器部署配置；角色配置通过公开语义摘要单独核验。
     common = {p:_common_sha(ROOT/p) for p in frozen if not p.startswith('configs/')}
-    plan = {'schema':SCHEMA,'diagnostic_id':diagnostic_id,'source_head':head,'side':side,
+    version = {'schema':limits.trace_schema,
+        **({'limits':limits.payload()} if window!=400 else {})}
+    plan = {**version,'diagnostic_id':diagnostic_id,'source_head':head,'side':side,
         'stream_map':stream_map,
         'source_sha256':frozen,'common_source_sha256':common,'software_review':software_review,
         'common_source_hash_mode':'sha256: CRLF to LF for .py/.toml/.lock; raw bytes otherwise',
         'source_dirty':dirty,'configurations':identities,'maximum_steps':steps,
-        'group_wall_limit_s':180,'activity_limit_s':30,'segment_steps':400,'material_slots':16,
+        'group_wall_limit_s':limits.wall_s,'activity_limit_s':limits.activity_s,'segment_steps':limits.segment_steps,'material_slots':16,
         'mode':'non_realtime_diagnostic','profile':PROFILE,'client_io':'ready-v1',
         'topology_digest':configs[0].topology.digest,'python':platform.python_version(),
         'platform':platform.platform(),'launcher_pid':os.getpid(),'clock_domain_id':context.clock_domain_id,
         'scope':'one user-started two-host group; no retry; no realtime qualification'}
-    ledger = {'schema':SCHEMA,'diagnostic_id':diagnostic_id,'side':side,'one_two_host':0,
-        'status':'reserved','output':str(output),'maximum_steps':steps,'maximum_wall_s':180}
+    ledger = {**version,'diagnostic_id':diagnostic_id,'side':side,
+        'two_host_2000' if window!=400 else 'one_two_host':0,
+        'status':'reserved','output':str(output),'maximum_steps':steps,'maximum_wall_s':limits.wall_s}
     ledger_root = ROOT/'results'/'tail_diagnostics'
     ledger_root.mkdir(parents=True,exist_ok=True)
     ledger_path = ledger_root/f'session-{diagnostic_id}-{side}.ledger.json'
@@ -383,6 +417,9 @@ def run_host(side, output, *, diagnostic_id, expected_head, software_review, con
     _write_new(output/'plan.json',plan)
     _write_new(output/'ledger.json',ledger)
     extra = {'stream_map':True} if stream_map else {}
+    if native_plan is not None:
+        from secure_control.experiments.native_tail_capture import NativeCapture
+        extra['native'] = NativeCapture(native_plan,output/'native-a.etl')
     group = _collect_host(configs,context,steps,wall_started=wall_started,**extra)
     records, files, errors = {}, [], []
     expected_roles = (*roles,'worker') if side == 'client' else roles
@@ -409,7 +446,7 @@ def run_host(side, output, *, diagnostic_id, expected_head, software_review, con
         unchanged = all(_sha(ROOT/p) == sha for p,sha in frozen.items())
     except OSError:
         unchanged = False
-    functional = (not group['forced_cleanup'] and group['stop_reason'] is None and group['wall_s'] <= 180
+    functional = (not group['forced_cleanup'] and group['stop_reason'] is None and group['wall_s'] <= limits.wall_s
         and len(group['roles']) == len(roles) and all(code == 0 for code in group['exitcodes'])
         and all(r['status'] in ('stopped','closed') for r in group['roles']))
     samples = client.get('timing',{}).get('raw',{}).get('samples',[])
@@ -417,11 +454,13 @@ def run_host(side, output, *, diagnostic_id, expected_head, software_review, con
         functional = (functional and client.get('outcome',{}).get('confirmed_step_count') == steps
             and client.get('outcome',{}).get('protocol_committed_count') == steps
             and material.get('worker_exited') is True and material.get('cleanup_failed') is False
-            and group['activity_elapsed_s'] is not None and group['activity_elapsed_s'] <= 30
+            and group['activity_elapsed_s'] is not None and group['activity_elapsed_s'] <= limits.activity_s
             and len(samples) == steps and all(s.get('status') == 'confirmed' for s in samples))
     complete = functional and verified and unchanged and not errors and all(
         r.get('diagnostic_complete') is True for r in records.values())
-    manifest = {'schema':SCHEMA,'diagnostic_id':diagnostic_id,'source_head':head,'side':side,
+    if native_plan is not None:
+        complete = complete and group.get('native',{}).get('status')=='saved'
+    manifest = {**version,'diagnostic_id':diagnostic_id,'source_head':head,'side':side,
         'diagnostic_complete':complete,'functional_complete':functional,'expected_step_count':steps,
         'mode':'non_realtime_diagnostic','clock_domains':{context.clock_domain_id:{
             'local_spawn_verified':verified,'launcher_pid':os.getpid(),'members':members,'wall_clock':wall_clock}},

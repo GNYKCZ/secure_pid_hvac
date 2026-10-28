@@ -14,6 +14,8 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from .diagnostic_limits import limits_for
+
 SCHEMA = 'control-tail-diagnostic-v1'
 PHASES = {name: i+1 for i, name in enumerate((
     'startup', 'control', 'stop', 'cleanup', 'sample', 'work', 'material_claim',
@@ -45,6 +47,14 @@ class DiagnosticContext:
     topology_digest: str = ''
     experiment_sha256: str = ''
     source_dirty: bool = True
+    window: int = 400
+
+
+def context_payload(context):
+    """v1原上下文不扩字段；window由v2文件limits声明并传播到原worker。"""
+    value = asdict(context)
+    value.pop('window')
+    return value
 
 
 def current():
@@ -61,7 +71,10 @@ def _clock(name):
 class TailRecorder:
     """每进程≤1MiB预分配数字/身份缓冲；热路径不生成事件dict、JSON或写盘。"""
 
-    def __init__(self, context: DiagnosticContext, role: str, *, event_capacity=12288, gc_capacity=2048, stream_map=False):
+    def __init__(self, context: DiagnosticContext, role: str, *, event_capacity=None, gc_capacity=None, stream_map=False):
+        self.limits = limits_for(context.window)
+        event_capacity = self.limits.events if event_capacity is None else event_capacity
+        gc_capacity = self.limits.gc_events if gc_capacity is None else gc_capacity
         if _active is not None:
             raise RuntimeError('每进程只允许一个活动诊断会话。')
         if (not isinstance(context, DiagnosticContext) or role not in ('Client','P1','P2','worker')
@@ -69,8 +82,8 @@ class TailRecorder:
                        for v in (context.diagnostic_id, context.clock_domain_id, context.source_head))
                 or type(context.launcher_pid) is not int or context.launcher_pid <= 0
                 or re.fullmatch(r'[0-9a-f]{40}',context.source_head) is None
-                or type(event_capacity) is not int or not 1 <= event_capacity <= 12288
-                or type(gc_capacity) is not int or not 1 <= gc_capacity <= 2048):
+                or type(event_capacity) is not int or not 1 <= event_capacity <= self.limits.events
+                or type(gc_capacity) is not int or not 1 <= gc_capacity <= self.limits.gc_events):
             raise ValueError('诊断身份/角色/固定容量无效。')
         self.context, self.role = context, role
         if type(stream_map) is not bool or stream_map and (role != 'Client' or context.transport != 'insecure_tcp'):
@@ -78,11 +91,11 @@ class TailRecorder:
         self.streams = None
         if stream_map:
             from .client_stream_map import ClientStreamMap
-            self.streams = ClientStreamMap()
+            self.streams = ClientStreamMap(window=context.window)
         self.event_capacity, self.gc_capacity = event_capacity, gc_capacity
         self._events = bytearray(event_capacity*_ROW.size)
         self._gc_events = bytearray(gc_capacity*_ROW.size)
-        self._identities = bytearray(64*1024)
+        self._identities = bytearray(self.limits.identity_bytes)
         self.buffer_bytes = len(self._events)+len(self._gc_events)+len(self._identities)
         self._count = self._gc_count = self._sequence = self.lost_events = 0
         self.first_lost_sequence = None
@@ -145,8 +158,8 @@ class TailRecorder:
                 raise ValueError('诊断事件码错误')
             global_step = self._control_step if step is None else step
             material_step = getattr(self._local, 'material_step', -1) if material is None else material
-            if (type(global_step) is not int or not -1 <= global_step < 400
-                    or type(material_step) is not int or not -1 <= material_step < 416):
+            if (type(global_step) is not int or not -1 <= global_step < self.limits.window
+                    or type(material_step) is not int or not -1 <= material_step < self.limits.identities):
                 raise ValueError('诊断步骤超出固定窗口')
             if material_step >= 0:
                 self._local.material_step = material_step
@@ -179,7 +192,7 @@ class TailRecorder:
 
     def control_step(self, step):
         """原控制owner显式更新快照，不从辅助线程推断当前控制步。"""
-        if type(step) is not int or not 0 <= step < 400:
+        if type(step) is not int or not 0 <= step < self.limits.window:
             self.observation_failed(ValueError())
             return
         self._control_step = step
@@ -225,7 +238,7 @@ class TailRecorder:
     def bind_round(self, step, round_id):
         """416个固定槽存公开round，不复制秘密或每事件重复身份字符串。"""
         try:
-            if type(step) is not int or not 0 <= step < 416 or type(round_id) is not str:
+            if type(step) is not int or not 0 <= step < self.limits.identities or type(round_id) is not str:
                 raise ValueError('round索引错误')
             encoded = round_id.encode('ascii')
             if not 0 < len(encoded) <= 128:
@@ -267,7 +280,7 @@ class TailRecorder:
                 for i in range(count)]
         rows.sort(key=lambda row:row[0])
         rounds = {}
-        for step in range(416):
+        for step in range(self.limits.identities):
             size, value = _IDENTITY.unpack_from(self._identities, step*_IDENTITY.size)
             if size:
                 rounds[str(step)] = value[:size].decode('ascii')
@@ -284,7 +297,9 @@ class TailRecorder:
                 else:
                     pending_gc.remove(key)
         gc_balanced = gc_balanced and not pending_gc
-        return {'schema':SCHEMA, 'context':asdict(self.context), 'role':self.role,
+        return {'schema':self.limits.trace_schema,
+            **({'limits':self.limits.payload()} if self.limits.window!=400 else {}),
+            'context':context_payload(self.context), 'role':self.role,
             'pid':os.getpid(),'parent_pid':os.getppid(),'main_thread_id':self.main_thread_id,
             'hostname':socket.gethostname(),'python':platform.python_version(),'platform':platform.platform(),
             'clock':self.clock,'gc_before':self.gc_before,'gc_after':gc_after,
@@ -305,7 +320,7 @@ class TailRecorder:
                 json.dump(report,stream,ensure_ascii=False,allow_nan=False,separators=(',',':'))
             if self.streams is not None:
                 sidecar = self.streams.report()
-                sidecar.update(context=asdict(self.context),protocol=self._protocol,
+                sidecar.update(context=context_payload(self.context),protocol=self._protocol,
                     role_file_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
                     complete=sidecar['complete'] and report['diagnostic_complete'])
                 with path.with_name('Client.stream.json').open('x',encoding='utf8') as stream:

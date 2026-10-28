@@ -44,6 +44,66 @@ D13已有结果继续标记Work实测、未独立结果复核。
 软件引用图检查能验证不再产生这两类临时闭包环，但不证明它们解释全部gen2扫描成本。
 本阶段没有新增性能运行；长期最慢耗时及双机收益需另行验证，不能据此宣布GC尖峰已解决。
 
+## 显式2000步诊断窗口与原生采集准备（D132-17）
+
+依据[2000步设计](https://github.com/GNYKCZ/secure_pid_hvac/issues/132#issuecomment-6460925858)，
+`client`、`pair`诊断入口增加显式`--window 2000 --steps 2000`窗口声明。
+按D17后续设计答复，两端2000入口目前在配置读取、账本扣减、provider及控制子进程前
+直接拒绝并报告“实测封锁”；没有force/ack开关。下面的2000编排是待审软件候选，
+不是已开放的启动命令。只读准备与离线分析仍可使用，400入口保持原契约。
+旧默认窗口、`local`入口和旧v1文件的400步边界不变；这不会改变日常动画配置或控制算法。
+业务段仍为400步、材料库存16，控制身份0…1999，材料身份0…2015；
+399/799/1199/1599后继续下一段，1999结束，不发第2001次控制。
+此项用于定位延迟，不是提速，也不表示20ms实时资格通过。
+
+容量、schema、计时预算统一由`execution.diagnostic_limits`声明。
+新文件显式使用`control-tail-diagnostic-v2`及`client-stream-map-v2`并包含完整`limits`；
+旧v1精确读取，未知schema、版本混配、声明不一致均拒绝，不重写旧结果。
+2000窗口每角色普通事件最多61440、GC事件10240、身份槽2016；
+Client流映射最多4000条、320KiB。每角色诊断数值缓冲≤6MiB、四角色≤24MiB；
+当前四份角色缓冲加Client流映射精确为19726080B。
+这不是业务RSS、Python导出对象或原有light计时内存的上限。
+溢出保留partial，不能扩大容量或只保存末400步掩盖丢失。
+
+一次新`two_host_2000`账本在启动前扣为0；失败也不恢复、不换目录补跑。
+Client活动上限90秒，两端各总墙钟240秒。A原生窗口100秒包含10秒停止预留；
+监督器至90秒停止业务采集，进程清退也受这一边界约束。
+只启动本端成员，只清理自有PID树，不远程控制B，不改GC、网卡或系统优先级。
+
+新增`prepare-native`仅查询本机TCPIP TDH字段、已有会话并调用WPR `-profiledetails`，
+保存准备计划；不启用provider、不运行控制。A的2000窗口必须同时显式启用
+`--stream-map`及提供同head准备计划`--native-plan`，B不启动原生采集。
+`configs/control-tail-native-2000.wprp`采用内存模式：ProcessThread/CSwitch/ReadyThread
+64KiB×128，TCPIP 64KiB×64，总数值缓冲12MiB；不采stack或业务payload。
+TCPIP事件ID严格为1033/1038/1040/1043/1074/1300，逐本机注册版本审计字段名、类型和flags。
+宽keyword本身可能包含数据事件，因此不能删除ID过滤或遇到不支持版本后扩大provider。
+离线reader还接受1038/1040/1043的已支持v0/v1；其他版本保留unsupported。
+
+只有用户明确执行带计划的A诊断命令才调用WPR启动；使用本次随机唯一instance，
+冲突已有WPR/NT Kernel Logger时停止准备，不取消其他会话。
+启动后只接受两份同instance会话、QPC时钟和实际缓冲≤12MiB；
+结束前核对GUID归属、loss、耗时与文件大小。单ETL≤64MiB、输出ETL总计≤256MiB、
+启动前空闲≥1GiB。内存模式避免持续ETL写入，但WPR停止合并时的临时总磁盘占用
+仍未获得实际验证，不能将结束后的文件检查说成完整的256MiB硬配额。
+
+原生操作系统调用或WPR失败不能被Python时限变成绝对保证：
+启动超时撤销本次唯一instance的部分启动；已有GUID变化、无法复核归属、
+停止超时或超过窗口时明确输出`*_manual_attention`，不宣称成功退出、不自动重试或停止别人。
+这些故障意味着采集不完整，用户需要检查报告中的instance。
+真实会话命名、退出、临时磁盘峰值、实际ETL descriptor/QPC/loss、SeqNo语义和流锚点
+仍须在获准的唯一组中核验；软件mock通过不等于现场已验证。
+现阶段只提供软件准备，**未验证的退出/磁盘前置条件必须交回Design确认，不能称ready-to-run**。
+
+离线分析保留原样本、所有超20ms步骤、最慢8步与邻步，按五个400步段列出摘要。
+`expected_maintenance_steps`是计划边界，`observed_maintenance_steps`来自实际maintenance计时，
+不把计划索引当执行证据。普通、继续维护、末步停止及计时未知组分别统计，未知不填零。
+两机必须采用同一新会话和版本，不能拼接旧B；跨A/B绝对时钟不相减。
+TCP事件覆盖不等于socket可读，调度Ready不等于正在运行，不由本功能断言历史34ms根因。
+
+发布两端最终实测命令前须完成当前head的软件独审及采集前置核实。
+累计自动返工3/3已用完，本轮允许首次实施和首次独审；新的有效Finding需报告用户/Design，
+不得自行继续返工、实测、补跑、合并PR或关闭Issue。
+
 ## 默认关闭的帧边界与Windows离线关联（D132-16B）
 
 本功能仅是软件前置，依据[16B设计](https://github.com/GNYKCZ/secure_pid_hvac/issues/132#issuecomment-6446474476)。

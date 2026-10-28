@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<WindowsPerformanceRecorder Version="1.0" Author="secure_control">
+  <Profiles>
+    <SystemCollector Id="D17System" Name="D17System">
+      <BufferSize Value="64"/><Buffers Value="128"/>
+    </SystemCollector>
+    <EventCollector Id="D17Events" Name="D17Events">
+      <BufferSize Value="64"/><Buffers Value="64"/>
+    </EventCollector>
+    <SystemProvider Id="D17Scheduling">
+      <Keywords><Keyword Value="ProcessThread"/><Keyword Value="CSwitch"/><Keyword Value="ReadyThread"/></Keywords>
+    </SystemProvider>
+    <EventProvider Id="D17Tcp" Name="2f07e2ee-15db-40f1-90ef-9d7ba282188a" Level="5">
+      <Keywords><Keyword Value="0x600000484"/></Keywords>
+      <EventFilters FilterIn="true">
+        <EventId Value="1033"/><EventId Value="1038"/><EventId Value="1040"/>
+        <EventId Value="1043"/><EventId Value="1074"/><EventId Value="1300"/>
+      </EventFilters>
+    </EventProvider>
+    <Profile Id="D17.Verbose.Memory" Name="D17" Description="Explicit bounded metadata preparation; no payload" LoggingMode="Memory" DetailLevel="Verbose">
+      <Collectors>
+        <SystemCollectorId Value="D17System"><SystemProviderId Value="D17Scheduling"/></SystemCollectorId>
+        <EventCollectorId Value="D17Events"><EventProviders><EventProviderId Value="D17Tcp"/></EventProviders></EventCollectorId>
+      </Collectors>
+    </Profile>
+  </Profiles>
+</WindowsPerformanceRecorder>
