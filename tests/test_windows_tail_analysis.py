@@ -70,6 +70,17 @@ def test_scheduler_unknown_when_lifecycle_or_events_missing(fault):
     assert scheduling({'events':events,'complete':True},1,2,'born-1',lost=lost)=={'state':'unknown','ready_waits':[]}
 
 
+def test_circular_suffix_with_zero_loss_cannot_prove_schedule_or_tcp_coverage():
+    """环形保留末段时lost可为零；命令保存成功并不补回首窗口或线程start。"""
+    retained = {'events':[{'provider':THREAD,'opcode':50,'time_ns':30,
+                           'values':{'TThreadId':2}}], 'complete':True}
+    normalized = normalize_schedule(retained)
+    assert not normalized['complete'] and normalized['unassociated_events']==1
+    assert scheduling(normalized,1,2,'born-1',lost=0)=={'state':'unknown','ready_waits':[]}
+    assert byte_coverage([],FLOW,1000,100,trusted=True,lost=0)=={
+        'boundary':'unknown','complete_at':None,'socket_readable':'unknown'}
+
+
 FLOW=('epoch1','B','A',34401,12345,'receive','TCPIP1074')
 
 
