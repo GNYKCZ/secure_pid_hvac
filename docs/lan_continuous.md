@@ -1,5 +1,74 @@
 # 独立三角色连续 LAN 实验（Issues #86、#84、#75、#92）
 
+## 维护候选与采集有效性（D132-19，软件阶段）
+
+按[D19设计](https://github.com/GNYKCZ/secure_pid_hvac/issues/132#issuecomment-6464649290)，
+本轮以 `f4f078ed4f7ce84ddbab5ce7fb9f7c237dce70fc` 为基准，分别验收以下两项。
+这是人工有限软件续接累计7/7；只有一次独审，新Finding先报用户，不自动返工或实测。
+当前角色映射采用用户最新配置 design5/work7/review5，替代设计评论里的旧对话名称。
+
+### A：同一次复合维护的两路就绪处理
+
+只有显式 `client_io: ready-v1` 的原compact continue路径复用 `_exchange_two_frames`。
+两份完整请求仍先编码核查，再发送；每方回执一到即验证身份、计数、段链和epoch，
+独立推进该方序号。P2先确认后P1失败时保留P2事实，终止不确定会话，不重试。
+成功记录仍按P1/P2排序；双方确认、源核查、release与原截止检查后才激活下一段。
+服务器仍在回复之前准备下一prefix，消息数/wire/数学/材料/GC/20ms周期均不变。
+stop/switch、旧模式和TLS继续使用原收发路径。维护不伪装为普通控制帧写入流映射。
+
+原三组每组2000步、每400步维护，12次continue的公开计时如下（毫秒）：
+
+| 已测区间 | 最小 | 中位 | 最大 | 可得结论 |
+|---|---:|---:|---:|---|
+| 全维护 | 8.2293 | 9.6464 | 10.5347 | 原维护真实开销，不能全部算作可消除收益 |
+| maintenance_advance | 7.8327 | 9.2599 | 10.1450 | 包含请求准备、网络等待、服务器准备及回执处理，不能叫纯网络 |
+| maintenance_source | 0.3353 | 0.3584 | 0.3745 | 源检查占较小部分，继续保留 |
+
+来源为三个原A目录的 `manifest.json/control_samples/phase_durations_ns`；步号399/799/1199/1599。
+这些区间没有进一步隔离服务器prefix准备和等待，不能从历史数据证明串行接收就是根因。
+软件oracle只验证消息和状态等价。新实机改善值 **NOT RUN**；117个exchange慢步仍未解释，
+本候选也不构成它们的修复结论。
+
+### B：采集选择核验与明确阻断
+
+`prepare-native`现在同时保存实际TDH descriptor的provider、version、level、keyword，
+检查每个版本与固定provider、level5、原keyword `0x600000484`、原六个event-ID筛选相容。
+`source_selection_audit_version: 1`区分这项来源核验；旧字段列表计划不足以通过新preflight，
+需要重新做只读准备，不能改写旧计划或旧ETL。实际源列表在启动前仍重查，不放宽字段白名单。
+没有更换keyword、扩大provider、增加缓冲或改Memory模式，也没有新增生产协议/报告schema。
+
+本机只读核查（WPR 10.0.26100）确认profiledetails中的128×64KiB系统缓冲、64×64KiB
+事件缓冲、六个ID/level5/keyword均与profile一致；TDH的15个已注册事件版本均满足选择条件。
+这是配置/注册信息的证据，**不是旧会话运行时已经正确启用或实际产出事件的证明**。
+
+| 必要证据 | 原三组结果 | 本轮结论 |
+|---|---|---|
+| TCP事件且目标流/SeqNo锚点可信 | 三组TCPIP均0 | FAIL；缺失原因尚不能确定，不能猜mask后重采 |
+| 调度覆盖应用首末窗口 | 应用40.7005/40.7374/40.5888秒，保留调度包络仅10.4158/5.6851/13.1604秒 | FAIL；包络也不证明内部无缺口 |
+| 目标线程生命周期 | 三组目标main-thread start均0 | FAIL；native先启动再spawn Client，仍未保留完整前缀 |
+| 实际CSwitch版本可解释 | v5事件128095/129239/128645；本机TDH1168 | BLOCKED；不套v3布局 |
+| QPC/loss与资源记录 | QPC且lost0；旧资源例外保留 | 必要但不足，不升级为完整采集 |
+| 本轮新事件验证 | 未运行新的两机控制实验或系统采集 | NOT RUN；不能称ready-to-run |
+
+[WPR官方Logging Mode说明](https://learn.microsoft.com/en-us/windows-hardware/test/wpt/logging-mode)
+规定Memory使用环形缓冲，旧事件会被覆盖；lost0不能证明首窗口仍在。
+它与当前只保留尾段的现象相容，但不能单独解释所有TCP事件缺失。
+[ETW选择规则](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-enabletraceex2)
+也只说明level/keyword筛选的必要条件，不保证指定工作负载一定触发事件。
+
+### 下一次联合验证的前置条件（尚未授权运行）
+
+先为实际CSwitch v5取得可靠字段来源，并核实原生会话实际启用链及TCP目标流锚点。
+覆盖方案有两条待决路线：保留12MiB预算但缩短观察窗口（不再是原2000步实验），或经用户
+批准采用File/更大缓冲覆盖约40秒。前者更容易保留前缀但可能不复现尖峰；后者引入写盘扰动
+或额外内存，必须先明确数值上限、停止/保存策略及可接受例外。现有256MiB临时磁盘目标、
+64MiB最终ETL与12MiB原生缓冲不是新扩容许可；File模式本身不提供硬文件上限。
+仅改存储模式也不能解决TCP为0或v5无法解码的问题。
+
+上述前置软件与独审完成后，另提一组同head两机2000步/约40秒的具体预算和启动命令，
+经批准才能执行。该组可分别判断维护实际耗时与采集覆盖是否有效；若诊断扰动和历史组不同，
+不得直接算百分比提速或声称因果改善。缺前置条件就停止，不能以本机替代、试采或连续重跑。
+
 ## 绝对节拍与演示计时（D132-14）
 
 动态持续light入口省略`--non-realtime`时，复用既有`AbsoluteCycleClock`：

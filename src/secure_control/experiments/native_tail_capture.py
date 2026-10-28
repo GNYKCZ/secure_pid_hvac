@@ -12,7 +12,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from secure_control.execution.diagnostic_limits import limits_for
-from secure_control.experiments.windows_tail_analysis import tcp_source_schemas
+from secure_control.experiments.windows_tail_analysis import TCPIP, tcp_source_schemas
 
 _IDS = {1033,1038,1040,1043,1074,1300}
 _SCALARS = {'Tcb':16,'NumBytes':8,'SeqNo':8,'NumPkt':8,'LocalAddressLength':8,
@@ -37,7 +37,7 @@ def profile_contract(path, schemas):
     providers = root.findall('.//EventProvider')
     profiles = root.findall('.//Profile')
     if (len(providers)!=1 or len(profiles)!=1
-            or providers[0].get('Name')!='2f07e2ee-15db-40f1-90ef-9d7ba282188a'
+            or providers[0].get('Name')!=TCPIP or providers[0].get('Level')!='5'
             or profiles[0].get('Name')!='D17' or profiles[0].get('LoggingMode')!='Memory'
             or any('Stack' in e.tag or e.tag in ('CaptureStateOnStart','CaptureStateOnSave') for e in root.iter())):
         raise ValueError('unexpected capture provider/profile')
@@ -56,10 +56,21 @@ def profile_contract(path, schemas):
     if (len(collectors)!=2 or sorted((int(e.find('BufferSize').get('Value')),
              int(e.find('Buffers').get('Value'))) for e in collectors) != [(64,64),(64,128)]):
         raise ValueError('native buffer budget')
-    seen = set()
+    seen, descriptors = set(), set()
     for row in schemas:
-        if row['id'] not in _IDS:
-            raise ValueError('unselected source schema')
+        # 字段白名单并不能证明该版本会被当前level/keyword选中。
+        # 只核验实际TDH descriptor，不根据事件缺失猜测或扩大keyword。
+        if (type(row['id']) is not int or row['id'] not in _IDS
+                or row.get('provider')!=TCPIP
+                or type(row['version']) is not int or not 0<=row['version']<=255
+                or type(row.get('level')) is not int or not 0<=row['level']<=5
+                or type(row.get('keyword')) is not int or not 0<=row['keyword']<2**64
+                or row['keyword'] and not row['keyword'] & 0x600000484):
+            raise ValueError('unselected source descriptor')
+        identity = (row['id'],row['version'])
+        if identity in descriptors:
+            raise ValueError('duplicate source descriptor')
+        descriptors.add(identity)
         seen.add(row['id'])
         required = {'Tcb','NumBytes','SeqNo'} if row['id']==1074 else {
             'Tcb','LocalAddress','RemoteAddress','Pid' if row['id']==1300 else 'ProcessId'}
@@ -76,8 +87,11 @@ def profile_contract(path, schemas):
         raise ValueError('selected event schemas incomplete')
     return {'profile':str(path),'profile_sha256':hashlib.sha256(path.read_bytes()).hexdigest(),
         'event_ids':sorted(_IDS),'source_schemas':schemas,'native_buffer_bytes':12*1024*1024,
+        'source_selection_audit_version':1,
         'source_payload':'excluded by ID allowlist and actual registered field audit',
-        'runtime_semantics':'SeqNo/version/QPC/loss and stream anchors require actual single-group validation'}
+        'runtime_semantics':('NOT RUN: actual TCP target-flow/SeqNo anchors, first-to-last scheduling coverage, '
+            'thread lifetime, actual CSwitch version, QPC/loss and resource validation required; '
+            'Memory is circular: lost=0 does not prove full-window retention')}
 
 
 def _sessions():
@@ -185,6 +199,8 @@ class NativeCapture:
             raise ValueError('native capture cannot restart/overwrite')
         profile = Path(self.plan['profile']).resolve()
         if (self.plan.get('schema')!='native-tail-preparation-v1'
+                or type(self.plan.get('source_selection_audit_version')) is not int
+                or self.plan['source_selection_audit_version']!=1
                 or self.plan.get('window')!=2000
                 or profile != Path(__file__).resolve().parents[3]/'configs/control-tail-native-2000.wprp'
                 or hashlib.sha256(profile.read_bytes()).hexdigest()!=self.plan['profile_sha256']

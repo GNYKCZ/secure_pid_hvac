@@ -22,7 +22,10 @@ def schemas():
         names=[('Tcb',16,0),('NumBytes',8,0),('SeqNo',8,0)] if event==1074 else [
             ('Tcb',16,0),('LocalAddress',14,2),('RemoteAddress',14,2),
             ('Pid' if event==1300 else 'ProcessId',8,0)]
-        result.append({'id':event,'version':0,'fields':[{'name':n,'type':t,'flags':f} for n,t,f in names]})
+        result.append({'id':event,'version':0,
+            'provider':'2f07e2ee-15db-40f1-90ef-9d7ba282188a','level':4,
+            'keyword':0x200000000 if event==1074 else 0x400000084,
+            'fields':[{'name':n,'type':t,'flags':f} for n,t,f in names]})
     return result
 
 
@@ -81,6 +84,30 @@ def test_preparation_never_issues_start_stop_or_cancel():
     assert [a[0] for a in backend.commands]==['-profiledetails']
     assert plan['native_buffer_bytes']==12582912 and plan['window']==2000
     assert plan['prepared_not_captured'] and not plan['real_capture_verified']
+    assert plan['source_selection_audit_version']==1
+    assert 'Memory is circular: lost=0' in plan['runtime_semantics']
+
+
+@pytest.mark.parametrize('field,value', [('provider','wrong'),('level',6),('level',True),
+    ('keyword',1<<40),('keyword',False),('keyword',-1),('keyword',1<<64),
+    ('version',False),('version',256),('id',1033.0)])
+def test_registered_descriptor_must_match_selected_provider_level_and_keyword(field,value):
+    rows=schemas()
+    rows[0][field]=value
+    with pytest.raises(ValueError,match='source descriptor'):
+        profile_contract(PROFILE,rows)
+
+
+def test_old_field_only_plan_and_duplicate_descriptor_are_not_selection_evidence(tmp_path):
+    rows=schemas()
+    del rows[0]['keyword']
+    with pytest.raises(ValueError): profile_contract(PROFILE,rows)
+    rows=schemas()
+    rows.append(copy.deepcopy(rows[0]))
+    with pytest.raises(ValueError,match='duplicate'): profile_contract(PROFILE,rows)
+    profile=tmp_path/'wrong-level.wprp'
+    profile.write_text(PROFILE.read_text().replace('Level="5"','Level="3"'))
+    with pytest.raises(ValueError): profile_contract(profile,schemas())
 
 
 @pytest.mark.parametrize('fault',['payload','field_type','missing_event','missing_fields','unselected_id','profile_filter','profile_buffer'])
@@ -162,7 +189,8 @@ def test_native_exception_paths_do_not_hide_session_state(tmp_path,monkeypatch,f
         assert [a[0] for a in backend.commands]==['-start','-stop']
 
 
-@pytest.mark.parametrize('fault',['not_admin','schema_change','space','profile_path','approval','conflict'])
+@pytest.mark.parametrize('fault',['not_admin','schema_change','space','profile_path','approval','conflict',
+                                 'old_audit','bool_audit','float_audit'])
 def test_native_preflight_rejects_other_conditions_despite_resource_exceptions(tmp_path,monkeypatch,fault):
     import secure_control.experiments.native_tail_capture as module
     plan=prepare_native(PROFILE,_schemas=schemas(),_backend=Backend())
@@ -172,6 +200,9 @@ def test_native_preflight_rejects_other_conditions_despite_resource_exceptions(t
         profile.write_bytes(PROFILE.read_bytes())
         plan['profile']=str(profile)
     if fault=='approval': plan['resource_exceptions']['temporary_disk_hard_quota']=True
+    if fault=='old_audit': plan.pop('source_selection_audit_version')
+    if fault=='bool_audit': plan['source_selection_audit_version']=True
+    if fault=='float_audit': plan['source_selection_audit_version']=1.0
     monkeypatch.setattr(module.shutil,'disk_usage',lambda path:SimpleNamespace(free=0 if fault=='space' else 2*1024**3))
     capture=NativeCapture(plan,tmp_path/'not-created'/'native.etl',_backend=backend)
     with pytest.raises((PermissionError,ValueError)):

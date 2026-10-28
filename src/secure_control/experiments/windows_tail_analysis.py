@@ -392,6 +392,7 @@ def tcp_source_schemas():
                 raise ValueError('source name unterminated')
             fields.append({'name':raw[offset:end].decode('utf-16le'),'type':typ,'flags':flags})
         rows.append({'id':desc.id,'version':desc.version,'fields':fields,
+            'provider':TCPIP,'level':desc.level,'keyword':desc.keyword,
             'schema_sha256':hashlib.sha256(raw).hexdigest()})
     return rows
 
