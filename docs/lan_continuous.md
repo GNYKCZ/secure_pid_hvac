@@ -153,16 +153,34 @@ round由原Client.json的step身份表解释。body只按长度跳过，从不�
 新的`experiments.windows_tail_analysis.read_stream_link`验证链接、身份、容量、重复/重叠区间、
 原角色文件与manifest绑定；坏hash/round/越界直接拒绝，partial保留未知完成端点。
 
-同模块提供`read_etl(path)`窄离线API：Windows x64消费者，文件≤64MiB、最多100000个事件，
+同模块提供`read_etl(path)`窄离线API：Windows x64消费者，非空文件≤64MiB、默认100000个事件，
+仅显式`maximum_events=300000`可读取较长既有文件，硬上限300000，不自动重读或扩大。
+遍历计数包括未知事件及超出解码预算后的事件；超限标不完整，不能截断后宣称完整。
 只调用OpenTraceW/ProcessTrace/CloseTrace，设置文件名与RAW_TIMESTAMP|EVENT_RECORD；
 文件头目前只接受64位布局；32位进程的事件指针仍按各条32/64位flags解码，WOW文件头布局未验证则拒绝。
 没有实时session/provider启动API。原始QPC/正PerfFreq/trace终止与loss必须核验，
 回调异常保留为不完整，finally关闭自己的读取句柄；未知事件不静默丢弃后宣称完整。
-必要白名单为classic Process Start/End v2…4、Thread Start/End v2、ReadyThread v2、
+必要白名单为classic Process Start/End v2…4、Thread Start/End v2/v3、ReadyThread v2、
 CSwitch v2/v3及TCPIP1074 v0/v1、1033/1300 v0/v1。每条仍用本机TDH核验实际字段名/type/flags，
 不硬套历史AFD结构，不解引用内核地址或Buffer。TCB/进程键只输出本次局部ID。
 字段版本不支持、连接地址/生命周期缺失或端点语义未证实时保留unsupported/unknown。
 跨平台import不加载Windows DLL，普通D15分析仍可运行。
+
+D132-18仅修读取已有ETL：原OpenTrace模式错误含`0x100`（REAL_TIME），导致离线文件
+以无LoggerName的实时会话打开并报123；正确模式是`0x1000 | 0x10000000`
+（RAW_TIMESTAMP | EVENT_RECORD），仍用Unicode路径和自有读取handle。
+数值来源为[微软evntcons.h](https://raw.githubusercontent.com/microsoft/win32metadata/main/generation/WinSDK/RecompiledIdlHeaders/um/evntcons.h)，
+结构、union布局与模式语义依据[EVENT_TRACE_LOGFILEW](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/ns-evntrace-event_trace_logfilew)。
+独立mock核查x64偏移/448B结构、112B记录、64位handle、中文空格路径及关闭顺序。
+新增descriptor/unsupported/解码错误计数（各descriptor最多4096种），
+来自Process/Thread/TCPIP的未支持计数与其他元数据分列；前者不表示每条都与目标线程相关。
+不支持记录只读固定头，不保留其UserData，complete仍false，不忽略未知字段制造归因。
+事件列表有显式数量上限、字段长度≤128B；这是记录数/字段边界，不是Python RSS硬配额。
+
+已有01/02/03的真实文件可遍历208124/210554/208928事件，QPC频率10MHz、loss=0；
+但CSwitch v5本机TDH返回1168、没有TCPIP事件，故Ready→Running及TCP覆盖仍未知。
+Thread v3实际TDH验证仅提取ProcessId/TThreadId；不从v2/v3猜CSwitch v5布局。
+读取修复不等于采集字段齐全，不为了归因打开新provider、重采或宽松解析。
 
 原16A字段查询与合成oracle纳入本次软件核验：本机manifest字段存在、合成EVENT_RECORD解码、
 mock API的头/loss/异常关闭与合成调度/TCP重组只能证明软件，不证明真实ETL事件会按预期出现。
