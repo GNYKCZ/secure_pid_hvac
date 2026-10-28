@@ -6,6 +6,8 @@ import struct
 import threading
 import time
 
+from .diagnostic_limits import limits_for
+
 SCHEMA = 'client-stream-map-v1'
 _ROW = struct.Struct('!8q')
 _MAX = 2**63-1
@@ -14,8 +16,9 @@ _MAX = 2**63-1
 class ClientStreamMap:
     """固定64KiB：800份两方控制帧槽，余量不作逐syscall历史。"""
 
-    def __init__(self):
-        self.buffer = bytearray(65536)
+    def __init__(self, *, window=400):
+        self.limits = limits_for(window)
+        self.buffer = bytearray(self.limits.stream_bytes)
         self.connections = []
         self.count = 0
         self.error = None
@@ -43,7 +46,7 @@ class ClientStreamMap:
     def begin(self, sockets, lengths, step):
         """仅原双路交换标记控制请求；所有setup/停止IO仍通过同一计数器。"""
         try:
-            if type(step) is not int or not 0 <= step < 400 or self.count+2 > 800:
+            if type(step) is not int or not 0 <= step < self.limits.window or self.count+2 > self.limits.frame_rows:
                 raise ValueError('frame_capacity')
             for sock,length in zip(sockets,lengths,strict=True):
                 if (not isinstance(sock,_CountedSocket) or sock.owner is not self or sock.active is not None
@@ -63,7 +66,9 @@ class ClientStreamMap:
         rows = [list(_ROW.unpack_from(self.buffer,i*_ROW.size)) for i in range(self.count)]
         complete = (self.error is None and len(self.connections)==2
                     and all(r[3] == r[1]+r[2] and r[5] > 0 and r[6] == r[4]+4+r[5] for r in rows))
-        return {'schema':SCHEMA,'buffer_bytes':len(self.buffer),'complete':complete,
+        return {'schema':self.limits.stream_schema,
+            **({'limits':self.limits.payload()} if self.limits.window!=400 else {}),
+            'buffer_bytes':len(self.buffer),'complete':complete,
             'error_type':self.error,'rows':rows,'row_fields':[
                 'step_times_two_plus_connection','send_start','send_length','send_complete',
                 'receive_start','receive_body_length','receive_complete','reserved'],

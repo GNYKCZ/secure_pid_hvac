@@ -7,7 +7,8 @@ import math
 import re
 from pathlib import Path
 
-from secure_control.execution.tail_diagnostics import PHASES, SCHEMA, SPAN_PHASES
+from secure_control.execution.diagnostic_limits import artifact_limits
+from secure_control.execution.tail_diagnostics import PHASES, SPAN_PHASES
 
 _NAMES = {v:k for k,v in PHASES.items()}
 
@@ -18,6 +19,15 @@ def _union(intervals):
         total += max(0, end-max(start, right if right is not None else start))
         right = max(end, right if right is not None else end)
     return total
+
+
+def _distribution(values):
+    """保留全分母的工作时长摘要；维护分类由实际计时字段决定。"""
+    work = sorted(values)
+    return {'count':len(work),'mean_ns':sum(work)/len(work) if work else None,
+        'max_ns':max(work,default=None),'above_20ms':sum(v>20_000_000 for v in work),
+        'quantiles_ns':{label:work[math.ceil(len(work)*p)-1] if work else None
+                        for label,p in (('p50',.5),('p95',.95),('p99',.99))}}
 
 
 def gc_intersections(events, start_ns, end_ns):
@@ -40,23 +50,24 @@ def gc_intersections(events, start_ns, end_ns):
 
 
 def _decode(record):
-    if record.get('schema') != SCHEMA or record.get('role') not in ('Client','P1','P2','worker'):
+    limits = artifact_limits(record)
+    if record.get('role') not in ('Client','P1','P2','worker'):
         raise ValueError('不支持的角色/诊断schema')
-    if type(record.get('buffer_bytes')) is not int or not 0 < record['buffer_bytes'] <= 1024*1024:
+    if type(record.get('buffer_bytes')) is not int or not 0 < record['buffer_bytes'] <= limits.memory_limit:
         raise ValueError('诊断缓冲越界')
     if any(type(record.get(k)) is not int or record[k] <= 0 for k in ('pid','parent_pid','main_thread_id')):
         raise ValueError('进程/线程必须是严格正整数')
     events = record.get('events')
-    if not isinstance(events,list) or len(events) > 14336:
+    if not isinstance(events,list) or len(events) > limits.events+limits.gc_events:
         raise ValueError('事件容量无效')
-    for field,maximum in (('event_capacity',12288),('gc_capacity',2048)):
+    for field,maximum in (('event_capacity',limits.events),('gc_capacity',limits.gc_events)):
         if type(record.get(field)) is not int or not 1 <= record[field] <= maximum:
             raise ValueError('记录容量字段错误')
     for field,capacity in (('event_count',record['event_capacity']),('gc_count',record['gc_capacity'])):
         if type(record.get(field)) is not int or not 0 <= record[field] <= capacity:
             raise ValueError('记录数量字段错误')
     if (record['event_count']+record['gc_count'] != len(events)
-            or record['buffer_bytes'] != (record['event_capacity']+record['gc_capacity'])*64+65536
+            or record['buffer_bytes'] != (record['event_capacity']+record['gc_capacity'])*64+limits.identity_bytes
             or type(record.get('lost_events')) is not int or record['lost_events'] < 0):
         raise ValueError('缓冲长度/数量/丢失不一致')
     spans, points, gcs, open_spans, open_gc = [], [], [], {}, {}
@@ -66,7 +77,7 @@ def _decode(record):
         if not isinstance(row,list) or len(row) != 8 or any(type(v) is not int for v in row):
             raise ValueError('事件必须为严格8整数行')
         sequence,code,step,material,wall,cpu,thread,aux = row
-        if sequence <= previous or wall < 0 or cpu < 0 or thread <= 0 or not -1 <= step < 400 or not -1 <= material < 416:
+        if sequence <= previous or wall < 0 or cpu < 0 or thread <= 0 or not -1 <= step < limits.window or not -1 <= material < limits.identities:
             raise ValueError('事件序号/端点/线程/身份无效')
         previous = sequence
         if code in (900,901):
@@ -164,6 +175,9 @@ def analyze_records(records, *, clock_domains=None, samples=(), same_host=False,
     """同一分析入口处理本机或合成/未来双机数据；不启动任何控制或网络。"""
     if not records or len(records) > 4 or len({r['role'] for r in records}) != len(records):
         raise ValueError('角色重复或记录数量无效')
+    limits = artifact_limits(records[0])
+    if any(artifact_limits(r) != limits for r in records):
+        raise ValueError('诊断窗口混配')
     contexts = [r['context'] for r in records]
     if any(type(c.get('source_head')) is not str or re.fullmatch(r'[0-9a-f]{40}',c['source_head']) is None
            or type(c.get('diagnostic_id')) is not str or not c['diagnostic_id'] for c in contexts):
@@ -176,7 +190,7 @@ def analyze_records(records, *, clock_domains=None, samples=(), same_host=False,
     rounds = {}
     for record in records:
         for step,identity in record['rounds'].items():
-            if not step.isdigit() or not 0 <= int(step) < 416 or type(identity) is not str:
+            if not step.isdigit() or not 0 <= int(step) < limits.identities or type(identity) is not str:
                 raise ValueError('round关联错误')
             if step in rounds and rounds[step] != identity:
                 raise ValueError('同一控制/材料步的round身份不一致')
@@ -192,7 +206,7 @@ def analyze_records(records, *, clock_domains=None, samples=(), same_host=False,
                       (PHASES['startup'],PHASES['control'],PHASES['stop'],PHASES['cleanup'])}
     if expected_steps is not None:
         if (not isinstance(expected_steps,(list,tuple,range)) or not expected_steps
-                or any(type(s) is not int or not 0 <= s < 400 for s in expected_steps)
+                or any(type(s) is not int or not 0 <= s < limits.window for s in expected_steps)
                 or list(expected_steps) != list(range(len(expected_steps)))):
             raise ValueError('声明的控制步骤范围无效')
         required_steps = set(expected_steps)
@@ -218,7 +232,7 @@ def analyze_records(records, *, clock_domains=None, samples=(), same_host=False,
     sample_ids, unknown_round_steps = [], []
     for sample in samples:
         step = sample['global_step']
-        if type(step) is not int or not 0 <= step < 400:
+        if type(step) is not int or not 0 <= step < limits.window:
             raise ValueError('原工作样本身份错误')
         # 输入/采样失败可能早于runtime.step，而worker已预生成同槽round。
         # 只保留显式partial的未完成失败行；绝不从材料身份填造Client已尝试事务。
@@ -392,19 +406,57 @@ def analyze_records(records, *, clock_domains=None, samples=(), same_host=False,
                     (s['global_step'] in (step-1,step) or s['material_step'] in (step,step+1)
                      or s['global_step'] is None and s['material_step'] is None)] for r in records}
     work = sorted(s['work_elapsed_ns'] for s in samples if s.get('work_elapsed_ns') is not None) if samples else sorted(b-a for a,b in by_step.values())
-    distribution = {'count':len(work),'mean_ns':sum(work)/len(work) if work else None,
-        'max_ns':max(work,default=None),'above_20ms':sum(v>20_000_000 for v in work),
-        'quantiles_ns':{label:work[math.ceil(len(work)*p)-1] if work else None
-                        for label,p in (('p50',.5),('p95',.95),('p99',.99))},
+    distribution = {**_distribution(work),
         'scope':('original completed Client work samples' if samples else 'diagnostic sample/work pairs')+
                 '; failures listed separately; not pure network latency'}
-    return {'schema':SCHEMA,'diagnostic_id':contexts[0]['diagnostic_id'],'source_head':contexts[0]['source_head'],
+    expected_maintenance = [s for s in sorted(required_steps) if s+1<len(required_steps)
+                            and (s+1)%limits.segment_steps==0]
+    maintenance = [s['global_step'] for s in samples
+                   if s.get('phase_durations_ns',{}).get('maintenance',0)>0]
+    client = next((r for r in records if r['role']=='Client'),{})
+    stop_spans = [s for s in decoded.get('Client',{}).get('spans',[])
+                  if s['phase']=='stop' and s['thread_id']==client.get('main_thread_id')]
+    final_step = None
+    # 预定范围和观察前缀都不是停止事实。finish在失败时也补stop事件，故必须同时
+    # 有成功状态、完整配对、主线程身份和末次已完成工作之后的真实停止边界。
+    if client.get('status')=='stopped' and decoded.get('Client',{}).get('complete') and len(stop_spans)==1:
+        stop = stop_spans[0]
+        step = stop['global_step']
+        if (step in by_step and step==max(observed_steps,default=None)
+                and by_step[step][1]<=stop['start_ns']
+                and any(s['global_step']==step and s.get('status')=='confirmed'
+                        and s.get('work_elapsed_ns') is not None for s in samples)):
+            final_step = step
+    def groups(rows):
+        # 缺计时字段不能按索引猜维护；final_stop是成功停止前末次工作，不是停止耗时。
+        groups = {'ordinary':[],'continuing_maintenance':[],'final_stop':[],'unknown':[]}
+        for row in rows:
+            value = row.get('work_elapsed_ns')
+            if value is None:
+                continue
+            step = row['global_step']
+            phase = row.get('phase_durations_ns',{})
+            group = ('final_stop' if step==final_step else
+                'continuing_maintenance' if step in expected_maintenance and step in maintenance else
+                'ordinary' if 'maintenance' in phase and phase['maintenance']==0 else 'unknown')
+            groups[group].append(value)
+        return {name:_distribution(values) for name,values in groups.items()}
+    return {'schema':limits.trace_schema,
+        **({'limits':limits.payload()} if limits.window!=400 else {}),
+        'diagnostic_id':contexts[0]['diagnostic_id'],'source_head':contexts[0]['source_head'],
         'diagnostic_complete':complete,'clock_axes':axes,'steps':result,'missing_evidence':missing,
         'all_work_steps':sorted(by_step),'incomplete_roles':[k for k,v in decoded.items() if not v['complete']],
         'requested_steps_unavailable':[s for s in targets if s not in by_step],
         'work_distribution':distribution,
         'unfinished_spans':{r:d['unfinished_spans'] for r,d in decoded.items()},
         'failure_samples':[s for s in samples if s.get('status') != 'confirmed'],
+        'segments':[{'start':start,'end':min(start+limits.segment_steps,limits.window)-1,
+            'completed_steps':[s for s in sorted(by_step) if start<=s<start+limits.segment_steps],
+            'work_distribution':_distribution(s['work_elapsed_ns'] for s in samples
+                if start<=s['global_step']<start+limits.segment_steps and s.get('work_elapsed_ns') is not None)}
+            for start in range(0,limits.window,limits.segment_steps)],
+        'expected_maintenance_steps':expected_maintenance,
+        'observed_maintenance_steps':maintenance,'work_groups':groups(samples),
         'unknown_sample_round_steps':unknown_round_steps,
         'scope':'diagnostic observation only; not a performance comparison or strict realtime qualification'}
 
@@ -416,12 +468,13 @@ def analyze_manifests(paths, *, same_host=False, partial=False):
     for name in paths:
         path = Path(name)
         manifest = json.loads(path.read_text(encoding='utf8'))
-        if manifest.get('schema') != SCHEMA:
-            raise ValueError('manifest schema错误')
+        limits = artifact_limits(manifest)
+        if loaded and limits != artifact_limits(loaded[0]):
+            raise ValueError('manifest窗口版本不一致')
         loaded.append(manifest)
         manifests_complete = manifests_complete and manifest.get('diagnostic_complete') is True
         count = manifest.get('expected_step_count')
-        if type(count) is not int or not 1 <= count <= 400:
+        if type(count) is not int or not 1 <= count <= limits.window:
             manifests_complete = False
         elif expected is not None and expected != count:
             raise ValueError('manifest声明的控制范围不一致')
@@ -442,6 +495,8 @@ def analyze_manifests(paths, *, same_host=False, partial=False):
             if hashlib.sha256(raw).hexdigest() != entry['sha256']:
                 raise ValueError('角色文件hash不符')
             record = json.loads(raw)
+            if artifact_limits(record) != limits:
+                raise ValueError('manifest与角色窗口版本不一致')
             if (record['context']['diagnostic_id'] != manifest.get('diagnostic_id')
                     or record['context']['source_head'] != manifest.get('source_head')):
                 raise ValueError('manifest与角色身份/SHA不符')
@@ -503,7 +558,9 @@ def analyze_manifests(paths, *, same_host=False, partial=False):
     if not records:
         if not partial:
             raise ValueError('没有角色记录')
-        return {'schema':SCHEMA,'diagnostic_complete':False,'steps':[],
+        return {'schema':limits.trace_schema,
+            **({'limits':limits.payload()} if limits.window!=400 else {}),
+            'diagnostic_complete':False,'steps':[],
             'missing_evidence':['no role records'],'file_errors':file_errors,'manifests':loaded,
             'scope':'partial diagnostic; no clock/latency conclusion'}
     result = analyze_records(records,clock_domains=domains,samples=samples,same_host=same_host,

@@ -20,19 +20,37 @@ def main():
         host.add_argument('--expected-head',required=True)
         host.add_argument('--software-review',required=True)
         host.add_argument('--steps',type=int,default=400)
+        host.add_argument('--window',type=int,choices=(400,2000),default=400,help='显式版本窗口，旧默认400保持')
         if side == 'client':
             host.add_argument('--stream-map',action='store_true',help='显式公开帧区间sidecar；不启动系统跟踪')
+            host.add_argument('--native-plan',type=Path,help='仅2000专项：用户明确执行时才启动计划中的自有WPR会话')
             host.add_argument('--config',type=Path,default=Path('configs/lab-client-cart-pole-demo.example.yaml'))
         else:
             host.add_argument('--p1-config',type=Path,default=Path('configs/lab-p1-cart-pole-demo.example.yaml'))
             host.add_argument('--p2-config',type=Path,default=Path('configs/lab-p2-cart-pole-demo.example.yaml'))
+    prepare = modes.add_parser('prepare-native',help='只读核查profile/source/session，写计划，不启动采集/控制')
+    prepare.add_argument('output',type=Path)
+    prepare.add_argument('--expected-head',required=True)
     analyze = modes.add_parser('analyze',help='只读角色manifest，不运行控制')
     analyze.add_argument('manifests',type=Path,nargs='+')
     analyze.add_argument('--output',type=Path,required=True)
     analyze.add_argument('--same-host',action='store_true',help='没有实际同机spawn证明时拒绝合轴')
     analyze.add_argument('--partial',action='store_true',help='保留失败前缀/缺角色；不升级为完整证据')
     args = parser.parse_args()
-    if args.mode == 'local':
+    if args.mode == 'prepare-native':
+        import subprocess
+
+        from secure_control.experiments.native_tail_capture import prepare_native
+        from secure_control.experiments.tail_diagnostic_runner import ROOT
+        head = subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
+        if head!=args.expected_head:
+            parser.error('准备计划head不一致')
+        result = prepare_native(ROOT/'configs/control-tail-native-2000.wprp')
+        result['source_head'] = head
+        with args.output.open('x',encoding='utf8') as stream:
+            json.dump(result,stream,ensure_ascii=False,indent=2)
+        print('仅准备计划已保存；尚未启动任何系统或控制采集。')
+    elif args.mode == 'local':
         from secure_control.experiments.tail_diagnostic_runner import run_local
         result = run_local(args.output,expected_head=args.expected_head,
                            software_review=args.software_review,steps=args.steps)
@@ -44,7 +62,10 @@ def main():
         paths = [args.config] if args.mode == 'client' else [args.p1_config,args.p2_config]
         result = run_host(args.mode,args.output,diagnostic_id=args.diagnostic_id,
             expected_head=args.expected_head,software_review=args.software_review,
-            config_paths=paths,steps=args.steps,**({'stream_map':True} if args.mode=='client' and args.stream_map else {}))
+            config_paths=paths,steps=args.steps,**({'window':args.window} if args.window!=400 else {}),
+            **({'stream_map':True} if args.mode=='client' and args.stream_map else {}),
+            **({'native_plan':json.loads(args.native_plan.read_text(encoding='utf8'))}
+               if args.mode=='client' and args.native_plan else {}))
         print(json.dumps({'diagnostic_complete':result['diagnostic_complete'],
             'functional_complete':result['functional_complete'],
             'manifest':str(args.output/'manifest.json')},ensure_ascii=False))

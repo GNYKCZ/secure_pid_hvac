@@ -7,6 +7,8 @@ import os
 import struct
 from pathlib import Path
 
+from secure_control.execution.diagnostic_limits import artifact_limits
+
 TCPIP = '2f07e2ee-15db-40f1-90ef-9d7ba282188a'
 THREAD = '3d6fa8d1-fe05-11d0-9dda-00c04fd7ba7c'
 PROCESS = '3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c'
@@ -129,11 +131,14 @@ def read_stream_link(path):
     manifest = load(link['manifest'],link['manifest_sha256'])
     sidecar = load(link['sidecar'],link['sidecar_sha256'])
     role = load('Client.json',sidecar['role_file_sha256'])
+    limits = artifact_limits(sidecar,stream=True)
+    if artifact_limits(manifest) != limits or artifact_limits(role) != limits:
+        raise ValueError('stream/trace窗口不一致')
     if not any(e.get('path')=='Client.json' and e.get('sha256')==sidecar['role_file_sha256']
                for e in manifest.get('files',[])):
         raise ValueError('role hash not bound by original manifest')
-    if (sidecar.get('schema') != 'client-stream-map-v1' or sidecar.get('buffer_bytes') != 65536
-            or len(sidecar.get('rows',[])) > 800 or len(sidecar.get('connections',[])) > 2
+    if (sidecar.get('buffer_bytes') != limits.stream_bytes
+            or len(sidecar.get('rows',[])) > limits.frame_rows or len(sidecar.get('connections',[])) > 2
             or sidecar.get('context') != role.get('context') or sidecar.get('protocol') != role.get('protocol')
             or manifest.get('diagnostic_id') != sidecar['context']['diagnostic_id']
             or manifest.get('source_head') != sidecar['context']['source_head']):
@@ -148,7 +153,7 @@ def read_stream_link(path):
     previous = {}
     for row in sidecar['rows']:
         if (not isinstance(row,list) or len(row)!=8 or any(type(v) is not int for v in row)
-                or not 0 <= row[0] < 800 or row[0] in identities):
+                or not 0 <= row[0] < limits.frame_rows or row[0] in identities):
             raise ValueError('stream frame identity')
         identities.add(row[0])
         step, connection = divmod(row[0],2)
@@ -311,9 +316,9 @@ def _fields(key):
     guid,event,version,opcode = key
     if guid==TCPIP and event==1074 and version in (0,1):
         return {'Tcb':(16,),'NumBytes':(8,),'SeqNo':(8,),**({'NumPkt':(8,)} if version else {})}
-    if guid==TCPIP and event in (1033,1300) and version in (0,1):
+    if guid==TCPIP and event in (1033,1038,1040,1043,1300) and version in (0,1):
         return {'Tcb':(16,),'LocalAddress':(14,),'RemoteAddress':(14,),
-            'ProcessId' if event==1033 else 'Pid':(8,),
+            'Pid' if event==1300 else 'ProcessId':(8,),
             **({'ProcessStartKey':(10,)} if version else {})}
     if guid==THREAD:
         if opcode in (1,2) and version==2:
@@ -326,6 +331,61 @@ def _fields(key):
     if guid==PROCESS and opcode in (1,2) and version in (2,3,4):
         return {'ProcessId':(8,),'UniqueProcessKey':(16,)}
     return None
+
+
+def tcp_source_schemas():
+    """只读全部本机TCPIP manifest descriptor，审计指定事件源，无provider启用。"""
+    import ctypes as c
+    import uuid
+    api = _native()
+    record = api.record_type()
+    guid = record.header.provider
+    guid.data[:] = uuid.UUID(TCPIP).bytes_le
+    desc_type = type(record.header.desc)
+    dll = c.WinDLL('tdh')
+    enum = dll.TdhEnumerateManifestProviderEvents
+    enum.argtypes = [c.c_void_p,c.c_void_p,c.POINTER(c.c_uint32)]
+    enum.restype = c.c_uint32
+    info = dll.TdhGetManifestEventInformation
+    info.argtypes = [c.c_void_p,c.c_void_p,c.c_void_p,c.POINTER(c.c_uint32)]
+    info.restype = c.c_uint32
+    def query(fn,*args):
+        size = c.c_uint32()
+        if fn(*args,None,c.byref(size))!=122 or not 8<=size.value<=1024*1024:
+            raise ValueError('source schema unavailable')
+        buffer = c.create_string_buffer(size.value)
+        if fn(*args,buffer,c.byref(size)):
+            raise ValueError('source schema query failed')
+        return buffer.raw[:size.value]
+    data = query(enum,c.byref(guid))
+    count = struct.unpack_from('<I',data)[0]
+    if count>4096 or len(data)!=8+count*16:
+        raise ValueError('source descriptor bounds')
+    rows = []
+    for index in range(count):
+        desc = desc_type.from_buffer_copy(data[8+index*16:24+index*16])
+        if desc.id not in (1033,1038,1040,1043,1074,1300):
+            continue
+        raw = query(info,c.byref(guid),c.byref(desc))
+        if len(raw)<112:
+            raise ValueError('source schema header')
+        properties = struct.unpack_from('<I',raw,100)[0]
+        if properties>128 or 112+properties*24>len(raw):
+            raise ValueError('source schema property bounds')
+        fields = []
+        for prop in range(properties):
+            flags,offset,typ = struct.unpack_from('<IIH',raw,112+24*prop)
+            if offset%2 or not 112<=offset<len(raw):
+                raise ValueError('source name offset')
+            end = offset
+            while end+2<=len(raw) and raw[end:end+2]!=b'\0\0':
+                end += 2
+            if end+2>len(raw):
+                raise ValueError('source name unterminated')
+            fields.append({'name':raw[offset:end].decode('utf-16le'),'type':typ,'flags':flags})
+        rows.append({'id':desc.id,'version':desc.version,'fields':fields,
+            'schema_sha256':hashlib.sha256(raw).hexdigest()})
+    return rows
 
 
 def read_etl(path, *, maximum_events=100000, _api=None):

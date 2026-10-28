@@ -44,6 +44,86 @@ D13已有结果继续标记Work实测、未独立结果复核。
 软件引用图检查能验证不再产生这两类临时闭包环，但不证明它们解释全部gen2扫描成本。
 本阶段没有新增性能运行；长期最慢耗时及双机收益需另行验证，不能据此宣布GC尖峰已解决。
 
+## 显式2000步诊断窗口与原生采集准备（D132-17）
+
+依据[2000步设计](https://github.com/GNYKCZ/secure_pid_hvac/issues/132#issuecomment-6460925858)，
+`client`、`pair`诊断入口增加显式`--window 2000 --steps 2000`窗口声明。
+按[D17R用户批准](https://github.com/GNYKCZ/secure_pid_hvac/issues/132#issuecomment-6462410802)，
+取消先前两项资源硬保证导致的无条件封锁；仅放行其余检查完整的显式2000路径，
+没有force/ignore开关。100秒为停止监督目标，OS异常下不保证ETW已经结束；
+含临时256MiB为磁盘目标而非硬配额，WPR merge峰值可能超过。
+两项固定例外及批准来源进入准备计划、两端plan、manifest和原生报告；其余限制不变。
+旧默认窗口、`local`入口和旧v1文件的400步边界不变；这不会改变日常动画配置或控制算法。
+业务段仍为400步、材料库存16，控制身份0…1999，材料身份0…2015；
+399/799/1199/1599后继续下一段，1999结束，不发第2001次控制。
+此项用于定位延迟，不是提速，也不表示20ms实时资格通过。
+
+容量、schema、计时预算统一由`execution.diagnostic_limits`声明。
+新文件显式使用`control-tail-diagnostic-v2`及`client-stream-map-v2`并包含完整`limits`；
+旧v1精确读取，未知schema、版本混配、声明不一致均拒绝，不重写旧结果。
+2000窗口每角色普通事件最多61440、GC事件10240、身份槽2016；
+Client流映射最多4000条、320KiB。每角色诊断数值缓冲≤6MiB、四角色≤24MiB；
+当前四份角色缓冲加Client流映射精确为19726080B。
+这不是业务RSS、Python导出对象或原有light计时内存的上限。
+溢出保留partial，不能扩大容量或只保存末400步掩盖丢失。
+
+一次新`two_host_2000`账本在启动前扣为0；失败也不恢复、不换目录补跑。
+Client活动上限90秒，两端各总监督240秒。A原生目标窗口100秒包含10秒停止预留；
+监督器至90秒停止业务采集，进程清退也受这一边界约束。
+只启动本端成员，只清理自有PID树，不远程控制B，不改GC、网卡或系统优先级。
+
+新增`prepare-native`仅查询本机TCPIP TDH字段、已有会话并调用WPR `-profiledetails`，
+保存准备计划；不启用provider、不运行控制。A的2000窗口必须同时显式启用
+`--stream-map`及提供同head准备计划`--native-plan`，B不启动原生采集。
+A必须使用管理员PowerShell。正式启动前、账本扣减之前重新核验权限、仓库白名单profile、
+原字节hash及实际TDH字段、工具、空间、会话冲突、新目录和同head；begin前再核验一次。
+旧准备文件缺少本次例外声明会被拒绝，应重新prepare，不能手工改成自称已实测。
+`configs/control-tail-native-2000.wprp`采用内存模式：ProcessThread/CSwitch/ReadyThread
+64KiB×128，TCPIP 64KiB×64，总数值缓冲12MiB；不采stack或业务payload。
+TCPIP事件ID严格为1033/1038/1040/1043/1074/1300，逐本机注册版本审计字段名、类型和flags。
+宽keyword本身可能包含数据事件，因此不能删除ID过滤或遇到不支持版本后扩大provider。
+离线reader还接受1038/1040/1043的已支持v0/v1；其他版本保留unsupported。
+
+只有用户明确执行带计划的A诊断命令才调用WPR启动；使用本次随机唯一instance，
+冲突已有WPR/NT Kernel Logger时停止准备，不取消其他会话。
+启动后只接受两份同instance会话、QPC时钟和实际缓冲≤12MiB；
+结束前核对GUID归属、loss、耗时与文件大小。单ETL≤64MiB、输出目录目标≤256MiB、
+启动前空闲≥1GiB。内存模式避免持续ETL写入，但WPR停止合并时的临时总磁盘占用
+仍未获得实际验证，不能将结束后的文件检查说成完整的256MiB硬配额。
+目录检查包含子目录和非ETL文件；可观察超目标记录`resource_budget_exceeded=true`及partial，
+停止后续自动处理，不删除原件凑预算，不改输出盘或系统配额。外部临时峰值明确未测。
+
+原生操作系统调用或WPR失败不能被Python时限变成绝对保证：
+启动超时撤销本次唯一instance的部分启动；已有GUID变化、无法复核归属、
+停止超时或超过窗口时明确输出`*_manual_attention`，不宣称成功退出、不自动重试或停止别人。
+这些故障意味着采集不完整，用户需要检查报告中的instance。WPR命令返回后仍查询本次
+会话是否消失；命令超时/退出本身不作为ETW已经停止的证据。
+provider启动前保存`native-owner.json`，成功启动后更新session GUID，结束后更新最终报告。
+异常时在A管理员终端读取该文件的`instance`、`sessions`及`manual_recovery`，
+先执行该instance的`wpr -status -instancename`检查，再对比会话名/GUID；只有确认仍为
+本次自己的会话才使用文件内`save`命令，输出到新的`native-a-manual.etl`，不覆盖原ETL。
+若GUID变更或无法核实归属则停止人工操作并反馈，不能全局stop/cancel或改用其他instance。
+正常结束无需手动停止；手动保存不是再跑控制组，也不恢复已扣账本。
+真实会话命名、退出、临时磁盘峰值、实际ETL descriptor/QPC/loss、SeqNo语义和流锚点
+仍须在获准的唯一组中核验；软件mock通过不等于现场已验证。
+本次软件复审通过且其他前置核实后，才交付精确的新ID/目录与两端命令，由用户启动唯一组。
+代理不代跑/远程操作、试采或用本机替代，缺其他条件仍停止，不用例外绕过。
+
+离线分析保留原样本、所有超20ms步骤、最慢8步与邻步，按五个400步段列出摘要。
+`expected_maintenance_steps`是计划边界，`observed_maintenance_steps`来自实际maintenance计时，
+不把计划索引当执行证据。普通、继续维护、末步停止及计时未知组分别统计，未知不填零。
+`final_stop`仅表示成功停止前的末次已完成工作样本，不是停止握手自身的耗时。
+必须同时有Client成功停止状态、完整主线程配对stop事件、停止前末次工作的时间/身份
+及confirmed样本；预定最大步或最后观察步都不能单独证明停止。失败时清理补出的stop
+也不能冒充成功停止；缺证据按已知普通/维护或未知分类，保留原样本与全分母。
+两机必须采用同一新会话和版本，不能拼接旧B；跨A/B绝对时钟不相减。
+TCP事件覆盖不等于socket可读，调度Ready不等于正在运行，不由本功能断言历史34ms根因。
+
+发布两端最终实测命令前须完成当前head的软件独审及采集前置核实。
+本轮为人工限定续接累计5/5（不重置），只允许本次实施/检查和原Review一次复审；
+新的有效Finding需报告用户/Design，
+不得自行继续返工、实测、补跑、合并PR或关闭Issue。
+
 ## 默认关闭的帧边界与Windows离线关联（D132-16B）
 
 本功能仅是软件前置，依据[16B设计](https://github.com/GNYKCZ/secure_pid_hvac/issues/132#issuecomment-6446474476)。

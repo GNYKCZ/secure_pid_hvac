@@ -172,7 +172,7 @@ def link_fixture(tmp_path):
         sock.recv(5)
     result=recorder.save('stopped')
     assert result['status']=='saved' and recorder.buffer_bytes+len(owner.buffer)==1024*1024
-    manifest={'diagnostic_id':'stream','source_head':'a'*40,'diagnostic_complete':True,
+    manifest={'schema':'control-tail-diagnostic-v1','diagnostic_id':'stream','source_head':'a'*40,'diagnostic_complete':True,
               'files':[{'path':'Client.json','sha256':hashlib.sha256((tmp_path/'Client.json').read_bytes()).hexdigest()}]}
     (tmp_path/'manifest.json').write_text(json.dumps(manifest))
     link={'schema':'client-stream-map-link-v1','manifest':'manifest.json','sidecar':'Client.stream.json',
