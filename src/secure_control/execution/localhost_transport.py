@@ -184,6 +184,12 @@ def _exchange_two_frames(sockets, payloads, *, deadline, limit, on_request, on_r
     # 两路都先检查，避免第二份非法时第一份已经发出。
     for payload in payloads:
         _validate_frame_payload(payload, limit)
+    if observer is not None:
+        # 旧观察器不要求新能力；仅显式sidecar标控制帧，IO计数只由socket包装器负责。
+        from .tail_diagnostics import current
+        diagnostic = current()
+        if diagnostic is not None and diagnostic.streams is not None:
+            diagnostic.streams.begin(sockets,[len(p) for p in payloads],diagnostic._control_step)
     outgoing = [memoryview(_HEADER.pack(len(p)) + p) for p in payloads]
     incoming = [bytearray(), bytearray()]
     targets, headers, complete, attempted = [4, 4], [False, False], [False, False], [False, False]

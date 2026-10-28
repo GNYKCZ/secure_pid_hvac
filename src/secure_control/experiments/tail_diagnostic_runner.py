@@ -54,10 +54,10 @@ def _role_child(role, ports, context, results, stop, deadline, steps):
     _configured_child(config,context,results,stop,deadline,steps)
 
 
-def _configured_child(config, context, results, stop, deadline, steps, activity=None):
+def _configured_child(config, context, results, stop, deadline, steps, activity=None, stream_map=False):
     """仅装配原角色；两机模式保留加载的配置和原业务循环。"""
     role = config.role
-    recorder = TailRecorder(context,role).start()
+    recorder = TailRecorder(context,role,stream_map=stream_map and role == 'Client').start()
     result = {'role':role,'pid':os.getpid(),'parent_pid':os.getppid(),'status':'failed'}
     try:
         if activity is not None:
@@ -272,7 +272,7 @@ def _clear_owned(processes, deadline, *, _now=time.perf_counter, _run=subprocess
     return forced
 
 
-def _collect_host(configs, context, steps, *, wall_started=None, _mp=mp, _now=time.perf_counter):
+def _collect_host(configs, context, steps, *, wall_started=None, stream_map=False, _mp=mp, _now=time.perf_counter):
     """本机监督实际成员；30秒活动/180秒总窗口，无跨机时钟或额外连接。"""
     started = _now() if wall_started is None else wall_started
     spawn = _mp.get_context('spawn')
@@ -284,7 +284,7 @@ def _collect_host(configs, context, steps, *, wall_started=None, _mp=mp, _now=ti
                 reason = 'wall_limit'
                 break
             process = spawn.Process(target=_configured_child,
-                args=(config,context,results,stop,started+177,steps,activity))
+                args=(config,context,results,stop,started+177,steps,activity,stream_map))
             processes.append(process)
             process.start()
         while len(reports) < len(processes):
@@ -325,10 +325,12 @@ def _config_identity(config):
         'timeouts':{name:getattr(config,name+'_timeout') for name in ('startup','step','idle','shutdown')}}
 
 
-def run_host(side, output, *, diagnostic_id, expected_head, software_review, config_paths, steps=400):
+def run_host(side, output, *, diagnostic_id, expected_head, software_review, config_paths, steps=400, stream_map=False):
     """显式两机一次采集；同ID本端账本拒绝换目录重跑，原local入口保持。"""
     wall_started = time.perf_counter()
     from secure_control.execution.lan_config import load_lan_config
+    if type(stream_map) is not bool or stream_map and side != 'client':
+        raise ValueError('流映射只可显式用于A端')
     if side not in ('client','pair') or type(steps) is not int or not 1 <= steps <= 400:
         raise ValueError('诊断端或attempt上限无效')
     if not isinstance(diagnostic_id,str) or re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}',diagnostic_id) is None:
@@ -362,6 +364,7 @@ def run_host(side, output, *, diagnostic_id, expected_head, software_review, con
     # 共享源码摘要不含机器部署配置；角色配置通过公开语义摘要单独核验。
     common = {p:_common_sha(ROOT/p) for p in frozen if not p.startswith('configs/')}
     plan = {'schema':SCHEMA,'diagnostic_id':diagnostic_id,'source_head':head,'side':side,
+        'stream_map':stream_map,
         'source_sha256':frozen,'common_source_sha256':common,'software_review':software_review,
         'common_source_hash_mode':'sha256: CRLF to LF for .py/.toml/.lock; raw bytes otherwise',
         'source_dirty':dirty,'configurations':identities,'maximum_steps':steps,
@@ -379,7 +382,8 @@ def run_host(side, output, *, diagnostic_id, expected_head, software_review, con
     output.mkdir(parents=True,exist_ok=False)
     _write_new(output/'plan.json',plan)
     _write_new(output/'ledger.json',ledger)
-    group = _collect_host(configs,context,steps,wall_started=wall_started)
+    extra = {'stream_map':True} if stream_map else {}
+    group = _collect_host(configs,context,steps,wall_started=wall_started,**extra)
     records, files, errors = {}, [], []
     expected_roles = (*roles,'worker') if side == 'client' else roles
     for role in expected_roles:
@@ -426,6 +430,12 @@ def run_host(side, output, *, diagnostic_id, expected_head, software_review, con
         'last_step_semantics':f'{steps-1} is final stop; no continuing segment maintenance',
         'observation_warning':'diagnostic changes allocation/GC; cross-host absolute ns cannot be subtracted'}
     _write_new(output/'manifest.json',manifest)
+    if stream_map:
+        # 独立链接不扩展旧v1 manifest/事件schema；sidecar丢失不伪造成功。
+        sidecar = output/'Client.stream.json'
+        _write_new(output/'stream-link.json',{'schema':'client-stream-map-link-v1',
+            'manifest':'manifest.json','manifest_sha256':_sha(output/'manifest.json'),
+            'sidecar':'Client.stream.json','sidecar_sha256':_sha(sidecar) if sidecar.is_file() else None})
     ledger.update(status='complete' if complete else 'partial',manifest_sha256=_sha(output/'manifest.json'),
                   functional_complete=functional,diagnostic_complete=complete,wall_s=group['wall_s'])
     for path in (ledger_path,output/'ledger.json'):

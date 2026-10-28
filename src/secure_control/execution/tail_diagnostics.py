@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 import os
 import platform
@@ -60,7 +61,7 @@ def _clock(name):
 class TailRecorder:
     """每进程≤1MiB预分配数字/身份缓冲；热路径不生成事件dict、JSON或写盘。"""
 
-    def __init__(self, context: DiagnosticContext, role: str, *, event_capacity=12288, gc_capacity=2048):
+    def __init__(self, context: DiagnosticContext, role: str, *, event_capacity=12288, gc_capacity=2048, stream_map=False):
         if _active is not None:
             raise RuntimeError('每进程只允许一个活动诊断会话。')
         if (not isinstance(context, DiagnosticContext) or role not in ('Client','P1','P2','worker')
@@ -72,6 +73,12 @@ class TailRecorder:
                 or type(gc_capacity) is not int or not 1 <= gc_capacity <= 2048):
             raise ValueError('诊断身份/角色/固定容量无效。')
         self.context, self.role = context, role
+        if type(stream_map) is not bool or stream_map and (role != 'Client' or context.transport != 'insecure_tcp'):
+            raise ValueError('流映射只支持显式Client明文诊断')
+        self.streams = None
+        if stream_map:
+            from .client_stream_map import ClientStreamMap
+            self.streams = ClientStreamMap()
         self.event_capacity, self.gc_capacity = event_capacity, gc_capacity
         self._events = bytearray(event_capacity*_ROW.size)
         self._gc_events = bytearray(gc_capacity*_ROW.size)
@@ -296,6 +303,13 @@ class TailRecorder:
             path = Path(self.context.output_directory)/f'{self.role}.json'
             with path.open('x', encoding='utf8') as stream:
                 json.dump(report,stream,ensure_ascii=False,allow_nan=False,separators=(',',':'))
+            if self.streams is not None:
+                sidecar = self.streams.report()
+                sidecar.update(context=asdict(self.context),protocol=self._protocol,
+                    role_file_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                    complete=sidecar['complete'] and report['diagnostic_complete'])
+                with path.with_name('Client.stream.json').open('x',encoding='utf8') as stream:
+                    json.dump(sidecar,stream,ensure_ascii=False,allow_nan=False,separators=(',',':'))
             return {'status':'saved','path':path.name,'diagnostic_complete':report['diagnostic_complete']}
         except Exception as error:  # noqa: BLE001 - 独立导出状态，不覆盖原控制失败。
             self.observation_failed(error)

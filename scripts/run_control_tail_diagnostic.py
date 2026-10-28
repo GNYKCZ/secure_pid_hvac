@@ -21,6 +21,7 @@ def main():
         host.add_argument('--software-review',required=True)
         host.add_argument('--steps',type=int,default=400)
         if side == 'client':
+            host.add_argument('--stream-map',action='store_true',help='显式公开帧区间sidecar；不启动系统跟踪')
             host.add_argument('--config',type=Path,default=Path('configs/lab-client-cart-pole-demo.example.yaml'))
         else:
             host.add_argument('--p1-config',type=Path,default=Path('configs/lab-p1-cart-pole-demo.example.yaml'))
@@ -43,7 +44,7 @@ def main():
         paths = [args.config] if args.mode == 'client' else [args.p1_config,args.p2_config]
         result = run_host(args.mode,args.output,diagnostic_id=args.diagnostic_id,
             expected_head=args.expected_head,software_review=args.software_review,
-            config_paths=paths,steps=args.steps)
+            config_paths=paths,steps=args.steps,**({'stream_map':True} if args.mode=='client' and args.stream_map else {}))
         print(json.dumps({'diagnostic_complete':result['diagnostic_complete'],
             'functional_complete':result['functional_complete'],
             'manifest':str(args.output/'manifest.json')},ensure_ascii=False))
