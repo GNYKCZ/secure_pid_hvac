@@ -1506,14 +1506,11 @@ class LanSegmentedRuntime:
                          (WireEnvelope(SCHEMA_VERSION, "request", "Client", role,
                           segment._sequences[party], operation, segment.session_id,
                           None, None, None, payload), None) for party, role in enumerate(("P1", "P2"))])
-            for sock, (request, encoded) in zip(segment._sockets, prepared, strict=True):
-                if advance:
-                    localhost_transport.send_frame(sock, encoded, deadline=deadline, limit=_FRAME_LIMIT)
-                else:
-                    send_envelope(sock, request, deadline=deadline, limit=_FRAME_LIMIT)
-            receipts = []
-            for sock, (request, _) in zip(segment._sockets, prepared, strict=True):
-                response = receive_envelope(sock, deadline=deadline, limit=_FRAME_LIMIT)
+            receipts = [None, None]
+
+            def accept_receipt(party, response):
+                # 任一方完整到达即核验并保留事实；另一方失败不得抹去已知密封。
+                request = prepared[party][0]
                 _validate_party_reply(response, request)
                 expected = SegmentEndReceipt(
                     request.recipient, segment.session_id, end, self.confirmed_step_count,
@@ -1521,9 +1518,25 @@ class LanSegmentedRuntime:
                 )
                 if response.payload != (SegmentAdvanceReceipt(expected, begin) if advance else expected):
                     raise ValueError("段关闭回执与双提交/物理确认前缀不一致。")
-                receipts.append(expected)
-                self.last_segment_receipts = tuple(receipts)
-                segment._sequences[0 if request.recipient == "P1" else 1] += 1
+                receipts[party] = expected
+                self.last_segment_receipts = tuple(r for r in receipts if r is not None)
+                segment._sequences[party] += 1
+
+            if advance and self.config.client_io == "ready-v1":
+                # 复用原线程的公平收发，不提前ACK、不激活下一段，也不增加wire消息。
+                # 维护不是普通控制帧，不能向逐步stream sidecar伪报其字节偏移。
+                localhost_transport._exchange_two_frames(segment._sockets,
+                    tuple(encoded for _, encoded in prepared), deadline=deadline, limit=_FRAME_LIMIT,
+                    on_request=lambda _party, _state: None,
+                    on_reply=lambda party, data: accept_receipt(party, decode_envelope(data)))
+            else:
+                for sock, (request, encoded) in zip(segment._sockets, prepared, strict=True):
+                    if advance:
+                        localhost_transport.send_frame(sock, encoded, deadline=deadline, limit=_FRAME_LIMIT)
+                    else:
+                        send_envelope(sock, request, deadline=deadline, limit=_FRAME_LIMIT)
+                for party, sock in enumerate(segment._sockets):
+                    accept_receipt(party, receive_envelope(sock, deadline=deadline, limit=_FRAME_LIMIT))
             setup = segment.setup
             record = SegmentRecord(
                 self.hello, segment.session_id, tuple(self._records), tuple(receipts), setup,

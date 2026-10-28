@@ -50,7 +50,7 @@ def compact_advance(monkeypatch, request):
         range_verification=None, modulus_verification=None, _material_pool=None,
         last_commit_observation=None, _last_phase_ns={}, close=lambda: closed.append(True))
     runtime.__dict__.update(_v2=True, _full_v3=False, _wire_profile=request.param,
-        config=SimpleNamespace(shutdown_timeout=1.), control=RunControl(), _segment=segment,
+        config=SimpleNamespace(shutdown_timeout=1., client_io="blocking-v1"), control=RunControl(), _segment=segment,
         _pending=None, phase="RUNNING", run_id="run", controller_epoch="e"*64,
         segment_capacity=400, segment_index=0, global_start=0, confirmed_step_count=400,
         _last_end_round_id=None, _last_closed_segment_count=0, last_sealed_record=None,
@@ -200,6 +200,87 @@ def test_compact_advance_already_expired_budget_closes_without_send(compact_adva
         runtime.end_segment(deadline_ns=1)
     assert runtime.phase == "UNCERTAIN" and closed and not sent
     assert runtime.confirmed_step_count == 400 and not runtime.last_segment_receipts
+
+
+@pytest.mark.parametrize("fault", [None, "missing_p1", "eof_p1", "bad_p1", "bad_p2", "restore", "late", "stop"])
+@pytest.mark.parametrize("compact_advance", ["control-dynamic-matrix-preauthorized-v2"], indirect=True)
+def test_ready_maintenance_p2_first_preserves_seals_and_original_wire(compact_advance, monkeypatch, fault):
+    """独立400步边界oracle经过真实双路helper；分片/背压及首错不靠sleep断言。"""
+    import struct
+
+    from test_localhost_transport import _ReadySocket
+
+    from secure_control.execution import localhost_codec as c
+    from secure_control.execution import localhost_transport as t
+    from secure_control.execution.cycle_timing import CycleDeadlineExceeded
+
+    runtime, _sent, _injection, closed = compact_advance
+    runtime._wire_profile = "control-dynamic-matrix-preauthorized-v2"
+    runtime.config.client_io = "ready-v1"
+    end = c.SegmentEndPayload("run", 0, 0, 400, 400, "round-399", "continue")
+    begin = c.SegmentBeginPayload("run", 1, 400, "e"*64, "round-399")
+    requests, sockets = [], []
+    frame = lambda data: struct.pack("!I", len(data)) + data
+    for party, role in enumerate(("P1", "P2")):
+        request = c.WireEnvelope(c.SCHEMA_VERSION, "request", "Client", role, 17,
+            "segment_advance", "session", None, None, None, c.SegmentAdvancePayload(end, begin))
+        requests.append(request)
+        receipt = c.SegmentEndReceipt(role, "session", end, 400, 12000, 1600)
+        if fault == f"bad_p{party+1}":
+            receipt = replace(receipt, products=11999)
+        reply = replace(request, kind="reply", sender=role, recipient="Client",
+                        payload=c.SegmentAdvanceReceipt(receipt, begin))
+        sockets.append(_ReadySocket(frame(c.encode_envelope(reply)), chunk=19))
+    runtime._segment._sockets = sockets
+    sockets[0].block_send = lambda: not sockets[1].sent
+    def hold_p1():
+        if fault == "stop":
+            runtime.control.request_stop()
+        if not runtime.last_segment_receipts:
+            return True
+        assert runtime.last_segment_receipts[0].role == "P2"
+        assert runtime._segment._sequences == [17, 18]
+        assert runtime.segment_index == 0 and runtime.phase == "ENDING_SEGMENT"
+        if fault in {"missing_p1", "eof_p1"}:
+            sockets[0].incoming.clear()
+            sockets[0].eof = fault == "eof_p1"
+        return False
+    sockets[0].block_recv = hold_p1
+    if fault == "restore":
+        sockets[0].restore_error = True
+    def wait(*args):
+        assert fault == "missing_p1"
+        raise t.LocalhostTransportTimeout("P1 missing")
+    monkeypatch.setattr(t.select, "select", wait)
+    monkeypatch.setattr(t, "remaining_seconds", lambda _deadline: 1.)
+    if fault == "late":
+        def deadline(_ns, phase):
+            if phase == "SEGMENT_END":
+                raise CycleDeadlineExceeded(phase)
+        monkeypatch.setattr(lan_runtime, "check_deadline", deadline)
+    if fault not in {None, "stop"}:
+        with pytest.raises((ValueError, RuntimeError, OSError)):
+            runtime.end_segment()
+        assert runtime.phase == "UNCERTAIN" and closed
+        expected_parties = [] if fault == "bad_p2" else ["P1", "P2"] if fault in {"restore", "late"} else ["P2"]
+        assert [r.role for r in runtime.last_segment_receipts] == expected_parties
+        assert runtime._segment._sequences == [17+int("P1" in expected_parties), 17+int("P2" in expected_parties)]
+        with pytest.raises(RuntimeError):
+            runtime.next_segment()
+        with pytest.raises(RuntimeError):
+            runtime.step([0.])
+    else:
+        record = runtime.end_segment()
+        assert [r.role for r in record.receipts] == ["P1", "P2"]
+        assert runtime.phase == "CONNECTING_NEXT" and runtime.segment_index == 0
+        runtime.next_segment()
+        assert runtime.segment_index == 1 and runtime.global_start == 400
+        assert runtime._segment._sequences == [18, 18]
+        assert runtime.control.stop_requested == (fault == "stop")
+    assert [bytes(s.sent) for s in sockets] == [frame(c.encode_envelope(r)) for r in requests]
+    assert runtime.confirmed_step_count == runtime._segment._step == 400
+    assert runtime._segment._products == 12000 and runtime._segment._truncations == 1600
+    assert all(s.modes == [0., 3.] for s in sockets)
 
 
 @pytest.mark.parametrize("expected,received", [("control-batch-v1", "control-dynamic-compact-v2"),
