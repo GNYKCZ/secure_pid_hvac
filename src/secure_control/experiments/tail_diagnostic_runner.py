@@ -286,6 +286,8 @@ def _collect_host(configs, context, steps, *, wall_started=None, stream_map=Fals
     try:
         if native is not None:
             native.begin()
+            (native.output.parent/'native-owner.json').write_text(
+                json.dumps(native.report,ensure_ascii=False,indent=2),encoding='utf8')
         for config in configs:
             if _now() >= run_deadline:
                 reason = 'wall_limit'
@@ -313,6 +315,8 @@ def _collect_host(configs, context, steps, *, wall_started=None, stream_map=Fals
             if report.get('status') not in ('stopped','closed'):
                 reason = 'first_functional_failure'
                 break
+    except KeyboardInterrupt:
+        reason, launcher_error = 'user_interrupted', 'KeyboardInterrupt'
     except Exception as error:  # noqa: BLE001 - 启动失败也冻结partial，不重试或丢弃已用账本。
         reason, launcher_error = 'launcher_failure', type(error).__name__
     finally:
@@ -349,10 +353,6 @@ def run_host(side, output, *, diagnostic_id, expected_head, software_review, con
     """显式两机一次采集；同ID本端账本拒绝换目录重跑，原local入口保持。"""
     wall_started = time.perf_counter()
     limits = limits_for(window)
-    if window==2000:
-        # D17设计续答：软件候选可审，但原生退出及临时磁盘硬条件尚未满足。
-        # 在ledger、provider和控制子进程之前拒绝，不提供force/ack绕过。
-        raise ValueError('2000步实测封锁：原生停止时限与临时磁盘硬上限尚未验证；仅允许只读准备及软件审查')
     from secure_control.execution.lan_config import load_lan_config
     if type(stream_map) is not bool or stream_map and side != 'client':
         raise ValueError('流映射只可显式用于A端')
@@ -384,6 +384,18 @@ def run_host(side, output, *, diagnostic_id, expected_head, software_review, con
     output = Path(output).resolve()
     if output.exists():
         raise FileExistsError('输出目录已存在，不能重跑')
+    native = None
+    native_preflight = None
+    exceptions = {}
+    if window==2000:
+        from secure_control.experiments.native_tail_capture import (
+            NativeCapture,
+            resource_exceptions,
+        )
+        exceptions = resource_exceptions()
+        if side=='client':
+            native = NativeCapture(native_plan,output/'native-a.etl')
+            native_preflight = native.preflight()  # 只读；管理员/profile/source/空间/冲突均在账本与子进程前拒绝。
     paths = subprocess.check_output(['git','ls-files','--cached','--others','--exclude-standard',
         'src','scripts','configs','pyproject.toml','uv.lock'],cwd=ROOT,text=True).splitlines()
     frozen = {p:_sha(ROOT/p) for p in paths}
@@ -397,6 +409,8 @@ def run_host(side, output, *, diagnostic_id, expected_head, software_review, con
     version = {'schema':limits.trace_schema,
         **({'limits':limits.payload()} if window!=400 else {})}
     plan = {**version,'diagnostic_id':diagnostic_id,'source_head':head,'side':side,
+        **({'resource_exceptions':exceptions} if exceptions else {}),
+        **({'native_preparation':native_plan,'native_preflight':native_preflight} if native is not None else {}),
         'stream_map':stream_map,
         'source_sha256':frozen,'common_source_sha256':common,'software_review':software_review,
         'common_source_hash_mode':'sha256: CRLF to LF for .py/.toml/.lock; raw bytes otherwise',
@@ -417,10 +431,13 @@ def run_host(side, output, *, diagnostic_id, expected_head, software_review, con
     _write_new(output/'plan.json',plan)
     _write_new(output/'ledger.json',ledger)
     extra = {'stream_map':True} if stream_map else {}
-    if native_plan is not None:
-        from secure_control.experiments.native_tail_capture import NativeCapture
-        extra['native'] = NativeCapture(native_plan,output/'native-a.etl')
+    if native is not None:
+        # 首个provider之前留下唯一instance与精确恢复命令，父进程异常时仍可找到。
+        _write_new(output/'native-owner.json',native.report)
+        extra['native'] = native
     group = _collect_host(configs,context,steps,wall_started=wall_started,**extra)
+    if native is not None:
+        (output/'native-owner.json').write_text(json.dumps(native.report,ensure_ascii=False,indent=2),encoding='utf8')
     records, files, errors = {}, [], []
     expected_roles = (*roles,'worker') if side == 'client' else roles
     for role in expected_roles:
@@ -461,6 +478,7 @@ def run_host(side, output, *, diagnostic_id, expected_head, software_review, con
     if native_plan is not None:
         complete = complete and group.get('native',{}).get('status')=='saved'
     manifest = {**version,'diagnostic_id':diagnostic_id,'source_head':head,'side':side,
+        **({'resource_exceptions':exceptions} if exceptions else {}),
         'diagnostic_complete':complete,'functional_complete':functional,'expected_step_count':steps,
         'mode':'non_realtime_diagnostic','clock_domains':{context.clock_domain_id:{
             'local_spawn_verified':verified,'launcher_pid':os.getpid(),'members':members,'wall_clock':wall_clock}},

@@ -36,6 +36,14 @@ class Backend:
         self.live=False
         self.changed=False
 
+    def is_admin(self):
+        return self.fault!='not_admin'
+
+    def source_schemas(self):
+        result=schemas()
+        if self.fault=='schema_change': result[0]['version']=8
+        return result
+
     def sessions(self):
         if self.fault=='conflict':
             return [{'name':'WPR_other_user'}]
@@ -62,7 +70,7 @@ class Backend:
             if self.fault=='stop_timeout':
                 raise subprocess.TimeoutExpired('mock-wpr',10)
             Path(args[1]).write_bytes(b'mock-only ETL output')
-            self.live=False
+            self.live=self.fault=='stop_still_live'
         if args[0]=='-cancel': self.live=False
         return SimpleNamespace(returncode=0,stdout=b'profile parsed; fake-only')
 
@@ -152,3 +160,47 @@ def test_native_exception_paths_do_not_hide_session_state(tmp_path,monkeypatch,f
         assert capture.finish()['status']=='stop_failed_manual_attention'
         assert backend.live  # 未知状态如实呈现，绝不宣称已成功清退。
         assert [a[0] for a in backend.commands]==['-start','-stop']
+
+
+@pytest.mark.parametrize('fault',['not_admin','schema_change','space','profile_path','approval','conflict'])
+def test_native_preflight_rejects_other_conditions_despite_resource_exceptions(tmp_path,monkeypatch,fault):
+    import secure_control.experiments.native_tail_capture as module
+    plan=prepare_native(PROFILE,_schemas=schemas(),_backend=Backend())
+    backend=Backend(fault)
+    if fault=='profile_path':
+        profile=tmp_path/'copied.wprp'
+        profile.write_bytes(PROFILE.read_bytes())
+        plan['profile']=str(profile)
+    if fault=='approval': plan['resource_exceptions']['temporary_disk_hard_quota']=True
+    monkeypatch.setattr(module.shutil,'disk_usage',lambda path:SimpleNamespace(free=0 if fault=='space' else 2*1024**3))
+    capture=NativeCapture(plan,tmp_path/'not-created'/'native.etl',_backend=backend)
+    with pytest.raises((PermissionError,ValueError)):
+        capture.preflight()
+    assert not backend.commands and not backend.live and not capture.output.parent.exists()
+
+
+@pytest.mark.parametrize('kind',['etl','directory','still_live'])
+def test_native_stop_budget_and_actual_session_state_are_not_command_exit(tmp_path,monkeypatch,kind):
+    import secure_control.experiments.native_tail_capture as module
+    monkeypatch.setattr(module.shutil,'disk_usage',lambda path:SimpleNamespace(free=2*1024**3))
+    plan=prepare_native(PROFILE,_schemas=schemas(),_backend=Backend())
+    backend=Backend('stop_still_live' if kind=='still_live' else None)
+    original=backend.run
+    def run(args,timeout):
+        result=original(args,timeout)
+        if args[0]=='-stop' and kind!='still_live':
+            file=Path(args[1]) if kind=='etl' else tmp_path/'merge-temporary.bin'
+            with file.open('wb') as stream:
+                stream.truncate((65 if kind=='etl' else 257)*1024*1024)
+        return result
+    backend.run=run
+    capture=NativeCapture(plan,tmp_path/'native.etl',_backend=backend,_now=lambda:0.)
+    capture.begin()
+    report=capture.finish()
+    if kind=='still_live':
+        assert report['status']=='stop_unverified_manual_attention' and backend.live
+    else:
+        assert report['status']=='partial' and report['resource_budget_exceeded']
+        assert (tmp_path/'native.etl').exists() and not report['temporary_peak_verified']
+    assert report['resource_exceptions']['authorization']==module.AUTHORIZATION
+    assert report['manual_recovery']['status'][-1]==capture.instance

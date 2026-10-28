@@ -1,5 +1,6 @@
 """2000窗口独立容量/身份/跨段/监督oracle，绝不启动2000控制或原生试采。"""
 import copy
+import json
 import os
 from types import SimpleNamespace
 
@@ -194,25 +195,75 @@ def test_2000_requires_explicit_window_and_native_preparation_before_any_launch(
     with pytest.raises(ValueError): run_local(tmp_path/'local',expected_head='a'*40,software_review='https://r',steps=2000)
     with pytest.raises(ValueError): run_host('client',tmp_path/'old',diagnostic_id='test',expected_head='a'*40,
         software_review='https://r',config_paths=[],steps=2000)
-    with pytest.raises(ValueError,match='实测封锁'):
+    with pytest.raises(ValueError,match='原生准备'):
         run_host('client',tmp_path/'new',diagnostic_id='test',expected_head='a'*40,
             software_review='https://r',config_paths=[],steps=2000,window=2000,stream_map=True)
     assert not list(tmp_path.iterdir())
 
 
 @pytest.mark.parametrize('side',['client','pair'])
-def test_pending_runtime_gate_precedes_config_ledger_and_native_launch(tmp_path,monkeypatch,side):
+def test_2000_bad_head_still_precedes_ledger_and_native_launch(tmp_path,monkeypatch,side):
     from secure_control.experiments import tail_diagnostic_runner as runner
     def forbidden(*args,**kwargs):
-        pytest.fail('blocked runtime must not inspect git, reserve ledger or launch')
-    monkeypatch.setattr(runner.subprocess,'check_output',forbidden)
+        pytest.fail('bad head must not reserve ledger or launch')
+    monkeypatch.setattr(runner.subprocess,'check_output',lambda *a,**kw:'b'*40)
     monkeypatch.setattr(runner,'_write_new',forbidden)
     monkeypatch.setattr(runner,'_collect_host',forbidden)
-    with pytest.raises(ValueError,match='实测封锁'):
+    with pytest.raises(ValueError,match='HEAD'):
         runner.run_host(side,tmp_path/'no-output',diagnostic_id='d17-blocked',
             expected_head='a'*40,software_review='https://example.test/review',config_paths=[],
             steps=2000,window=2000,stream_map=side=='client',native_plan={'source_head':'a'*40} if side=='client' else None)
     assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize('side',['client','pair'])
+@pytest.mark.parametrize('preflight_denied',[False,True])
+def test_2000_approved_path_reaches_only_mock_collector_after_preflight(tmp_path,monkeypatch,side,preflight_denied):
+    from secure_control.execution import lan_config
+    from secure_control.experiments import native_tail_capture as native
+    from secure_control.experiments import tail_diagnostic_runner as runner
+    roles=['Client'] if side=='client' else ['P1','P2']
+    names=['client'] if side=='client' else ['p1','p2']
+    configs=[lan_config.load_lan_config(runner.ROOT/f'configs/lab-{name}-cart-pole-demo.example.yaml',role)
+             for name,role in zip(names,roles,strict=True)]
+    monkeypatch.setattr(lan_config,'load_lan_config',lambda path,role:configs[roles.index(role)])
+    monkeypatch.setattr(runner,'ROOT',tmp_path)
+    def git(args,**kwargs):
+        return 'a'*40 if args[1]=='rev-parse' else ''
+    monkeypatch.setattr(runner.subprocess,'check_output',git)
+    calls=[]
+    class Native:
+        def __init__(self,plan,output):
+            self.report={'status':'not_started','instance':'D17_mock_only'}
+        def preflight(self):
+            calls.append('preflight')
+            assert not (tmp_path/'results').exists()
+            if preflight_denied: raise PermissionError('mock admin missing')
+    monkeypatch.setattr(native,'NativeCapture',Native)
+    def collect(configs,ctx,steps,**kwargs):
+        calls.append('collector')
+        assert steps==2000 and ctx.window==2000
+        assert (tmp_path/'output'/'ledger.json').is_file()
+        if side=='client':
+            assert calls==['preflight','collector']
+            assert (tmp_path/'output'/'native-owner.json').is_file() and kwargs['native']
+        return {'wall_s':0.,'roles':[],'forced_cleanup':[],'owned_pids':[],
+            'exitcodes':[],'members':{},'stop_reason':'mock_no_run','activity_elapsed_s':None,
+            **({'native':{'status':'partial'}} if side=='client' else {})}
+    monkeypatch.setattr(runner,'_collect_host',collect)
+    args={'diagnostic_id':'approved-2000','expected_head':'a'*40,'software_review':'https://review.invalid',
+        'config_paths':names,'steps':2000,'window':2000,'stream_map':side=='client',
+        'native_plan':{'source_head':'a'*40} if side=='client' else None}
+    if side=='client' and preflight_denied:
+        with pytest.raises(PermissionError): runner.run_host(side,tmp_path/'output',**args)
+        assert calls==['preflight'] and not (tmp_path/'results').exists()
+        return
+    result=runner.run_host(side,tmp_path/'output',**args)
+    assert not result['diagnostic_complete']  # mock没有制造成功/现场证据。
+    assert result['resource_exceptions']==result['plan']['resource_exceptions']==native.resource_exceptions()
+    ledger=json.loads((tmp_path/'output'/'ledger.json').read_text())
+    assert ledger['two_host_2000']==0 and ledger['status']=='partial'
+    with pytest.raises(FileExistsError): runner.run_host(side,tmp_path/'output',**args)
 
 
 def test_v2_stream_capacity_and_last_step_do_not_extend_v1():
@@ -268,3 +319,45 @@ def test_2000_host_fakeclock_90_and_240_cleanup_only_owned(monkeypatch,boundary)
         _mp=SimpleNamespace(get_context=lambda _:spawn),_now=lambda:clock[0])
     assert result['stop_reason']==('activity_limit' if boundary=='activity' else 'wall_limit')
     assert cleared==started==[44] and result['wall_s']<=240
+
+
+@pytest.mark.parametrize('interrupt',[False,True])
+def test_native_window_or_interrupt_preserves_owner_receipt_and_stop_reserve(tmp_path,monkeypatch,interrupt):
+    from secure_control.experiments import tail_diagnostic_runner as runner
+    clock=[0.]
+    processes=[]
+    class Process:
+        pid=99
+        exitcode=None
+        def __init__(self,**kwargs): processes.append(self)
+        def start(self):
+            assert json.loads((tmp_path/'native-owner.json').read_text())['sessions']==['mock-guid']
+    class Queue:
+        def get(self,timeout):
+            if interrupt: raise KeyboardInterrupt
+            clock[0]=90.
+            raise runner.queue.Empty
+        def close(self): pass
+        def cancel_join_thread(self): pass
+    class Capture:
+        output=tmp_path/'native.etl'
+        started=None
+        def __init__(self): self.report={}
+        def begin(self):
+            self.started=0.
+            self.capture_deadline=90.
+            self.report={'status':'recording','sessions':['mock-guid']}
+        def finish(self):
+            assert processes[0].exitcode==-1 and clock[0]<=90
+            return {'status':'partial','instance':'mock'}
+    spawn=SimpleNamespace(Process=Process,Queue=Queue,
+        Event=lambda:SimpleNamespace(set=lambda:None),Value=lambda *a:SimpleNamespace(value=0.))
+    def cleanup(owned,deadline,**kwargs):
+        assert deadline==90. and owned==processes
+        for process in owned: process.exitcode=-1
+        return [{'pid':p.pid} for p in owned]
+    monkeypatch.setattr(runner,'_clear_owned',cleanup)
+    result=runner._collect_host([SimpleNamespace(role='Client')],SimpleNamespace(window=2000),2000,
+        native=Capture(),_mp=SimpleNamespace(get_context=lambda _:spawn),_now=lambda:clock[0])
+    assert result['stop_reason']==('user_interrupted' if interrupt else 'native_window_limit')
+    assert result['native']['status']=='partial'

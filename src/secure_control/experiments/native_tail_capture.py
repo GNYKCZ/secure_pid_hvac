@@ -18,6 +18,14 @@ _IDS = {1033,1038,1040,1043,1074,1300}
 _SCALARS = {'Tcb':16,'NumBytes':8,'SeqNo':8,'NumPkt':8,'LocalAddressLength':8,
     'RemoteAddressLength':8,'Status':8,'ProcessId':8,'Compartment':8,'ProcessStartKey':10,
     'State':8,'Pid':8,'Inspect':13,'SendTrackerEnabled':8,'RcvBufSet':8}
+AUTHORIZATION = 'https://github.com/GNYKCZ/secure_pid_hvac/issues/132#issuecomment-6462410802'
+
+
+def resource_exceptions():
+    """本次用户批准的两项固定例外，不提供通用force/ignore开关。"""
+    return {'authorization':AUTHORIZATION,'native_stop_target_s':100,
+        'os_abnormal_stop_hard_guarantee':False,'temporary_disk_target_bytes':256*1024*1024,
+        'temporary_disk_hard_quota':False,'temporary_peak_verified':False}
 
 
 def profile_contract(path, schemas):
@@ -120,6 +128,14 @@ class WprBackend:
         """只读系统会话，不解析语言相关的WPR状态文本。"""
         return _sessions()
 
+    def is_admin(self):
+        """只读核对当前令牌；不弹提权窗口或变更权限。"""
+        return bool(ctypes.WinDLL('shell32').IsUserAnAdmin())
+
+    def source_schemas(self):
+        """开始前重查实际字段，不能信任过期计划自报。"""
+        return tcp_source_schemas()
+
     def run(self,args,timeout):
         """有界调用自带WPR，不安装工具、不启用其他命令。"""
         return subprocess.run([self.executable,*args],capture_output=True,timeout=timeout,check=False)
@@ -138,6 +154,7 @@ def prepare_native(profile, *, _schemas=None, _backend=None):
     return {**plan,'schema':'native-tail-preparation-v1','window':2000,
         'profiledetails_sha256':hashlib.sha256(result.stdout).hexdigest(),
         'prepared_not_captured':True,'real_capture_verified':False,
+        'resource_exceptions':resource_exceptions(),
         'minimum_free_bytes':1024**3,'etl_limit_bytes':64*1024*1024,
         'disk_budget_bytes':256*1024*1024,'native_window_s':limits_for(2000).native_s}
 
@@ -152,26 +169,51 @@ class NativeCapture:
         self.instance = 'D17_'+uuid4().hex
         self.owned = None
         self.started = None
-        self.report = {'status':'not_started','instance':self.instance}
+        self.report = {'status':'not_started','instance':self.instance,
+            'resource_exceptions':resource_exceptions(),
+            'manual_recovery':{'status':['wpr','-status','-instancename',self.instance],
+                'query_sessions':['uv','run','python','-c',
+                    ("import json,sys; from secure_control.experiments.native_tail_capture import _sessions; "
+                     "print(json.dumps([r for r in _sessions() if sys.argv[1] in r['name']],indent=2))"),self.instance],
+                'save':['wpr','-stop',str(self.output.with_name('native-a-manual.etl')),
+                        '-skipPdbGen','-instancename',self.instance],
+                'condition':'先核对本instance及sessions的GUID；归属变化或无法确认时不要停止；无全局cancel'}}
 
-    def begin(self):
-        """ledger已扣减后才运行；启动前再次核验profile/hash/冲突与磁盘。"""
+    def preflight(self):
+        """只读启动前核验；入口在账本前执行，begin还会重查以发现竞态。"""
         if self.started is not None or self.output.exists():
             raise ValueError('native capture cannot restart/overwrite')
+        profile = Path(self.plan['profile']).resolve()
         if (self.plan.get('schema')!='native-tail-preparation-v1'
                 or self.plan.get('window')!=2000
-                or hashlib.sha256(Path(self.plan['profile']).read_bytes()).hexdigest()!=self.plan['profile_sha256']):
+                or profile != Path(__file__).resolve().parents[3]/'configs/control-tail-native-2000.wprp'
+                or hashlib.sha256(profile.read_bytes()).hexdigest()!=self.plan['profile_sha256']
+                or self.plan.get('resource_exceptions')!=resource_exceptions()):
             raise ValueError('native plan/profile mismatch')
-        profile_contract(self.plan['profile'],self.plan['source_schemas'])
+        if not self.backend.is_admin():
+            raise PermissionError('A原生诊断需要管理员PowerShell；未启动采集')
+        actual_schemas = self.backend.source_schemas()
+        profile_contract(profile,actual_schemas)
+        if actual_schemas != self.plan['source_schemas']:
+            raise ValueError('native source schemas changed since preparation')
         if any(self.plan.get(k)!=v for k,v in {'minimum_free_bytes':1024**3,
                 'etl_limit_bytes':64*1024*1024,'disk_budget_bytes':256*1024*1024,
                 'native_window_s':limits_for(2000).native_s,'native_buffer_bytes':12*1024*1024}.items()):
             raise ValueError('native resource limits changed')
-        if shutil.disk_usage(self.output.parent).free < self.plan['minimum_free_bytes']:
+        parent = self.output.parent
+        while not parent.exists():
+            parent = parent.parent
+        if shutil.disk_usage(parent).free < self.plan['minimum_free_bytes']:
             raise ValueError('native disk reserve')
         before = self.backend.sessions()
         if any(r['name'].startswith('WPR_') or r['name']=='NT Kernel Logger' for r in before):
             raise ValueError('native session conflict')
+        return {'administrator':True,'profile_sha256':self.plan['profile_sha256'],
+                'resource_exceptions':resource_exceptions(),'source_schemas_rechecked':True}
+
+    def begin(self):
+        """ledger已扣减后才运行；仍核验profile/hash/权限/冲突与磁盘。"""
+        self.report['preflight'] = self.preflight()
         self.started = self.now()
         self.capture_deadline = self.started+limits_for(2000).native_s-10
         # start超时也可能已经创建自身会话，不能在finally中被误认成从未启动。
@@ -235,10 +277,25 @@ class NativeCapture:
         elapsed = self.now()-self.started
         valid = (not result.returncode and elapsed<=limits_for(2000).native_s
                  and not any(r['events_lost'] or r['buffers_lost'] for r in current))
+        try:
+            remaining_sessions = [r for r in self.backend.sessions() if self.instance in r['name']]
+        except Exception as error:  # noqa: BLE001 - 命令退出不等于ETW已停。
+            self.report.update(status='stop_unverified_manual_attention',error_type=type(error).__name__)
+            return self.report
+        if result.returncode or remaining_sessions:
+            self.report.update(status='stop_unverified_manual_attention',
+                stop_returncode=result.returncode,remaining_sessions=remaining_sessions)
+            return self.report
+        exceeded = False
         if not cancel:
-            files = list(self.output.parent.glob('*.etl'))
-            valid = (valid and self.output.is_file() and self.output.stat().st_size<=64*1024*1024
-                     and sum(p.stat().st_size for p in files)<=256*1024*1024)
+            # 可观察的本目录包括非ETL产物；merge外部临时峰值仍未知，不冒称硬配额。
+            directory_bytes = sum(p.stat().st_size for p in self.output.parent.rglob('*') if p.is_file())
+            etl_bytes = self.output.stat().st_size if self.output.is_file() else None
+            exceeded = (directory_bytes>self.plan['disk_budget_bytes']
+                        or etl_bytes is not None and etl_bytes>self.plan['etl_limit_bytes'])
+            self.report.update(output_directory_bytes=directory_bytes,etl_bytes=etl_bytes,
+                resource_budget_exceeded=exceeded,temporary_peak_verified=False)
+            valid = valid and etl_bytes is not None and not exceeded
         self.report.update(status='cancelled' if cancel and valid else 'saved' if valid else 'partial',
             elapsed_s=elapsed,stop_returncode=result.returncode,final_sessions=current)
         return self.report
