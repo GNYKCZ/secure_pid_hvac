@@ -3,6 +3,7 @@ import ctypes
 import os
 import struct
 import uuid
+from types import SimpleNamespace
 
 import pytest
 
@@ -150,6 +151,124 @@ class MockAPI:
                 'ticks':100,'pointer_size':8,'values':{'Tcb':0xdeadbeef,'NumBytes':10,'SeqNo':1000}}
 
     def close(self,handle): self.closed.append(handle)
+
+
+@pytest.mark.skipif(os.name!='nt',reason='Windows x64 ctypes ABI oracle')
+def test_native_offline_unicode_path_abi_mode_and_handle_lifetime(tmp_path,monkeypatch):
+    # 官方evntcons.h：REAL_TIME=0x100、RAW_TIMESTAMP=0x1000、EVENT_RECORD=0x10000000。
+    # 官方x64布局的偏移为独立oracle，不从被测结构生成expected。
+    original=ctypes.WinDLL
+    seen={}
+    class Function:
+        def __init__(self,call): self.call=call
+        def __call__(self,*args): return self.call(*args)
+    def open_trace(pointer):
+        log=pointer._obj
+        typ=type(log)
+        assert ctypes.sizeof(log)==448
+        assert {k:getattr(typ,k).offset for k in ('filename','logger','process_mode','header','callback','context')}=={
+            'filename':0,'logger':8,'process_mode':28,'header':120,'callback':424,'context':440}
+        assert ctypes.sizeof(log.header)==280
+        assert type(log.header).frequency.offset==256 and type(log.header).clock.offset==272
+        seen.update(path=log.filename,log=log)
+        if log.process_mode!=0x10001000 or log.logger is not None:
+            ctypes.set_last_error(123)
+            return 2**64-1
+        log.header.clock=1;log.header.frequency=10000000;log.header.pointer_size=8;log.header.end=1
+        return 2**40+123
+    def process(handle,count,*args):
+        assert handle._obj.value==2**40+123 and count==1
+        assert seen['log'].filename==str(path.resolve())
+        return 0
+    closed=[]
+    fake=SimpleNamespace(OpenTraceW=Function(open_trace),ProcessTrace=Function(process),
+        CloseTrace=Function(lambda handle:closed.append(handle) or 0))
+    monkeypatch.setattr(ctypes,'WinDLL',lambda name,**kw:fake if name=='advapi32' else original(name,**kw))
+    path=tmp_path/'\u6d4b\u8bd5 space.etl'
+    path.write_bytes(b'mock only, not a real ETL')
+    api=_native()
+    assert ctypes.sizeof(api.record_type)==112 and api.record_type.user.offset==96
+    result=read_etl(path,_api=api)
+    assert result['event_count']==0 and closed==[2**40+123]
+    assert seen['path']==str(path.resolve())
+
+
+@pytest.mark.parametrize('total,limit,exceeded',[
+    (100001,100000,True),(100001,300000,False),(300000,300000,False),(300001,300000,True),
+])
+def test_explicit_300k_cap_counts_all_events_including_unsupported(tmp_path,total,limit,exceeded):
+    class API(MockAPI):
+        def process(self,handle):
+            for i in range(total): self.callback(i)
+        def event(self,index):
+            return {'unsupported':('other metadata',1,0,0)} if index else super().event(index)
+    api=API(None)
+    path=tmp_path/'counted.etl';path.write_bytes(b'mock')
+    trace=read_etl(path,maximum_events=limit,_api=api)
+    assert trace['event_count']==total and len(trace['events'])==1
+    assert trace['unsupported_counts'][0]['count']==min(total,limit)-1
+    assert ('event budget exceeded' in trace['errors']) is exceeded
+    assert trace['other_unsupported_count']==min(total,limit)-1
+    assert not trace['complete'] and api.closed==[123]
+
+
+@pytest.mark.parametrize('limit',[True,0,300001])
+def test_cap_refuses_unbounded_calls_before_open(tmp_path,limit):
+    path=tmp_path/'mock.etl';path.write_bytes(b'mock')
+    class API:
+        def open(self,*args): pytest.fail('must reject before native open')
+    with pytest.raises(ValueError,match='budget'): read_etl(path,maximum_events=limit,_api=API())
+
+
+@pytest.mark.skipif(os.name!='nt',reason='实际本机TDH仅用于合成线程v3事件')
+@pytest.mark.parametrize('opcode',[1,2])
+def test_thread_v3_required_lifetime_fields_are_tdh_checked(opcode):
+    api=_native();event=api.record_type()
+    event.header.size=80;event.header.flags=0x140
+    event.header.provider.data[:]=uuid.UUID(THREAD).bytes_le
+    event.header.desc.version=3;event.header.desc.opcode=opcode
+    data=ctypes.create_string_buffer(struct.pack('<II7QI4B',11,22,*([0]*12)))
+    event.user=ctypes.cast(data,ctypes.c_void_p);event.length=len(data)-1
+    result=api.event(ctypes.pointer(event))
+    assert result['values']=={'ProcessId':11,'TThreadId':22}
+    # 实际CSwitch v5本机TDH无schema，不能从v2/v3套布局猜测。
+    assert _fields((THREAD,0,5,36)) is None
+
+
+def test_default_budget_stays_100k_and_descriptor_counts_mark_critical_gaps(tmp_path):
+    class API(MockAPI):
+        def event(self,index): return {'unsupported':(THREAD,0,5,36)}
+    path=tmp_path/'mock.etl';path.write_bytes(b'mock')
+    trace=read_etl(path,_api=API(None))
+    assert trace['maximum_events']==100000 and trace['event_count']==3
+    assert trace['critical_unsupported_count']==3 and trace['other_unsupported_count']==0
+    assert trace['descriptor_counts']==trace['unsupported_counts']
+
+
+def test_descriptor_count_after_budget_and_empty_input_do_not_claim_complete(tmp_path):
+    class API(MockAPI):
+        def descriptor(self,pointer): return (TCPIP,1074,0,0)
+    path=tmp_path/'empty.etl';path.touch()
+    api=API(None)
+    with pytest.raises(ValueError,match='boundary'): read_etl(path,_api=api)
+    assert not api.closed
+    path.write_bytes(b'mock')
+    trace=read_etl(path,_api=api,maximum_events=1)
+    assert trace['event_count']==trace['descriptor_counts'][0]['count']==3
+    assert len(trace['events'])==1 and trace['events'][0]['event_index']==1 and not trace['complete']
+
+
+def test_open_failure_never_closes_unallocated_handle_and_truncated_decode_stays_partial(tmp_path):
+    path=tmp_path/'truncated.etl';path.write_bytes(b'\x00')
+    class API(MockAPI):
+        def open(self,path,callback): raise OSError(13,'mock truncated input')
+    api=API(None)
+    with pytest.raises(OSError): read_etl(path,_api=api)
+    assert not api.closed
+    broken=MockAPI('callback')
+    trace=read_etl(path,_api=broken)
+    assert trace['decode_errors']=={'ValueError':3} and not trace['complete']
+    assert broken.closed==[123]
 
 
 @pytest.mark.parametrize('fault',[None,'clock','width','loss','partial','realtime','process','callback','unsupported','budget'])

@@ -225,8 +225,10 @@ def _native():
 
         def open(self, path, handler):
             self.log = Logfile()
-            self.log.filename = str(path)
-            self.log.process_mode = 0x1000|0x100
+            self.filename = c.create_unicode_buffer(str(path))
+            self.log.filename = c.cast(self.filename,c.c_wchar_p)
+            # evntcons.h：0x100是REAL_TIME，离线文件必须排除；回调需EVENT_RECORD。
+            self.log.process_mode = 0x1000|0x10000000
             self.callback = callback_type(handler)
             self.log.callback = self.callback
             handle = advapi.OpenTraceW(c.byref(self.log))
@@ -249,6 +251,12 @@ def _native():
         def close(self,handle):
             if advapi.CloseTrace(handle):
                 raise OSError('CloseTrace failed')
+
+        def descriptor(self,pointer):
+            """只读固定事件头用于完整遍历计数；未知事件不读取UserData。"""
+            import uuid
+            h = pointer.contents.header
+            return (str(uuid.UUID(bytes_le=bytes(h.provider.data))),h.desc.id,h.desc.version,h.desc.opcode)
 
         def event(self,pointer):
             import uuid
@@ -321,7 +329,7 @@ def _fields(key):
             'Pid' if event==1300 else 'ProcessId':(8,),
             **({'ProcessStartKey':(10,)} if version else {})}
     if guid==THREAD:
-        if opcode in (1,2) and version==2:
+        if opcode in (1,2) and version in (2,3):
             return {'ProcessId':(8,),'TThreadId':(8,)}
         if opcode==50 and version==2:
             return {'TThreadId':(8,)}
@@ -389,24 +397,38 @@ def tcp_source_schemas():
 
 
 def read_etl(path, *, maximum_events=100000, _api=None):
-    """有界离线文件读取；mock可验证finally资源清理，不构成真实ETL验证。"""
+    """默认10万、显式最高30万；数所有遍历事件，未知描述符不降格成完整证据。"""
     path = Path(path).resolve()
-    if path.suffix.lower()!='.etl' or not path.is_file() or path.stat().st_size>64*1024*1024:
+    if path.suffix.lower()!='.etl' or not path.is_file() or not 0<path.stat().st_size<=64*1024*1024:
         raise ValueError('ETL file boundary')
-    if type(maximum_events) is not int or not 1 <= maximum_events <= 100000:
+    if type(maximum_events) is not int or not 1 <= maximum_events <= 300000:
         raise ValueError('event budget')
     api = _api if _api is not None else _native()
     rows, errors, keys, count = [], [], {}, 0
+    descriptors, unsupported, decode_errors = {}, {}, {}
     exhausted = False
+    def tally(mapping,key):
+        # 不允许坏文件用无限descriptor/错误类别增长计数器；超界仍令证据不完整。
+        if key not in mapping and len(mapping)>=4096:
+            raise ValueError('descriptor capacity')
+        mapping[key] = mapping.get(key,0)+1
     def callback(pointer):
         nonlocal count, exhausted
         count += 1
-        if count>maximum_events:
-            exhausted = True
-            return
         try:
+            descriptor = api.descriptor(pointer) if hasattr(api,'descriptor') else None
+            if descriptor is not None:
+                tally(descriptors,descriptor)
+            if count>maximum_events:
+                exhausted = True
+                return
             row = api.event(pointer)
+            if descriptor is None:
+                descriptor = tuple(row['unsupported']) if 'unsupported' in row else (
+                    row['provider'],row['id'],row['version'],row['opcode'])
+                tally(descriptors,descriptor)
             if 'unsupported' in row:
+                tally(unsupported,tuple(row['unsupported']))
                 if 'unsupported event present' not in errors:
                     errors.append('unsupported event present')
                 return
@@ -419,9 +441,11 @@ def read_etl(path, *, maximum_events=100000, _api=None):
                             raise ValueError('identity capacity')
                         keys[key] = len(keys)
                     row['values'][field] = keys[key]
+            row['event_index'] = count  # 原文件遍历序号，未知事件的空位不重新编号。
             rows.append(row)
         except Exception as error:  # noqa: BLE001 - 不允许异常跨native callback。
             kind = type(error).__name__
+            decode_errors[kind] = decode_errors.get(kind,0)+1
             if kind not in errors:
                 errors.append(kind)
     handle = api.open(path,callback)
@@ -441,7 +465,15 @@ def read_etl(path, *, maximum_events=100000, _api=None):
         errors.append('event budget exceeded')
     for row in rows:
         row['time_ns'] = qpc_ns(row['ticks'],header['frequency'],header['clock'])
+    def summaries(mapping):
+        return [{'provider':k[0],'id':k[1],'version':k[2],'opcode':k[3],'count':v}
+                for k,v in sorted(mapping.items())]
     return {'header':header,'events':rows,'event_count':count,'errors':errors,
+        'maximum_events':maximum_events,'retained_event_count':len(rows),
+        'descriptor_counts':summaries(descriptors),'unsupported_counts':summaries(unsupported),
+        'critical_unsupported_count':sum(v for k,v in unsupported.items() if k[0] in (PROCESS,THREAD,TCPIP)),
+        'other_unsupported_count':sum(v for k,v in unsupported.items() if k[0] not in (PROCESS,THREAD,TCPIP)),
+        'decode_errors':decode_errors,
         'complete':not errors,'network_semantics':'unverified; event presence is not socket readability',
         'real_event_schema_validation':'performed per descriptor; runtime SeqNo semantic validation still required'}
 
