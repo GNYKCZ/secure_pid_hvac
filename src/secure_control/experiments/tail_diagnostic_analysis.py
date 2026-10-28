@@ -413,9 +413,22 @@ def analyze_records(records, *, clock_domains=None, samples=(), same_host=False,
                             and (s+1)%limits.segment_steps==0]
     maintenance = [s['global_step'] for s in samples
                    if s.get('phase_durations_ns',{}).get('maintenance',0)>0]
-    final_step = max(required_steps,default=None)
+    client = next((r for r in records if r['role']=='Client'),{})
+    stop_spans = [s for s in decoded.get('Client',{}).get('spans',[])
+                  if s['phase']=='stop' and s['thread_id']==client.get('main_thread_id')]
+    final_step = None
+    # 预定范围和观察前缀都不是停止事实。finish在失败时也补stop事件，故必须同时
+    # 有成功状态、完整配对、主线程身份和末次已完成工作之后的真实停止边界。
+    if client.get('status')=='stopped' and decoded.get('Client',{}).get('complete') and len(stop_spans)==1:
+        stop = stop_spans[0]
+        step = stop['global_step']
+        if (step in by_step and step==max(observed_steps,default=None)
+                and by_step[step][1]<=stop['start_ns']
+                and any(s['global_step']==step and s.get('status')=='confirmed'
+                        and s.get('work_elapsed_ns') is not None for s in samples)):
+            final_step = step
     def groups(rows):
-        # 缺计时字段不能按索引猜成已执行维护；末步停止单列。
+        # 缺计时字段不能按索引猜维护；final_stop是成功停止前末次工作，不是停止耗时。
         groups = {'ordinary':[],'continuing_maintenance':[],'final_stop':[],'unknown':[]}
         for row in rows:
             value = row.get('work_elapsed_ns')

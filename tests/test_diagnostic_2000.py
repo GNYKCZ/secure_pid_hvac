@@ -95,6 +95,70 @@ def test_partial_samples_without_observed_steps_remain_unknown():
     assert result['work_groups']['final_stop']['count']==0
 
 
+@pytest.mark.parametrize('window',[400,2000])
+@pytest.mark.parametrize('case',[
+    'undeclared_prefix','declared_prefix','declared_last_no_stop','failed_stop',
+    'completed_stop','undeclared_stop','early_normal_stop','unpaired_stop',
+    'wrong_thread_stop','stop_before_work',
+])
+def test_rv006_final_stop_requires_actual_successful_stop_evidence(window,case):
+    from test_tail_diagnostics import fixture_records, recount
+
+    from secure_control.execution.tail_diagnostics import PHASES
+    records,domains=fixture_records()
+    if window==2000:
+        limits=limits_for(window)
+        for record in records:
+            record.update(schema=limits.trace_schema,limits=limits.payload())
+            record['buffer_bytes']=(record['event_capacity']+record['gc_capacity'])*64+limits.identity_bytes
+    client=records[0]
+    client['status']='failed' if case=='failed_stop' else 'stopped'
+    has_stop=case not in ('undeclared_prefix','declared_prefix','declared_last_no_stop')
+    if has_stop:
+        thread=client['main_thread_id']+(1 if case=='wrong_thread_stop' else 0)
+        for edge,wall in ((0,310 if case=='stop_before_work' else 330),(1,340)):
+            if case=='unpaired_stop' and edge==1:
+                continue
+            client['events'].append([0,2*PHASES['stop']+edge,1,-1,wall,0,thread,0])
+        recount(client)
+    expected=(None if case in ('undeclared_prefix','undeclared_stop') else
+              range(3) if case in ('declared_prefix','early_normal_stop') else range(2))
+    samples=[{'global_step':1,'round_id':'round1','actual_sample_start_ns':300,
+        'control_applied_ns':319,'work_completed_ns':320,'work_elapsed_ns':20,
+        'control_latency_ns':19,'status':'confirmed','phase_durations_ns':{'maintenance':0}}]
+    result=analyze_records(records,clock_domains=domains,samples=samples,expected_steps=expected,partial=True)
+    final=case in ('completed_stop','undeclared_stop','early_normal_stop')
+    groups=result['work_groups']
+    assert groups['final_stop']['count']==int(final)
+    assert groups['ordinary']['count']==int(not final)
+    assert sum(group['count'] for group in groups.values())==result['work_distribution']['count']==1
+    assert groups['final_stop' if final else 'ordinary']['mean_ns']==20
+    assert result['work_distribution']['mean_ns']==20
+
+
+def test_rv006_maintenance_boundary_prefix_is_not_final_stop():
+    from test_tail_diagnostics import fixture_records, recount
+    records,domains=fixture_records()
+    limits=limits_for(2000)
+    for record in records:
+        record.update(schema=limits.trace_schema,limits=limits.payload())
+        record['buffer_bytes']=(record['event_capacity']+record['gc_capacity'])*64+limits.identity_bytes
+        record['rounds']['399']=record['rounds'].pop('1')
+        for row in record['events']:
+            if row[2]==1: row[2]=399
+            if row[3]==1: row[3]=399
+        recount(record)
+    samples=[{'global_step':399,'round_id':'round1','actual_sample_start_ns':300,
+        'control_applied_ns':319,'work_completed_ns':320,'work_elapsed_ns':20,
+        'control_latency_ns':19,'status':'confirmed',
+        'phase_durations_ns':{'maintenance':5,'maintenance_advance':5}}]
+    result=analyze_records(records,clock_domains=domains,samples=samples,expected_steps=range(800),partial=True)
+    assert result['work_groups']['continuing_maintenance']['count']==1
+    assert result['work_groups']['final_stop']['count']==0
+    assert sum(group['count'] for group in result['work_groups'].values())==1
+    assert not result['diagnostic_complete']
+
+
 def test_explicit_2000_attempt_callbacks_four_continuations_and_no_2001(tmp_path,monkeypatch):
     from secure_control.execution.lan_config import load_lan_config
     from secure_control.experiments import lan_continuous_profile, lan_runner, live_timing
