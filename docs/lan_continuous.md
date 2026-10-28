@@ -1,5 +1,104 @@
 # 独立三角色连续 LAN 实验（Issues #86、#84、#75、#92）
 
+## D132-20 A：来源调查、离线解码解除条件与待批准预算
+
+依据[D20设计](https://github.com/GNYKCZ/secure_pid_hvac/issues/132#issuecomment-6470834346)，
+基准main为`93ec51c85c570ab47a2169df3bede91b03fa4bb5`。本节是A阶段调查交付，
+不是采集已修复或可直接运行的声明。没有改变生产profile、解析白名单、业务代码或运行额度。
+
+### TCP为零：已排除与尚未排除的环节
+
+启用链是专项CLI读取计划→preflight重查profile/注册源→NativeCapture.begin调用唯一instance
+的WPR start→核对两个自有session的GUID/clock/buffer→spawn Client→结束保存→离线读取。
+旧owner记录及start成功只证明会话生命周期，未保存每个provider实际启用状态的独立证据。
+本轮只调用profiledetails、TDH/WMI查询及旧ETL离线转换，没有start/stop/cancel或新流量。
+
+| 假设 | 当前证据 | 结论 |
+|---|---|---|
+| 仅是本解析器不认识TCP descriptor | 原ETL全descriptor计数与系统tracerpt摘要均无所选TCPIP GUID事件 | 可以排除此单一解释；不是解析器把已有TCP事件全部漏标 |
+| 注册源level/keyword不匹配 | 15个实际注册版本均满足原level5和mask，profiledetails与原六ID一致 | 未发现静态不匹配；不能证明旧会话实际启用正确 |
+| provider未实际启用或启用回调/源运行条件未满足 | 只有会话级owner记录，没有运行时provider状态及成功目标事件 | 尚不能区分，不能认定已查明TCP0根因 |
+| 工作负载未触发所选事件 | 控制确有应用字节，但不证明特定内核组件事件一定触发 | 尚未排除；需要公开字节锚点校准 |
+| 环形覆盖丢掉早期网络事件 | Memory模式、首窗口和目标start缺失；无完整网络时间序列 | 相容，但不能用它解释全部TCP0 |
+
+旧/新来源相同：GUID `2f07e2ee-15db-40f1-90ef-9d7ba282188a`，ID
+1033/1038/1040/1043/1074/1300，opcode/版本仍按实际注册信息，level5、mask`0x600000484`。
+没有扩大来源，也没有把传统kernel NetworkTCPIP flag当成当前manifest provider的等价替换。
+
+### CSwitch v5：实际形状与独立解码缺口
+
+本机平台为Windows build26200，WPR版本10.0.26100，x64消费者。原三份ETL未改写，
+SHA仍与D19表一致。本轮只对所选线程descriptor读取有界元数据形状：
+
+| 组 | ETL字节 | 总事件 | `(THREAD, id0, version5, opcode36)` | payload长度/flags |
+|---|---:|---:|---:|---|
+| 01 | 9,830,400 | 208,124 | 128,095 | 全部28字节/0x350 |
+| 02 | 10,092,544 | 210,554 | 129,239 | 全部28字节/0x350 |
+| 03 | 9,830,400 | 208,928 | 128,645 | 全部28字节/0x350 |
+
+固定[Microsoft TraceEvent源码](https://github.com/microsoft/perfview/blob/9f071a5cb2e70cdfee13abc510344ab1e8840c90/src/TraceEvent/Parsers/KernelTraceEventParser.cs)
+的CSwitchTraceData提供候选字段访问及版本>2至少24字节的要求；实际28字节满足该长度下界，
+但长度相容不是布局已验证。特别是NewThreadID依赖原库的header fixup，不能直接拿事件头TID
+当新线程，也不能照抄v3白名单或忽略CPU字段来源和实际架构。
+
+独立路径核查：本机TDH对实际v5返回1168；WMI只发现CSwitch_V1–V4；系统tracerpt对旧ETL
+导出的schema没有可核对的v5 CSwitch模板。PATH及标准Windows Performance Toolkit目录未发现
+可用的dotnet、xperf或WPAExport工具；没有据此声称全磁盘不存在其他用户工具。
+故尚不能完成独立字段交叉检查，本轮**不启用v5生产解析**，C3保持BLOCKED。
+
+最小解除条件：批准仅用于离线读取原ETL的固定Microsoft TraceEvent/PerfView解码器，或提供
+本机已有的可信工具路径。建议优先核对固定源码与其正式发布物的对应关系，再确定包版本、
+官方来源、签名/摘要及传递依赖清单；不能拿任意最新版NuGet包冒充上述固定源码。
+工具包下载/解包总量建议上限64MiB、离线输出上限32MiB；不加入项目Python依赖、不安装系统
+服务、不启用provider。下载运行尚未批准、未执行。实际独立解码不成功就停止，不放行候选。
+
+### 唯一推荐的完整窗口候选：File，仍待资源决定
+
+推荐顺序File，维持原12MiB采集缓冲；不推荐在没有容量上界证明时继续扩大环形Memory。
+原文件约47.1–47.9字节/总事件，但含全机事件和收尾元数据，不能当未来稳定压缩比。
+用总事件除保留调度包络得到约15.9k/20.0k/37.0k事件每秒的容量代理值；它不是精确发生率。
+按最坏代理37,037/s×55s估计约204万事件、约98MB；增加TCP事件/机器负载后可能更多。
+
+| 项目 | 推荐候选值（均未放行） | 边界/代价 |
+|---|---|---|
+| 系统/事件缓冲 | 8MiB / 4MiB，合计12MiB | 保留原缓冲，不新增stack/payload源 |
+| LoggingMode | 顺序File | 新增写盘扰动；WPR本身没有硬文件上限 |
+| 有效采集窗口 | 最多55秒，覆盖约41秒应用及启动/结束上下文 | native开始必须先于Client进程/线程创建 |
+| 会话收尾 | 目标10秒；总专项目标100秒 | 异常系统调用无法硬保证退出，保留唯一instance人工恢复 |
+| 最终ETL | 目标128MiB，超出则本次无效并停，不重跑 | 原64MiB限制须经批准同步修改 |
+| 临时合并峰值 | 目标384MiB、运行前磁盘余量2GiB | 超过原256MiB目标；需用户接受软目标或另给OS配额方案 |
+| 离线遍历 | 最多250万事件、输入128MiB | 原30万/64MiB不能直接读取此候选 |
+| 离线保留 | 只保留目标线程/流的最多10万条元数据；其他事件计数 | 需窄的目标选择/生命周期实现及独审，当前入口尚不具备 |
+| 离线内存 | 目标进程峰值512MiB、输出32MiB | 必须实测；当前read_etl保留全部行，不能仅调大事件上限 |
+
+采用相同代理，55秒窗口若继续Memory系统缓冲需约78MiB量级才可能保留调度事件，且负载变化
+仍可能覆盖，远超当前8MiB系统池；因此优先File。两个估算均非硬保证，新profile和离线容量
+不能只改一个数。当前未修改这些上限，也未继承旧资源例外放行新候选。
+
+### 一次性校准计划与真实入口状态
+
+先完成离线v5交叉验证，再实施并独审批准后的profile/目标流及窗口入口；三项全通过前不称ready。
+推荐校准为两机一次、A一个受控Client进程和主线程，B两个目标端口；沿用已核实的IP/端口配置。
+在同一55秒上限内，每条连接双向发送确定性公开帧，事先记录长度和偏移，包含setup前缀及
+维护形状帧，并安排公开等待/唤醒段。无秘密控制数据，不运行plant或2000步控制器，不把它当性能对照。
+记录连接四元组/方向/建立与关闭、初始序号及全部frame偏移、PID/native TID/生命周期、QPC和CPU。
+同时保存实际provider启用证据，验证数据序号/长度语义；仅时间接近或看到TCP事件不算流关联通过。
+首个错误、超过目标资源、窗口缺口、unsupported/truncation/loss均判本次失败并收尾，不能自动补跑。
+
+**校准入口尚未实现，现有client/pair命令运行的是控制实验，不能拿来替代上述公开流量校准。**
+因此本阶段不给伪造的可执行校准命令。B阶段批准并实现后必须给出精确新profile路径、软件SHA、
+两端命令、单次账本、停止/保存及人工恢复步骤，才有可以批准运行的完整计划。
+现有只读入口可实际执行（输出目录已存在且文件名未占用时）：
+
+```powershell
+uv run python scripts/run_control_tail_diagnostic.py --help
+wpr -profiledetails configs/control-tail-native-2000.wprp!D17
+```
+
+校准验收：C1目标事件+启用链+流锚点、C2首末/生命周期/中间覆盖与丢失检查、C3独立v5字段
+交叉核对全部通过；C4关联反例、C5实际资源与所有权、C6门禁均需独审。当前C1/C2实际新验证
+为NOT RUN、C3为BLOCKED，C4沿用已有软件契约，C5仅有估算方案，C6未通过。正式2000步另行批准。
+
 ## 维护候选与采集有效性（D132-19，软件阶段）
 
 按[D19设计](https://github.com/GNYKCZ/secure_pid_hvac/issues/132#issuecomment-6464649290)，
