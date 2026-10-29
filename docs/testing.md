@@ -1,6 +1,6 @@
 # 精简后的测试范围与运行入口
 
-默认正式验证为 `uv run pytest`，同时执行 `uv run ruff check .`。
+日常验证按 `AGENTS.md` Phase E 选择受影响测试，稳定版本集中验收一次。纯文档只做文档与diff检查，不跑pytest；局部诊断不带上无关全仓测试。全套只在影响无法限定并说明理由或用户明确要求时执行。
 下列计数表保留#117及早期#121的历史裁剪记录；当前数量以实际pytest收集为准。
 后续仅增加必要新契约回归，不恢复已删除的1249项历史矩阵。
 
@@ -82,7 +82,7 @@ journal/哈希及完整包装行界，用原数组转换方式核对标量/数�
 | 短进程集成 | `uv run pytest -m "integration and not gui and not stress"` | 实际Tk与stress |
 | 短GUI | `uv run pytest -m "gui and not stress"` | stress及其他组 |
 | 长时验证 | `uv run pytest -m stress` | 其他三个分区 |
-| 当前完整验证 | `uv run pytest` | 无分组排除 |
+| 按需扩展全套（非每次必跑） | `uv run pytest` | 无分组排除 |
 
 `integration` 表示实际进程、socket/TLS或间接使用真实网络结果fixture；
 `gui` 表示实际Tk；`stress` 表示保留的长轨迹或资源/性能见证。
