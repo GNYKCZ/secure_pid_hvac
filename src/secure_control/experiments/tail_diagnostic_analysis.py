@@ -594,7 +594,11 @@ def select_slow_steps(samples, threshold_ns=20_000_000):
 
 def analyze_slow_control(paths):
     """只读逐慢步证据，不跨主机减QPC；缺独立TCP零点时仍输出应用及调度。"""
-    from secure_control.experiments.windows_tail_analysis import normalize_schedule
+    from secure_control.experiments.windows_tail_analysis import (
+        control_frame_coverage,
+        control_tcp_anchor,
+        normalize_schedule,
+    )
     validated=analyze_manifests(paths,partial=True)
     manifests=[(Path(p),json.loads(Path(p).read_text(encoding='utf8'))) for p in paths]
     control_plans=[m.get('plan',{}).get('control_plan_sha256') for _,m in manifests]
@@ -640,6 +644,9 @@ def analyze_slow_control(paths):
                 raise ValueError('control native/stream target mismatch')
             native_reason='independent SeqNo/application-offset-zero anchor unavailable for this connection'
     normalized=(normalize_schedule({**native,'target_tid':native['target_tid']}) if native else None)
+    anchors=[control_tcp_anchor(native,stream,i) for i in (0,1)] if native and stream else []
+    for anchor in anchors:
+        if anchor.get('verified'):anchor['evidence'].update(artifact_sha256=native_hashes)
     results=[]
     for step in chosen:
         sample=next(s for s in samples if s['global_step']==step)
@@ -669,6 +676,9 @@ def analyze_slow_control(paths):
                 for name in ('reply_read','reply_frame')}
             server=[s for s in decoded.get(role,{}).get('spans',[]) if s['global_step']==step]
             mapping=[r for r in (stream or {}).get('rows',[]) if r[0]==step*2+party]
+            coverage=(control_frame_coverage(native,stream,step*2+party,anchors[party],
+                points['reply_read'],points['reply_frame']) if anchors else {'complete_at':None,'reason':native_reason})
+            covered=coverage['complete_at']
             wait=None
             first=points['reply_read']
             if len(send)==1 and first is not None and first>=send[0]['end_ns']:
@@ -682,11 +692,13 @@ def analyze_slow_control(paths):
                     'ready_observed_ns':ready_ns if verified else None,
                     'running_observed_ns':running_ns if verified else None,
                     'other_scheduler_states_ns':hi-lo-ready_ns-running_ns if verified else None,
-                    'before_component_coverage_ns':None,'after_component_coverage_ns':None,
+                    'before_component_coverage_ns':None if covered is None else max(0,min(hi,covered)-lo),
+                    'after_component_coverage_ns':None if covered is None else max(0,hi-max(lo,covered)),
                     'note':'scheduler occupancy only; waiting is not proof of network delay'}
             parties.append({'role':role,'A_wait_analysis':wait,'A_request_send_spans':send,'A_reply_points_ns':points,
                 'A_reply_stream_row':mapping[0] if len(mapping)==1 else None,
-                'tcp_component_complete_ns':None,'tcp_unknown_reason':native_reason,
+                'tcp_component_complete_ns':covered,'tcp_coverage':coverage,
+                'tcp_unknown_reason':None if covered is not None else coverage.get('reason',native_reason),
                 'B_local_spans':server,'B_clock_domain_id':records.get(role,{}).get('context',{}).get('clock_domain_id'),
                 'cross_host_difference_ns':None})
         results.append({'diagnostic_id':(client_manifest or {}).get('diagnostic_id'),
@@ -699,4 +711,6 @@ def analyze_slow_control(paths):
     return {'schema':'control-slow-step-analysis-v1','status':'observed' if slow else 'not_reproduced' if validated['diagnostic_complete'] else 'incomplete_no_slow_observed',
         'threshold_ns':20_000_000,'slow_steps':slow,'normal_neighbors':neighbors,'rows':results,
         'diagnostic_complete':validated['diagnostic_complete'],'role_sha256':sources,
-        'native_sha256':native_hashes,'socket_readable':'unknown','retry':False}
+        'native_sha256':native_hashes,
+        'tcp_anchors':[{k:v for k,v in a.items() if k!='packets'} for a in anchors],
+        'socket_readable':'unknown','retry':False}

@@ -208,3 +208,24 @@ def test_explicit_sidecar_is_independent_and_tamper_checked(tmp_path,fault):
         old=json.loads((tmp_path/'Client.json').read_text())
         assert old['schema']=='control-tail-diagnostic-v1' and 'streams' not in old
         assert struct.calcsize('!8q')*800<=65536
+
+
+@pytest.mark.parametrize('fault',[None,'partial','duplicate','peek','concurrent'])
+def test_setup_checkpoint_is_fixed_validated_boundary_and_next_existing_send(monkeypatch,fault):
+    from secure_control.execution import client_stream_map as m
+    mapper=ClientStreamMap();raw=Socket();raw.input=[struct.pack('!I',6)+b'setup!']
+    sock=mapper.register(raw);sock.send(b'query')
+    if fault=='concurrent':monkeypatch.setattr(m.threading,'get_native_id',lambda:sock.thread+1)
+    data=sock.recv(100,2) if fault=='peek' else sock.recv(5 if fault=='partial' else 100)
+    assert data
+    mapper.setup_checkpoint(sock)
+    if fault=='duplicate':mapper.setup_checkpoint(sock)
+    if fault:
+        assert mapper.error is not None;return
+    cp=dict(sock.checkpoint)
+    assert cp['received_bytes']==10 and cp['next_send_enter_ns'] is None
+    assert raw.address_queries==2
+    assert sock.send(b'next request')==12
+    assert sock.checkpoint['checkpoint_ns']<=sock.checkpoint['next_send_enter_ns']
+    first=sock.checkpoint['next_send_enter_ns'];sock.send(b'part2')
+    assert sock.checkpoint['next_send_enter_ns']==first

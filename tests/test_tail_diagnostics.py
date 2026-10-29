@@ -1079,3 +1079,47 @@ def test_slow_table_native_hash_identity_and_clipped_thread_evidence(tmp_path,mo
     assert wait['other_scheduler_states_ns']==10
     assert result['rows'][0]['parties'][0]['tcp_component_complete_ns'] is None
     assert result['rows'][0]['parties'][0]['cross_host_difference_ns'] is None
+
+
+@pytest.mark.parametrize('native_status',[None,'partial','saved'])
+def test_control_client_still_requires_its_actual_native_save(tmp_path,monkeypatch,native_status):
+    from dataclasses import asdict
+
+    from secure_control.experiments import native_tail_capture as n
+    from secure_control.experiments import tail_calibration as c
+    from secure_control.experiments import tail_diagnostic_runner as r
+    root=r.ROOT;monkeypatch.setattr(r,'ROOT',tmp_path)
+    monkeypatch.setattr(r.subprocess,'check_output',lambda args,**kw:'a'*40 if 'rev-parse' in args else '')
+    monkeypatch.setattr(c,'_source_clean',lambda:True)
+    monkeypatch.setattr(n,'authorize_control',lambda *a,**kw:None)
+    class Capture:
+        def __init__(self,plan,output,**kw):self.report={'status':native_status}
+        def preflight(self):return {'mock':True}
+    monkeypatch.setattr(n,'NativeCapture',Capture)
+    from secure_control.experiments import windows_tail_analysis as w
+    monkeypatch.setattr(w,'read_calibration_etl',lambda *a,**kw:{'events':[],'complete':True,'schedule_window_complete':True})
+    monkeypatch.setattr(c,'_peak_memory',lambda:1)
+    records,_=fixture_records(dual=True);records=[x for x in records if x['role'] in ('Client','worker')]
+    def collect(configs,ctx,steps,**kw):
+        out=Path(ctx.output_directory)
+        for record in records:
+            record['context']=asdict(ctx)
+            if record['role']=='Client':record['parent_pid']=os.getpid()
+            (out/(record['role']+'.json')).write_text(json.dumps(record),encoding='utf8')
+        (out/'native-a.etl').write_bytes(b'mock');(out/'Client.stream.json').write_text('{}',encoding='utf8')
+        samples=[{'global_step':i,'round_id':str(i),'status':'confirmed','actual_sample_start_ns':i*1000+1,
+            'work_completed_ns':i*1000+101,'work_elapsed_ns':100} for i in range(2000)]
+        group={'wall_s':1.,'forced_cleanup':[],'stop_reason':None,'exitcodes':[0],
+            'owned_pids':[101],'members':{'Client':{'pid':101}},'activity_elapsed_s':1.,
+            'roles':[{'role':'Client','pid':101,'status':'closed','timing':{'raw':{'samples':samples}},
+                'outcome':{'confirmed_step_count':2000,'protocol_committed_count':2000,
+                    'material_summary':{'worker_exited':True,'cleanup_failed':False,'worker':{'pid':104}}}}]}
+        if native_status is not None:group['native']={'status':native_status}
+        return group
+    monkeypatch.setattr(r,'_collect_host',collect)
+    manifest=r.run_host('client',tmp_path/'A',diagnostic_id='owner-save',expected_head='a'*40,
+        software_review='https://review.test',config_paths=[root/'configs/lab-client-cart-pole-demo.example.yaml'],
+        window=2000,steps=2000,stream_map=True,authorization={},native_plan={
+            'purpose':'control-slow-step-v1','source_head':'a'*40,'software_review':'https://review.test'})
+    assert manifest['functional_complete'] and manifest['native_evidence']['status']=='read'
+    assert manifest['diagnostic_complete']==(native_status=='saved')

@@ -579,7 +579,8 @@ def _read_etl(path, *, maximum_events, _api=None, target=None):
                         if len(target_tcbs)>=64 and v['Tcb'] not in target_tcbs:
                             raise ValueError('target connection capacity')
                         target_tcbs.add(v['Tcb'])
-                    keep = v.get('Tcb') in target_tcbs
+                    # 先有界保留元数据再关联，避免跨CPU绑定行晚于数据行导致丢前缀。
+                    keep = True
                 if not keep:
                     filtered += 1
                     return
@@ -621,6 +622,11 @@ def _read_etl(path, *, maximum_events, _api=None, target=None):
         errors.append('retention budget exceeded')
     if cpu_chain_mismatches:
         errors.append('CPU switch chain gap')
+    if target is not None:
+        identifiers={keys.get(('Tcb',tcb)) for tcb in target_tcbs}
+        selected=[r for r in rows if r['provider']!=TCPIP or r['values'].get('Tcb') in identifiers]
+        filtered += len(rows)-len(selected)
+        rows=selected
     for row in rows:
         row['time_ns'] = qpc_ns(row['ticks'],header['frequency'],header['clock'])
     def summaries(mapping):
@@ -754,3 +760,99 @@ def correlate_frame(sidecar, identity, events, anchor=None):
         trusted=True,lost=anchor.get('lost',0))
     return {**result,'anchor_evidence':anchor['evidence'],
             'note':'caller-supplied verified anchor; software does not establish TCP/socket readiness semantics'}
+
+
+def control_tcp_anchor(trace, sidecar, connection):
+    """以已验证setup静止边界的独立字节N证明本次流零点，不用普通控制帧反推。"""
+    from .tail_calibration import _sockaddr
+    def unknown(reason):return {'verified':False,'reason':reason}
+    if not trace.get('complete') or not sidecar.get('complete'):
+        return unknown('file or stream incomplete')
+    if connection not in (0,1) or len(sidecar.get('connections',[]))!=2:
+        return unknown('connection identity unavailable')
+    conn=sidecar['connections'][connection];cp=conn.get('setup_checkpoint')
+    if (conn.get('epoch')!=connection or conn.get('pid')!=trace.get('target_pid') or not cp
+            or cp.get('operation')!='lan_setup' or cp.get('sequence')!=2
+            or cp.get('contract')!='validated-setup-reply-then-offline-request-v1'
+            or cp.get('epoch')!=connection):return unknown('setup checkpoint missing/wrong epoch')
+    n,stamp,next_send=(cp.get(k) for k in ('received_bytes','checkpoint_ns','next_send_enter_ns'))
+    if (any(type(v) is not int for v in (n,stamp,next_send)) or not 0<n<2**31
+            or not conn['registered_ns']<stamp<next_send):return unknown('checkpoint bounds ambiguous')
+    if not isinstance(sidecar.get('protocol'),(tuple,list)) or len(sidecar['protocol'])!=3 or any(not isinstance(v,str) or not v for v in sidecar['protocol']):
+        return unknown('public protocol identity missing')
+    rows=[r for r in trace['events'] if r['provider']==TCPIP]
+    births=[r for r in rows if r['id']==1033 and r['values'].get('ProcessId')==conn['pid']
+        and _sockaddr(r['values'].get('LocalAddress'))==tuple(conn['local'])
+        and _sockaddr(r['values'].get('RemoteAddress'))==tuple(conn['remote'])]
+    if len(births)!=1:return unknown('unique connect-completed event unavailable')
+    birth=births[0];tcb=birth['values']['Tcb']
+    starts=[r['time_ns'] for r in trace['events'] if r['provider']==PROCESS and r['opcode']==1 and r['values'].get('ProcessId')==conn['pid']]
+    process_ends=[r['time_ns'] for r in trace['events'] if r['provider']==PROCESS and r['opcode']==2 and r['values'].get('ProcessId')==conn['pid']]
+    if len(starts)!=1 or len(process_ends)!=1 or not starts[0]<=birth['time_ns']<stamp<process_ends[0]:
+        return unknown('unique process lifetime unavailable')
+    if sum(r['id']==1033 and r['values'].get('Tcb')==tcb for r in rows)!=1:
+        return unknown('TCB reused')
+    metadata=[r for r in rows if r['id']!=1074 and r['values'].get('Tcb')==tcb]
+    if any(_sockaddr(r['values'].get('LocalAddress'))!=tuple(conn['local'])
+           or _sockaddr(r['values'].get('RemoteAddress'))!=tuple(conn['remote'])
+           or r['values'].get('ProcessId',r['values'].get('Pid')) not in (0,conn['pid']) for r in metadata):
+        return unknown('connection lifecycle identity conflict')
+    data=[r for r in rows if r['id']==1074 and r['values']['Tcb']==tcb and r['values']['NumBytes']>0]
+    if any(r['time_ns']<birth['time_ns'] for r in data):return unknown('data precedes connection birth')
+    if any(r['time_ns'] in (stamp,next_send) for r in data):return unknown('checkpoint timestamp tie')
+    prefix=[r for r in data if r['time_ns']<stamp]
+    if not prefix:return unknown('setup prefix absent')
+    candidates=[]
+    for start in {r['values']['SeqNo'] for r in prefix}:
+        ranges=sorted(((r['values']['SeqNo']-start)%2**32,
+                       (r['values']['SeqNo']-start)%2**32+r['values']['NumBytes']) for r in prefix)
+        end=0
+        for left,right in ranges:
+            if left>end or right>n:break
+            end=max(end,right)
+        else:
+            if end==n:candidates.append(start)
+    if len(candidates)!=1:return unknown('prefix union is not uniquely exactly N bytes')
+    start=candidates[0]
+    if any((r['values']['SeqNo']-start)%2**32+r['values']['NumBytes']>n
+           for r in data if stamp<r['time_ns']<next_send):
+        return unknown('unsolicited prefix growth before next request')
+    ends=[*process_ends,*[r['time_ns'] for r in metadata if r['id'] in (1040,1043)]]
+    end_ns=min(ends) if ends else None
+    if end_ns is not None and end_ns<=next_send:return unknown('connection ended before setup boundary')
+    flow=('control','P'+str(connection+1),'Client',connection,0,'receive','TCPIP1074')
+    return {'verified':True,'sequence_at_application_offset_zero':start,'flow':flow,
+        'diagnostic_id':sidecar['context']['diagnostic_id'],'source_head':sidecar['context']['source_head'],
+        'protocol':sidecar['protocol'],'connection':conn,'semantic_boundary':'TCPIP1074 verified data sequence',
+        'evidence':{'checkpoint':cp,'birth_event_index':birth['event_index'],
+            'prefix_event_indices':[r['event_index'] for r in prefix],'prefix_union_bytes':n,'connection_end_ns':end_ns},
+        'packets':[{'seq':r['values']['SeqNo'],'length':r['values']['NumBytes'],'time':r['time_ns'],
+                    'packet':r['event_index'],'flow':flow} for r in data]}
+
+
+def control_frame_coverage(trace, sidecar, identity, anchor, first_read_ns, frame_ns):
+    """只使用内部独立锚点，逐回复验证；窗外额外字节保留unknown，不猜FIN。"""
+    unknown={'boundary':'unknown','complete_at':None,'socket_readable':'unknown'}
+    if not anchor.get('verified'):return {**unknown,'reason':anchor.get('reason')}
+    if type(first_read_ns) is not int or type(frame_ns) is not int or first_read_ns>frame_ns:
+        return {**unknown,'reason':'application read bounds unavailable'}
+    rows=[r for r in sidecar['rows'] if r[0]==identity]
+    if len(rows)!=1 or len(rows[0])!=8 or any(type(v) is not int for v in rows[0]) or rows[0][4]<anchor['evidence']['checkpoint']['received_bytes'] or rows[0][5]<=0 or rows[0][6]!=rows[0][4]+4+rows[0][5] or rows[0][3]!=rows[0][1]+rows[0][2]:
+        return {**unknown,'reason':'control frame is not after independent setup prefix'}
+    if first_read_ns<=anchor['evidence']['checkpoint']['next_send_enter_ns']:
+        return {**unknown,'reason':'control read precedes next request boundary'}
+    packets=anchor['packets']
+    if any((p['seq']-anchor['sequence_at_application_offset_zero'])%2**32>=2**31 for p in packets):
+        return {**unknown,'reason':'sequence unwrap ambiguous'}
+    end_ns=anchor['evidence'].get('connection_end_ns')
+    if end_ns is not None:
+        target_start=rows[0][4];target_end=rows[0][6]
+        for p in packets:
+            offset=(p['seq']-anchor['sequence_at_application_offset_zero'])%2**32
+            if p['time']>=end_ns and max(offset,target_start)<min(offset+p['length'],target_end):
+                return {**unknown,'reason':'target bytes overlap ended connection'}
+    result=correlate_frame(sidecar,identity,packets,anchor)
+    if result['complete_at'] is not None and result['complete_at']>frame_ns:
+        return {**unknown,'reason':'component coverage occurs after application frame read'}
+    result['outside_business_events_unknown']=[p['packet'] for p in packets if p['time']>trace['target_window_ns'][1]]
+    return result

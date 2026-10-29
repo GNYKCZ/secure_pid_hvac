@@ -533,7 +533,8 @@ def run_host(side, output, *, diagnostic_id, expected_head, software_review, con
             view.update(purpose='control-slow-step-v1',source_head=head,diagnostic_id=diagnostic_id,
                 etl_sha256=_sha(output/'native-a.etl'),process_peak_working_set_bytes=_peak_memory())
             view['memory_target_met']=view['process_peak_working_set_bytes']<=512*1024*1024
-            if not view['memory_target_met']:manifest['diagnostic_complete']=False
+            if not view['memory_target_met'] or not view.get('complete') or not view.get('schedule_window_complete'):
+                manifest['diagnostic_complete']=False
             _save(output/'control-native-view.json',view)
             manifest['native_evidence']={'status':'read','files':{n:_sha(output/n) for n in
                 ('native-a.etl','control-native-events.json','control-native-view.json','Client.stream.json')}}

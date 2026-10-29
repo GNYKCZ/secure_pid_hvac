@@ -647,6 +647,9 @@ class LanContinuousRuntime:
                 _request(sock, role, 2, "lan_setup", self.session_id,
                          config.startup_timeout, setup,
                          deadline=network_deadline(config.startup_timeout, deadline_ns))
+                if (diagnostic is not None and diagnostic.streams is not None
+                        and wire_profile==PREAUTHORIZED_PROFILE_V2):
+                    diagnostic.streams.setup_checkpoint(sock)
                 material = self.distribution.p1 if party == 0 else self.distribution.p2
                 _request(sock, role, 3, "offline", self.session_id,
                          config.startup_timeout, PartyOfflineMaterial.from_message(material),

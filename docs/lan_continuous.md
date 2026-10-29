@@ -176,10 +176,15 @@ uv run python scripts/run_control_tail_diagnostic.py analyze-control results/tai
 
 逐步表含run/step/round、work/exchange、A发送/首次读/收齐、线程Ready/Running区间、B本地
 处理span、原件摘要、时钟域和缺证据原因。只同机相减；Running不是Python/GIL可用证明，
-等待不是网络延迟证明。控制连接目前仍需要本次独立SeqNo/应用累计字节零点；既有stream-map
-累计setup字节但不独立证明TCP序号锚点，因此当前分析会保留TCP覆盖时间unknown，不复用v3
-序号、不把首个普通控制帧当0、不忽略未知末尾+1。它提供应用与调度证据，不能承诺一次
-拆开B读取前和网络等待。若无慢步返回not_reproduced；不完整包无慢步另标incomplete，均不补跑。
+等待不是网络延迟证明。控制连接以现有已校验lan_setup回复后的静止边界证明本次独立SeqNo零点：每连接一次记录
+累计接收N/checkpoint及下一已有send进入时刻。B在该回复后仅等待offline请求，无主动推送。
+原socket从任何应用握手前注册；并发/PEEK/旁路IO使证据失效。完整新连接1033出生事件、
+PID/四元组/TCB唯一关联后，checkpoint前序号区间并集必须唯一连续且恰为N，直至下一send
+不增长；缺首部、空洞、未来补洞、TCB复用或时间相等歧义均返回具体unknown。先有界保留
+TCP元数据再关联，避免回调绑定晚于数据而丢失前缀。锚点及每帧首次覆盖证据均绑定原件摘要
+和事件索引，不复用v3序号、不把首个普通控制帧当0。业务窗外额外+1单独保留unknown，
+不猜FIN；若影响目标区间/生命周期则该帧拒绝。通过时给出A等待在组件覆盖之前/之后的
+同机时间分段；该组件仍不等同socket可读，不能承诺一次拆开B读取前和网络等待。若无慢步返回not_reproduced；不完整包无慢步另标incomplete，均不补跑。
 
 ## 维护候选与采集有效性（D132-19，软件阶段）
 
