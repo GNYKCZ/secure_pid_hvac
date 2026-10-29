@@ -1,5 +1,123 @@
 # 独立三角色连续 LAN 实验（Issues #86、#84、#75、#92）
 
+## Issue #153（续接D132-20）：集中修复后的显式校准候选（新实采尚未运行）
+
+按[集中修订](https://github.com/GNYKCZ/secure_pid_hvac/issues/132#issuecomment-6471238272)，
+在同一PR151实施v5窄解析、File候选/目标过滤及公开流量校准入口；不再把调查文档当作补齐。
+业务控制协议、20ms、GC、网卡/系统全局设置、D19维护优化及原Memory入口保持。
+
+### 离线工具已准备，v5已完成独立交叉核验
+
+选定Microsoft官方TraceEvent 3.1.21，工具仅在被忽略的`.tmp/d20-tools/`。
+官方[GitHub发布](https://github.com/microsoft/perfview/releases/tag/v3.1.21)与
+[NuGet包](https://www.nuget.org/packages/Microsoft.Diagnostics.Tracing.TraceEvent/3.1.21)
+的TraceEvent DLL字节完全一致，SHA256：
+`401e948dac99d0f9756ef96d5a8b8e4736e19e9f82ce8cdd744495951e3a94bb`。
+Authenticode状态Valid，签名者Microsoft Corporation，证书指纹
+`245D262748012A4FE6CE8BA6C951A4C4AFBC3E5D`。
+使用现有PowerShell7.6.5/.NET10.0.11及包内FastSerialization读取离线文件；未安装服务、SDK
+或Python依赖，未启用provider。包/解包/候选源码等总量低于64MiB，三份独立CSV输出合计
+14,544,753字节，低于32MiB。完整摘要/引用和依赖审计在本轮实施评论及临时tool-manifest中。
+
+发布tag对应公开源码commit`4b14fe0c8c6101cb3c1c6bfed2e317a9d29f68ee`。
+DLL ProductVersion内嵌构建标识为`04132a81a0b2c147d48661d2b104f4ab7d136cd5`，
+该标识在公开仓库查询为404；不能声称已复现完整DLL构建。已核对公开tag中的CSwitchTraceData
+字段访问与签名DLL相关getter IL，并通过独立DLL实际输出核验适用的字段布局。
+它替代上轮未验证的9f071a5候选，不从邻版本猜布局。
+
+| 原ETL | v5条数 | 独立对齐字段 | 差异 | 每CPU切入/切出链不一致 |
+|---|---:|---|---:|---:|
+| 01 | 128095 | 原文件事件序号、QPC、CPU、28字节长度、新/旧TID、旧状态、version | 0 | 0 |
+| 02 | 129239 | 同上 | 0 | 0 |
+| 03 | 128645 | 同上 | 0 | 0 |
+
+本机build26200/x64的385979条实际事件已逐条核对。`_cswitch_v5`仅接受已核验的
+THREAD/id0/opcode36/version5、x64、28字节，保留v2/v3的TDH路径，未知长度/版本/架构拒绝。
+新TID取payload中字段而非可能为0xffffffff的header TID，CPU取对应buffer context。
+v5的schema_source指向公开tag，schema_sha256是固定布局契约说明的摘要，不是TDH数据或源码
+文件摘要；独立DLL摘要在上文。旧v2/v3仍保留实际TDH schema摘要。
+旧ETL缺失目标生命周期前缀仍不能归因；解析修复不补造历史start。
+
+### TCP链路：实际enable证明和完整公开流锚点，不猜来源
+
+新File入口在自有两个session创建后，以QueryAllTraces的session ID/GUID与
+EnumerateTraceGuidsEx返回的TRACE_ENABLE_INFO对应，核对本次TCPIP enable、level5、
+MatchAny/MatchAll。失败不启动Client子进程/公开流量，保存失败事实并收尾。
+TDH注册清单或profiledetails不再代替本次实际enable证据；event-ID过滤仍由固定profile绑定，
+运行时enable查询本身不返回ID filter，实际ETL descriptor统计继续验证。
+
+新旧provider都为`2f07e2ee-15db-40f1-90ef-9d7ba282188a`；未扩大provider、keyword或payload。
+旧TCP0可排除“只是Python解码器不认识已有所选descriptor”的单一解释：全descriptor遍历和
+系统tracerpt摘要均无该GUID。不能由此认定未启用、没有网络或仅由Memory覆盖造成。
+
+| ID | 已核实版本 | opcode/事件level | keyword | 解码的元数据 |
+|---|---|---|---|---|
+| 1033 | 0/1 | 0/4 | 0x8000000400000484 | Tcb/LocalAddress/RemoteAddress/ProcessId，v1含ProcessStartKey |
+| 1038 | 0/1 | 0/4 | 0x8000001000000404 | 同上 |
+| 1040 | 0/1 | 0/4 | 0x8000001000000484 | 同上 |
+| 1043 | 0/1/2 | 0/4 | 0x8000001000000484 | 同上（版本>0含ProcessStartKey） |
+| 1074 | 0/1 | 0/4 | 0x8000000200000000 | Tcb/NumBytes/SeqNo，v1含NumPkt |
+| 1300 | 0/1/2/3 | 0/4 | 0x8000000400000484 | Tcb/LocalAddress/RemoteAddress/Pid，版本>0含ProcessStartKey |
+
+选择器仍为level5、MatchAny`0x600000484`、MatchAll0和上述六ID；注册模板的其他字段继续由
+原白名单审计，不导出业务payload。新增已存在的1043v2/1300v2-v3解码只走实际TDH字段核查。
+微软[1074说明](https://devblogs.microsoft.com/scripting/use-powershell-to-parse-network-log/)将其
+描述为received data/ThSeq；这里仍只称选定组件的数据覆盖，绝不称物理包到达或socket readable。
+
+一次校准检验的具体假设是：原窄来源实际启用后，File保留窗口中的两条新建公开连接能产生
+可按PID/TCB/四元组/方向/生命周期关联的1074记录。公开流包含全部setup及维护形状帧，长度变化，
+检验SeqNo起点语义，处理回绕/重传，缺流、前缀、方向或连接复用保持unknown。若仍为0，结合
+本次enable及完整窗口证据判定源工作条件/选择仍不足；不追加其他provider或自动重跑。
+
+### File与离线处理已实施的固定候选预算
+
+独立profile为`configs/control-tail-calibration.wprp!D20`，File顺序日志，显式`-filemode`。
+系统/事件缓冲8MiB/4MiB不变；有效native窗口最多55秒，公开应用窗口至少40秒，收尾目标10秒、
+专项总目标100秒。最终ETL目标128MiB、目录/临时目标384MiB、启动余量2GiB；WPR及异常系统调用
+不提供硬配额/退出保证，停止或GUID归属无法确认仍人工处理，不能停止别人会话或自动重试。
+
+`read_calibration_etl`是独立预算入口，旧read_etl的64MiB/30万限制保持。校准输入最多128MiB，
+解码预算250万事件；耗尽后在下一个ETW缓冲边界取消离线处理并标partial，不冒充完整遍历。
+计数包含过滤前descriptor/错误/丢失；保留最多10万条目标线程/进程和其TCP元数据，其他行不保存。
+同时核查目标生命周期夹住窗口、内部切换/唤醒序列和全局每CPU切换链；缺前缀、内部缺口、
+unsupported或保留耗尽都不能设完整。输出JSON合计32MiB、实际进程峰值工作集目标512MiB并核对。
+输出/峰值/ETL超限判失败，不用仅增大数字掩盖原全量行内存问题。
+
+容量推导仍是估计：原三组文件约9.8–10.1MB，保留调度包络5.7–13.2秒，总事件/包络的最坏
+容量代理约37k/s，55秒约204万事件/98MB。代理不是稳定发生率，加入TCP和机器负载变化后
+可能超预算。File写盘扰动组不能直接与旧Memory计算因果提速。
+
+### 可执行的显式入口与唯一下一批准动作
+
+校准不运行plant或控制协议：B单进程两个端口回显，A由native开始后spawn的独立主线程在
+约41秒内双向发送公开确定性变长帧。两端均最多一次，首错停；只接受明确两机字面量地址。
+入口要求新的`native-calibration-authorization-v1`文件，绑定准确源码SHA、完整计划摘要、ID、
+两端新输出绝对路径、attempts严格整数1/窗口55，以及本次用户批准评论URL；设计评论和旧额度
+不能冒充新运行批准。源码/候选profile脏时拒绝，用户部署及工作流修改保留。计划绑定拓扑摘要。
+下面命令中的SHA必须对应同一已审版本，批准文件仅在用户批准后生成；当前未生成有效批准文件。
+
+```powershell
+# A：只读准备，--config选用已核实的A端部署文件；不启动采集/控制/流量。
+$runHead = (git rev-parse HEAD).Trim()
+uv run python scripts/run_control_tail_diagnostic.py prepare-file-calibration .tmp/d20-plan.json --expected-head $runHead --config configs/lab-client-cart-pole-demo.example.yaml
+
+# 获批且两端同SHA后，将同一plan/批准文件复制到B，先执行B，再立即执行A。
+uv run python scripts/run_control_tail_diagnostic.py calibrate-pair results/tail_diagnostics/d20-calibration-B --expected-head $runHead --plan .tmp/d20-plan.json --authorization .tmp/d20-authorization.json --p1-config configs/lab-p1-cart-pole-demo.example.yaml --p2-config configs/lab-p2-cart-pole-demo.example.yaml
+uv run python scripts/run_control_tail_diagnostic.py calibrate-client results/tail_diagnostics/d20-calibration-A --expected-head $runHead --plan .tmp/d20-plan.json --authorization .tmp/d20-authorization.json --config configs/lab-client-cart-pole-demo.example.yaml
+
+# 停止后把完整B目录原件复制到A，再只读核对两端同ID/SHA/拓扑/计划、帧数及原件hash。
+uv run python scripts/run_control_tail_diagnostic.py calibrate-analyze results/tail_diagnostics/d20-calibration-A results/tail_diagnostics/d20-calibration-B --output .tmp/d20-calibration-result.json
+```
+
+各输出目录/结果文件必须全新，ledger先于监听/采集；已有目录拒绝复用。A本地检查通过也只标
+local_checks_complete，双机校准结果必须再核对B原件。源query/启动失败、窗口不完整、流未知、
+超资源、两端身份或摘要不匹配都不通过；ETL和失败前缀保留，不补跑。
+
+**唯一下一批准动作**：软件独审后，批准该固定SHA和原窄来源/上述预算的一次公开两机校准，
+并确认两端设备/配置可用。此批准不包含正式2000步控制实验。当前新实采、新流量、实际窗口
+覆盖、TCP产出及资源峰值均NOT RUN；软件/离线v5通过不能替代它们。校准任一FAIL/PARTIAL
+就报告具体阻断并停止，三项实际能力通过后才申请正式根因实验。
+
 ## 维护候选与采集有效性（D132-19，软件阶段）
 
 按[D19设计](https://github.com/GNYKCZ/secure_pid_hvac/issues/132#issuecomment-6464649290)，

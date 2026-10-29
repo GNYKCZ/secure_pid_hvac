@@ -31,13 +31,32 @@ def main():
     prepare = modes.add_parser('prepare-native',help='只读核查profile/source/session，写计划，不启动采集/控制')
     prepare.add_argument('output',type=Path)
     prepare.add_argument('--expected-head',required=True)
+    file_prepare=modes.add_parser('prepare-file-calibration',help='只读准备显式File校准计划，不采集/发流量')
+    file_prepare.add_argument('output',type=Path)
+    file_prepare.add_argument('--expected-head',required=True)
+    file_prepare.add_argument('--config',type=Path,required=True,help='只读绑定Client拓扑摘要，不联网')
+    for side in ('client','pair'):
+        calibration=modes.add_parser('calibrate-'+side,help='需新的计划绑定用户批准；一次公开流量，不运行控制')
+        calibration.add_argument('output',type=Path)
+        calibration.add_argument('--expected-head',required=True)
+        calibration.add_argument('--plan',type=Path,required=True)
+        calibration.add_argument('--authorization',type=Path,required=True)
+        if side=='client':
+            calibration.add_argument('--config',type=Path,required=True)
+        else:
+            calibration.add_argument('--p1-config',type=Path,required=True)
+            calibration.add_argument('--p2-config',type=Path,required=True)
+    comparison=modes.add_parser('calibrate-analyze',help='只读核实已复制的同组两端原件')
+    comparison.add_argument('client_directory',type=Path)
+    comparison.add_argument('pair_directory',type=Path)
+    comparison.add_argument('--output',type=Path,required=True)
     analyze = modes.add_parser('analyze',help='只读角色manifest，不运行控制')
     analyze.add_argument('manifests',type=Path,nargs='+')
     analyze.add_argument('--output',type=Path,required=True)
     analyze.add_argument('--same-host',action='store_true',help='没有实际同机spawn证明时拒绝合轴')
     analyze.add_argument('--partial',action='store_true',help='保留失败前缀/缺角色；不升级为完整证据')
     args = parser.parse_args()
-    if args.mode == 'prepare-native':
+    if args.mode in ('prepare-native','prepare-file-calibration'):
         import subprocess
 
         from secure_control.experiments.native_tail_capture import prepare_native
@@ -45,11 +64,32 @@ def main():
         head = subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
         if head!=args.expected_head:
             parser.error('准备计划head不一致')
-        result = prepare_native(ROOT/'configs/control-tail-native-2000.wprp')
+        file_candidate=args.mode=='prepare-file-calibration'
+        result = prepare_native(ROOT/('configs/control-tail-calibration.wprp' if file_candidate
+                                      else 'configs/control-tail-native-2000.wprp'),_file_candidate=file_candidate)
+        if file_candidate:
+            from secure_control.experiments.tail_calibration import _config_addresses
+            _,result['topology_sha256']=_config_addresses([args.config],'client')
         result['source_head'] = head
         with args.output.open('x',encoding='utf8') as stream:
             json.dump(result,stream,ensure_ascii=False,indent=2)
         print('仅准备计划已保存；尚未启动任何系统或控制采集。')
+    elif args.mode in ('calibrate-client','calibrate-pair'):
+        from secure_control.experiments.tail_calibration import run_calibration
+        side=args.mode.removeprefix('calibrate-')
+        paths=[args.config] if side=='client' else [args.p1_config,args.p2_config]
+        result=run_calibration(side,args.output,plan=json.loads(args.plan.read_text(encoding='utf8')),
+            approval=json.loads(args.authorization.read_text(encoding='utf8')),config_paths=paths,
+            expected_head=args.expected_head)
+        print(json.dumps({k:v for k,v in result.items() if k not in ('events','tcp')},ensure_ascii=False))
+        if result.get('status')!='closed' and result.get('local_checks_complete') is not True:
+            raise SystemExit(2)
+    elif args.mode=='calibrate-analyze':
+        from secure_control.experiments.tail_calibration import _save, analyze_calibration
+        result=analyze_calibration(args.client_directory,args.pair_directory)
+        _save(args.output,result)
+        print(json.dumps(result,ensure_ascii=False))
+        if not result['calibration_complete']:raise SystemExit(2)
     elif args.mode == 'local':
         from secure_control.experiments.tail_diagnostic_runner import run_local
         result = run_local(args.output,expected_head=args.expected_head,
