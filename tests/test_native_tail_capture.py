@@ -246,7 +246,7 @@ def test_native_stop_budget_and_actual_session_state_are_not_command_exit(tmp_pa
     assert report['manual_recovery']['status'][-1]==capture.instance
 
 
-@pytest.mark.parametrize('fault',[None,'no_approval','old_approval','wrong_enable','missing_enable','old_profile','budget'])
+@pytest.mark.parametrize('fault',[None,'mixed','no_approval','old_approval','wrong_enable','missing_enable','pre_enable','pre_legacy','old_profile','budget'])
 def test_file_calibration_is_separate_plan_and_checks_own_actual_provider(tmp_path,monkeypatch,fault):
     from secure_control.experiments import native_tail_capture as m
     profile=PROFILE.with_name('control-tail-calibration.wprp')
@@ -259,8 +259,11 @@ def test_file_calibration_is_separate_plan_and_checks_own_actual_provider(tmp_pa
             for i,row in enumerate(rows): row['logger_id']=100+i
             return rows
         def provider_enables(self):
-            return [] if fault=='missing_enable' else [{'logger_id':101,'enabled':1,
-                'level':4 if fault=='wrong_enable' else 5,'match_any':0x600000484,'match_all':0}]
+            rows = [] if fault=='missing_enable' else [{'logger_id':101,'enabled':1,'provider_pid':0,
+                'level':4 if fault=='wrong_enable' else 5,'match_any':0x600000484,'match_all':0,
+                'instance_flags':2 if fault=='pre_enable' else 3 if fault=='pre_legacy' else 0}]
+            if fault=='mixed':rows.append({**rows[0],'instance_flags':2})
+            return rows
     backend=FileBackend()
     approval={'schema':'native-calibration-authorization-v1','plan_sha256':m.plan_digest(plan),
               'authorization_url':'https://github.com/GNYKCZ/secure_pid_hvac/issues/153#issuecomment-9999999999'}
@@ -270,9 +273,9 @@ def test_file_calibration_is_separate_plan_and_checks_own_actual_provider(tmp_pa
     if fault=='budget': plan['etl_limit_bytes']+=1
     monkeypatch.setattr(m.shutil,'disk_usage',lambda path:SimpleNamespace(free=3*1024**3))
     capture=NativeCapture(plan,tmp_path/'candidate.etl',_backend=backend,_now=lambda:0.,authorization=approval)
-    if fault:
+    if fault and fault!='mixed':
         with pytest.raises((PermissionError,ValueError)):capture.begin()
-        if fault in ('wrong_enable','missing_enable'):
+        if fault in ('wrong_enable','missing_enable','pre_enable','pre_legacy'):
             assert [a[0] for a in backend.commands]==['-start','-cancel']
         else: assert not backend.commands
         return
