@@ -158,7 +158,7 @@ def authorize(approval, plan, *, side, output, expected_head):
     url=approval.get('authorization_url')
     identity=approval.get('calibration_id')
     if (approval.get('schema')!='native-calibration-authorization-v1'
-            or plan.get('schema')!='native-calibration-preparation-v1'
+            or plan.get('schema')!='native-calibration-preparation-v1' or plan.get('purpose') is not None
             or approval.get('plan_sha256')!=plan_digest(plan)
             or approval.get('source_head')!=expected_head or plan.get('source_head')!=expected_head
             or expected_head!=_head()

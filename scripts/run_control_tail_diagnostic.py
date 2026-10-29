@@ -19,6 +19,7 @@ def main():
         host.add_argument('--diagnostic-id',required=True)
         host.add_argument('--expected-head',required=True)
         host.add_argument('--software-review',required=True)
+        host.add_argument('--authorization',type=Path)
         host.add_argument('--steps',type=int,default=400)
         host.add_argument('--window',type=int,choices=(400,2000),default=400,help='显式版本窗口，旧默认400保持')
         if side == 'client':
@@ -26,6 +27,7 @@ def main():
             host.add_argument('--native-plan',type=Path,help='仅2000专项：用户明确执行时才启动计划中的自有WPR会话')
             host.add_argument('--config',type=Path,default=Path('configs/lab-client-cart-pole-demo.example.yaml'))
         else:
+            host.add_argument('--native-plan',type=Path)
             host.add_argument('--p1-config',type=Path,default=Path('configs/lab-p1-cart-pole-demo.example.yaml'))
             host.add_argument('--p2-config',type=Path,default=Path('configs/lab-p2-cart-pole-demo.example.yaml'))
     prepare = modes.add_parser('prepare-native',help='只读核查profile/source/session，写计划，不启动采集/控制')
@@ -35,6 +37,12 @@ def main():
     file_prepare.add_argument('output',type=Path)
     file_prepare.add_argument('--expected-head',required=True)
     file_prepare.add_argument('--config',type=Path,required=True,help='只读绑定Client拓扑摘要，不联网')
+    control_prepare=modes.add_parser('prepare-control-file',help='只读准备原控制File计划，不运行')
+    control_prepare.add_argument('output',type=Path)
+    control_prepare.add_argument('--expected-head',required=True)
+    control_prepare.add_argument('--software-review',required=True)
+    for role in ('client','p1','p2'):
+        control_prepare.add_argument('--'+role+'-config',type=Path,default=Path('configs/lab-'+role+'-cart-pole-demo.example.yaml'))
     for side in ('client','pair'):
         calibration=modes.add_parser('calibrate-'+side,help='需新的计划绑定用户批准；一次公开流量，不运行控制')
         calibration.add_argument('output',type=Path)
@@ -50,13 +58,16 @@ def main():
     comparison.add_argument('client_directory',type=Path)
     comparison.add_argument('pair_directory',type=Path)
     comparison.add_argument('--output',type=Path,required=True)
+    control_analysis=modes.add_parser('analyze-control',help='只读逐work>20ms及正常邻步证据表')
+    control_analysis.add_argument('manifests',type=Path,nargs='+')
+    control_analysis.add_argument('--output',type=Path,required=True)
     analyze = modes.add_parser('analyze',help='只读角色manifest，不运行控制')
     analyze.add_argument('manifests',type=Path,nargs='+')
     analyze.add_argument('--output',type=Path,required=True)
     analyze.add_argument('--same-host',action='store_true',help='没有实际同机spawn证明时拒绝合轴')
     analyze.add_argument('--partial',action='store_true',help='保留失败前缀/缺角色；不升级为完整证据')
     args = parser.parse_args()
-    if args.mode in ('prepare-native','prepare-file-calibration'):
+    if args.mode in ('prepare-native','prepare-file-calibration','prepare-control-file'):
         import subprocess
 
         from secure_control.experiments.native_tail_capture import prepare_native
@@ -64,10 +75,18 @@ def main():
         head = subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
         if head!=args.expected_head:
             parser.error('准备计划head不一致')
-        file_candidate=args.mode=='prepare-file-calibration'
+        file_candidate=args.mode!='prepare-native'
         result = prepare_native(ROOT/('configs/control-tail-calibration.wprp' if file_candidate
                                       else 'configs/control-tail-native-2000.wprp'),_file_candidate=file_candidate)
-        if file_candidate:
+        if args.mode=='prepare-control-file':
+            from secure_control.execution.lan_config import load_lan_config
+            from secure_control.experiments.tail_diagnostic_runner import _config_identity
+            configs=[load_lan_config(getattr(args,r.lower()+'_config'),r) for r in ('Client','P1','P2')]
+            if len({c.topology.digest for c in configs})!=1:parser.error('拓扑不一致')
+            result.update(purpose='control-slow-step-v1',control_steps=2000,software_review=args.software_review,
+                control_configurations={c.role:_config_identity(c) for c in configs},
+                topology_sha256=configs[0].topology.digest,pair_wait_s=45,pair_business_s=55,pair_total_s=100)
+        elif file_candidate:
             from secure_control.experiments.tail_calibration import _config_addresses
             _,result['topology_sha256']=_config_addresses([args.config],'client')
         result['source_head'] = head
@@ -90,6 +109,11 @@ def main():
         _save(args.output,result)
         print(json.dumps(result,ensure_ascii=False))
         if not result['calibration_complete']:raise SystemExit(2)
+    elif args.mode=='analyze-control':
+        from secure_control.experiments.tail_diagnostic_analysis import analyze_slow_control
+        result=analyze_slow_control(args.manifests)
+        with args.output.open('x',encoding='utf8') as stream:json.dump(result,stream,indent=2)
+        print(json.dumps({'status':result['status'],'slow_steps':result['slow_steps']}))
     elif args.mode == 'local':
         from secure_control.experiments.tail_diagnostic_runner import run_local
         result = run_local(args.output,expected_head=args.expected_head,
@@ -105,7 +129,9 @@ def main():
             config_paths=paths,steps=args.steps,**({'window':args.window} if args.window!=400 else {}),
             **({'stream_map':True} if args.mode=='client' and args.stream_map else {}),
             **({'native_plan':json.loads(args.native_plan.read_text(encoding='utf8'))}
-               if args.mode=='client' and args.native_plan else {}))
+               if args.native_plan else {}),
+            **({'authorization':json.loads(args.authorization.read_text(encoding='utf8'))}
+               if args.authorization else {}))
         print(json.dumps({'diagnostic_complete':result['diagnostic_complete'],
             'functional_complete':result['functional_complete'],
             'manifest':str(args.output/'manifest.json')},ensure_ascii=False))

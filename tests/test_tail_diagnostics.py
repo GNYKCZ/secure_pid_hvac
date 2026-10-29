@@ -910,3 +910,163 @@ def test_rv003_partial_failure_round_unknown_preserves_prefix(tmp_path,prepared,
         with pytest.raises(ValueError,match='身份'):
             analyze_manifests(paths)
     assert all(not s['fixable_mechanism_confirmed'] for s in result['steps'])
+
+
+@pytest.mark.parametrize('values,slow,selected',[
+    ([20_000_000,20_000_001,1,30_000_000,1],[1,3],[0,1,2,3,4]),
+    ([20_000_000,1],[],[]),([21_000_000],[0],[0])])
+def test_control_slow_threshold_and_nearest_normal_neighbors(values,slow,selected):
+    from secure_control.experiments.tail_diagnostic_analysis import select_slow_steps
+    found,chosen,neighbors=select_slow_steps([{'global_step':i,'work_elapsed_ns':v} for i,v in enumerate(values)])
+    assert found==slow and chosen==selected
+    if len(values)==1:assert neighbors[0]=={'before':None,'after':None}
+
+
+@pytest.mark.parametrize('fault',[None,'calibration','purpose','plan','steps','path','config','resource','url'])
+def test_control_approval_does_not_reuse_calibration_or_other_run(tmp_path,fault):
+    from secure_control.experiments.native_tail_capture import (
+        CALIBRATION_RESOURCES,
+        authorize_control,
+        plan_digest,
+    )
+    plan={'schema':'native-calibration-preparation-v1','purpose':'control-slow-step-v1',
+        'source_selection_audit_version':2,'source_head':'a'*40,'control_steps':2000,
+        'pair_wait_s':45,'pair_business_s':55,'pair_total_s':100,
+        'control_configurations':{'Client':{'role':'Client','identity':'frozen'}},**CALIBRATION_RESOURCES}
+    approval={'schema':'native-control-authorization-v1','purpose':'control-slow-step-v1',
+        'source_head':'a'*40,'plan_sha256':plan_digest(plan),'diagnostic_id':'run','attempts':1,
+        'steps':2000,'client_output':str(tmp_path/'A'),
+        'authorization_url':'https://github.com/GNYKCZ/secure_pid_hvac/issues/153#issuecomment-9999999999'}
+    configs=[{'role':'Client','identity':'frozen'}]
+    if fault=='calibration':approval['schema']='native-calibration-authorization-v1'
+    if fault=='purpose':approval['purpose']='public-echo'
+    if fault=='plan':approval['plan_sha256']='b'*64
+    if fault=='steps':approval['steps']=True
+    if fault=='path':approval['client_output']=str(tmp_path/'other')
+    if fault=='config':configs[0]['identity']='changed'
+    if fault=='resource':plan['active_window_s']=100
+    if fault=='url':approval['authorization_url']=None
+    if fault:
+        with pytest.raises(PermissionError):authorize_control(approval,plan,side='client',output=tmp_path/'A',
+            head='a'*40,diagnostic_id='run',configurations=configs)
+    else:assert authorize_control(approval,plan,side='client',output=tmp_path/'A',head='a'*40,
+        diagnostic_id='run',configurations=configs)==approval
+
+
+@pytest.mark.parametrize('business',[False,True])
+def test_control_pair_wait_and_business_deadlines_without_spawn(monkeypatch,business):
+    import queue
+
+    from secure_control.experiments import tail_diagnostic_runner as runner
+    clock=[0.];activity=SimpleNamespace(value=0.);children=[]
+    class Process:
+        def __init__(self,**kwargs):
+            self.pid=100+len(children);self.exitcode=None;children.append(self)
+            assert kwargs['args'][-1] is True
+        def start(self):pass
+    class Queue:
+        def get(self,timeout):
+            clock[0]+=1
+            if business and clock[0]>=20 and not activity.value:activity.value=20
+            raise queue.Empty
+        def close(self):pass
+        def cancel_join_thread(self):pass
+    spawn=SimpleNamespace(Queue=Queue,Value=lambda *a:activity,
+        Event=lambda:SimpleNamespace(set=lambda:None),Process=Process)
+    monkeypatch.setattr(runner,'_clear_owned',lambda *a,**kw:[])
+    result=runner._collect_host([SimpleNamespace(role='P1'),SimpleNamespace(role='P2')],None,2000,
+        control_file=True,_mp=SimpleNamespace(get_context=lambda _:spawn),_now=lambda:clock[0])
+    assert result['stop_reason']=='control_wait_or_business_limit'
+    assert clock[0]==(75 if business else 45)
+    assert result['owned_pids']==[100,101]
+
+
+def test_control_party_reuses_first_request_hook_once_without_network(tmp_path,monkeypatch):
+    from contextlib import nullcontext
+
+    from secure_control.execution import lan_runtime
+    from secure_control.experiments import tail_diagnostic_runner as runner
+    activity=SimpleNamespace(value=0.,get_lock=lambda:nullcontext())
+    events=[];reports=[]
+    class Recorder:
+        def __init__(self,*a,**kw):pass
+        def start(self):return self
+        def emit(self,*a,**kw):events.append(a)
+        def save(self,status):return {'status':status}
+    monkeypatch.setattr(runner,'TailRecorder',Recorder)
+    monkeypatch.setattr(runner.subprocess,'check_output',lambda *a,**kw:'a'*40)
+    def party(*a,**kw):
+        # 当前安装的recorder由构造保存，直接驱动原有观察点。
+        recorder[0].emit('request_receive',0)
+        first=activity.value
+        recorder[0].emit('request_receive',0)
+        assert first>0 and activity.value==first
+        return {'status':'closed'}
+    recorder=[]
+    def factory(*a,**kw):
+        r=Recorder();recorder.append(r);return r
+    monkeypatch.setattr(runner,'TailRecorder',factory)
+    monkeypatch.setattr(lan_runtime,'run_party_single_step',party)
+    runner._configured_child(SimpleNamespace(role='P1'),context(tmp_path),
+        SimpleNamespace(put=reports.append),SimpleNamespace(set=lambda:None),100,2000,
+        activity=activity,control_file=True)
+    assert reports[0]['status']=='closed' and len(events)==2
+
+
+def test_control_missing_approval_fails_before_ledger_or_native(tmp_path,monkeypatch):
+    from secure_control.experiments import tail_calibration
+    from secure_control.experiments import tail_diagnostic_runner as runner
+    monkeypatch.setattr(tail_calibration,'_source_clean',lambda:True)
+    head=__import__('subprocess').check_output(['git','rev-parse','HEAD'],cwd=runner.ROOT,text=True).strip()
+    with pytest.raises(PermissionError):runner.run_host('client',tmp_path/'new',diagnostic_id='noapproval',
+        expected_head=head,software_review='https://example.test/review',
+        config_paths=[runner.ROOT/'configs/lab-client-cart-pole-demo.example.yaml'],steps=2000,
+        stream_map=True,window=2000,native_plan={'purpose':'control-slow-step-v1',
+            'source_head':head,'software_review':'https://example.test/review'})
+    assert not (tmp_path/'new').exists()
+
+
+@pytest.mark.parametrize('fault',[None,'hash','identity'])
+def test_slow_table_native_hash_identity_and_clipped_thread_evidence(tmp_path,monkeypatch,fault):
+    """只测试新离线拼接边界；角色解码/跨机身份由已有分析器独立覆盖。"""
+    import hashlib
+
+    from secure_control.experiments import tail_diagnostic_analysis as a
+    from secure_control.experiments.windows_tail_analysis import PROCESS, THREAD
+    monkeypatch.setattr(a,'analyze_manifests',lambda *args,**kw:{'diagnostic_complete':True})
+    ctx={'diagnostic_id':'x','source_head':'a'*40,'clock_domain_id':'A'}
+    client={'role':'Client','pid':1,'main_thread_id':2,'context':ctx}
+    decoded={'spans':[{'global_step':0,'phase':'request_send','aux':0,'start_ns':30,'end_ns':40}],
+        'points':[{'global_step':0,'phase':'reply_read','aux':0,'wall_ns':90}]}
+    monkeypatch.setattr(a,'_decode',lambda _:decoded)
+    raw=json.dumps(client).encode();(tmp_path/'Client.json').write_bytes(raw)
+    rows=[{'provider':PROCESS,'opcode':1,'time_ns':1,'values':{'ProcessId':1,'UniqueProcessKey':1}},
+        {'provider':THREAD,'opcode':1,'time_ns':2,'values':{'TThreadId':2,'ProcessId':1}},
+        {'provider':THREAD,'opcode':36,'time_ns':20,'cpu':0,'event_index':1,'values':{'NewThreadId':2,'OldThreadId':0,'OldThreadState':1}},
+        {'provider':THREAD,'opcode':36,'time_ns':60,'cpu':0,'event_index':2,'values':{'NewThreadId':0,'OldThreadId':2,'OldThreadState':5}},
+        {'provider':THREAD,'opcode':50,'time_ns':70,'cpu':0,'event_index':3,'values':{'TThreadId':2}},
+        {'provider':THREAD,'opcode':36,'time_ns':80,'cpu':0,'event_index':4,'values':{'NewThreadId':2,'OldThreadId':0,'OldThreadState':1}},
+        {'provider':THREAD,'opcode':2,'time_ns':110,'values':{'TThreadId':2,'ProcessId':1}}]
+    (tmp_path/'native-a.etl').write_bytes(b'fake offline input')
+    etlhash=hashlib.sha256((tmp_path/'native-a.etl').read_bytes()).hexdigest()
+    view={'purpose':'control-slow-step-v1','source_head':'a'*40,'diagnostic_id':'bad' if fault=='identity' else 'x',
+        'target_pid':1,'target_tid':2,'complete':True,'schedule_window_complete':True,'etl_sha256':etlhash,
+        'window_replay':{'anchor':{'time':20}}}
+    files={'control-native-view.json':view,'control-native-events.json':rows,'Client.stream.json':{'context':ctx,'rows':[]}}
+    for name,value in files.items():(tmp_path/name).write_text(json.dumps(value),encoding='utf8')
+    hashes={name:hashlib.sha256((tmp_path/name).read_bytes()).hexdigest() for name in (*files,'native-a.etl')}
+    manifest={'side':'client','files':[{'path':'Client.json','sha256':hashlib.sha256(raw).hexdigest()}],
+        'control_samples':[{'global_step':0,'round_id':'r0','actual_sample_start_ns':30,
+            'work_completed_ns':100,'work_elapsed_ns':21_000_000}],
+        'native_evidence':{'status':'read','files':hashes}}
+    p=tmp_path/'manifest.json';p.write_text(json.dumps(manifest),encoding='utf8')
+    if fault=='hash':(tmp_path/'native-a.etl').write_bytes(b'changed')
+    if fault:
+        with pytest.raises(ValueError):a.analyze_slow_control([p])
+        return
+    result=a.analyze_slow_control([p]);wait=result['rows'][0]['parties'][0]['A_wait_analysis']
+    assert wait['send_complete_to_first_read_ns']==50
+    assert wait['ready_observed_ns']==10 and wait['running_observed_ns']==30
+    assert wait['other_scheduler_states_ns']==10
+    assert result['rows'][0]['parties'][0]['tcp_component_complete_ns'] is None
+    assert result['rows'][0]['parties'][0]['cross_host_difference_ns'] is None

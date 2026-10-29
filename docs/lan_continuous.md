@@ -140,6 +140,47 @@ local_checks_complete，双机校准结果必须再核对B原件。源query/启�
 覆盖、TCP产出及资源峰值均NOT RUN；软件/离线v5通过不能替代它们。校准任一FAIL/PARTIAL
 就报告具体阻断并停止，三项实际能力通过后才申请正式根因实验。
 
+## #153：原控制慢步诊断入口（新控制运行尚未授权）
+
+目标为逐个解释`work > 20_000_000 ns`的步骤及前后最近正常步，不以公开回显校准全绿或
+提速对比作为交付。原117步缺少的TCP事件不能事后补回；新运行只能解释新复现。
+
+`prepare-control-file`只读生成purpose=`control-slow-step-v1`的File计划，绑定三角色公开
+配置语义、拓扑、审查链接和源码。`client/pair --authorization`只接受新的
+`native-control-authorization-v1`记录，绑定同计划摘要、diagnostic_id、两端新绝对路径、
+严格整数attempts=1/steps=2000。v3回显及旧#132许可不能复用；批准无效在ledger/采集前拒绝，
+一旦尝试即由原单次ledger永久扣减，失败不退额、不重试。
+
+A沿原Client+worker/stream-map入口，原owner在spawn前启动File会话、子进程退出后收尾；
+55秒原生上限、12MiB非分页缓冲、128MiB ETL/384MiB临时目标、2GiB余量保持。B使用已有
+首request_receive观察点记录一次业务起点：等待至多45秒、业务至多55秒、总至多100秒。
+原20ms模型周期、协议/矩阵、GC和网卡设置保持；超时保留partial，不缩短2000步冒充成功。
+
+停止后唯一有界读取目标Client PID/TID/实际工作首末；保存带摘要的原生视图与目标元数据。
+离线峰值512MiB/JSON合计32MiB仍是软目标，超限失败而不重跑。没有新控制运行批准文件。
+
+下面是审查后、获批且两端固定同一SHA时的执行形式。`$runHead`和`$reviewUrl`须对应最终已审
+版本；准备生成的计划及获批后生成的批准文件须原样复制到B，输出路径必须与批准一致。
+本节命令不是现在启动控制采集的授权。
+
+```powershell
+# A只读准备
+uv run python scripts/run_control_tail_diagnostic.py prepare-control-file .tmp/d153-control-plan.json --expected-head $runHead --software-review $reviewUrl
+# B先启动
+uv run python scripts/run_control_tail_diagnostic.py pair results/tail_diagnostics/d153-control-B --diagnostic-id d153-control-once --expected-head $runHead --software-review $reviewUrl --window 2000 --steps 2000 --native-plan .tmp/d153-control-plan.json --authorization .tmp/d153-control-authorization.json
+# A紧接着启动（管理员）
+uv run python scripts/run_control_tail_diagnostic.py client results/tail_diagnostics/d153-control-A --diagnostic-id d153-control-once --expected-head $runHead --software-review $reviewUrl --window 2000 --steps 2000 --stream-map --native-plan .tmp/d153-control-plan.json --authorization .tmp/d153-control-authorization.json
+# 将B完整目录复制到A后，只读逐步分析
+uv run python scripts/run_control_tail_diagnostic.py analyze-control results/tail_diagnostics/d153-control-A/manifest.json results/tail_diagnostics/d153-control-B/manifest.json --output results/tail_diagnostics/d153-control-analysis.json
+```
+
+逐步表含run/step/round、work/exchange、A发送/首次读/收齐、线程Ready/Running区间、B本地
+处理span、原件摘要、时钟域和缺证据原因。只同机相减；Running不是Python/GIL可用证明，
+等待不是网络延迟证明。控制连接目前仍需要本次独立SeqNo/应用累计字节零点；既有stream-map
+累计setup字节但不独立证明TCP序号锚点，因此当前分析会保留TCP覆盖时间unknown，不复用v3
+序号、不把首个普通控制帧当0、不忽略未知末尾+1。它提供应用与调度证据，不能承诺一次
+拆开B读取前和网络等待。若无慢步返回not_reproduced；不完整包无慢步另标incomplete，均不补跑。
+
 ## 维护候选与采集有效性（D132-19，软件阶段）
 
 按[D19设计](https://github.com/GNYKCZ/secure_pid_hvac/issues/132#issuecomment-6464649290)，

@@ -30,6 +30,32 @@ def plan_digest(plan):
     return hashlib.sha256(json.dumps(plan,sort_keys=True,separators=(',',':')).encode()).hexdigest()
 
 
+def authorize_control(approval,plan,*,side,output,head,diagnostic_id,configurations):
+    """控制purpose单次批准绑定版本/拓扑/公开配置/新路径；不能复用回显额度。"""
+    url=approval.get('authorization_url','') if isinstance(approval,dict) else ''
+    import re
+    if (not isinstance(approval,dict) or plan.get('purpose')!='control-slow-step-v1'
+            or plan.get('schema')!='native-calibration-preparation-v1'
+            or plan.get('source_selection_audit_version')!=2
+            or any(plan.get(k)!=v for k,v in CALIBRATION_RESOURCES.items())
+            or plan.get('pair_wait_s')!=45 or plan.get('pair_business_s')!=55 or plan.get('pair_total_s')!=100
+            or approval.get('schema')!='native-control-authorization-v1'
+            or approval.get('purpose')!=plan['purpose']
+            or plan.get('source_head')!=head or approval.get('source_head')!=head
+            or approval.get('plan_sha256')!=plan_digest(plan)
+            or approval.get('diagnostic_id')!=diagnostic_id
+            or type(approval.get('attempts')) is not int or approval['attempts']!=1
+            or type(approval.get('steps')) is not int or approval['steps']!=2000
+            or plan.get('control_steps')!=2000 or plan.get('active_window_s')!=55
+            or side not in ('client','pair')
+            or not isinstance(approval.get(side+'_output'),str)
+            or Path(approval[side+'_output']).resolve()!=Path(output).resolve()
+            or not isinstance(url,str) or not re.fullmatch(r'https://github.com/GNYKCZ/secure_pid_hvac/issues/153#issuecomment-[0-9]+',url)
+            or any(c!=plan.get('control_configurations',{}).get(c['role']) for c in configurations)):
+        raise PermissionError('new control-purpose authorization required')
+    return approval
+
+
 def _exceptions_for(plan):
     if plan.get('schema')=='native-calibration-preparation-v1':
         return {'design':'https://github.com/GNYKCZ/secure_pid_hvac/issues/132#issuecomment-6471238272',
@@ -336,7 +362,8 @@ class NativeCapture:
         self.report['preflight'] = self.preflight()
         if self.file_candidate:
             approval = self.authorization
-            if (not isinstance(approval,dict) or approval.get('schema')!='native-calibration-authorization-v1'
+            if (not isinstance(approval,dict) or approval.get('schema')!=('native-control-authorization-v1' if self.plan.get('purpose')=='control-slow-step-v1' else 'native-calibration-authorization-v1')
+                    or self.plan.get('purpose')=='control-slow-step-v1' and approval.get('purpose')!='control-slow-step-v1'
                     or approval.get('plan_sha256')!=plan_digest(self.plan)
                     or not isinstance(approval.get('authorization_url'),str)
                     or not approval['authorization_url'].startswith('https://github.com/GNYKCZ/secure_pid_hvac/issues/153#issuecomment-')
