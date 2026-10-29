@@ -334,3 +334,26 @@ def test_public_client_forty_second_window_offsets_and_first_failure_without_rea
         assert len(report['frames'])==4
         assert report['frames'][2][3:5]==[len(c._frame('run',0,0))]*2
     else:assert len(report['frames'])==0
+
+
+@pytest.mark.parametrize('side', ['client', 'pair'])
+def test_real_lan_config_adapts_dial_and_bind_addresses(tmp_path, side):
+    """真实配置加载边界必须转成socket地址，B用bind、A用host。"""
+    root = Path(__file__).parents[1] / 'configs'
+    topology = tmp_path / 'topology.yaml'
+    topology.write_text((root / 'lab-cart-pole-demo-deployment.example.yaml').read_text(
+        encoding='utf8').replace('bind: 192.168.31.116', 'bind: 192.168.31.117'), encoding='utf8')
+    roles = ('client',) if side == 'client' else ('p1', 'p2')
+    paths = []
+    for role in roles:
+        path = tmp_path / (role + '.yaml')
+        path.write_text((root / f'lab-{role}-cart-pole-demo.example.yaml').read_text(
+            encoding='utf8').replace('topology: lab-cart-pole-demo-deployment.example.yaml',
+                                    'topology: ' + topology.as_posix()).replace(
+                'experiment: cart_pole_observer_lan.example.yaml',
+                'experiment: ' + (root / 'cart_pole_observer_lan.example.yaml').as_posix()), encoding='utf8')
+        paths.append(path)
+    addresses, digest = c._config_addresses(paths, side)
+    expected = '192.168.31.116' if side == 'client' else '192.168.31.117'
+    assert addresses == ((expected, 34401), (expected, 34402))
+    assert len(digest) == 64

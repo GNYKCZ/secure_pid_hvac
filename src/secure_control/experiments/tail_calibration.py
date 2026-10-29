@@ -187,7 +187,9 @@ def _config_addresses(paths, side):
             or len({c.topology.digest for c in configs})!=1):
         raise ValueError('calibration requires matched explicit insecure TCP topology')
     topology=configs[0].topology
-    return (topology.p1_client,topology.p2_client),topology.digest
+    # 配置端点是LanEndpoint；socket边界显式区分拨号host与监听bind。
+    endpoints = (topology.p1_client,topology.p2_client)
+    return tuple((e.host if side=='client' else e.bind,e.port) for e in endpoints),topology.digest
 
 
 def _client_worker(addresses, identity, results, stop):
