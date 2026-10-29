@@ -266,8 +266,13 @@ def test_pair_manifest_hash_and_identity_are_required_before_two_host_pass(tmp_p
     with pytest.raises(ValueError,match='hash'):c.analyze_calibration(a,b)
 
 
+@pytest.mark.parametrize('wait_s',[0,20])
 @pytest.mark.parametrize('fault',[None,'bad_content','truncated','oversized'])
-def test_public_pair_codec_with_in_memory_peers_always_closes_owned_sockets(monkeypatch,fault):
+def test_public_pair_codec_with_in_memory_peers_always_closes_owned_sockets(monkeypatch,fault,wait_s):
+    clock=[0.]; business_started=[False]
+    monkeypatch.setattr(c.time,'monotonic',lambda:clock[0])
+    receive=c._receive
+    monkeypatch.setattr(c,'_receive',lambda sock,deadline:receive(sock,deadline,_now=lambda:clock[0]))
     class Peer:
         def __init__(self,connection):
             self.data=bytearray(c._frame('run',connection,0)+c._frame('run',connection,1))
@@ -287,10 +292,16 @@ def test_public_pair_codec_with_in_memory_peers_always_closes_owned_sockets(monk
         def bind(self,address):assert address==('10.0.0.2',200+self.index)
         def listen(self,n):assert n==1
         def setblocking(self,value):assert value is False
-        def accept(self):return peers[self.index],('10.0.0.1',100+self.index)
+        def accept(self):
+            if self.index==0:clock[0]+=wait_s
+            return peers[self.index],('10.0.0.1',100+self.index)
         def close(self):self.closed=True
     monkeypatch.setattr(c.socket,'socket',lambda *args:Listener())
-    monkeypatch.setattr(c.select,'select',lambda readers,*args:(list(readers),[],[]))
+    def ready(readers,*args):
+        if readers and isinstance(readers[0],Peer) and not business_started[0]:
+            clock[0]+=41;business_started[0]=True
+        return list(readers),[],[]
+    monkeypatch.setattr(c.select,'select',ready)
     if fault:
         with pytest.raises((ValueError,EOFError)):c._pair([('10.0.0.2',200),('10.0.0.2',201)],'run')
     else:

@@ -233,7 +233,7 @@ def _client_worker(addresses, identity, results, stop):
 
 def _pair(addresses, identity):
     """B端单进程两个监听；只回显指定公开帧，无native/no controller/no worker。"""
-    listeners=[];peers={};counts=[0,0];deadline=time.monotonic()+55
+    listeners=[];peers={};counts=[0,0];deadline=time.monotonic()+45
     try:
         for address in addresses:
             listener=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
@@ -242,6 +242,8 @@ def _pair(addresses, identity):
             ready,_,_=select.select([listener],[],[],max(0,deadline-time.monotonic()))
             if not ready:raise TimeoutError('calibration accept deadline')
             sock,_=listener.accept();peers[sock]=connection
+        # 等待连接最多45秒；连接齐后业务独立55秒，B总期限不超过100秒。
+        deadline=time.monotonic()+55
         while peers:
             if time.monotonic()>=deadline:raise TimeoutError('calibration pair deadline')
             ready,_,_=select.select(list(peers),[],[],min(1.,deadline-time.monotonic()))
