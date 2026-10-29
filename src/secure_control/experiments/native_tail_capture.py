@@ -21,7 +21,7 @@ _SCALARS = {'Tcb':16,'NumBytes':8,'SeqNo':8,'NumPkt':8,'LocalAddressLength':8,
 AUTHORIZATION = 'https://github.com/GNYKCZ/secure_pid_hvac/issues/132#issuecomment-6462410802'
 CALIBRATION_RESOURCES = {'minimum_free_bytes':2*1024**3,'etl_limit_bytes':128*1024*1024,
     'disk_budget_bytes':384*1024*1024,'native_window_s':100,'active_window_s':55,
-    'native_buffer_bytes':12*1024*1024}
+    'native_buffer_bytes':12*1024*1024,'native_nonpaged_buffer_bytes':12*1024*1024}
 
 
 def plan_digest(plan):
@@ -55,6 +55,7 @@ def profile_contract(path, schemas, *, file_candidate=False):
     profiles = root.findall('.//Profile')
     if (len(providers)!=1 or len(profiles)!=1
             or providers[0].get('Name')!=TCPIP or providers[0].get('Level')!='5'
+            or file_candidate and providers[0].get('NonPagedMemory')!='true'
             or profiles[0].get('Name')!=('D20' if file_candidate else 'D17')
             or profiles[0].get('LoggingMode')!=('File' if file_candidate else 'Memory')
             or any('Stack' in e.tag or e.tag in ('CaptureStateOnStart','CaptureStateOnSave') for e in root.iter())):
@@ -105,7 +106,7 @@ def profile_contract(path, schemas, *, file_candidate=False):
         raise ValueError('selected event schemas incomplete')
     return {'profile':str(path),'profile_sha256':hashlib.sha256(path.read_bytes()).hexdigest(),
         'event_ids':sorted(_IDS),'source_schemas':schemas,'native_buffer_bytes':12*1024*1024,
-        'source_selection_audit_version':1,
+        'source_selection_audit_version':2 if file_candidate else 1,
         'source_payload':'excluded by ID allowlist and actual registered field audit',
         'runtime_semantics':('NOT RUN: actual TCP target-flow/SeqNo anchors, first-to-last scheduling coverage, '
             'thread lifetime, actual CSwitch version, QPC/loss and resource validation required; '
@@ -142,6 +143,7 @@ def _sessions():
         rows.append({'name':raw[offset:end].decode('utf-16le'),'guid':raw[24:40].hex(),
             # Microsoft TraceEventSession 3.1.21读取同一HistoricalContext作为session ID。
             'logger_id':struct.unpack_from('<Q',raw,8)[0],
+            'log_file_mode':struct.unpack_from('<I',raw,64)[0],
             'buffer_kb':struct.unpack_from('<I',raw,48)[0],
             'buffers':struct.unpack_from('<I',raw,80)[0],
             'events_lost':struct.unpack_from('<I',raw,88)[0],
@@ -250,7 +252,22 @@ def prepare_native(profile, *, _schemas=None, _backend=None, _file_candidate=Fal
         result['resource_exceptions'] = _exceptions_for(result)
         result['runtime_semantics'] = ('File calibration candidate; runtime enable/target flow, '
             'full lifecycle/coverage and measured resources require one separately authorized run')
+    if _file_candidate:
+        result['provider_snapshot_at_prepare'] = _provider_snapshot(backend)
     return result
+
+
+def _provider_snapshot(backend):
+    """仅观察已启用实例，不能替代新会话自己的logger/注册/筛选验证。"""
+    return {'qpc_ns':time.perf_counter_ns(),'utc_ns':time.time_ns(),
+        'enabled_instances':backend.provider_enables(),
+        'scope':'observation only; not own-session enable or target TCP usability proof'}
+
+
+def _nonpaged_sessions(rows):
+    """EVENT_TRACE_USE_PAGED_MEMORY=0x01000000禁止内核provider写入；缺字段同样拒绝。"""
+    return bool(rows) and all(type(r.get('log_file_mode')) is int
+        and not r['log_file_mode'] & 0x01000000 for r in rows)
 
 
 class NativeCapture:
@@ -283,7 +300,7 @@ class NativeCapture:
         name = 'control-tail-calibration.wprp' if self.file_candidate else 'control-tail-native-2000.wprp'
         if (self.plan.get('schema')!=('native-calibration-preparation-v1' if self.file_candidate else 'native-tail-preparation-v1')
                 or type(self.plan.get('source_selection_audit_version')) is not int
-                or self.plan['source_selection_audit_version']!=1
+                or self.plan['source_selection_audit_version']!=(2 if self.file_candidate else 1)
                 or self.plan.get('window')!=(55 if self.file_candidate else 2000)
                 or profile != Path(__file__).resolve().parents[3]/'configs'/name
                 or hashlib.sha256(profile.read_bytes()).hexdigest()!=self.plan['profile_sha256']
@@ -309,8 +326,10 @@ class NativeCapture:
         before = self.backend.sessions()
         if any(r['name'].startswith('WPR_') or r['name']=='NT Kernel Logger' for r in before):
             raise ValueError('native session conflict')
-        return {'administrator':True,'profile_sha256':self.plan['profile_sha256'],
+        proof = {'administrator':True,'profile_sha256':self.plan['profile_sha256'],
                 'resource_exceptions':_exceptions_for(self.plan),'source_schemas_rechecked':True}
+        if self.file_candidate:proof['provider_snapshot_before_start']=_provider_snapshot(self.backend)
+        return proof
 
     def begin(self):
         """ledger已扣减后才运行；仍核验profile/hash/权限/冲突与磁盘。"""
@@ -346,12 +365,15 @@ class NativeCapture:
                     or sum(r['buffer_kb']*r['buffers']*1024 for r in own)>12*1024*1024):
                 raise ValueError('native ownership/clock/buffer proof unavailable')
             self.owned = own
+            if self.file_candidate and not _nonpaged_sessions(own):
+                raise ValueError('kernel TCPIP requires proven nonpaged session buffers')
             self.report.update(status='recording',sessions=own)
             if self.file_candidate:
                 ids = {r.get('logger_id') for r in own}
                 if any(type(v) is not int or not 0<=v<65536 for v in ids):
                     raise ValueError('logger ID proof unavailable')
                 enables = [r for r in self.backend.provider_enables() if r['logger_id'] in ids]
+                self.report['tcpip_runtime_enables_qpc_ns'] = time.perf_counter_ns()
                 self.report['tcpip_runtime_enables'] = enables
                 self.report['resource_authorization'] = self.authorization['authorization_url']
                 # PRE_ENABLE=0x2仅说明会话等待provider注册，不是实际可产出事件的实例。
@@ -403,7 +425,9 @@ class NativeCapture:
         native_bytes = sum(r['buffer_kb']*r['buffers']*1024 for r in current)
         self.report.update(native_buffer_bytes_at_stop=native_bytes,
             native_buffer_budget_exceeded=native_bytes>self.plan['native_buffer_bytes'])
+        self.report['nonpaged_sessions_at_stop'] = _nonpaged_sessions(current) if self.file_candidate else None
         valid = (not result.returncode and elapsed<=limits_for(2000).native_s
+                 and (not self.file_candidate or self.report['nonpaged_sessions_at_stop'])
                  and not any(r['events_lost'] or r['buffers_lost'] or r['clock']!=1 for r in current)
                  and native_bytes<=self.plan['native_buffer_bytes'])
         try:

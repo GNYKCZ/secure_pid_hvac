@@ -40,6 +40,19 @@ v5的schema_source指向公开tag，schema_sha256是固定布局契约说明的�
 
 ### TCP链路：实际enable证明和完整公开流锚点，不猜来源
 
+File候选显式设置`NonPagedMemory="true"`。WPR默认false会使用分页缓冲；
+[微软日志模式文档](https://learn.microsoft.com/en-us/windows/win32/etw/logging-mode-constants)
+说明内核provider不能写入`EVENT_TRACE_USE_PAGED_MEMORY`会话；
+[微软WSL的同GUID配置](https://github.com/microsoft/WSL/blob/afa988cfb498fb9794718683823fb38dbc96673d/diagnostics/wsl.wprp)
+也显式使用非分页内存。候选据此修正，未更换provider/事件/关键词或启用系统全局设置。
+实际QueryAllTraces的LogFileMode在开始及结束均核对，分页或模式缺失不放行。
+旧运行未保存该会话字段，不能仅凭修正宣称已唯一解释旧TCP0，更不能声称新实采已通过。
+
+只读prepare与启动前各记录带UTC/QPC时间的已启用实例快照；它们不证明自有会话启用。
+启动后仍独立核对自有logger与实际注册实例。File来源审计版本升为2，计划明确
+`native_nonpaged_buffer_bytes=12582912`：总缓冲仍12MiB，非分页分配从原系统8MiB增至12MiB。
+旧计划/旧批准不能复用；Memory历史入口保持。实际TCP产出及流/序号关联仍待新批准校准。
+
 新File入口在自有两个session创建后，以QueryAllTraces的session ID/GUID与
 EnumerateTraceGuidsEx返回的TRACE_ENABLE_INFO对应，核对本次TCPIP enable、level5、
 MatchAny/MatchAll及实例flags。PRE_ENABLE(0x2)仅表示provider注册前预启用，不能证明

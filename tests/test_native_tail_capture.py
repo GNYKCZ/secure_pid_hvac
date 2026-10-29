@@ -42,6 +42,9 @@ class Backend:
     def is_admin(self):
         return self.fault!='not_admin'
 
+    def provider_enables(self):
+        return []
+
     def source_schemas(self):
         result=schemas()
         if self.fault=='schema_change': result[0]['version']=8
@@ -246,7 +249,7 @@ def test_native_stop_budget_and_actual_session_state_are_not_command_exit(tmp_pa
     assert report['manual_recovery']['status'][-1]==capture.instance
 
 
-@pytest.mark.parametrize('fault',[None,'mixed','no_approval','old_approval','wrong_enable','missing_enable','pre_enable','pre_legacy','old_profile','budget'])
+@pytest.mark.parametrize('fault',[None,'mixed','no_approval','old_approval','wrong_enable','missing_enable','pre_enable','pre_legacy','paged','missing_mode','mode_at_stop','old_audit','old_profile','budget'])
 def test_file_calibration_is_separate_plan_and_checks_own_actual_provider(tmp_path,monkeypatch,fault):
     from secure_control.experiments import native_tail_capture as m
     profile=PROFILE.with_name('control-tail-calibration.wprp')
@@ -254,9 +257,16 @@ def test_file_calibration_is_separate_plan_and_checks_own_actual_provider(tmp_pa
     assert plan['schema']=='native-calibration-preparation-v1' and plan['logging_mode']=='File'
     assert plan['etl_limit_bytes']==128*1024*1024
     class FileBackend(Backend):
+        stopping=False
+        def run(self,args,timeout):
+            if args[0]=='-stop':self.stopping=True
+            return super().run(args,timeout)
         def sessions(self):
             rows=super().sessions()
-            for i,row in enumerate(rows): row['logger_id']=100+i
+            for i,row in enumerate(rows):
+                row['logger_id']=100+i
+                row['log_file_mode']=0x01000001 if fault=='paged' or fault=='mode_at_stop' and self.stopping else 1
+                if fault=='missing_mode':row.pop('log_file_mode')
             return rows
         def provider_enables(self):
             rows = [] if fault=='missing_enable' else [{'logger_id':101,'enabled':1,'provider_pid':0,
@@ -269,19 +279,21 @@ def test_file_calibration_is_separate_plan_and_checks_own_actual_provider(tmp_pa
               'authorization_url':'https://github.com/GNYKCZ/secure_pid_hvac/issues/153#issuecomment-9999999999'}
     if fault=='no_approval': approval=None
     if fault=='old_approval': approval['authorization_url']=m.AUTHORIZATION
+    if fault=='old_audit':plan['source_selection_audit_version']=1
     if fault=='old_profile': plan['profile']=str(PROFILE.resolve())
     if fault=='budget': plan['etl_limit_bytes']+=1
     monkeypatch.setattr(m.shutil,'disk_usage',lambda path:SimpleNamespace(free=3*1024**3))
     capture=NativeCapture(plan,tmp_path/'candidate.etl',_backend=backend,_now=lambda:0.,authorization=approval)
-    if fault and fault!='mixed':
+    if fault and fault not in ('mixed','mode_at_stop'):
         with pytest.raises((PermissionError,ValueError)):capture.begin()
-        if fault in ('wrong_enable','missing_enable','pre_enable','pre_legacy'):
+        if fault in ('wrong_enable','missing_enable','pre_enable','pre_legacy','paged','missing_mode'):
             assert [a[0] for a in backend.commands]==['-start','-cancel']
         else: assert not backend.commands
         return
     capture.begin()
     assert capture.capture_deadline==55 and backend.commands[0][1].endswith('!D20')
-    assert capture.finish()['status']=='saved'
+    if fault=='mode_at_stop':backend.stopping=True
+    assert (capture.finish()['status']=='saved')==(fault!='mode_at_stop')
     with pytest.raises(ValueError):profile_contract(profile,schemas())
 
 
@@ -294,3 +306,47 @@ def test_enable_snapshot_decoder_preserves_logger_mask_and_rejects_truncation():
     assert rows[0]['logger_id']==42 and rows[0]['match_any']==0x600000484 and rows[0]['enabled']==1
     for n in (0,4,8,23,len(raw)-1):
         with pytest.raises(ValueError):_decode_provider_enables(raw[:n])
+
+
+@pytest.mark.parametrize('value',[None,'false'])
+def test_file_profile_requires_nonpaged_buffers(tmp_path,value):
+    """内核TCPIP不能写分页会话；遗漏属性不能通过只读契约。"""
+    profile=PROFILE.with_name('control-tail-calibration.wprp')
+    import xml.etree.ElementTree as ET
+    root=ET.fromstring(profile.read_bytes());provider=root.find('./Profiles/EventProvider')
+    provider.attrib.pop('NonPagedMemory',None)
+    if value is not None:provider.set('NonPagedMemory',value)
+    path=tmp_path/'paged.wprp';ET.ElementTree(root).write(path)
+    with pytest.raises(ValueError):profile_contract(path,schemas(),file_candidate=True)
+
+
+def test_session_query_reads_actual_log_file_mode_at_sdk_offset(monkeypatch):
+    """独立手写EVENT_TRACE_PROPERTIES布局，核对模式来自64字节处。"""
+    import ctypes as ct
+    import struct
+
+    from secure_control.experiments import native_tail_capture as m
+    class Query:
+        def __call__(self,pointers,capacity,count):
+            raw=bytearray(4216)
+            struct.pack_into('<I',raw,116,120)
+            struct.pack_into('<I',raw,64,0x01000001)
+            raw[120:130]='test'.encode('utf-16le')+b'\0\0'
+            ct.memmove(pointers[0],bytes(raw),len(raw))
+            ct.cast(count,ct.POINTER(ct.c_uint32))[0]=1
+            return 0
+    monkeypatch.setattr(m.ctypes,'WinDLL',lambda _:SimpleNamespace(QueryAllTracesW=Query()))
+    assert m._sessions()[0]['log_file_mode']==0x01000001
+
+
+def test_prepare_file_snapshot_is_observation_not_own_enable_proof():
+    """其他会话已注册只是准备快照，仍须begin重新核验自己的会话。"""
+    backend=Backend()
+    plan=prepare_native(PROFILE.with_name('control-tail-calibration.wprp'),
+        _schemas=schemas(),_backend=backend,_file_candidate=True)
+    assert plan['source_selection_audit_version']==2
+    assert plan['native_nonpaged_buffer_bytes']==12*1024*1024
+    assert plan['provider_snapshot_at_prepare']['enabled_instances']==[]
+    assert plan['provider_snapshot_at_prepare']['qpc_ns']>0
+    assert 'not own-session' in plan['provider_snapshot_at_prepare']['scope']
+    assert [a[0] for a in backend.commands]==['-profiledetails']

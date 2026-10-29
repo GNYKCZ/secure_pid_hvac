@@ -10,7 +10,7 @@
     <SystemProvider Id="D20Scheduling">
       <Keywords><Keyword Value="ProcessThread"/><Keyword Value="CSwitch"/><Keyword Value="ReadyThread"/></Keywords>
     </SystemProvider>
-    <EventProvider Id="D20Tcp" Name="2f07e2ee-15db-40f1-90ef-9d7ba282188a" Level="5">
+    <EventProvider Id="D20Tcp" Name="2f07e2ee-15db-40f1-90ef-9d7ba282188a" Level="5" NonPagedMemory="true">
       <Keywords><Keyword Value="0x600000484"/></Keywords>
       <EventFilters FilterIn="true">
         <EventId Value="1033"/><EventId Value="1038"/><EventId Value="1040"/>
