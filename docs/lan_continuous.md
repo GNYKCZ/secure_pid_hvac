@@ -42,7 +42,9 @@ v5的schema_source指向公开tag，schema_sha256是固定布局契约说明的�
 
 新File入口在自有两个session创建后，以QueryAllTraces的session ID/GUID与
 EnumerateTraceGuidsEx返回的TRACE_ENABLE_INFO对应，核对本次TCPIP enable、level5、
-MatchAny/MatchAll。失败不启动Client子进程/公开流量，保存失败事实并收尾。
+MatchAny/MatchAll及实例flags。PRE_ENABLE(0x2)仅表示provider注册前预启用，不能证明
+实际来源存在；必须有不带该标志的匹配注册实例，允许其与预启用记录共存，不以PID0拒绝。
+失败不启动Client子进程/公开流量，保存失败事实并收尾。
 TDH注册清单或profiledetails不再代替本次实际enable证据；event-ID过滤仍由固定profile绑定，
 运行时enable查询本身不返回ID filter，实际ETL descriptor统计继续验证。
 
@@ -79,6 +81,8 @@ TDH注册清单或profiledetails不再代替本次实际enable证据；event-ID�
 `read_calibration_etl`是独立预算入口，旧read_etl的64MiB/30万限制保持。校准输入最多128MiB，
 解码预算250万事件；耗尽后在下一个ETW缓冲边界取消离线处理并标partial，不冒充完整遍历。
 计数包含过滤前descriptor/错误/丢失；保留最多10万条目标线程/进程和其TCP元数据，其他行不保存。
+窗口外、已明确结束且未复用TID的terminal switch-out单独保存边界证据，不冒充窗口内缺口；
+窗口内/无归属/复用仍拒绝。
 同时核查目标生命周期夹住窗口、内部切换/唤醒序列和全局每CPU切换链；缺前缀、内部缺口、
 unsupported或保留耗尽都不能设完整。输出JSON合计32MiB、实际进程峰值工作集目标512MiB并核对。
 输出/峰值/ETL超限判失败，不用仅增大数字掩盖原全量行内存问题。
@@ -90,7 +94,8 @@ unsupported或保留耗尽都不能设完整。输出JSON合计32MiB、实际进
 ### 可执行的显式入口与唯一下一批准动作
 
 校准不运行plant或控制协议：B单进程两个端口回显，A由native开始后spawn的独立主线程在
-约41秒内双向发送公开确定性变长帧。两端均最多一次，首错停；只接受明确两机字面量地址。
+约41秒内双向发送公开确定性变长帧。B等待连接最多45秒，连接齐后独立计业务55秒，
+合计最多100秒；A原生采集上限仍55秒。两端均最多一次，首错停；只接受明确两机字面量地址。
 入口要求新的`native-calibration-authorization-v1`文件，绑定准确源码SHA、完整计划摘要、ID、
 两端新输出绝对路径、attempts严格整数1/窗口55，以及本次用户批准评论URL；设计评论和旧额度
 不能冒充新运行批准。源码/候选profile脏时拒绝，用户部署及工作流修改保留。计划绑定拓扑摘要。

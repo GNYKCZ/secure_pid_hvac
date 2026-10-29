@@ -354,8 +354,13 @@ class NativeCapture:
                 enables = [r for r in self.backend.provider_enables() if r['logger_id'] in ids]
                 self.report['tcpip_runtime_enables'] = enables
                 self.report['resource_authorization'] = self.authorization['authorization_url']
-                if not enables or any(r['enabled']!=1 or r['level']!=5
-                        or r['match_any']!=0x600000484 or r['match_all'] for r in enables):
+                # PRE_ENABLE=0x2仅说明会话等待provider注册，不是实际可产出事件的实例。
+                registered = [r for r in enables if type(r.get('instance_flags')) is int
+                              and not r['instance_flags'] & 0x2]
+                self.report['tcpip_registered_enables'] = registered
+                self.report['tcpip_source_state'] = 'registered' if registered else 'pre_enabled_or_unregistered'
+                if not registered or any(r['enabled']!=1 or r['level']!=5
+                        or r['match_any']!=0x600000484 or r['match_all'] for r in registered):
                     raise ValueError('own TCPIP provider enable proof failed; no traffic launched')
         except Exception:
             self.finish(cancel=True)

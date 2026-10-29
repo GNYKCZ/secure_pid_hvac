@@ -578,7 +578,7 @@ def _read_etl(path, *, maximum_events, _api=None, target=None):
         process_starts = [r for r in rows if r['provider']==PROCESS and r['opcode']==1
                           and r['values'].get('ProcessId')==pid and r['time_ns']<=window[0]]
         # 生命周期夹住完整应用窗口，并核查内部ready/in/out序列；不以包络或lost0单独判完整。
-        normalized = normalize_schedule({**result,'target_tid':tid})
+        normalized = normalize_schedule({**result,'target_tid':tid,'target_window_ns':list(window)})
         lives = [e['life'] for e in normalized['events'] if e['kind']=='start' and e['tid']==tid]
         state = scheduling(normalized,pid,tid,lives[0]) if len(lives)==1 else {'state':'unknown'}
         result.update(schema='native-calibration-view-v1',target_pid=pid,target_tid=tid,
@@ -596,6 +596,12 @@ def normalize_schedule(trace):
     """仅完整进程/线程生命周期可关联nativeID；不推测事件头PID是被唤醒线程。"""
     processes, threads, events = {}, {}, []
     unassociated = 0
+    ended, terminal_boundaries, start_counts = {}, [], {}
+    window = trace.get('target_window_ns')
+    for row in trace['events']:
+        if row['provider']==THREAD and row['opcode']==1:
+            tid = row['values']['TThreadId']
+            start_counts[tid] = start_counts.get(tid,0)+1
     for row in trace['events']:
         value, stamp = row['values'], row['time_ns']
         if row['provider']==PROCESS:
@@ -610,7 +616,8 @@ def normalize_schedule(trace):
                     threads.pop(tid)
         elif row['provider']==THREAD:
             opcode = row['opcode']
-            def emit(kind,tid,_stamp=stamp,**extra):
+            row_index = row.get('event_index')
+            def emit(kind,tid,_stamp=stamp,_index=row_index,terminal=False,**extra):
                 nonlocal unassociated
                 if trace.get('target_tid') is not None and tid!=trace['target_tid']:
                     return
@@ -618,7 +625,15 @@ def normalize_schedule(trace):
                     pid, life = threads[tid]
                     events.append({'kind':kind,'time':_stamp,'pid':pid,'tid':tid,'life':life,**extra})
                 elif tid:
-                    unassociated += 1
+                    # 仅明确结束后、窗口外、未复用TID的终止切出可单独保存；不隐藏窗口内未知。
+                    boundary = ended.get(tid)
+                    if (kind=='out' and terminal and boundary and start_counts.get(tid)==1
+                            and isinstance(window,(list,tuple)) and len(window)==2
+                            and window[1]<boundary[2]<_stamp):
+                        terminal_boundaries.append({'tid':tid,'pid':boundary[0],'life':boundary[1],
+                            'thread_end':boundary[2],'time':_stamp,'event_index':_index})
+                    else:
+                        unassociated += 1
             if opcode==1:
                 tid,pid = value['TThreadId'],value['ProcessId']
                 if pid in processes:
@@ -629,16 +644,20 @@ def normalize_schedule(trace):
                 else:
                     unassociated += 1
             elif opcode==2:
+                tid = value['TThreadId']
+                if tid in threads:
+                    owner,life = threads[tid]
+                    ended[tid] = (owner,life,stamp)
                 emit('end',value['TThreadId'])
                 threads.pop(value['TThreadId'],None)
             elif opcode==50:
                 emit('ready',value['TThreadId'])
             elif opcode==36:
                 state = {1:'ready',5:'waiting'}.get(value['OldThreadState'],'unknown')
-                emit('out',value['OldThreadId'],next=state)
+                emit('out',value['OldThreadId'],next=state,terminal=value['OldThreadState']==4)
                 emit('in',value['NewThreadId'])
     return {'events':events,'complete':trace['complete'] and not unassociated,
-        'unassociated_events':unassociated,
+        'unassociated_events':unassociated,'terminal_boundary_events':terminal_boundaries,
         'scope':'missing lifetime remains unassociated; Running does not identify Python recv/GIL'}
 
 
