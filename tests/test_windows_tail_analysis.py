@@ -11,6 +11,7 @@ from secure_control.experiments.windows_tail_analysis import (
     PROCESS,
     TCPIP,
     THREAD,
+    _cswitch_v5,
     _fields,
     _native,
     byte_coverage,
@@ -131,6 +132,37 @@ def test_qpc_integer_conversion_and_loss():
     assert qpc_ns(123456789,10000000,1)==12345678900
     assert qpc_ns(1,3000000,1)==333
     with pytest.raises(ValueError): qpc_ns(1,10000000,1,1)
+
+
+def test_cswitch_v5_matches_signed_microsoft_traceevent_3_1_21_oracle():
+    """原01 ETL前两条v5；expected来自独立官方DLL，不能由本解析生成。"""
+    raw = bytes.fromhex('f01b0000000000000f000200000c020901000000b1db398b02000000')
+    assert _cswitch_v5(raw,8)=={'NewThreadId':7152,'OldThreadId':0,'OldThreadState':2}
+    raw = bytes.fromhex('00000000f01b0000000f0000066105045e0e000093b9010008000000')
+    assert _cswitch_v5(raw,8)=={'NewThreadId':0,'OldThreadId':7152,'OldThreadState':5}
+
+
+@pytest.mark.parametrize('length,width',[(0,8),(24,8),(27,8),(29,8),(28,4),(28,True)])
+def test_cswitch_v5_refuses_unverified_shape_or_architecture(length,width):
+    with pytest.raises(ValueError): _cswitch_v5(bytes(length),width)
+
+
+@pytest.mark.skipif(os.name!='nt',reason='本机离线ABI；不创建会话')
+def test_native_cswitch_v5_descriptor_cpu_and_unknown_version_do_not_use_header_tid():
+    api=_native();event=api.record_type()
+    event.header.size=80;event.header.flags=0x350;event.buffer=9
+    event.header.tid=0xffffffff
+    event.header.provider.data[:]=uuid.UUID(THREAD).bytes_le
+    event.header.desc.id=0;event.header.desc.version=5;event.header.desc.opcode=36
+    raw=ctypes.create_string_buffer(bytes.fromhex('f01b0000000000000f000200000c020901000000b1db398b02000000'))
+    event.user=ctypes.cast(raw,ctypes.c_void_p);event.length=28
+    decoded=api.event(ctypes.pointer(event))
+    assert decoded['values']=={'NewThreadId':7152,'OldThreadId':0,'OldThreadState':2}
+    assert decoded['cpu']==9 and decoded['tid']==0xffffffff
+    event.header.desc.version=6;event.user=None
+    assert api.event(ctypes.pointer(event))=={'unsupported':(THREAD,0,6,36)}
+    event.header.desc.version=5
+    with pytest.raises(ValueError):api.event(ctypes.pointer(event))
 
 
 class MockAPI:

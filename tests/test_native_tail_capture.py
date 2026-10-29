@@ -210,7 +210,7 @@ def test_native_preflight_rejects_other_conditions_despite_resource_exceptions(t
     assert not backend.commands and not backend.live and not capture.output.parent.exists()
 
 
-@pytest.mark.parametrize('kind',['etl','directory','still_live'])
+@pytest.mark.parametrize('kind',['etl','directory','still_live','buffer_growth'])
 def test_native_stop_budget_and_actual_session_state_are_not_command_exit(tmp_path,monkeypatch,kind):
     import secure_control.experiments.native_tail_capture as module
     monkeypatch.setattr(module.shutil,'disk_usage',lambda path:SimpleNamespace(free=2*1024**3))
@@ -219,7 +219,7 @@ def test_native_stop_budget_and_actual_session_state_are_not_command_exit(tmp_pa
     original=backend.run
     def run(args,timeout):
         result=original(args,timeout)
-        if args[0]=='-stop' and kind!='still_live':
+        if args[0]=='-stop' and kind in ('etl','directory'):
             file=Path(args[1]) if kind=='etl' else tmp_path/'merge-temporary.bin'
             with file.open('wb') as stream:
                 stream.truncate((65 if kind=='etl' else 257)*1024*1024)
@@ -227,11 +227,67 @@ def test_native_stop_budget_and_actual_session_state_are_not_command_exit(tmp_pa
     backend.run=run
     capture=NativeCapture(plan,tmp_path/'native.etl',_backend=backend,_now=lambda:0.)
     capture.begin()
+    if kind=='buffer_growth':
+        snapshot=backend.sessions
+        def grown():
+            rows=snapshot()
+            if rows:rows[0]['buffers']=129
+            return rows
+        backend.sessions=grown
     report=capture.finish()
     if kind=='still_live':
         assert report['status']=='stop_unverified_manual_attention' and backend.live
+    elif kind=='buffer_growth':
+        assert report['status']=='partial' and report['native_buffer_budget_exceeded']
     else:
         assert report['status']=='partial' and report['resource_budget_exceeded']
         assert (tmp_path/'native.etl').exists() and not report['temporary_peak_verified']
     assert report['resource_exceptions']['authorization']==module.AUTHORIZATION
     assert report['manual_recovery']['status'][-1]==capture.instance
+
+
+@pytest.mark.parametrize('fault',[None,'no_approval','old_approval','wrong_enable','missing_enable','old_profile','budget'])
+def test_file_calibration_is_separate_plan_and_checks_own_actual_provider(tmp_path,monkeypatch,fault):
+    from secure_control.experiments import native_tail_capture as m
+    profile=PROFILE.with_name('control-tail-calibration.wprp')
+    plan=prepare_native(profile,_schemas=schemas(),_backend=Backend(),_file_candidate=True)
+    assert plan['schema']=='native-calibration-preparation-v1' and plan['logging_mode']=='File'
+    assert plan['etl_limit_bytes']==128*1024*1024
+    class FileBackend(Backend):
+        def sessions(self):
+            rows=super().sessions()
+            for i,row in enumerate(rows): row['logger_id']=100+i
+            return rows
+        def provider_enables(self):
+            return [] if fault=='missing_enable' else [{'logger_id':101,'enabled':1,
+                'level':4 if fault=='wrong_enable' else 5,'match_any':0x600000484,'match_all':0}]
+    backend=FileBackend()
+    approval={'schema':'native-calibration-authorization-v1','plan_sha256':m.plan_digest(plan),
+              'authorization_url':'https://github.com/GNYKCZ/secure_pid_hvac/issues/153#issuecomment-9999999999'}
+    if fault=='no_approval': approval=None
+    if fault=='old_approval': approval['authorization_url']=m.AUTHORIZATION
+    if fault=='old_profile': plan['profile']=str(PROFILE.resolve())
+    if fault=='budget': plan['etl_limit_bytes']+=1
+    monkeypatch.setattr(m.shutil,'disk_usage',lambda path:SimpleNamespace(free=3*1024**3))
+    capture=NativeCapture(plan,tmp_path/'candidate.etl',_backend=backend,_now=lambda:0.,authorization=approval)
+    if fault:
+        with pytest.raises((PermissionError,ValueError)):capture.begin()
+        if fault in ('wrong_enable','missing_enable'):
+            assert [a[0] for a in backend.commands]==['-start','-cancel']
+        else: assert not backend.commands
+        return
+    capture.begin()
+    assert capture.capture_deadline==55 and backend.commands[0][1].endswith('!D20')
+    assert capture.finish()['status']=='saved'
+    with pytest.raises(ValueError):profile_contract(profile,schemas())
+
+
+def test_enable_snapshot_decoder_preserves_logger_mask_and_rejects_truncation():
+    import struct
+
+    from secure_control.experiments.native_tail_capture import _decode_provider_enables
+    raw=struct.pack('<II',1,0)+struct.pack('<IIII',0,1,0,2)+struct.pack('<IBBHIIQQ',1,5,0,42,0,0,0x600000484,0)
+    rows=_decode_provider_enables(raw)
+    assert rows[0]['logger_id']==42 and rows[0]['match_any']==0x600000484 and rows[0]['enabled']==1
+    for n in (0,4,8,23,len(raw)-1):
+        with pytest.raises(ValueError):_decode_provider_enables(raw[:n])

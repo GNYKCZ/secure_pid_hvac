@@ -12,6 +12,17 @@ from secure_control.execution.diagnostic_limits import artifact_limits
 TCPIP = '2f07e2ee-15db-40f1-90ef-9d7ba282188a'
 THREAD = '3d6fa8d1-fe05-11d0-9dda-00c04fd7ba7c'
 PROCESS = '3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c'
+CSWITCH_V5_SOURCE = ('https://github.com/microsoft/perfview/blob/'
+    '4b14fe0c8c6101cb3c1c6bfed2e317a9d29f68ee/src/TraceEvent/Parsers/KernelTraceEventParser.cs')
+
+
+def _cswitch_v5(raw, width):
+    """独立TraceEvent 3.1.21逐条核验的x64/v5/28字节前缀；不接受邻版本回退。"""
+    if type(width) is not int or width!=8 or len(raw)!=28:
+        raise ValueError('unverified CSwitch v5 shape/architecture')
+    # Microsoft CSwitchTraceData：新/旧TID在0/4，旧状态在14；header TID可为-1。
+    return {'NewThreadId':int.from_bytes(raw[:4],'little'),
+        'OldThreadId':int.from_bytes(raw[4:8],'little'),'OldThreadState':raw[14]}
 
 
 def qpc_ns(ticks, frequency, clock, lost=0):
@@ -54,6 +65,8 @@ def scheduling(evidence, pid, tid, lifetime, *, lost=0):
                 return {'state':'unknown','ready_waits':[]}
             state, ready = 'ready', e['time']
         elif kind == 'in':
+            if state=='running':
+                return {'state':'unknown','ready_waits':[]}
             if ready is not None:
                 waits.append(e['time']-ready)
             state, ready = 'running', None
@@ -225,12 +238,17 @@ def _native():
 
         def open(self, path, handler):
             self.log = Logfile()
+            self.stop_requested = False
             self.filename = c.create_unicode_buffer(str(path))
             self.log.filename = c.cast(self.filename,c.c_wchar_p)
             # evntcons.h：0x100是REAL_TIME，离线文件必须排除；回调需EVENT_RECORD。
             self.log.process_mode = 0x1000|0x10000000
             self.callback = callback_type(handler)
             self.log.callback = self.callback
+            # 官方BufferCallback允许离线取消；只在预算耗尽后停在缓冲边界，不关闭活会话。
+            buffer_type = c.WINFUNCTYPE(u32,c.POINTER(Logfile))
+            self.buffer_callback = buffer_type(lambda _log: int(not self.stop_requested))
+            self.log.buffer_callback = c.cast(self.buffer_callback,c.c_void_p)
             handle = advapi.OpenTraceW(c.byref(self.log))
             if handle == 2**64-1:
                 raise OSError(c.get_last_error(),'OpenTrace failed')
@@ -245,8 +263,12 @@ def _native():
         def process(self, handle):
             value = u64(handle)
             status = advapi.ProcessTrace(c.byref(value),1,None,None)
-            if status:
+            if status and not (status==1223 and self.stop_requested):
                 raise OSError(status,'ProcessTrace failed')
+
+        def stop_processing(self):
+            """请求在下一缓冲边界停止离线遍历，后续不能声称完整文件已读。"""
+            self.stop_requested = True
 
         def close(self,handle):
             if advapi.CloseTrace(handle):
@@ -263,6 +285,18 @@ def _native():
             h = pointer.contents.header
             guid = str(uuid.UUID(bytes_le=bytes(h.provider.data)))
             key = (guid,h.desc.id,h.desc.version,h.desc.opcode)
+            if key==(THREAD,0,5,36):
+                import platform
+                width = {0x20:4,0x40:8}.get(h.flags&0x60)
+                if (platform.machine().lower() not in ('amd64','x86_64')
+                        or width!=8 or pointer.contents.length!=28 or not pointer.contents.user):
+                    raise ValueError('unverified CSwitch v5 architecture/length')
+                values = _cswitch_v5(c.string_at(pointer.contents.user,28),width)
+                return {'provider':guid,'id':0,'version':5,'opcode':36,'pid':h.pid,'tid':h.tid,
+                    'ticks':h.stamp,'pointer_size':width,'values':values,
+                    'cpu':pointer.contents.buffer & (0xffff if h.flags&0x200 else 0xff),
+                    'schema_source':CSWITCH_V5_SOURCE,
+                    'schema_sha256':hashlib.sha256(b'cswitch-v5-x64-size28-u32@0-u32@4-u8@14').hexdigest()}
             required = _fields(key)
             if required is None:
                 return {'unsupported':key}
@@ -315,6 +349,7 @@ def _native():
                 values[name] = data.raw.hex() if typ==14 else int.from_bytes(data.raw,'little',signed=typ==3)
             return {'provider':guid,'id':h.desc.id,'version':h.desc.version,'opcode':h.desc.opcode,
                 'pid':h.pid,'tid':h.tid,'ticks':h.stamp,'pointer_size':width,'values':values,
+                'cpu':pointer.contents.buffer & (0xffff if h.flags&0x200 else 0xff),
                 'schema_sha256':hashlib.sha256(raw).hexdigest()}
     return Native()
 
@@ -324,7 +359,8 @@ def _fields(key):
     guid,event,version,opcode = key
     if guid==TCPIP and event==1074 and version in (0,1):
         return {'Tcb':(16,),'NumBytes':(8,),'SeqNo':(8,),**({'NumPkt':(8,)} if version else {})}
-    if guid==TCPIP and event in (1033,1038,1040,1043,1300) and version in (0,1):
+    versions = {1033:(0,1),1038:(0,1),1040:(0,1),1043:(0,1,2),1300:(0,1,2,3)}
+    if guid==TCPIP and event in versions and version in versions[event]:
         return {'Tcb':(16,),'LocalAddress':(14,),'RemoteAddress':(14,),
             'Pid' if event==1300 else 'ProcessId':(8,),
             **({'ProcessStartKey':(10,)} if version else {})}
@@ -399,22 +435,40 @@ def tcp_source_schemas():
 
 def read_etl(path, *, maximum_events=100000, _api=None):
     """默认10万、显式最高30万；数所有遍历事件，未知描述符不降格成完整证据。"""
+    return _read_etl(path,maximum_events=maximum_events,_api=_api)
+
+
+def read_calibration_etl(path, *, pid, tid, window_ns, _api=None):
+    """File校准专用有界视图；总遍历与保留上限分离，不改变旧读取入口预算。"""
+    if (any(type(v) is not int or v<=0 for v in (pid,tid))
+            or not isinstance(window_ns,(tuple,list)) or len(window_ns)!=2
+            or any(type(v) is not int or v<0 for v in window_ns)
+            or window_ns[0]>=window_ns[1] or window_ns[1]-window_ns[0]>55_000_000_000):
+        raise ValueError('calibration target/window')
+    return _read_etl(path,maximum_events=2500000,_api=_api,target=(pid,tid,window_ns))
+
+
+def _read_etl(path, *, maximum_events, _api=None, target=None):
+    """两种固定预算共用唯一遍历；目标筛选不跳过descriptor/错误/截断计数。"""
     path = Path(path).resolve()
-    if path.suffix.lower()!='.etl' or not path.is_file() or not 0<path.stat().st_size<=64*1024*1024:
+    if path.suffix.lower()!='.etl' or not path.is_file() or not 0<path.stat().st_size<=(128 if target else 64)*1024*1024:
         raise ValueError('ETL file boundary')
-    if type(maximum_events) is not int or not 1 <= maximum_events <= 300000:
+    if type(maximum_events) is not int or not 1 <= maximum_events <= (2500000 if target else 300000):
         raise ValueError('event budget')
     api = _api if _api is not None else _native()
     rows, errors, keys, count = [], [], {}, 0
     descriptors, unsupported, decode_errors = {}, {}, {}
     exhausted = False
+    retention_exhausted, filtered, critical_gaps = False, 0, 0
+    target_tcbs = set()
+    cpu_running, cpu_chain_mismatches = {}, 0
     def tally(mapping,key):
         # 不允许坏文件用无限descriptor/错误类别增长计数器；超界仍令证据不完整。
         if key not in mapping and len(mapping)>=4096:
             raise ValueError('descriptor capacity')
         mapping[key] = mapping.get(key,0)+1
     def callback(pointer):
-        nonlocal count, exhausted
+        nonlocal count, exhausted, retention_exhausted, filtered, critical_gaps, cpu_chain_mismatches
         count += 1
         try:
             descriptor = api.descriptor(pointer) if hasattr(api,'descriptor') else None
@@ -422,6 +476,7 @@ def read_etl(path, *, maximum_events=100000, _api=None):
                 tally(descriptors,descriptor)
             if count>maximum_events:
                 exhausted = True
+                if hasattr(api,'stop_processing'):api.stop_processing()
                 return
             row = api.event(pointer)
             if descriptor is None:
@@ -430,9 +485,41 @@ def read_etl(path, *, maximum_events=100000, _api=None):
                 tally(descriptors,descriptor)
             if 'unsupported' in row:
                 tally(unsupported,tuple(row['unsupported']))
-                if 'unsupported event present' not in errors:
+                key = tuple(row['unsupported'])
+                selected = (key[0]==TCPIP or key[0]==THREAD and key[3] in (1,2,36,50)
+                            or key[0]==PROCESS and key[3] in (1,2))
+                critical_gaps += int(selected)
+                if (target is None or selected) and 'unsupported event present' not in errors:
                     errors.append('unsupported event present')
                 return
+            if target is not None:
+                pid,tid,_ = target
+                v = row['values']
+                keep = False
+                if row['provider']==THREAD:
+                    if row['opcode']==36:
+                        cpu=row.get('cpu')
+                        if type(cpu) is not int or not 0<=cpu<4096:
+                            raise ValueError('switch CPU unavailable/outside calibration scope')
+                        if cpu in cpu_running and cpu_running[cpu]!=v['OldThreadId']:
+                            cpu_chain_mismatches += 1
+                        cpu_running[cpu]=v['NewThreadId']
+                    keep = (tid in (v.get('NewThreadId'),v.get('OldThreadId')) if row['opcode']==36
+                            else v.get('TThreadId')==tid)
+                elif row['provider']==PROCESS:
+                    keep = v.get('ProcessId')==pid
+                elif row['provider']==TCPIP:
+                    if v.get('ProcessId',v.get('Pid'))==pid:
+                        if len(target_tcbs)>=64 and v['Tcb'] not in target_tcbs:
+                            raise ValueError('target connection capacity')
+                        target_tcbs.add(v['Tcb'])
+                    keep = v.get('Tcb') in target_tcbs
+                if not keep:
+                    filtered += 1
+                    return
+                if len(rows)>=100000:
+                    retention_exhausted = True
+                    return
             # 内核TCB/进程地址只作内部映射，以本次顺序ID输出，不导出原地址。
             for field in ('Tcb','UniqueProcessKey'):
                 if field in row['values']:
@@ -464,12 +551,16 @@ def read_etl(path, *, maximum_events=100000, _api=None):
         api.close(handle)
     if exhausted:
         errors.append('event budget exceeded')
+    if retention_exhausted:
+        errors.append('retention budget exceeded')
+    if cpu_chain_mismatches:
+        errors.append('CPU switch chain gap')
     for row in rows:
         row['time_ns'] = qpc_ns(row['ticks'],header['frequency'],header['clock'])
     def summaries(mapping):
         return [{'provider':k[0],'id':k[1],'version':k[2],'opcode':k[3],'count':v}
                 for k,v in sorted(mapping.items())]
-    return {'header':header,'events':rows,'event_count':count,'errors':errors,
+    result = {'header':header,'events':rows,'event_count':count,'errors':errors,
         'maximum_events':maximum_events,'retained_event_count':len(rows),
         'descriptor_counts':summaries(descriptors),'unsupported_counts':summaries(unsupported),
         'critical_unsupported_count':sum(v for k,v in unsupported.items() if k[0] in (PROCESS,THREAD,TCPIP)),
@@ -477,6 +568,28 @@ def read_etl(path, *, maximum_events=100000, _api=None):
         'decode_errors':decode_errors,
         'complete':not errors,'network_semantics':'unverified; event presence is not socket readability',
         'real_event_schema_validation':'performed per descriptor; runtime SeqNo semantic validation still required'}
+    if target is not None:
+        pid,tid,window = target
+        starts = [r for r in rows if r['provider']==THREAD and r['opcode']==1
+                  and r['values'].get('ProcessId')==pid and r['values'].get('TThreadId')==tid
+                  and r['time_ns']<=window[0]]
+        ends = [r for r in rows if r['provider']==THREAD and r['opcode']==2
+                and r['values'].get('TThreadId')==tid and r['time_ns']>=window[1]]
+        process_starts = [r for r in rows if r['provider']==PROCESS and r['opcode']==1
+                          and r['values'].get('ProcessId')==pid and r['time_ns']<=window[0]]
+        # 生命周期夹住完整应用窗口，并核查内部ready/in/out序列；不以包络或lost0单独判完整。
+        normalized = normalize_schedule({**result,'target_tid':tid})
+        lives = [e['life'] for e in normalized['events'] if e['kind']=='start' and e['tid']==tid]
+        state = scheduling(normalized,pid,tid,lives[0]) if len(lives)==1 else {'state':'unknown'}
+        result.update(schema='native-calibration-view-v1',target_pid=pid,target_tid=tid,
+            target_window_ns=list(window),filtered_event_count=filtered,retention_limit=100000,
+            target_connection_count=len(target_tcbs),target_critical_gaps=critical_gaps,
+            cpu_chain_mismatches=cpu_chain_mismatches,
+            schedule_window_complete=(not errors and len(starts)==len(ends)==len(process_starts)==1
+                                      and state['state']!='unknown'),
+            source_payload='excluded; target TCP metadata only',
+            tcp_usable=False)  # byte/SeqNo校准仍须独立应用流锚点，事件出现不自动设为可用。
+    return result
 
 
 def normalize_schedule(trace):
@@ -499,6 +612,8 @@ def normalize_schedule(trace):
             opcode = row['opcode']
             def emit(kind,tid,_stamp=stamp,**extra):
                 nonlocal unassociated
+                if trace.get('target_tid') is not None and tid!=trace['target_tid']:
+                    return
                 if tid in threads:
                     pid, life = threads[tid]
                     events.append({'kind':kind,'time':_stamp,'pid':pid,'tid':tid,'life':life,**extra})
