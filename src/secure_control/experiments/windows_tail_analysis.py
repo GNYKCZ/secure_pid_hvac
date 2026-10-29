@@ -80,6 +80,72 @@ def scheduling(evidence, pid, tid, lifetime, *, lost=0):
     return {'state':state,'ready_waits':waits}
 
 
+
+def _schedule_issues(events):
+    """线性记录严格状态规则的异常位置；保留前缀证据，不把未知区间计零。"""
+    state,ready,issues = 'unknown',False,[]
+    for e in events:
+        kind,reason=e['kind'],None
+        if kind=='start':state,ready='unknown',False
+        elif kind=='ready':
+            if state=='running' or ready:reason='ready while running/already ready'
+            state,ready='ready',True
+        elif kind=='in':
+            if state=='running':reason='duplicate in'
+            state,ready='running',False
+        elif kind=='out':
+            if state!='running':reason='out while not running'
+            if e['next'] not in ('ready','waiting'):reason='unknown switch-out state'
+            state,ready=e['next'],e['next']=='ready'
+        elif kind=='end':state,ready='ended',False
+        if reason:issues.append({'reason':reason,'event':e})
+    return issues
+
+
+def _window_schedule(evidence,pid,tid,window):
+    """唯一生命周期及CPU驻留证明后，以窗前明确切入锚定；不改变通用重放规则。"""
+    events=[e for e in evidence['events'] if e['tid']==tid]
+    starts=[e for e in events if e['kind']=='start']
+    ends=[e for e in events if e['kind']=='end']
+    lifetime={'state':'unknown','issues':_schedule_issues(events)}
+    result={'state':'unknown','range_ns':list(window),'anchor':None,'reason':'lifetime/quality unavailable'}
+    if (not evidence['complete'] or len(starts)!=1 or len(ends)!=1
+            or starts[0]['pid']!=pid or not starts[0]['time']<=window[0]<window[1]<=ends[0]['time']):
+        return lifetime,result
+    life=starts[0]['life']
+    lifetime.update(scheduling(evidence,pid,tid,life),range_ns=[starts[0]['time'],ends[0]['time']])
+    # 所有目标切换都核对驻留，前缀语义异常不能掩盖跨CPU双重运行或缺失切出。
+    cpu,previous=None,-1
+    for e in events:
+        if e['pid']!=pid or e['life']!=life or e['time']<previous:
+            result['reason']='identity/order gap';return lifetime,result
+        previous=e['time']
+        if e['kind'] in ('in','out'):
+            value=e.get('cpu')
+            if type(value) is not int or value<0:
+                result['reason']='CPU unavailable';return lifetime,result
+            if e['kind']=='in':
+                if cpu is not None:
+                    result['reason']='overlapping CPU residence';return lifetime,result
+                cpu=value
+            else:
+                if cpu!=value:
+                    result['reason']='unmatched CPU switch-out';return lifetime,result
+                cpu=None
+    anchors=[(i,e) for i,e in enumerate(events) if e['kind']=='in' and e['time']<=window[0]]
+    if not anchors:
+        result['reason']='no pre-window switch-in';return lifetime,result
+    index,anchor=anchors[-1]
+    fragment=[e for e in events[index:] if e['time']<=window[1]]
+    result.update(anchor=anchor,issues=_schedule_issues(fragment))
+    if result['issues']:
+        result['reason']='strict window replay conflict';return lifetime,result
+    # 使用真实生命周期start及明确in初始化；不借助窗内较晚事件跳过窗口开头。
+    replay=scheduling({**evidence,'events':[starts[0],*fragment]},pid,tid,life)
+    result.update(replay,reason='verified' if replay['state']!='unknown' else 'unknown window state')
+    return lifetime,result
+
+
 def byte_coverage(events, flow, anchor, length, *, trusted=False, lost=0):
     """指定系统事件边界的连续TCP数据区间；seq/长度均须外部可信锚点。"""
     unknown = {'boundary':'unknown','complete_at':None,'socket_readable':'unknown'}
@@ -579,14 +645,14 @@ def _read_etl(path, *, maximum_events, _api=None, target=None):
                           and r['values'].get('ProcessId')==pid and r['time_ns']<=window[0]]
         # 生命周期夹住完整应用窗口，并核查内部ready/in/out序列；不以包络或lost0单独判完整。
         normalized = normalize_schedule({**result,'target_tid':tid,'target_window_ns':list(window)})
-        lives = [e['life'] for e in normalized['events'] if e['kind']=='start' and e['tid']==tid]
-        state = scheduling(normalized,pid,tid,lives[0]) if len(lives)==1 else {'state':'unknown'}
+        lifetime_replay,window_replay = _window_schedule(normalized,pid,tid,window)
         result.update(schema='native-calibration-view-v1',target_pid=pid,target_tid=tid,
             target_window_ns=list(window),filtered_event_count=filtered,retention_limit=100000,
             target_connection_count=len(target_tcbs),target_critical_gaps=critical_gaps,
             cpu_chain_mismatches=cpu_chain_mismatches,
             schedule_window_complete=(not errors and len(starts)==len(ends)==len(process_starts)==1
-                                      and state['state']!='unknown'),
+                                      and window_replay['state']!='unknown'),
+            lifetime_replay=lifetime_replay,window_replay=window_replay,
             source_payload='excluded; target TCP metadata only',
             tcp_usable=False)  # byte/SeqNo校准仍须独立应用流锚点，事件出现不自动设为可用。
     return result
@@ -617,13 +683,14 @@ def normalize_schedule(trace):
         elif row['provider']==THREAD:
             opcode = row['opcode']
             row_index = row.get('event_index')
-            def emit(kind,tid,_stamp=stamp,_index=row_index,terminal=False,**extra):
+            row_cpu = row.get('cpu')
+            def emit(kind,tid,_stamp=stamp,_index=row_index,_cpu=row_cpu,terminal=False,**extra):
                 nonlocal unassociated
                 if trace.get('target_tid') is not None and tid!=trace['target_tid']:
                     return
                 if tid in threads:
                     pid, life = threads[tid]
-                    events.append({'kind':kind,'time':_stamp,'pid':pid,'tid':tid,'life':life,**extra})
+                    events.append({'kind':kind,'time':_stamp,'pid':pid,'tid':tid,'life':life,'cpu':_cpu,'event_index':_index,**extra})
                 elif tid:
                     # 仅明确结束后、窗口外、未复用TID的终止切出可单独保存；不隐藏窗口内未知。
                     boundary = ended.get(tid)
@@ -654,7 +721,7 @@ def normalize_schedule(trace):
                 emit('ready',value['TThreadId'])
             elif opcode==36:
                 state = {1:'ready',5:'waiting'}.get(value['OldThreadState'],'unknown')
-                emit('out',value['OldThreadId'],next=state,terminal=value['OldThreadState']==4)
+                emit('out',value['OldThreadId'],next=state,old_thread_state=value['OldThreadState'],terminal=value['OldThreadState']==4)
                 emit('in',value['NewThreadId'])
     return {'events':events,'complete':trace['complete'] and not unassociated,
         'unassociated_events':unassociated,'terminal_boundary_events':terminal_boundaries,

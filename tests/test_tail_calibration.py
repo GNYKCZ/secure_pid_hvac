@@ -388,3 +388,32 @@ def test_post_end_terminal_switch_is_evidence_not_window_gap(fault):
         assert result['complete'] and len(result['terminal_boundary_events'])==1
     else:
         assert not result.get('terminal_boundary_events')
+
+
+@pytest.mark.parametrize('fault',[None,'no_anchor','inside_ready','inside_unknown','double_cpu','wrong_cpu','reuse','missing_end','lost'])
+def test_window_anchor_preserves_prefix_conflicts_and_rejects_internal_gaps(tmp_path,fault):
+    """前缀running-ready冲突不能污染明确锚定的窗口，窗口内和驻留错误仍拒绝。"""
+    rows=timeline()
+    rows.insert(3,row(THREAD,50,27,TThreadId=2))  # 前缀running-ready冲突。
+    if fault=='no_anchor':window=[15,60]
+    else:window=[52,60]
+    if fault=='inside_ready':rows.insert(7,row(THREAD,50,55,TThreadId=2))
+    if fault=='inside_unknown':rows[4]['values']['OldThreadState']=3;window=[30,60]
+    if fault=='double_cpu':
+        extra=row(THREAD,36,53,NewThreadId=2,OldThreadId=0,OldThreadState=1);extra['cpu']=1;rows.insert(7,extra)
+    if fault=='wrong_cpu':rows[4]['cpu']=1
+    if fault=='reuse':rows.insert(-2,row(THREAD,1,68,ProcessId=1,TThreadId=2))
+    if fault=='missing_end':rows.pop(-2)
+    class API(CalibrationAPI):
+        def header(self):return {**super().header(),'events_lost':int(fault=='lost')}
+    path=tmp_path/'window.etl';path.write_bytes(b'mock')
+    if fault=='lost':
+        with pytest.raises(ValueError):read_calibration_etl(path,pid=1,tid=2,window_ns=window,_api=API(rows))
+        return
+    result=read_calibration_etl(path,pid=1,tid=2,window_ns=window,_api=API(rows))
+    assert result['schedule_window_complete']==(fault is None)
+    if fault is None:
+        assert result['lifetime_replay']['state']=='unknown'
+        assert result['window_replay']['anchor']['time']==50
+        assert result['window_replay']['state']=='running'
+        assert result['lifetime_replay']['issues']
