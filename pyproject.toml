@@ -22,9 +22,19 @@ build-backend = "uv_build"
 module-name = "secure_control"
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
-addopts = ["--strict-markers"]
+# 日常核心回归；完整扩展矩阵使用 uv run pytest tests -m "extended or not extended"。
+testpaths = [
+    "tests/test_smoke.py", "tests/test_architecture.py", "tests/test_contracts.py",
+    "tests/test_fixed_point.py", "tests/test_secret_sharing.py", "tests/test_beaver.py",
+    "tests/test_matrix_beaver.py", "tests/test_truncation.py", "tests/test_prime_contract.py",
+    "tests/test_two_party_protocol.py", "tests/test_plaintext_runtime.py",
+    "tests/test_secure_runtime.py", "tests/test_simulation_engine.py",
+    "tests/test_cycle_timing.py", "tests/test_preauthorized_matrix.py",
+    "tests/test_lan_single_step.py", "tests/test_live_timing.py",
+]
+addopts = ["--strict-markers", "-m", "not extended"]
 markers = [
+    "extended: exhaustive multi-process fault matrix; run explicitly when affected",
     "integration: real processes, sockets, TLS or fixtures producing network evidence",
     "gui: actual Tk windows and desktop interactions",
     "stress: long trajectories, tuning, resource growth and performance witnesses",

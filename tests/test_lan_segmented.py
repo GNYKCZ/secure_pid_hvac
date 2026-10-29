@@ -947,10 +947,17 @@ def test_dynamic_v2_keeps_secret_state_in_one_session_across_segments(tmp_path):
         reap_processes(parties)
 
 
-@pytest.mark.parametrize("delay_ns", [0, 55_000_000])
-@pytest.mark.parametrize("non_realtime", [True, False])
-@pytest.mark.parametrize("wire", ["control-batch-v1", "control-dynamic-compact-v2", "control-dynamic-matrix-v1",
-                                  "control-dynamic-matrix-preauthorized-v2"])
+# Runtime在此被替身替换；四种时序分支只在inline路径完整覆盖，worker各wire保留代表。
+# 真实协议/双提交失败由各自协议与LAN测试负责，不重复做4×2×2笛卡尔积。
+@pytest.mark.parametrize("wire,non_realtime,delay_ns", [
+    ("control-batch-v1", True, 0),
+    ("control-batch-v1", True, 55_000_000),
+    ("control-batch-v1", False, 0),
+    ("control-batch-v1", False, 55_000_000),
+    ("control-dynamic-compact-v2", True, 0),
+    ("control-dynamic-matrix-v1", False, 0),
+    ("control-dynamic-matrix-preauthorized-v2", False, 55_000_000),
+])
 def test_demo_paces_actual_samples_and_slow_steps_do_not_refresh_realtime_deadline(
     tmp_path, monkeypatch, delay_ns, non_realtime, wire,
 ):
