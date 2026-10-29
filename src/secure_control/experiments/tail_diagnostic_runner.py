@@ -508,7 +508,8 @@ def run_host(side, output, *, diagnostic_id, expected_head, software_review, con
             and len(samples) == steps and all(s.get('status') == 'confirmed' for s in samples))
     complete = functional and verified and unchanged and not errors and all(
         r.get('diagnostic_complete') is True for r in records.values())
-    if native_plan is not None:
+    if native is not None:
+        # 只有实际持有采集owner的A端需要native.saved，B仅携带同计划作批准绑定。
         complete = complete and group.get('native',{}).get('status')=='saved'
     manifest = {**version,'diagnostic_id':diagnostic_id,'source_head':head,'side':side,
         **({'resource_exceptions':exceptions} if exceptions else {}),

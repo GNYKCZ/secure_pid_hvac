@@ -547,9 +547,9 @@ def test_observation_preserves_existing_independent_output_oracle_and_failure_se
     assert {p.name for p in tmp_path.glob('*.json')} == {'Client.json','P1.json','P2.json','worker.json'}
 
 
-@pytest.mark.parametrize('side',['client','pair'])
+@pytest.mark.parametrize('side,control_plan',[('client',False),('pair',False),('pair',True)])
 @pytest.mark.parametrize('failure',[False,True])
-def test_two_host_freezes_actual_config_reserves_id_and_keeps_partial(tmp_path,monkeypatch,side,failure):
+def test_two_host_freezes_actual_config_reserves_id_and_keeps_partial(tmp_path,monkeypatch,side,failure,control_plan):
     """纯装配oracle，不启动双机或本机替代实验；同ID换目录仍被账本拒绝。"""
     from dataclasses import asdict
 
@@ -564,7 +564,8 @@ def test_two_host_freezes_actual_config_reserves_id_and_keeps_partial(tmp_path,m
     configs = [root/'configs'/f'lab-{r}-cart-pole-demo.example.yaml'
                for r in (['client'] if side=='client' else ['p1','p2'])]
 
-    def collect(loaded,ctx,steps,*,wall_started):
+    def collect(loaded,ctx,steps,*,wall_started,**extra):
+        assert extra.get('control_file',False)==control_plan
         assert [c.role for c in loaded] == (['Client'] if side=='client' else ['P1','P2'])
         assert all(c.topology.p1_peer.host=='192.168.31.116' for c in loaded)
         reports = []
@@ -594,12 +595,20 @@ def test_two_host_freezes_actual_config_reserves_id_and_keeps_partial(tmp_path,m
     monkeypatch.setattr(runner,'_collect_host',collect)
     kwargs = {'diagnostic_id':'one-session','expected_head':'a'*40,
         'software_review':'https://software-test.invalid','config_paths':configs,'steps':2}
+    if control_plan:
+        from secure_control.experiments import native_tail_capture, tail_calibration
+        monkeypatch.setattr(native_tail_capture,'authorize_control',lambda *a,**kw:None)
+        monkeypatch.setattr(tail_calibration,'_source_clean',lambda:True)
+        kwargs.update(window=2000,steps=2000,authorization={},native_plan={
+            'schema':'native-calibration-preparation-v1','purpose':'control-slow-step-v1',
+            'source_head':'a'*40,'software_review':kwargs['software_review']})
     manifest = runner.run_host(side,tmp_path/'first',**kwargs)
     assert manifest['diagnostic_complete'] is (not failure)
     assert manifest['mode']=='non_realtime_diagnostic' and not manifest['strict_qualification']
     assert manifest['clock_domains'][manifest['plan']['clock_domain_id']]['local_spawn_verified']
     ledger = json.loads((tmp_path/f'results/tail_diagnostics/session-one-session-{side}.ledger.json').read_text())
-    assert ledger['one_two_host']==0 and ledger['status']==('partial' if failure else 'complete')
+    assert ledger['two_host_2000' if control_plan else 'one_two_host']==0
+    assert ledger['status']==('partial' if failure else 'complete')
     with pytest.raises(FileExistsError):
         runner.run_host(side,tmp_path/'different',**kwargs)
     assert not (tmp_path/'different').exists()
