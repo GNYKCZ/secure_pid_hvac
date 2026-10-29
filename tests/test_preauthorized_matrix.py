@@ -556,6 +556,8 @@ _V2_OUTPUT_FAULTS = ['bad_base64', 'null_output', 'bool_scale', 'wrong_length', 
                      'wrong_output_type', 'noncanonical_base64']
 
 
+# 完整真实多进程故障矩阵按需运行；日常保留本文件独立契约及单步LAN代表。
+@pytest.mark.extended
 @pytest.mark.parametrize('profile,fault,segment_steps,client_io',
     [(PREAUTHORIZED_PROFILE, f, s, 'blocking-v1') for f in _SESSION_FAULTS for s in (1, 2)]
     +[(PREAUTHORIZED_PROFILE_V2, f, 2, 'blocking-v1') for f in _SESSION_FAULTS+_V2_OUTPUT_FAULTS]

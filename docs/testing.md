@@ -78,16 +78,16 @@ journal/哈希及完整包装行界，用原数组转换方式核对标量/数�
 
 | 用途 | 命令 | 未运行内容 |
 |---|---|---|
-| 快速反馈 | `uv run pytest -m "not integration and not gui and not stress"` | 真实进程/socket/TLS、实际Tk与长时见证 |
-| 短进程集成 | `uv run pytest -m "integration and not gui and not stress"` | 实际Tk与stress |
-| 短GUI | `uv run pytest -m "gui and not stress"` | stress及其他组 |
-| 长时验证 | `uv run pytest -m stress` | 其他三个分区 |
-| 按需扩展全套（非每次必跑） | `uv run pytest` | 无分组排除 |
+| 快速反馈 | `uv run pytest tests -m "not integration and not gui and not stress"` | 真实进程/socket/TLS、实际Tk与长时见证 |
+| 短进程集成 | `uv run pytest tests -m "integration and not gui and not stress"` | 实际Tk与stress |
+| 短GUI | `uv run pytest tests -m "gui and not stress"` | stress及其他组 |
+| 长时验证 | `uv run pytest tests -m stress` | 其他三个分区 |
+| 按需扩展全套（非每次必跑） | `uv run pytest tests -m "extended or not extended"` | 无分组排除 |
 
 `integration` 表示实际进程、socket/TLS或间接使用真实网络结果fixture；
 `gui` 表示实际Tk；`stress` 表示保留的长轨迹或资源/性能见证。
 marker允许重叠，上表按stress、gui、integration、fast的优先级组成互斥分区。
-`pyproject.toml` 只启用strict-markers，默认仍收集全部剩余测试。
+`pyproject.toml` 的testpaths选择17个核心/代表性集成文件作为日常基线；明确路径仍运行该路径全部用例。`uv run pytest tests -m "extended or not extended"`才收集扩展全套，无skip或自动丢弃失败用例。
 不使用pytest-xdist，避免端口探测/绑定、Tk和资源测量互相干扰。
 
 #121 的既有动态结果/故障注入集成夹具显式使用非实时诊断调度，保留原来注入位置与
@@ -147,3 +147,11 @@ uv run ruff check .
 记录当前SHA、用户已有修改、实际通过/失败、总墙钟与未检查范围。
 性能和原始日志放系统临时目录，实施结果发布在当前Issue/PR；
 不复用裁剪前1249项通过记录作为本轮证据，不自动继续其他Issue。
+
+## #152 日常范围缩减（2026-10-29）
+
+日常17个文件包含核心算术、协议/状态、计时及真实单步LAN代表。GUI、长轨迹、多场景、历史wire组合和诊断专项按需运行，修改时显式追加相应路径。新测试文件也必须按影响显式选择，不能以日常绿色声称全套通过。完整命令是 `uv run pytest tests -m "extended or not extended"`，不作为每次的第二遍验收。
+
+分段调度使用假的Runtime，16组wire×时序合并为7组：inline四种时序、三个worker wire代表，保留全部断言；真实协议和失败路径测试仍保留。日常基线与相关集合合并为一次命令，Review复用结果。
+
+预授权真实多进程故障矩阵标记为 `extended`，日常明确排除；相关协议变更须用 `-m "extended or not extended"` 覆盖默认选择。无skip、未删除失败断言。单次较大验收337项通过/335.29秒；最终仅追加选择标记，不改变用例行为，复用该结果，未为默认范围再次计时。
