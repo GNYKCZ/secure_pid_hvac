@@ -513,6 +513,7 @@ def _fields(key):
     if guid==TCPIP and event in versions and version in versions[event]:
         return {'Tcb':(16,),'LocalAddress':(14,),'RemoteAddress':(14,),
             'Pid' if event==1300 else 'ProcessId':(8,),
+            **({'Status':(8,)} if event==1017 else {}),
             **({'ProcessStartKey':(10,)} if version else {})}
     if guid==THREAD:
         if opcode in (1,2) and version in (2,3):
@@ -888,7 +889,8 @@ def control_tcp_anchor(trace, sidecar, connection):
     if not isinstance(sidecar.get('protocol'),(tuple,list)) or len(sidecar['protocol'])!=3 or any(not isinstance(v,str) or not v for v in sidecar['protocol']):
         return unknown('public protocol identity missing')
     rows=[r for r in trace['events'] if r['provider']==TCPIP]
-    births=[r for r in rows if r['id']==(1017 if party_request else 1033) and r['values'].get('ProcessId')==conn['pid']
+    births=[r for r in rows if r['id']==(1017 if party_request else 1033)
+        and (not party_request or r['values'].get('Status')==0) and r['values'].get('ProcessId')==conn['pid']
         and _sockaddr(r['values'].get('LocalAddress'))==tuple(conn['local'])
         and _sockaddr(r['values'].get('RemoteAddress'))==tuple(conn['remote'])]
     if len(births)!=1:return unknown('unique connect-completed event unavailable')

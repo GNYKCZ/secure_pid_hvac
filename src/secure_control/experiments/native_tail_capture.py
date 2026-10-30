@@ -174,6 +174,7 @@ def profile_contract(path, schemas, *, file_candidate=False, b_receive=False):
         seen.add(row['id'])
         required = {'Tcb','NumBytes','SeqNo'} if row['id']==1074 else {
             'Tcb','LocalAddress','RemoteAddress','Pid' if row['id']==1300 else 'ProcessId'}
+        if row['id']==1017:required.add('Status')
         if not required <= {f['name'] for f in row['fields']}:
             raise ValueError('required source metadata absent')
         for field in row['fields']:

@@ -507,7 +507,7 @@ def party_request_evidence():
     sidecar={'schema':'party-receive-map-v1','role':'P1','complete':True,'connection':conn,
         'context':{'diagnostic_id':'run','source_head':'a'*40,'clock_domain_id':'B'},
         'protocol':['run','session','epoch'],'rows':[[2,10,4,18,70,85,90,0,4,2]]}
-    birth={'provider':TCPIP,'id':1017,'time_ns':10,'event_index':1,'values':{'Tcb':9,
+    birth={'provider':TCPIP,'id':1017,'time_ns':10,'event_index':1,'values':{'Tcb':9,'Status':0,
         'ProcessId':1,'LocalAddress':addr('10.0.0.1',100),'RemoteAddress':addr('10.0.0.2',200)}}
     packets=[{'provider':TCPIP,'id':1074,'time_ns':t,'event_index':i,
         'values':{'Tcb':9,'SeqNo':seq,'NumBytes':size}} for seq,size,t,i in
@@ -519,7 +519,7 @@ def party_request_evidence():
 
 
 @pytest.mark.parametrize('fault',[None,'split','wrong_birth','rundown','wrong_pid','lost','reuse',
-    'future','wrong_frame','before_recv','late_enter'])
+    'future','wrong_frame','before_recv','late_enter','failed_accept','missing_accept_status'])
 def test_party_request_anchor_and_first_byte_vs_full_frame_boundaries(fault):
     from secure_control.experiments.windows_tail_analysis import (
         control_tcp_anchor,
@@ -530,6 +530,8 @@ def test_party_request_anchor_and_first_byte_vs_full_frame_boundaries(fault):
     if fault=='rundown':rows[1]['id']=1300
     if fault=='wrong_pid':rows[1]['values']['ProcessId']=3
     if fault=='lost':trace['complete']=False
+    if fault=='failed_accept':rows[1]['values']['Status']=0xc0000001
+    if fault=='missing_accept_status':rows[1]['values'].pop('Status')
     if fault=='reuse':rows.insert(2,copy.deepcopy(rows[1]))
     if fault=='split':
         rows[4]['values']['NumBytes']=2;rows[4]['time_ns']=75

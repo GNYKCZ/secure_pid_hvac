@@ -31,7 +31,8 @@ def schemas():
 
 def test_b_receive_root_binds_two_independent_nodes_and_separate_resources(tmp_path):
     from secure_control.experiments import native_tail_capture as m
-    rows=schemas();rows.append({**rows[0],'id':1017})
+    rows=schemas();rows.append({**rows[0],'id':1017,'fields':[
+        *rows[0]['fields'],{'name':'Status','type':8,'flags':0}]})
     class BBackend(Backend):
         def source_schemas(self,**kwargs):return rows
         def sessions(self):

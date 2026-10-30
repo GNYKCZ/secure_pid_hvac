@@ -160,7 +160,7 @@ def test_accept_1017_uses_actual_tdh_manifest_with_constructed_payload(version):
     buffer=ctypes.create_string_buffer(raw);event.user=ctypes.cast(buffer,ctypes.c_void_p);event.length=len(raw)
     decoded=api.event(ctypes.pointer(event))
     assert decoded['values']=={'Tcb':0x1234,'LocalAddress':local.hex(),'RemoteAddress':remote.hex(),
-        'ProcessId':41,**({'ProcessStartKey':98765} if version else {})}
+        'ProcessId':41,'Status':0,**({'ProcessStartKey':98765} if version else {})}
     assert decoded['schema_sha256']
     assert _fields((TCPIP,1017,2,0)) is None
 
