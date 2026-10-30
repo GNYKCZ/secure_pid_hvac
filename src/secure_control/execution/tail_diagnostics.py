@@ -71,7 +71,7 @@ def _clock(name):
 class TailRecorder:
     """每进程≤1MiB预分配数字/身份缓冲；热路径不生成事件dict、JSON或写盘。"""
 
-    def __init__(self, context: DiagnosticContext, role: str, *, event_capacity=None, gc_capacity=None, stream_map=False):
+    def __init__(self, context: DiagnosticContext, role: str, *, event_capacity=None, gc_capacity=None, stream_map=False, party_receive_map=False):
         self.limits = limits_for(context.window)
         event_capacity = self.limits.events if event_capacity is None else event_capacity
         gc_capacity = self.limits.gc_events if gc_capacity is None else gc_capacity
@@ -89,6 +89,13 @@ class TailRecorder:
         if type(stream_map) is not bool or stream_map and (role != 'Client' or context.transport != 'insecure_tcp'):
             raise ValueError('流映射只支持显式Client明文诊断')
         self.streams = None
+        self.party_receives=None
+        if type(party_receive_map) is not bool:raise ValueError('Party观察开关必须为bool')
+        if party_receive_map:
+            if role not in ('P1','P2') or context.window!=2000 or context.transport!='insecure_tcp':
+                raise ValueError('Party接收观察只支持显式2000步明文诊断')
+            from .client_stream_map import PartyReceiveMap
+            self.party_receives=PartyReceiveMap()
         if stream_map:
             from .client_stream_map import ClientStreamMap
             self.streams = ClientStreamMap(window=context.window)
@@ -97,6 +104,8 @@ class TailRecorder:
         self._gc_events = bytearray(gc_capacity*_ROW.size)
         self._identities = bytearray(self.limits.identity_bytes)
         self.buffer_bytes = len(self._events)+len(self._gc_events)+len(self._identities)
+        if self.party_receives is not None:self.buffer_bytes+=len(self.party_receives.buffer)
+        if self.buffer_bytes>self.limits.memory_limit:raise ValueError('diagnostic memory budget')
         self._count = self._gc_count = self._sequence = self.lost_events = 0
         self.first_lost_sequence = None
         self.error_type = None
@@ -324,6 +333,13 @@ class TailRecorder:
                     role_file_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
                     complete=sidecar['complete'] and report['diagnostic_complete'])
                 with path.with_name('Client.stream.json').open('x',encoding='utf8') as stream:
+                    json.dump(sidecar,stream,ensure_ascii=False,allow_nan=False,separators=(',',':'))
+            if self.party_receives is not None:
+                sidecar=self.party_receives.report()
+                sidecar.update(context=context_payload(self.context),protocol=self._protocol,role=self.role,
+                    role_file_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                    complete=sidecar['complete'] and report['diagnostic_complete'])
+                with path.with_name(self.role+'.receive.json').open('x',encoding='utf8') as stream:
                     json.dump(sidecar,stream,ensure_ascii=False,allow_nan=False,separators=(',',':'))
             return {'status':'saved','path':path.name,'diagnostic_complete':report['diagnostic_complete']}
         except Exception as error:  # noqa: BLE001 - 独立导出状态，不覆盖原控制失败。

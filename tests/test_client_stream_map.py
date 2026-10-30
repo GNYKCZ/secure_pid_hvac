@@ -50,6 +50,74 @@ class Socket:
         self.timeout=value
 
 
+def test_party_receive_counts_all_frames_and_only_validates_explicit_identity(monkeypatch):
+    from secure_control.execution import client_stream_map as m
+    ticks=iter(range(100,10000,10));monkeypatch.setattr(m.time,'perf_counter_ns',lambda:next(ticks))
+    owner=m.PartyReceiveMap();raw=Socket();sock=owner.register(raw)
+    raw.input=[b'\0\0\0\1h',b'\0\0',b'\0\3abc']
+    sock.recv(100)  # hello，未绑定
+    sock.recv(100);sock.recv(100)  # setup长度头分片，5+7字节累计
+    owner.validate(sock,2,'lan_setup');sock.send(b'reply')
+    raw.input=[TimeoutError(),b'\0',b'\0\0\2xy']
+    with pytest.raises(TimeoutError):sock.recv(100)
+    sock.recv(100);sock.recv(100)
+    assert owner.report()['rows'][-1][7:]==[-1,-1,0]
+    owner.validate(sock,4,'online_permit',0)
+    report=owner.report();assert report['complete'] and report['buffer_bytes']<=1024*1024
+    assert [r[1:4] for r in report['rows']]==[[0,1,5],[5,3,12],[12,2,18]]
+    assert report['rows'][0][9]==0 and report['rows'][2][7:]==[0,4,2]
+    assert report['rows'][2][4:7]==[200,210,230]
+    assert report['connection']['setup_checkpoint']['received_bytes']==12
+    assert 'abc' not in json.dumps(report) and 'xy' not in json.dumps(report)
+
+
+@pytest.mark.parametrize('fault',['peek','thread','bypass','capacity','partial_eof','duplicate','setup_pipeline'])
+def test_party_receive_observation_failures_preserve_business_bytes(monkeypatch,fault):
+    from secure_control.execution import client_stream_map as m
+    owner=m.PartyReceiveMap();raw=Socket();sock=owner.register(raw)
+    frame=b'\0\0\0\1x';raw.input=[frame]
+    if fault=='thread':monkeypatch.setattr(m.threading,'get_native_id',lambda:-1)
+    if fault=='capacity':owner.capacity=0
+    if fault=='bypass':getattr(sock,'recv_into',None)
+    if fault=='partial_eof':raw.input=[b'\0',b''];sock.recv(10)
+    data=sock.recv(100,1) if fault=='peek' else sock.recv(100)
+    if fault not in ('partial_eof',):assert data==frame
+    if fault=='duplicate':owner.validate(sock,2,'lan_setup');owner.validate(sock,2,'lan_setup')
+    if fault=='setup_pipeline':
+        raw.input=[frame+b'\0'];sock.recv(100);owner.validate(sock,2,'lan_setup')
+    assert not owner.report()['complete'] and owner.error is not None
+
+
+def test_party_receive_coalesced_frames_share_call_times_without_byte_arrival_guess(monkeypatch):
+    from secure_control.execution import client_stream_map as m
+    ticks=iter([1,10,20]);monkeypatch.setattr(m.time,'perf_counter_ns',lambda:next(ticks))
+    owner=m.PartyReceiveMap();raw=Socket();sock=owner.register(raw)
+    raw.input=[b'\0\0\0\1a\0\0\0\2bc'];sock.recv(100)
+    rows=owner.report()['rows']
+    assert [r[1:4] for r in rows]==[[0,1,5],[5,2,11]]
+    assert [r[4:7] for r in rows]==[[10,20,20],[10,20,20]]
+
+
+@pytest.mark.parametrize('valid',[False,True])
+def test_party_setup_checkpoint_is_only_called_after_request_identity_checks(monkeypatch,valid):
+    from types import SimpleNamespace
+
+    from secure_control.execution import client_stream_map as m
+    from secure_control.execution import lan_runtime as runtime
+    owner=m.PartyReceiveMap();raw=Socket();sock=owner.register(raw)
+    raw.input=[b'\0\0\0\1s'];sock.recv(100)
+    request=SimpleNamespace(kind='request',sender='Client',recipient='P1',sequence=2 if valid else 3,
+        operation='lan_setup',session_id='session',round_id=None,step=None,resource_id=None)
+    monkeypatch.setattr(runtime,'receive_envelope',lambda *args,**kwargs:request)
+    monkeypatch.setattr(runtime.tail_diagnostics,'current',lambda:SimpleNamespace(party_receives=owner))
+    if not valid:
+        with pytest.raises(ValueError):runtime._party_receive(sock,'P1',2,'lan_setup','session',5)
+        assert owner.checkpoint is None and owner.report()['rows'][0][9]==0
+    else:
+        assert runtime._party_receive(sock,'P1',2,'lan_setup','session',5) is request
+        assert owner.checkpoint['received_bytes']==5
+
+
 def test_default_off_no_new_buffer_or_address_query(monkeypatch,tmp_path):
     from secure_control.execution import lan_transport
     ctx = DiagnosticContext('off','domain',str(tmp_path),'a'*40,1)

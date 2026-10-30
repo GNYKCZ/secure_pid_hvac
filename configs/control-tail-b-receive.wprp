@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<WindowsPerformanceRecorder Version="1.0" Author="secure_control">
+  <Profiles>
+    <SystemCollector Id="D21System" Name="D21System">
+      <BufferSize Value="64"/><Buffers Value="32"/>
+    </SystemCollector>
+    <EventCollector Id="D21Events" Name="D21Events">
+      <BufferSize Value="64"/><Buffers Value="64"/>
+    </EventCollector>
+    <SystemProvider Id="D21Life"><Keywords><Keyword Value="ProcessThread"/></Keywords></SystemProvider>
+    <EventProvider Id="D21Tcp" Name="2f07e2ee-15db-40f1-90ef-9d7ba282188a" Level="5" NonPagedMemory="true">
+      <Keywords><Keyword Value="0x600000484"/></Keywords>
+      <EventFilters FilterIn="true">
+        <EventId Value="1017"/><EventId Value="1033"/><EventId Value="1038"/>
+        <EventId Value="1040"/><EventId Value="1043"/><EventId Value="1074"/><EventId Value="1300"/>
+      </EventFilters>
+    </EventProvider>
+    <Profile Id="D21.Verbose.File" Name="D21" Description="Opt-in B request metadata; no packet payload" LoggingMode="File" DetailLevel="Verbose">
+      <Collectors>
+        <SystemCollectorId Value="D21System"><SystemProviderId Value="D21Life"/></SystemCollectorId>
+        <EventCollectorId Value="D21Events"><EventProviders><EventProviderId Value="D21Tcp"/></EventProviders></EventCollectorId>
+      </Collectors>
+    </Profile>
+  </Profiles>
+</WindowsPerformanceRecorder>

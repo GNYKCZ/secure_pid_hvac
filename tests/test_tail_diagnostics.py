@@ -963,31 +963,40 @@ def test_control_approval_does_not_reuse_calibration_or_other_run(tmp_path,fault
 
 
 @pytest.mark.parametrize('business',[False,True])
-def test_control_pair_wait_and_business_deadlines_without_spawn(monkeypatch,business):
+@pytest.mark.parametrize('b_boundary',[False,True])
+def test_control_pair_wait_and_business_deadlines_without_spawn(monkeypatch,business,b_boundary,tmp_path):
     import queue
 
     from secure_control.experiments import tail_diagnostic_runner as runner
-    clock=[0.];activity=SimpleNamespace(value=0.);children=[]
+    clock=[0.];activity=SimpleNamespace(value=0.);children=[];order=[]
+    class Native:
+        def __init__(self):
+            self.started=None;self.capture_deadline=110.;self.output=tmp_path/'native-b.etl';self.report={}
+        def begin(self):self.started=clock[0];order.append('native')
+        def finish(self):order.append('stop');return {'status':'saved'}
     class Process:
         def __init__(self,**kwargs):
             self.pid=100+len(children);self.exitcode=None;children.append(self)
             assert kwargs['args'][-1] is True
-        def start(self):pass
+        def start(self):order.append('spawn')
     class Queue:
         def get(self,timeout):
             clock[0]+=1
-            if business and clock[0]>=20 and not activity.value:activity.value=20
+            if business and clock[0]>=(44 if b_boundary else 20) and not activity.value:
+                activity.value=44 if b_boundary else 20
             raise queue.Empty
         def close(self):pass
         def cancel_join_thread(self):pass
     spawn=SimpleNamespace(Queue=Queue,Value=lambda *a:activity,
         Event=lambda:SimpleNamespace(set=lambda:None),Process=Process)
     monkeypatch.setattr(runner,'_clear_owned',lambda *a,**kw:[])
+    extra={'b_receive_boundary':True,'native':Native()} if b_boundary else {}
     result=runner._collect_host([SimpleNamespace(role='P1'),SimpleNamespace(role='P2')],None,2000,
-        control_file=True,_mp=SimpleNamespace(get_context=lambda _:spawn),_now=lambda:clock[0])
+        control_file=True,_mp=SimpleNamespace(get_context=lambda _:spawn),_now=lambda:clock[0],**extra)
     assert result['stop_reason']=='control_wait_or_business_limit'
-    assert clock[0]==(75 if business else 45)
+    assert clock[0]==((99 if b_boundary else 75) if business else 45)
     assert result['owned_pids']==[100,101]
+    if b_boundary:assert order==['native','spawn','spawn','stop']
 
 
 def test_control_party_reuses_first_request_hook_once_without_network(tmp_path,monkeypatch):
@@ -1022,7 +1031,8 @@ def test_control_party_reuses_first_request_hook_once_without_network(tmp_path,m
     assert reports[0]['status']=='closed' and len(events)==2
 
 
-def test_control_missing_approval_fails_before_ledger_or_native(tmp_path,monkeypatch):
+@pytest.mark.parametrize('purpose',['control-slow-step-v1','control-b-receive-boundary-v1'])
+def test_control_missing_approval_fails_before_ledger_or_native(tmp_path,monkeypatch,purpose):
     from secure_control.experiments import tail_calibration
     from secure_control.experiments import tail_diagnostic_runner as runner
     monkeypatch.setattr(tail_calibration,'_source_clean',lambda:True)
@@ -1030,7 +1040,7 @@ def test_control_missing_approval_fails_before_ledger_or_native(tmp_path,monkeyp
     with pytest.raises(PermissionError):runner.run_host('client',tmp_path/'new',diagnostic_id='noapproval',
         expected_head=head,software_review='https://example.test/review',
         config_paths=[runner.ROOT/'configs/lab-client-cart-pole-demo.example.yaml'],steps=2000,
-        stream_map=True,window=2000,native_plan={'purpose':'control-slow-step-v1',
+        stream_map=True,window=2000,native_plan={'purpose':purpose,
             'source_head':head,'software_review':'https://example.test/review'})
     assert not (tmp_path/'new').exists()
 
@@ -1142,3 +1152,73 @@ def test_control_client_still_requires_its_actual_native_save(tmp_path,monkeypat
             'purpose':'control-slow-step-v1','source_head':'a'*40,'software_review':'https://review.test'})
     assert manifest['functional_complete'] and manifest['native_evidence']['status']=='read'
     assert manifest['diagnostic_complete']==(native_status=='saved')
+
+
+@pytest.mark.parametrize('fault',[None,'hash','identity','range'])
+def test_b_request_consumer_binds_files_and_keeps_local_clocks_separate(tmp_path,monkeypatch,fault):
+    import copy
+    import hashlib
+
+    from test_tail_calibration import addr, party_request_evidence
+
+    from secure_control.experiments import tail_diagnostic_analysis as a
+    from secure_control.experiments.windows_tail_analysis import TCPIP
+    monkeypatch.setattr(a,'analyze_manifests',lambda *args,**kwargs:{'diagnostic_complete':False})
+    monkeypatch.setattr(a,'_decode',lambda record:{'spans':[], 'points':[]})
+    paths=[];records={};hashes={}
+    for side in ('client','pair'):
+        directory=tmp_path/side;directory.mkdir();files=[]
+        for role,pid,tid in ([('Client',11,12)] if side=='client' else [('P1',1,2),('P2',3,4)]):
+            record={'role':role,'pid':pid,'main_thread_id':tid,'protocol':['run','session','epoch'],
+                'context':{'diagnostic_id':'run','source_head':'a'*40,'clock_domain_id':'A' if side=='client' else 'B'}}
+            records[role]=record
+            raw=json.dumps(record).encode();(directory/(role+'.json')).write_bytes(raw)
+            hashes[role]=hashlib.sha256(raw).hexdigest();files.append({'path':role+'.json','sha256':hashes[role]})
+        manifest={'side':side,'files':files,'source_head':'a'*40,'diagnostic_id':'run','control_samples':[]}
+        def artifact(name,value,directory=directory):
+            raw=value if isinstance(value,bytes) else json.dumps(value).encode()
+            (directory/name).write_bytes(raw);return hashlib.sha256(raw).hexdigest()
+        if side=='client':
+            manifest['control_samples']=[{'global_step':0,'work_elapsed_ns':21_000_001,
+                'actual_sample_start_ns':10**12,'work_completed_ns':10**12+21_000_001}]
+            etlhash=artifact('native-a.etl',b'mock A')
+            view={'complete':False,'purpose':'control-slow-step-v1','source_head':'a'*40,
+                'diagnostic_id':'run','target_pid':11,'target_tid':12,'etl_sha256':etlhash}
+            stream={'complete':False,'context':records['Client']['context'],'rows':[
+                [0,11 if fault=='range' else 10,8,18,10,4,18,0],[1,10,8,18,10,4,18,0]]}
+            ah={'native-a.etl':etlhash,'control-native-view.json':artifact('control-native-view.json',view),
+                'control-native-events.json':artifact('control-native-events.json',[]),
+                'Client.stream.json':artifact('Client.stream.json',stream)}
+            manifest['native_evidence']={'status':'read','files':ah}
+        else:
+            trace,s1=party_request_evidence();s2=copy.deepcopy(s1)
+            s2.update(role='P2');s2['connection'].update(pid=3,thread_id=4,local=['10.0.0.1',101])
+            extra=copy.deepcopy(trace['events'])
+            for row in extra:
+                if row['values'].get('ProcessId')==1:row['values']['ProcessId']=3
+                if 'Tcb' in row['values']:row['values']['Tcb']=10
+                if row.get('id')==1017:row['values']['LocalAddress']=addr('10.0.0.1',101)
+                if 'event_index' in row:row['event_index']+=100
+            assert sum(row.get('id')==1017 and row['provider']==TCPIP for row in extra)==1
+            trace['events'].extend(extra)
+            events=trace.pop('events');etlhash=artifact('native-b.etl',b'mock B')
+            trace.update(purpose='control-b-receive-boundary-v1',source_head='a'*40,
+                diagnostic_id='run',etl_sha256=etlhash,targets=[[1,2],[3,4]])
+            bh={'native-b.etl':etlhash,'request-native-events.json':artifact('request-native-events.json',events),
+                'request-native-view.json':artifact('request-native-view.json',trace)}
+            for role,s in [('P1',s1),('P2',s2)]:
+                s.update(context=records[role]['context'],role_file_sha256=hashes[role])
+                if fault=='identity' and role=='P1':s['connection']['pid']=3
+                bh[role+'.receive.json']=artifact(role+'.receive.json',s)
+            manifest['b_request_evidence']={'status':'read','files':bh}
+            if fault=='hash':(directory/'native-b.etl').write_bytes(b'changed')
+        path=directory/'manifest.json';path.write_text(json.dumps(manifest),encoding='utf8');paths.append(path)
+    if fault in ('hash','identity'):
+        with pytest.raises(ValueError):a.analyze_slow_control(paths)
+        return
+    result=a.analyze_slow_control(paths);parties=result['rows'][0]['parties']
+    assert parties[0]['B_receive_analysis']['verified']==(fault is None)
+    assert parties[1]['B_receive_analysis']['first_component_to_first_recv_ns']==5
+    assert parties[1]['B_receive_analysis']['first_component_ns']==80  # B域，不减10**12的A域时刻。
+    assert parties[1]['cross_host_difference_ns'] is None
+    assert not result['diagnostic_complete']

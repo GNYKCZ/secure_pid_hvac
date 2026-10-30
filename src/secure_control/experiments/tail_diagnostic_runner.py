@@ -55,11 +55,12 @@ def _role_child(role, ports, context, results, stop, deadline, steps):
     _configured_child(config,context,results,stop,deadline,steps)
 
 
-def _configured_child(config, context, results, stop, deadline, steps, activity=None, stream_map=False, control_file=False):
+def _configured_child(config, context, results, stop, deadline, steps, activity=None, stream_map=False, control_file=False, b_receive_boundary=False):
     """仅装配原角色；两机模式保留加载的配置和原业务循环。"""
     role = config.role
     limits = limits_for(context.window)
-    recorder = TailRecorder(context,role,stream_map=stream_map and role == 'Client').start()
+    recorder = TailRecorder(context,role,stream_map=stream_map and role == 'Client',
+        **({'party_receive_map':True} if b_receive_boundary and role in ('P1','P2') else {})).start()
     if control_file and role in ('P1','P2'):
         # 复用已有首请求观察点，只报告一次业务起点，不修改协议或增加网络流量。
         emit = recorder.emit
@@ -286,11 +287,11 @@ def _clear_owned(processes, deadline, *, _now=time.perf_counter, _run=subprocess
     return forced
 
 
-def _collect_host(configs, context, steps, *, wall_started=None, stream_map=False, native=None, control_file=False, _mp=mp, _now=time.perf_counter):
+def _collect_host(configs, context, steps, *, wall_started=None, stream_map=False, native=None, control_file=False, b_receive_boundary=False, _mp=mp, _now=time.perf_counter):
     """按声明窗口监督实际成员；无跨机时钟或额外连接。"""
     started = _now() if wall_started is None else wall_started
     limits = limits_for(context.window if context is not None else 400)
-    run_deadline = started+(100 if control_file else limits.wall_s-3)
+    run_deadline = started+(110 if b_receive_boundary and configs[0].role!='Client' else 100 if control_file else limits.wall_s-3)
     spawn = _mp.get_context('spawn')
     results, stop, activity = spawn.Queue(), spawn.Event(), spawn.Value('d',0.)
     processes, reports, reason, launcher_error = [], [], None, None
@@ -306,11 +307,13 @@ def _collect_host(configs, context, steps, *, wall_started=None, stream_map=Fals
                 break
             process = spawn.Process(target=_configured_child,
                 args=(config,context,results,stop,run_deadline,steps,activity,stream_map,
-                      *([True] if control_file else [])))
+                      *([True,True] if b_receive_boundary else [True] if control_file else [])))
             processes.append(process)
             process.start()
         while len(reports) < len(processes):
             now = _now()
+            if b_receive_boundary and native is not None and configs[0].role!='Client' and activity.value:
+                native.capture_deadline=min(native.capture_deadline,activity.value+55)
             if control_file and configs[0].role!='Client' and (
                     not activity.value and now>=started+45 or activity.value and now>=activity.value+55):
                 reason='control_wait_or_business_limit';break
@@ -372,7 +375,8 @@ def run_host(side, output, *, diagnostic_id, expected_head, software_review, con
     from secure_control.execution.lan_config import load_lan_config
     if type(stream_map) is not bool or stream_map and side != 'client':
         raise ValueError('流映射只可显式用于A端')
-    control_file = bool(native_plan and native_plan.get('purpose')=='control-slow-step-v1')
+    b_receive_boundary=bool(native_plan and native_plan.get('purpose')=='control-b-receive-boundary-v1')
+    control_file = bool(native_plan and native_plan.get('purpose')=='control-slow-step-v1') or b_receive_boundary
     if authorization is not None and not control_file:
         raise PermissionError('control approval requires control-purpose plan')
     if native_plan is not None and (window!=2000 or side!='client' and not control_file):
@@ -408,8 +412,13 @@ def run_host(side, output, *, diagnostic_id, expected_head, software_review, con
         from secure_control.experiments.tail_calibration import _source_clean
         if steps!=2000 or not _source_clean():raise ValueError('control source/steps changed')
         if native_plan.get('software_review')!=software_review:raise ValueError('control review changed')
-        authorize_control(authorization,native_plan,side=side,output=output,head=head,
-            diagnostic_id=diagnostic_id,configurations=[_config_identity(c) for c in configs])
+        if b_receive_boundary:
+            from secure_control.experiments.native_tail_capture import authorize_receive
+            authorize_receive(authorization,native_plan,side=side,output=output,head=head,
+                diagnostic_id=diagnostic_id,configurations=[_config_identity(c) for c in configs])
+        else:
+            authorize_control(authorization,native_plan,side=side,output=output,head=head,
+                diagnostic_id=diagnostic_id,configurations=[_config_identity(c) for c in configs])
     native = None
     native_preflight = None
     exceptions = {}
@@ -420,11 +429,13 @@ def run_host(side, output, *, diagnostic_id, expected_head, software_review, con
         )
         if control_file:
             from secure_control.experiments.native_tail_capture import _exceptions_for
-            exceptions = _exceptions_for(native_plan)
+            exceptions = _exceptions_for(native_plan['hosts'][side] if b_receive_boundary else native_plan)
         else:exceptions = resource_exceptions()
-        if side=='client':
-            native = NativeCapture(native_plan,output/'native-a.etl',
-                **({'authorization':authorization} if control_file else {}))
+        if side=='client' or b_receive_boundary:
+            node=native_plan['hosts'][side] if b_receive_boundary else native_plan
+            native = NativeCapture(node,output/('native-a.etl' if side=='client' else 'native-b.etl'),
+                **({'authorization':authorization} if control_file else {}),
+                **({'authorization_plan':native_plan,'side':side} if b_receive_boundary else {}))
             native_preflight = native.preflight()  # 只读；管理员/profile/source/空间/冲突均在账本与子进程前拒绝。
     paths = subprocess.check_output(['git','ls-files','--cached','--others','--exclude-standard',
         'src','scripts','configs','pyproject.toml','uv.lock'],cwd=ROOT,text=True).splitlines()
@@ -447,14 +458,14 @@ def run_host(side, output, *, diagnostic_id, expected_head, software_review, con
         'source_sha256':frozen,'common_source_sha256':common,'software_review':software_review,
         'common_source_hash_mode':'sha256: CRLF to LF for .py/.toml/.lock; raw bytes otherwise',
         'source_dirty':dirty,'configurations':identities,'maximum_steps':steps,
-        'group_wall_limit_s':100 if control_file else limits.wall_s,'activity_limit_s':55 if control_file else limits.activity_s,'segment_steps':limits.segment_steps,'material_slots':16,
+        'group_wall_limit_s':120 if b_receive_boundary and side=='pair' else 100 if control_file else limits.wall_s,'activity_limit_s':55 if control_file else limits.activity_s,'segment_steps':limits.segment_steps,'material_slots':16,
         'mode':'non_realtime_diagnostic','profile':PROFILE,'client_io':'ready-v1',
         'topology_digest':configs[0].topology.digest,'python':platform.python_version(),
         'platform':platform.platform(),'launcher_pid':os.getpid(),'clock_domain_id':context.clock_domain_id,
         'scope':'one user-started two-host group; no retry; no realtime qualification'}
     ledger = {**version,'diagnostic_id':diagnostic_id,'side':side,
         'two_host_2000' if window!=400 else 'one_two_host':0,
-        'status':'reserved','output':str(output),'maximum_steps':steps,'maximum_wall_s':100 if control_file else limits.wall_s}
+        'status':'reserved','output':str(output),'maximum_steps':steps,'maximum_wall_s':120 if b_receive_boundary and side=='pair' else 100 if control_file else limits.wall_s}
     ledger_root = ROOT/'results'/'tail_diagnostics'
     ledger_root.mkdir(parents=True,exist_ok=True)
     ledger_path = ledger_root/f'session-{diagnostic_id}-{side}.ledger.json'
@@ -464,6 +475,7 @@ def run_host(side, output, *, diagnostic_id, expected_head, software_review, con
     _write_new(output/'ledger.json',ledger)
     extra = {'stream_map':True} if stream_map else {}
     if control_file:extra['control_file']=True
+    if b_receive_boundary:extra['b_receive_boundary']=True
     if native is not None:
         # 首个provider之前留下唯一instance与精确恢复命令，父进程异常时仍可找到。
         _write_new(output/'native-owner.json',native.report)
@@ -499,6 +511,7 @@ def run_host(side, output, *, diagnostic_id, expected_head, software_review, con
     functional = (not group['forced_cleanup'] and group['stop_reason'] is None and group['wall_s'] <= limits.wall_s
         and len(group['roles']) == len(roles) and all(code == 0 for code in group['exitcodes'])
         and all(r['status'] in ('stopped','closed') for r in group['roles']))
+    if b_receive_boundary:functional=functional and group['wall_s']<=(120 if side=='pair' else 100)
     samples = client.get('timing',{}).get('raw',{}).get('samples',[])
     if side == 'client':
         functional = (functional and client.get('outcome',{}).get('confirmed_step_count') == steps
@@ -540,6 +553,28 @@ def run_host(side, output, *, diagnostic_id, expected_head, software_review, con
                 ('native-a.etl','control-native-events.json','control-native-view.json','Client.stream.json')}}
         except Exception as error:  # noqa: BLE001 - 只读失败不篡改已完成控制结果。
             manifest['native_evidence']={'status':'partial','error_type':type(error).__name__}
+            manifest['diagnostic_complete']=False
+    if b_receive_boundary and side=='pair':
+        try:
+            from secure_control.experiments.tail_calibration import _peak_memory, _save
+            from secure_control.experiments.windows_tail_analysis import read_party_requests_etl
+            receive_maps={r:json.loads((output/(r+'.receive.json')).read_text(encoding='utf8')) for r in roles}
+            if any(not s.get('complete') or s['role_file_sha256']!=_sha(output/(r+'.json')) for r,s in receive_maps.items()):
+                raise ValueError('Party receive map incomplete')
+            if any(sorted(row[7] for row in s['rows'] if row[9]==2)!=list(range(steps)) for s in receive_maps.values()):
+                raise ValueError('Party validated request coverage incomplete')
+            trace=read_party_requests_etl(output/'native-b.etl',targets=[(records[r]['pid'],records[r]['main_thread_id']) for r in roles])
+            _save(output/'request-native-events.json',trace['events'])
+            view={k:v for k,v in trace.items() if k!='events'}
+            view.update(purpose='control-b-receive-boundary-v1',source_head=head,diagnostic_id=diagnostic_id,
+                etl_sha256=_sha(output/'native-b.etl'),process_peak_working_set_bytes=_peak_memory())
+            view['memory_target_met']=view['process_peak_working_set_bytes']<=512*1024*1024
+            _save(output/'request-native-view.json',view)
+            if not view['memory_target_met'] or not trace.get('complete'):manifest['diagnostic_complete']=False
+            manifest['b_request_evidence']={'status':'read','files':{n:_sha(output/n) for n in
+                ('native-b.etl','request-native-events.json','request-native-view.json','P1.receive.json','P2.receive.json')}}
+        except Exception as error:  # noqa: BLE001 - 新观测失败保留功能结果、原件与单次扣额。
+            manifest['b_request_evidence']={'status':'partial','error_type':type(error).__name__}
             manifest['diagnostic_complete']=False
     _write_new(output/'manifest.json',manifest)
     if stream_map:
