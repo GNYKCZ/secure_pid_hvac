@@ -222,16 +222,60 @@ def _sessions():
             end += 2
         if end+2>len(raw):
             raise ValueError('session name terminator')
+        file_offset=struct.unpack_from('<I',raw,112)[0]
+        file_name=''
+        if file_offset:
+            if file_offset%2 or not 120<=file_offset<len(raw):
+                raise ValueError('session file boundary')
+            file_end=file_offset
+            while file_end+2<=len(raw) and raw[file_end:file_end+2]!=b'\0\0':
+                file_end+=2
+            if file_end+2>len(raw):raise ValueError('session file terminator')
+            file_name=raw[file_offset:file_end].decode('utf-16le')
         rows.append({'name':raw[offset:end].decode('utf-16le'),'guid':raw[24:40].hex(),
             # Microsoft TraceEventSession 3.1.21读取同一HistoricalContext作为session ID。
             'logger_id':struct.unpack_from('<Q',raw,8)[0],
             'log_file_mode':struct.unpack_from('<I',raw,64)[0],
             'buffer_kb':struct.unpack_from('<I',raw,48)[0],
+            'minimum_buffers':struct.unpack_from('<I',raw,52)[0],
+            'maximum_buffers':struct.unpack_from('<I',raw,56)[0],
+            'maximum_file_mb':struct.unpack_from('<I',raw,60)[0],
+            'flush_timer_s':struct.unpack_from('<I',raw,68)[0],
+            'enable_flags':struct.unpack_from('<I',raw,72)[0],
+            'log_file':file_name,
             'buffers':struct.unpack_from('<I',raw,80)[0],
             'events_lost':struct.unpack_from('<I',raw,88)[0],
+            'buffers_written':struct.unpack_from('<I',raw,92)[0],
             'buffers_lost':struct.unpack_from('<I',raw,96)[0],
             'clock':struct.unpack_from('<I',raw,40)[0]})
     return rows
+
+
+_SESSION_DYNAMIC={'buffers','events_lost','buffers_lost','buffers_written'}
+
+
+def _session_snapshot(rows):
+    """保留原始查询；仅完全相同重复行可合并，身份歧义不猜测。"""
+    unique=[]
+    for row in rows:
+        if (not isinstance(row.get('name'),str) or not row['name']
+                or not isinstance(row.get('guid'),str) or not row['guid']
+                or type(row.get('logger_id')) is not int or not 0<=row['logger_id']<65536):
+            raise ValueError('session snapshot identity unavailable')
+        if row in unique:continue
+        if any(r['name']==row['name'] or r['logger_id']==row['logger_id'] for r in unique):
+            raise ValueError('session snapshot ambiguous name/logger ID')
+        unique.append(dict(row))
+    stable=[{k:v for k,v in r.items() if k not in _SESSION_DYNAMIC} for r in unique]
+    return {'raw':rows,'sessions':unique,'duplicate_rows':len(rows)-len(unique),
+            'stable':sorted(stable,key=lambda r:(r['name'],r['guid'],r['logger_id']))}
+
+
+def _own_names(profile,instance):
+    """WPR的system名称固定；不以instance子串或XML SystemCollector名称认领。"""
+    root=ET.fromstring(Path(profile).read_bytes())
+    event=root.find('./Profiles/EventCollector').attrib['Name']
+    return {f'WPR_initiated_{instance}_WPR System Collector',f'WPR_initiated_{instance}_{event}'}
 
 
 def _provider_enables():
@@ -316,8 +360,7 @@ def prepare_native(profile, *, _schemas=None, _backend=None, _file_candidate=Fal
     schemas = tcp_source_schemas(accept=_b_receive) if _schemas is None else _schemas
     plan = profile_contract(profile,schemas,file_candidate=_file_candidate,b_receive=_b_receive)
     backend = WprBackend() if _backend is None else _backend
-    if any(r['name'].startswith('WPR_') or r['name']=='NT Kernel Logger' for r in backend.sessions()):
-        raise ValueError('existing recording conflict; do not cancel it')
+    background=_session_snapshot(backend.sessions())
     name = 'D21' if _b_receive else 'D20' if _file_candidate else 'D17'
     result = backend.run(['-profiledetails',plan['profile']+'!'+name],10)
     if result.returncode:
@@ -326,6 +369,7 @@ def prepare_native(profile, *, _schemas=None, _backend=None, _file_candidate=Fal
         'prepared_host':socket.gethostname(),'capture_role':'pair' if _b_receive else 'client',
         'profiledetails_sha256':hashlib.sha256(result.stdout).hexdigest(),
         'prepared_not_captured':True,'real_capture_verified':False,
+        'session_coexistence':{'version':1,'prepared':background},
         'resource_exceptions':resource_exceptions(),
         'minimum_free_bytes':1024**3,'etl_limit_bytes':64*1024*1024,
         'disk_budget_bytes':256*1024*1024,'native_window_s':limits_for(2000).native_s}
@@ -371,6 +415,8 @@ class NativeCapture:
         self.instance = ('D20_' if self.file_candidate else 'D17_')+uuid4().hex
         self.owned = None
         self.started = None
+        self.before = None
+        self.names = _own_names(plan['profile'],self.instance)
         self.report = {'status':'not_started','instance':self.instance,
             'resource_exceptions':_exceptions_for(plan),
             'manual_recovery':{'status':['wpr','-status','-instancename',self.instance],
@@ -414,11 +460,16 @@ class NativeCapture:
             parent = parent.parent
         if shutil.disk_usage(parent).free < self.plan['minimum_free_bytes']:
             raise ValueError('native disk reserve')
-        before = self.backend.sessions()
-        if any(r['name'].startswith('WPR_') or r['name']=='NT Kernel Logger' for r in before):
-            raise ValueError('native session conflict')
+        before = _session_snapshot(self.backend.sessions())
+        policy=self.plan.get('session_coexistence',{})
+        if policy.get('version')!=1 or before['stable']!=policy.get('prepared',{}).get('stable'):
+            raise ValueError('background session configuration changed; prepare a new plan')
+        if any(r['name'] in self.names for r in before['sessions']):
+            raise ValueError('native instance name already exists')
+        self.before=before
         proof = {'administrator':True,'profile_sha256':self.plan['profile_sha256'],
-                'resource_exceptions':_exceptions_for(self.plan),'source_schemas_rechecked':True}
+                'resource_exceptions':_exceptions_for(self.plan),'source_schemas_rechecked':True,
+                'background_before_start':before}
         if self.file_candidate:proof['provider_snapshot_before_start']=_provider_snapshot(self.backend)
         return proof
 
@@ -447,18 +498,24 @@ class NativeCapture:
         try:
             result = self.backend.run(['-start',self.plan['profile']+('!D21' if self.b_receive else '!D20' if self.file_candidate else '!D17'),
                 *(['-filemode'] if self.file_candidate else []),'-instancename',self.instance],10)
-        except Exception:
+        except Exception as error:
+            self.report['start_error_type']=type(error).__name__
             self.finish(cancel=True)
             raise
         if result.returncode:
+            self.report['start_returncode']=result.returncode
             self.report['status'] = 'start_failed'
             self.finish(cancel=True)
             raise ValueError('native start failed; no retry')
         # 自己成功创建的唯一instance才允许finally关闭，绝不全局stop/cancel。
         self.owned = []
         try:
-            rows = self.backend.sessions()
-            own = [r for r in rows if self.instance in r['name']]
+            snapshot = _session_snapshot(self.backend.sessions())
+            self.report['snapshot_after_start']=snapshot
+            own = self._proven_own(snapshot)
+            self.owned=own
+            if not self._background_unchanged(snapshot):
+                raise ValueError('background sessions changed during start; no traffic launched')
             if (len(own)!=2 or any(r['clock']!=1 for r in own)
                     or sum(r['buffer_kb']*r['buffers']*1024 for r in own)>self.plan['native_buffer_bytes']):
                 raise ValueError('native ownership/clock/buffer proof unavailable')
@@ -486,25 +543,39 @@ class NativeCapture:
             self.finish(cancel=True)
             raise
 
+    def _proven_own(self,snapshot):
+        own=[r for r in snapshot['sessions'] if r['name'] in self.names]
+        baseline=self.before['sessions']
+        if any(r['name'] in self.names for r in baseline) or any(
+                r['logger_id']==b['logger_id'] for r in own for b in baseline):
+            raise ValueError('new session reuses background identity')
+        return own
+
+    def _background_unchanged(self,snapshot):
+        stable=[r for r in snapshot['stable'] if r['name'] not in self.names]
+        return stable==self.before['stable']
+
     def finish(self,*,cancel=False):
         """只停止自己成功创建且GUID仍吻合的会话；冲突时不关闭他人会话。"""
         if self.owned is None:
             return self.report
         try:
-            rows = self.backend.sessions()
+            snapshot = _session_snapshot(self.backend.sessions())
+            current=self._proven_own(snapshot)
         except Exception as error:  # noqa: BLE001 - 无法证明GUID时不停止可能变更归属的会话。
             self.report.update(status='ownership_unavailable_manual_attention',error_type=type(error).__name__)
-            if self.owned:
-                self.owned = None
-                return self.report
-            # start返回前未知GUID，仅允许撤销本次随机instance的部分启动。
-            rows = []
-            cancel = True
-        current = [r for r in rows if self.instance in r['name']]
-        expected = {(r['name'],r['guid']) for r in self.owned}
-        if self.owned and {(r['name'],r['guid']) for r in current}!=expected:
+            self.owned = None
+            return self.report
+        self.report['snapshot_before_stop']=snapshot
+        background_ok=self._background_unchanged(snapshot)
+        expected = {(r['name'],r['guid'],r['logger_id']) for r in self.owned}
+        if self.owned and {(r['name'],r['guid'],r['logger_id']) for r in current}!=expected:
             self.report['status'] = 'ownership_changed_manual_attention'
             self.owned = None
+            return self.report
+        if not current:
+            self.report.update(status='no_owned_sessions',background_unchanged=background_ok)
+            self.owned=None
             return self.report
         args = ['-cancel'] if cancel else ['-stop',str(self.output),'-skipPdbGen']
         remaining = self.plan['native_window_s']-(self.now()-self.started)
@@ -529,7 +600,12 @@ class NativeCapture:
                  and not any(r['events_lost'] or r['buffers_lost'] or r['clock']!=1 for r in current)
                  and native_bytes<=self.plan['native_buffer_bytes'])
         try:
-            remaining_sessions = [r for r in self.backend.sessions() if self.instance in r['name']]
+            after=_session_snapshot(self.backend.sessions())
+            self.report['snapshot_after_stop']=after
+            remaining_sessions = [r for r in after['sessions'] if r['name'] in self.names]
+            background_ok=background_ok and self._background_unchanged(after)
+            self.report['background_unchanged']=background_ok
+            valid=valid and background_ok
         except Exception as error:  # noqa: BLE001 - 命令退出不等于ETW已停。
             self.report.update(status='stop_unverified_manual_attention',error_type=type(error).__name__)
             return self.report
