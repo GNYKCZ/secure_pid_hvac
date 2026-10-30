@@ -229,6 +229,27 @@ def test_preparation_never_issues_start_stop_or_cancel():
     assert 'Memory is circular: lost=0' in plan['runtime_semantics']
 
 
+@pytest.mark.parametrize('mode',['memory','file','b_receive'])
+def test_profiledetails_explicitly_selects_the_profile_logging_mode(mode):
+    class ModeBackend(Backend):
+        def run(self,args,timeout):
+            result=super().run(args,timeout)
+            if args[0]=='-profiledetails':
+                # WPR defaults to Memory; a File-only profile rejects a missing switch.
+                result.returncode=0 if ('-filemode' in args)==(mode!='memory') else 1
+            return result
+    backend=ModeBackend()
+    rows=schemas()
+    if mode=='b_receive':
+        rows.append({**rows[0],'id':1017,'fields':[
+            *rows[0]['fields'],{'name':'Status','type':8,'flags':0}]})
+    profile=PROFILE if mode=='memory' else PROFILE.with_name(
+        'control-tail-b-receive.wprp' if mode=='b_receive' else 'control-tail-calibration.wprp')
+    prepare_native(profile,_schemas=rows,_backend=backend,
+                   _file_candidate=mode!='memory',_b_receive=mode=='b_receive')
+    assert len(backend.commands)==1 and backend.commands[0][0]=='-profiledetails'
+
+
 @pytest.mark.parametrize('field,value', [('provider','wrong'),('level',6),('level',True),
     ('keyword',1<<40),('keyword',False),('keyword',-1),('keyword',1<<64),
     ('version',False),('version',256),('id',1033.0)])
