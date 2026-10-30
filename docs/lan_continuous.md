@@ -200,6 +200,8 @@ TCP元数据再关联，避免回调绑定晚于数据而丢失前缀。锚点�
 窗口必须由实际切换边界夹住，不用线程结束或窗口长度补齐缺边界。Ready事件与切出状态
 2/3/7不会改变这一驻留结果；原严格Ready重放及失败状态保持。状态名见
 [Microsoft CSwitch定义](https://learn.microsoft.com/en-us/windows/win32/etw/cswitch)。
+同一原始事件的旧/新TID相同时，仅在当前已驻留同CPU、out/in同刻配对时作为连续驻留，
+保留事件索引，不生成离CPU间隙；错CPU或无匹配驻留仍拒绝。
 Not-running不等于Ready或网络等待，Running也不证明Python/GIL可用或有效计算时间。
 
 每方`A_wait_analysis`新增`residency_verified`、`running_residency_ns`、`not_running_ns`、

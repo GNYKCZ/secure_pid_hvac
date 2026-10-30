@@ -62,7 +62,7 @@ def test_thread_already_running_does_not_invent_ready_delay():
 @pytest.mark.parametrize('fault',[None,'lost','chain','gap','missing_end','reuse','cpu',
     'duplicate_in','missing_out','time','window','identity','missing_anchor','missing_right_boundary',
     'self_switch','cross_cpu_overlap','backward_migration','unknown_descriptor','event_order',
-    'migration','zero_migration'])
+    'migration','zero_migration','self_continuous','self_wrong_cpu'])
 def test_cpu_residence_uses_switch_pairs_without_inventing_ready(fault):
     """显式时间线oracle：窗口[10,50)，CPU驻留10..20和40..50共20，未驻留20。"""
     from secure_control.experiments.windows_tail_analysis import cpu_residence
@@ -101,10 +101,19 @@ def test_cpu_residence_uses_switch_pairs_without_inventing_ready(fault):
     if fault in ('migration','zero_migration'):
         rows[5]['cpu']=rows[6]['cpu']=1
     if fault=='zero_migration':rows[5]['time_ns']=20
+    if fault in ('self_continuous','self_wrong_cpu'):
+        for row in rows[3:]:row['event_index']+=1
+        self_row=raw(THREAD,36,15,4,NewThreadId=2,OldThreadId=2,OldThreadState=2)
+        if fault=='self_wrong_cpu':self_row['cpu']=1
+        rows.insert(3,self_row)
     result=cpu_residence(trace)
-    if fault not in (None,'migration','zero_migration'):
+    if fault not in (None,'migration','zero_migration','self_continuous'):
         assert result['verified'] is False and not result['intervals'];return
     assert result['verified'] is True
+    if fault=='self_continuous':
+        assert result['continuous_self_switches']==[{'event_index':4,'time_ns':15,'cpu':0}]
+        assert sum(r['end_ns']-r['start_ns'] for r in result['intervals'] if r['state']=='not_running')==20
+        return
     assert [(r['state'],r['start_ns'],r['end_ns']) for r in result['intervals']]==(
         [('running',10,20),('running',20,50)] if fault=='zero_migration' else
         [('running',10,20),('not_running',20,40),('running',40,50)])

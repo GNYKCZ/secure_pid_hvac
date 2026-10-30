@@ -177,9 +177,13 @@ def cpu_residence(trace):
                 <window[1]<=ends[0]['time']<=process_ends[0]['time_ns']):
         return {**unknown,'reason':'unique enclosing lifetime unavailable'}
     life=starts[0]['life'];on=None;previous=-1;previous_index=-1;switches=[]
-    if any(r['provider']==THREAD and r['opcode']==36
-           and r['values']['NewThreadId']==r['values']['OldThreadId']==tid for r in trace['events']):
-        return {**unknown,'reason':'self-switch CPU semantics unavailable'}
+    raw_switches=[r for r in trace['events'] if r['provider']==THREAD and r['opcode']==36
+        and tid in (r['values']['NewThreadId'],r['values']['OldThreadId'])]
+    indices=[r.get('event_index') for r in raw_switches]
+    if any(type(i) is not int or i<0 for i in indices) or len(set(indices))!=len(indices):
+        return {**unknown,'reason':'switch event identity unavailable'}
+    self_switches=[r for r in raw_switches if r['values']['NewThreadId']==r['values']['OldThreadId']]
+    self_indices={r['event_index'] for r in self_switches}
     for e in events:
         if e['pid']!=pid or e['tid']!=tid or e['life']!=life or e['time']<previous:
             return {**unknown,'reason':'lifetime identity/order conflict'}
@@ -189,7 +193,11 @@ def cpu_residence(trace):
         if type(cpu) is not int or not 0<=cpu<4096:
             return {**unknown,'reason':'CPU unavailable'}
         index=e.get('event_index')
-        if type(index) is not int or index<=previous_index:
+        # 同一原始自切换的out/in必须同CPU同刻且先匹配当前驻留；零时区间不计离CPU。
+        self_in=(index in self_indices and e['kind']=='in' and switches
+            and switches[-1]['kind']=='out' and switches[-1]['event_index']==index
+            and switches[-1]['time']==e['time'] and switches[-1]['cpu']==cpu)
+        if type(index) is not int or index<previous_index or index==previous_index and not self_in:
             return {**unknown,'reason':'switch event order unavailable'}
         previous_index=index
         if e['kind']=='in':
@@ -217,6 +225,8 @@ def cpu_residence(trace):
     return {'verified':True,'intervals':intervals,'ready_state':'unknown',
         'reason':'paired CPU switch boundaries; Ready/GIL/socket state not inferred',
         'range_ns':list(window),'anchor_event_index':anchor.get('event_index'),
+        'continuous_self_switches':[{'event_index':r['event_index'],'time_ns':r['time_ns'],
+            'cpu':r['cpu']} for r in self_switches],
         'terminal_boundary_events':normalized['terminal_boundary_events']}
 
 
