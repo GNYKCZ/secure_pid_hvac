@@ -67,8 +67,14 @@ def _decode(record):
     for field,capacity in (('event_count',record['event_capacity']),('gc_count',record['gc_capacity'])):
         if type(record.get(field)) is not int or not 0 <= record[field] <= capacity:
             raise ValueError('记录数量字段错误')
+    expected_buffer=(record['event_capacity']+record['gc_capacity'])*64+limits.identity_bytes
+    allowed_buffers={expected_buffer}
+    if (record['role'] in ('P1','P2') and limits.window==2000
+            and record.get('context',{}).get('transport')=='insecure_tcp'):
+        # Opt-in PartyReceiveMap has exactly 8192 fixed 10-int64 rows.
+        allowed_buffers.add(expected_buffer+8192*10*8)
     if (record['event_count']+record['gc_count'] != len(events)
-            or record['buffer_bytes'] != (record['event_capacity']+record['gc_capacity'])*64+limits.identity_bytes
+            or record['buffer_bytes'] not in allowed_buffers
             or type(record.get('lost_events')) is not int or record['lost_events'] < 0):
         raise ValueError('缓冲长度/数量/丢失不一致')
     spans, points, gcs, open_spans, open_gc = [], [], [], {}, {}

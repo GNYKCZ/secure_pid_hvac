@@ -26,6 +26,21 @@ def context(tmp_path):
     return DiagnosticContext('diagnostic-test', 'domain-A', str(tmp_path), 'a'*40, 10)
 
 
+def test_party_receive_record_buffer_is_decodable_and_strictly_bounded(tmp_path):
+    from secure_control.experiments.tail_diagnostic_analysis import _decode
+    ctx=replace(context(tmp_path),window=2000,transport='insecure_tcp')
+    recorder=TailRecorder(ctx,'P1',party_receive_map=True)
+    record=recorder.finish('stopped')
+    assert record['buffer_bytes']==5_504_960
+    _decode(record)
+    for delta in (-1,1,655360):
+        bad=copy.deepcopy(record);bad['buffer_bytes']+=delta
+        with pytest.raises(ValueError):_decode(bad)
+    for role in ('Client','worker'):
+        bad=copy.deepcopy(record);bad['role']=role
+        with pytest.raises(ValueError):_decode(bad)
+
+
 def test_recorder_default_off_bounded_overflow_and_no_secret_payload(tmp_path):
     assert current() is None
     original = list(gc.callbacks)
