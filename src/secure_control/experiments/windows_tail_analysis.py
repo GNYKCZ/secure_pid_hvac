@@ -146,6 +146,80 @@ def _window_schedule(evidence,pid,tid,window):
     return lifetime,result
 
 
+def cpu_residence(trace):
+    """只证明目标线程的CPU驻留，不把Ready顺序或切出状态解释成网络/GIL等待。"""
+    unknown={'verified':False,'intervals':[],'ready_state':'unknown'}
+    header=trace.get('header',{})
+    if (trace.get('complete') is not True or trace.get('errors')
+            or header.get('events_lost')!=0 or header.get('buffers_lost')!=0
+            or trace.get('target_critical_gaps')!=0 or trace.get('cpu_chain_mismatches')!=0):
+        return {**unknown,'reason':'trace quality unavailable'}
+    pid,tid,window=(trace.get(k) for k in ('target_pid','target_tid','target_window_ns'))
+    if (type(pid) is not int or type(tid) is not int or not isinstance(window,(list,tuple))
+            or len(window)!=2 or any(type(t) is not int for t in window) or not window[0]<window[1]):
+        return {**unknown,'reason':'target identity/window unavailable'}
+    normalized=normalize_schedule(trace)
+    events=normalized['events']
+    starts=[e for e in events if e['kind']=='start']
+    ends=[e for e in events if e['kind']=='end']
+    process_starts=[r for r in trace['events'] if r['provider']==PROCESS
+        and r['opcode']==1 and r['values'].get('ProcessId')==pid]
+    process_ends=[r for r in trace['events'] if r['provider']==PROCESS
+        and r['opcode']==2 and r['values'].get('ProcessId')==pid]
+    thread_starts=[r for r in trace['events'] if r['provider']==THREAD
+        and r['opcode']==1 and r['values'].get('TThreadId')==tid]
+    thread_ends=[r for r in trace['events'] if r['provider']==THREAD
+        and r['opcode']==2 and r['values'].get('TThreadId')==tid]
+    if (not normalized['complete'] or len(starts)!=1 or len(ends)!=1
+            or len(thread_starts)!=1 or len(thread_ends)!=1
+            or len(process_starts)!=1 or len(process_ends)!=1
+            or not process_starts[0]['time_ns']<=starts[0]['time']<=window[0]
+                <window[1]<=ends[0]['time']<=process_ends[0]['time_ns']):
+        return {**unknown,'reason':'unique enclosing lifetime unavailable'}
+    life=starts[0]['life'];on=None;previous=-1;previous_index=-1;switches=[]
+    if any(r['provider']==THREAD and r['opcode']==36
+           and r['values']['NewThreadId']==r['values']['OldThreadId']==tid for r in trace['events']):
+        return {**unknown,'reason':'self-switch CPU semantics unavailable'}
+    for e in events:
+        if e['pid']!=pid or e['tid']!=tid or e['life']!=life or e['time']<previous:
+            return {**unknown,'reason':'lifetime identity/order conflict'}
+        previous=e['time']
+        if e['kind'] not in ('in','out'):continue
+        cpu=e.get('cpu')
+        if type(cpu) is not int or not 0<=cpu<4096:
+            return {**unknown,'reason':'CPU unavailable'}
+        index=e.get('event_index')
+        if type(index) is not int or index<=previous_index:
+            return {**unknown,'reason':'switch event order unavailable'}
+        previous_index=index
+        if e['kind']=='in':
+            if on is not None:return {**unknown,'reason':'overlapping CPU residence'}
+            on=cpu
+        else:
+            if on!=cpu:return {**unknown,'reason':'unmatched CPU switch-out'}
+            on=None
+        switches.append(e)
+    anchors=[i for i,e in enumerate(switches) if e['time']<=window[0]]
+    if not anchors:return {**unknown,'reason':'no pre-window CPU boundary'}
+    index=anchors[-1];anchor=switches[index];intervals=[]
+    # 只依据实际in/out边界，Ready和OldThreadState原始值保留在严格重放中。
+    for i in range(index,len(switches)-1):
+        event=switches[i];following=switches[i+1]
+        left,right=max(window[0],event['time']),min(window[1],following['time'])
+        if left<right:
+            intervals.append({'state':'running' if event['kind']=='in' else 'not_running',
+                'start_ns':left,'end_ns':right,'cpu':event['cpu'] if event['kind']=='in' else None,
+                'life':life,
+                'start_event_index':event.get('event_index'),'end_event_index':following.get('event_index')})
+        if following['time']>=window[1]:break
+    if sum(r['end_ns']-r['start_ns'] for r in intervals)!=window[1]-window[0]:
+        return {**unknown,'reason':'CPU residence does not cover window'}
+    return {'verified':True,'intervals':intervals,'ready_state':'unknown',
+        'reason':'paired CPU switch boundaries; Ready/GIL/socket state not inferred',
+        'range_ns':list(window),'anchor_event_index':anchor.get('event_index'),
+        'terminal_boundary_events':normalized['terminal_boundary_events']}
+
+
 def byte_coverage(events, flow, anchor, length, *, trusted=False, lost=0):
     """指定系统事件边界的连续TCP数据区间；seq/长度均须外部可信锚点。"""
     unknown = {'boundary':'unknown','complete_at':None,'socket_readable':'unknown'}
@@ -797,8 +871,13 @@ def control_tcp_anchor(trace, sidecar, connection):
            or _sockaddr(r['values'].get('RemoteAddress'))!=tuple(conn['remote'])
            or r['values'].get('ProcessId',r['values'].get('Pid')) not in (0,conn['pid']) for r in metadata):
         return unknown('connection lifecycle identity conflict')
-    data=[r for r in rows if r['id']==1074 and r['values']['Tcb']==tcb and r['values']['NumBytes']>0]
-    if any(r['time_ns']<birth['time_ns'] for r in data):return unknown('data precedes connection birth')
+    observed=[r for r in rows if r['id']==1074 and r['values']['Tcb']==tcb and r['values']['NumBytes']>0]
+    if any(r['time_ns']==birth['time_ns'] for r in observed):return unknown('connect timestamp tie')
+    early=[r for r in observed if r['time_ns']<birth['time_ns']]
+    if any(r['time_ns']<starts[0] for r in early):return unknown('pre-connect event outside process lifetime')
+    # 1033是连接完成，并非TCB创建；早到事件不能用于证明应用字节或提前覆盖。
+    # 仅用完成后的独立完整setup前缀锚定，再验证早到区间全部被该前缀包容。
+    data=[r for r in observed if r['time_ns']>birth['time_ns']]
     if any(r['time_ns'] in (stamp,next_send) for r in data):return unknown('checkpoint timestamp tie')
     prefix=[r for r in data if r['time_ns']<stamp]
     if not prefix:return unknown('setup prefix absent')
@@ -814,6 +893,17 @@ def control_tcp_anchor(trace, sidecar, connection):
             if end==n:candidates.append(start)
     if len(candidates)!=1:return unknown('prefix union is not uniquely exactly N bytes')
     start=candidates[0]
+    if any((r['values']['SeqNo']-start)%2**32+r['values']['NumBytes']>n for r in early):
+        return unknown('pre-connect range not contained in independent prefix')
+    redundant=[]
+    for r in early:
+        left=(r['values']['SeqNo']-start)%2**32;right=left+r['values']['NumBytes']
+        redundant.append({'classification':'pre_connect_observation_redundant',
+            'event_index':r['event_index'],'time_ns':r['time_ns'],
+            'seq':r['values']['SeqNo'],'length':r['values']['NumBytes'],
+            'post_prefix_witness_indices':[p['event_index'] for p in prefix
+                if max(left,(p['values']['SeqNo']-start)%2**32)
+                    <min(right,(p['values']['SeqNo']-start)%2**32+p['values']['NumBytes'])]})
     if any((r['values']['SeqNo']-start)%2**32+r['values']['NumBytes']>n
            for r in data if stamp<r['time_ns']<next_send):
         return unknown('unsolicited prefix growth before next request')
@@ -825,7 +915,9 @@ def control_tcp_anchor(trace, sidecar, connection):
         'diagnostic_id':sidecar['context']['diagnostic_id'],'source_head':sidecar['context']['source_head'],
         'protocol':sidecar['protocol'],'connection':conn,'semantic_boundary':'TCPIP1074 verified data sequence',
         'evidence':{'checkpoint':cp,'birth_event_index':birth['event_index'],
-            'prefix_event_indices':[r['event_index'] for r in prefix],'prefix_union_bytes':n,'connection_end_ns':end_ns},
+            'prefix_event_indices':[r['event_index'] for r in prefix],'prefix_union_bytes':n,'connection_end_ns':end_ns,
+            'pre_connect_events_unknown':[r['event_index'] for r in early],
+            'pre_connect_observations':redundant,'prefix_policy':'post-connect-independent-v1'},
         'packets':[{'seq':r['values']['SeqNo'],'length':r['values']['NumBytes'],'time':r['time_ns'],
                     'packet':r['event_index'],'flow':flow} for r in data]}
 

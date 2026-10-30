@@ -59,6 +59,59 @@ def test_thread_already_running_does_not_invent_ready_delay():
     assert scheduling({'events':[e('start',0),e('in',5)],'complete':True},1,2,'born-1')=={'state':'running','ready_waits':[]}
 
 
+@pytest.mark.parametrize('fault',[None,'lost','chain','gap','missing_end','reuse','cpu',
+    'duplicate_in','missing_out','time','window','identity','missing_anchor','missing_right_boundary',
+    'self_switch','cross_cpu_overlap','backward_migration','unknown_descriptor','event_order',
+    'migration','zero_migration'])
+def test_cpu_residence_uses_switch_pairs_without_inventing_ready(fault):
+    """显式时间线oracle：窗口[10,50)，CPU驻留10..20和40..50共20，未驻留20。"""
+    from secure_control.experiments.windows_tail_analysis import cpu_residence
+    def raw(provider,opcode,time,index,**values):
+        return {'provider':provider,'opcode':opcode,'time_ns':time,'event_index':index,
+            'cpu':0,'values':values}
+    rows=[raw(PROCESS,1,0,1,ProcessId=1,UniqueProcessKey=7),
+        raw(THREAD,1,1,2,ProcessId=1,TThreadId=2),
+        raw(THREAD,36,5,3,NewThreadId=2,OldThreadId=0,OldThreadState=1),
+        raw(THREAD,50,19,4,TThreadId=2),  # 跨CPU Ready先于切出，不能污染CPU驻留。
+        raw(THREAD,36,20,5,NewThreadId=0,OldThreadId=2,OldThreadState=3),
+        raw(THREAD,36,40,6,NewThreadId=2,OldThreadId=0,OldThreadState=7),
+        raw(THREAD,36,55,7,NewThreadId=0,OldThreadId=2,OldThreadState=2),
+        raw(THREAD,2,60,8,TThreadId=2,ProcessId=1),raw(PROCESS,2,65,9,ProcessId=1)]
+    trace={'complete':True,'header':{'events_lost':0,'buffers_lost':0},'errors':[],
+        'cpu_chain_mismatches':0,'target_critical_gaps':0,'target_pid':1,'target_tid':2,
+        'target_window_ns':[10,50],'events':rows}
+    if fault=='lost':trace['header']['events_lost']=1
+    if fault=='chain':trace['cpu_chain_mismatches']=1
+    if fault=='gap':trace['target_critical_gaps']=1
+    if fault=='missing_end':rows.pop(-2)
+    if fault=='reuse':rows.insert(-1,raw(THREAD,1,62,10,ProcessId=1,TThreadId=2))
+    if fault=='cpu':rows[4]['cpu']=1
+    if fault=='duplicate_in':rows[4]['values'].update(NewThreadId=2,OldThreadId=0)
+    if fault=='missing_out':rows.pop(4)
+    if fault=='time':rows[4]['time_ns']=4
+    if fault=='window':trace['target_window_ns']=[0,50]
+    if fault=='identity':trace['target_pid']=3
+    if fault=='missing_anchor':rows.pop(2)
+    if fault=='missing_right_boundary':rows.pop(6)
+    if fault=='self_switch':rows[4]['values']['NewThreadId']=2
+    if fault=='cross_cpu_overlap':rows.insert(4,{**rows[2],'cpu':1,'time_ns':19})
+    if fault=='backward_migration':rows[5]['time_ns']=20;rows[4],rows[5]=rows[5],rows[4]
+    if fault=='unknown_descriptor':trace['complete']=False
+    if fault=='event_order':rows[4]['event_index']=3
+    if fault in ('migration','zero_migration'):
+        rows[5]['cpu']=rows[6]['cpu']=1
+    if fault=='zero_migration':rows[5]['time_ns']=20
+    result=cpu_residence(trace)
+    if fault not in (None,'migration','zero_migration'):
+        assert result['verified'] is False and not result['intervals'];return
+    assert result['verified'] is True
+    assert [(r['state'],r['start_ns'],r['end_ns']) for r in result['intervals']]==(
+        [('running',10,20),('running',20,50)] if fault=='zero_migration' else
+        [('running',10,20),('not_running',20,40),('running',40,50)])
+    assert result['ready_state']=='unknown'
+    assert normalize_schedule(trace)['complete']
+
+
 @pytest.mark.parametrize('fault',['missing_start','reuse','lost','backward','ready_while_running'])
 def test_scheduler_unknown_when_lifecycle_or_events_missing(fault):
     events=[e('start',0),e('ready',10),e('in',44)]
