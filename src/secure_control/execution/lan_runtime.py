@@ -1731,6 +1731,8 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
         _LAN_LOG.info("%s 已启动，正在等待 Client（最多 %.0f 秒）。", role,
                       config.startup_timeout)
         client_socket = accept_role(client_listener, config, "Client", startup_deadline)
+        if diagnostic is not None and getattr(diagnostic,'party_receives',None) is not None:
+            client_socket=diagnostic.party_receives.register(client_socket)
         session, wire_hello = _accept_hello(
             client_socket,
             "Client",
@@ -2064,6 +2066,8 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
             if (online_request.step != expected_step or online_request.round_id is None
                     or online_request.resource_id is not None):
                 raise ValueError("LAN online step 必须连续递增。")
+            if diagnostic is not None and getattr(diagnostic,'party_receives',None) is not None:
+                diagnostic.party_receives.validate(client_socket,online_request.sequence,operation,expected_step)
             online_material = (preload_store.claim(online_request.payload)
                                if preload_store is not None else online_request.payload)
             if diagnostic is not None:
@@ -2451,6 +2455,9 @@ def _party_receive(
         message.round_id is not None or message.step is not None or message.resource_id is not None
     ):
         raise ValueError("LAN 准备或关闭请求不得携带 round identity。")
+    diagnostic=tail_diagnostics.current()
+    if operation=='lan_setup' and diagnostic is not None and getattr(diagnostic,'party_receives',None) is not None:
+        diagnostic.party_receives.validate(sock,sequence,operation)
     return message
 
 

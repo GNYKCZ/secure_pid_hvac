@@ -15,6 +15,93 @@ from secure_control.experiments.native_tail_capture import (
 PROFILE=Path(__file__).parents[1]/'configs/control-tail-native-2000.wprp'
 
 
+def test_background_kernel_logger_is_observed_without_controlling_it():
+    class Background(Backend):
+        def sessions(self):
+            row={'name':'NT Kernel Logger','guid':'background','logger_id':1,
+                 'clock':2,'log_file_mode':41943042,'buffer_kb':4,'buffers':32,
+                 'events_lost':7,'buffers_lost':0}
+            return [row,dict(row)]
+    backend=Background()
+    plan=prepare_native(PROFILE,_schemas=schemas(),_backend=backend)
+    snapshot=plan['session_coexistence']['prepared']
+    assert len(snapshot['raw'])==2 and len(snapshot['sessions'])==1
+    assert snapshot['duplicate_rows']==1
+    assert [args[0] for args in backend.commands]==['-profiledetails']
+
+
+@pytest.mark.parametrize('fault',['name','id','config','dynamic'])
+def test_background_snapshot_distinguishes_exact_duplicates_from_ambiguity(fault):
+    from secure_control.experiments.native_tail_capture import _session_snapshot
+    row={'name':'background','guid':'g','logger_id':1,'clock':2,'buffers':32}
+    other=dict(row)
+    if fault=='name':other['guid']='different'
+    if fault=='id':other['name']='another'
+    if fault=='config':other['clock']=1
+    if fault=='dynamic':other['buffers']=33
+    with pytest.raises(ValueError,match='ambiguous'):_session_snapshot([row,other])
+
+
+@pytest.mark.parametrize('fault',[None,'dynamic','before_change','start_change','stop_change',
+    'reuse','partial_start','partial_timeout','query_failure','substring','existing_instance'])
+def test_independent_instance_preserves_background_and_fails_closed(tmp_path,fault):
+    class Coexisting(Backend):
+        def __init__(self):
+            super().__init__()
+            self.background={'name':'NT Kernel Logger','guid':'external','logger_id':1,
+                'clock':2,'log_file_mode':41943042,'buffer_kb':4,'buffers':32,
+                'events_lost':7,'buffers_lost':0,'log_file':'external.etl'}
+            self.stopped=False
+            self.collision=None
+        def sessions(self):
+            if self.live and fault=='query_failure':raise OSError('unavailable')
+            own=super().sessions()
+            if own and fault=='reuse':own[0]['logger_id']=1
+            if fault in ('partial_start','partial_timeout'):own=own[:1]
+            if fault=='substring' and own:
+                own=[{**own[0],'name':'unrelated_'+self.instance+'_extra'}]
+            row=dict(self.background)
+            if fault=='dynamic':row.update(buffers=33 if self.live else 32,events_lost=8)
+            if fault=='start_change' and self.live or fault=='stop_change' and self.stopped:
+                row['clock']=1
+            return [row,dict(row),*own,*([self.collision] if self.collision else [])]
+        def run(self,args,timeout):
+            result=super().run(args,timeout)
+            if args[0] in ('-stop','-cancel'):self.stopped=True
+            if args[0]=='-start':
+                if fault=='partial_start':result.returncode=1
+                if fault=='partial_timeout':raise subprocess.TimeoutExpired('mock',10)
+            return result
+    backend=Coexisting()
+    plan=prepare_native(PROFILE,_schemas=schemas(),_backend=backend)
+    backend.commands.clear()
+    capture=NativeCapture(plan,tmp_path/'owned.etl',_backend=backend,_now=lambda:0.)
+    if fault=='before_change':backend.background['clock']=1
+    if fault=='existing_instance':
+        backend.collision={**backend.background,'name':next(iter(capture.names)),
+                           'guid':'previous','logger_id':2}
+        # Even a freshly prepared snapshot cannot authorize taking an existing instance.
+        from secure_control.experiments.native_tail_capture import _session_snapshot
+        plan['session_coexistence']['prepared']=_session_snapshot(backend.sessions())
+    if fault in ('before_change','start_change','reuse','partial_start','partial_timeout',
+                 'query_failure','substring','existing_instance'):
+        with pytest.raises((ValueError,OSError,subprocess.TimeoutExpired)):capture.begin()
+        actions=[args[0] for args in backend.commands]
+        if fault in ('before_change','existing_instance'):assert actions==[]
+        elif fault in ('reuse','query_failure','substring'):assert actions==['-start']
+        else:assert actions==['-start','-cancel']
+    else:
+        capture.begin()
+        result=capture.finish()
+        assert result['status']==('partial' if fault=='stop_change' else 'saved')
+        assert result['background_unchanged']==(fault!='stop_change')
+        assert [a[0] for a in backend.commands]==['-start','-stop']
+    assert all(args[-2:]==['-instancename',capture.instance] for args in backend.commands)
+    assert all('external.etl' not in arg and arg!='NT Kernel Logger'
+               for args in backend.commands for arg in args)
+    assert backend.background['guid']=='external' and backend.background['logger_id']==1
+
+
 def schemas():
     """手写允许字段oracle，不能代替本机TDH实际字段核验。"""
     result=[]
@@ -27,6 +114,55 @@ def schemas():
             'keyword':0x200000000 if event==1074 else 0x400000084,
             'fields':[{'name':n,'type':t,'flags':f} for n,t,f in names]})
     return result
+
+
+def test_b_receive_root_binds_two_independent_nodes_and_separate_resources(tmp_path):
+    from secure_control.experiments import native_tail_capture as m
+    rows=schemas();rows.append({**rows[0],'id':1017,'fields':[
+        *rows[0]['fields'],{'name':'Status','type':8,'flags':0}]})
+    class BBackend(Backend):
+        def source_schemas(self,**kwargs):return rows
+        def sessions(self):
+            result=super().sessions()
+            for i,row in enumerate(result):
+                row.update(logger_id=100+i,log_file_mode=1)
+                if i==0:row['buffers']=32
+            return result
+        def provider_enables(self):
+            return [{'logger_id':101,'enabled':1,'level':5,'match_any':0x600000484,
+                'match_all':0,'instance_flags':0}] if self.live else []
+    backend=BBackend()
+    pair=m.prepare_native(PROFILE.with_name('control-tail-b-receive.wprp'),_schemas=rows,
+        _backend=backend,_file_candidate=True,_b_receive=True)
+    client=m.prepare_native(PROFILE.with_name('control-tail-calibration.wprp'),_schemas=schemas(),
+        _backend=Backend(),_file_candidate=True)
+    configs={r:{'role':r,'topology_digest':'topology'} for r in ('Client','P1','P2')}
+    for node in (client,pair):node.update(source_head='a'*40,software_review='https://example.test/review',control_configurations=configs)
+    client['purpose']='control-slow-step-v1'
+    root=m.combine_receive_plans(client,pair,'one-boundary-run')
+    assert pair['native_buffer_bytes']==6*1024*1024 and client['native_buffer_bytes']==12*1024*1024
+    assert pair['native_window_s']==120 and 1017 in pair['event_ids'] and 1017 not in client['event_ids']
+    assert [args[0] for args in backend.commands]==['-profiledetails']
+    approval={'schema':'b-receive-authorization-v1','purpose':m.B_RECEIVE_PURPOSE,
+        'source_head':'a'*40,'plan_sha256':m.plan_digest(root),'diagnostic_id':'one-boundary-run',
+        'attempts':1,'steps':2000,'client_output':str(tmp_path/'A'),'pair_output':str(tmp_path/'B'),
+        'authorization_url':'https://github.com/GNYKCZ/secure_pid_hvac/issues/161#issuecomment-9999999999'}
+    def authorize():return m.authorize_receive(approval,root,side='pair',output=tmp_path/'B',head='a'*40,
+        diagnostic_id='one-boundary-run',configurations=[configs['P1'],configs['P2']])
+    assert authorize() is approval
+    for key,value in [('purpose','control-slow-step-v1'),('attempts',True),('steps',400),
+        ('plan_sha256','wrong'),('pair_output',str(tmp_path/'other')),
+        ('authorization_url','https://github.com/GNYKCZ/secure_pid_hvac/issues/153#issuecomment-9999999999')]:
+        previous=approval[key];approval[key]=value
+        with pytest.raises(PermissionError):authorize()
+        approval[key]=previous
+    (tmp_path/'B').mkdir()
+    capture=m.NativeCapture(pair,tmp_path/'B'/'native-b.etl',_backend=backend,_now=lambda:0.,
+        authorization=approval,authorization_plan=root,side='pair')
+    capture.begin()
+    assert capture.capture_deadline==110 and backend.commands[-1][0]=='-start'
+    assert '!D21' in backend.commands[-1][1]
+    assert capture.finish()['status']=='saved'
 
 
 class Backend:
@@ -57,10 +193,12 @@ class Backend:
             return []
         if self.fault=='query':
             raise OSError('mock query failure')
-        return [{'name':'WPR_'+self.instance+'_system','guid':'changed' if self.changed else 'a',
+        event='D21Events' if '!D21' in self.commands[0][1] else 'D20Events' if '!D20' in self.commands[0][1] else 'D17Events'
+        return [{'name':'WPR_initiated_'+self.instance+'_WPR System Collector','guid':'changed' if self.changed else 'a',
+            'logger_id':100,
             'clock':2 if self.fault=='clock' else 1,'buffer_kb':64,
             'buffers':129 if self.fault=='buffers' else 128,'events_lost':0,'buffers_lost':0},
-            {'name':'WPR_'+self.instance+'_events','guid':'b','clock':1,'buffer_kb':64,
+            {'name':'WPR_initiated_'+self.instance+'_'+event,'guid':'b','logger_id':101,'clock':1,'buffer_kb':64,
              'buffers':64,'events_lost':1 if self.fault=='loss' else 0,'buffers_lost':0}]
 
     def run(self,args,timeout):
@@ -183,8 +321,8 @@ def test_native_exception_paths_do_not_hide_session_state(tmp_path,monkeypatch,f
     if fault in ('start_timeout','query'):
         with pytest.raises((OSError,subprocess.TimeoutExpired)):
             capture.begin()
-        assert not backend.live
-        assert [a[0] for a in backend.commands]==['-start','-cancel']
+        assert backend.live==(fault=='query')
+        assert [a[0] for a in backend.commands]==(['-start'] if fault=='query' else ['-start','-cancel'])
     else:
         capture.begin()
         assert capture.finish()['status']=='stop_failed_manual_attention'
@@ -321,7 +459,7 @@ def test_file_profile_requires_nonpaged_buffers(tmp_path,value):
 
 
 def test_session_query_reads_actual_log_file_mode_at_sdk_offset(monkeypatch):
-    """独立手写EVENT_TRACE_PROPERTIES布局，核对模式来自64字节处。"""
+    """独立SDK布局oracle，核对共存所需配置和输出路径边界。"""
     import ctypes as ct
     import struct
 
@@ -331,12 +469,21 @@ def test_session_query_reads_actual_log_file_mode_at_sdk_offset(monkeypatch):
             raw=bytearray(4216)
             struct.pack_into('<I',raw,116,120)
             struct.pack_into('<I',raw,64,0x01000001)
+            for offset,value in ((52,8),(56,64),(60,100),(68,3),(72,7),(92,73397)):
+                struct.pack_into('<I',raw,offset,value)
+            struct.pack_into('<I',raw,112,256)
+            encoded='C:\\logs\\background.etl'.encode('utf-16le')+b'\0\0'
+            raw[256:256+len(encoded)]=encoded
             raw[120:130]='test'.encode('utf-16le')+b'\0\0'
             ct.memmove(pointers[0],bytes(raw),len(raw))
             ct.cast(count,ct.POINTER(ct.c_uint32))[0]=1
             return 0
     monkeypatch.setattr(m.ctypes,'WinDLL',lambda _:SimpleNamespace(QueryAllTracesW=Query()))
-    assert m._sessions()[0]['log_file_mode']==0x01000001
+    row=m._sessions()[0]
+    assert row['log_file_mode']==0x01000001
+    assert [row[k] for k in ('minimum_buffers','maximum_buffers','maximum_file_mb',
+                            'flush_timer_s','enable_flags','buffers_written')]==[8,64,100,3,7,73397]
+    assert row['log_file']=='C:\\logs\\background.etl'
 
 
 def test_prepare_file_snapshot_is_observation_not_own_enable_proof():

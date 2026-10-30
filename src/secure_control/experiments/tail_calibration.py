@@ -77,7 +77,7 @@ def _head():
 def _source_clean():
     """只拒绝待运行源码/候选profile脏改动，保留用户部署与工作流修改。"""
     return not subprocess.check_output(['git','status','--porcelain','--','src','scripts',
-        'configs/control-tail-calibration.wprp'],cwd=Path(__file__).resolve().parents[3],text=True).strip()
+        'configs/control-tail-calibration.wprp','configs/control-tail-b-receive.wprp'],cwd=Path(__file__).resolve().parents[3],text=True).strip()
 
 
 def _peak_memory():

@@ -509,10 +509,11 @@ def _fields(key):
     guid,event,version,opcode = key
     if guid==TCPIP and event==1074 and version in (0,1):
         return {'Tcb':(16,),'NumBytes':(8,),'SeqNo':(8,),**({'NumPkt':(8,)} if version else {})}
-    versions = {1033:(0,1),1038:(0,1),1040:(0,1),1043:(0,1,2),1300:(0,1,2,3)}
+    versions = {1017:(0,1),1033:(0,1),1038:(0,1),1040:(0,1),1043:(0,1,2),1300:(0,1,2,3)}
     if guid==TCPIP and event in versions and version in versions[event]:
         return {'Tcb':(16,),'LocalAddress':(14,),'RemoteAddress':(14,),
             'Pid' if event==1300 else 'ProcessId':(8,),
+            **({'Status':(8,)} if event==1017 else {}),
             **({'ProcessStartKey':(10,)} if version else {})}
     if guid==THREAD:
         if opcode in (1,2) and version in (2,3):
@@ -527,7 +528,7 @@ def _fields(key):
     return None
 
 
-def tcp_source_schemas():
+def tcp_source_schemas(*, accept=False):
     """只读全部本机TCPIP manifest descriptor，审计指定事件源，无provider启用。"""
     import ctypes as c
     import uuid
@@ -558,7 +559,7 @@ def tcp_source_schemas():
     rows = []
     for index in range(count):
         desc = desc_type.from_buffer_copy(data[8+index*16:24+index*16])
-        if desc.id not in (1033,1038,1040,1043,1074,1300):
+        if desc.id not in ((1017,1033,1038,1040,1043,1074,1300) if accept else (1033,1038,1040,1043,1074,1300)):
             continue
         raw = query(info,c.byref(guid),c.byref(desc))
         if len(raw)<112:
@@ -598,12 +599,24 @@ def read_calibration_etl(path, *, pid, tid, window_ns, _api=None):
     return _read_etl(path,maximum_events=2500000,_api=_api,target=(pid,tid,window_ns))
 
 
-def _read_etl(path, *, maximum_events, _api=None, target=None):
+def read_party_requests_etl(path, *, targets, _api=None):
+    """B单会话只解码一次，保留两个实际Party的生命周期和TCP元数据。"""
+    if (not isinstance(targets,(list,tuple)) or len(targets)!=2
+            or any(len(t)!=2 or any(type(v) is not int or v<=0 for v in t) for t in targets)
+            or len({t[0] for t in targets})!=2 or len({t[1] for t in targets})!=2):
+        raise ValueError('two unique Party PID/TID targets required')
+    return _read_etl(path,maximum_events=2500000,_api=_api,targets=targets)
+
+
+def _read_etl(path, *, maximum_events, _api=None, target=None, targets=None):
     """两种固定预算共用唯一遍历；目标筛选不跳过descriptor/错误/截断计数。"""
     path = Path(path).resolve()
-    if path.suffix.lower()!='.etl' or not path.is_file() or not 0<path.stat().st_size<=(128 if target else 64)*1024*1024:
+    targeted=target is not None or targets is not None
+    pids={t[0] for t in targets} if targets else {target[0]} if target else set()
+    tids={t[1] for t in targets} if targets else {target[1]} if target else set()
+    if path.suffix.lower()!='.etl' or not path.is_file() or not 0<path.stat().st_size<=(128 if targeted else 64)*1024*1024:
         raise ValueError('ETL file boundary')
-    if type(maximum_events) is not int or not 1 <= maximum_events <= (2500000 if target else 300000):
+    if type(maximum_events) is not int or not 1 <= maximum_events <= (2500000 if targeted else 300000):
         raise ValueError('event budget')
     api = _api if _api is not None else _native()
     rows, errors, keys, count = [], [], {}, 0
@@ -639,11 +652,10 @@ def _read_etl(path, *, maximum_events, _api=None, target=None):
                 selected = (key[0]==TCPIP or key[0]==THREAD and key[3] in (1,2,36,50)
                             or key[0]==PROCESS and key[3] in (1,2))
                 critical_gaps += int(selected)
-                if (target is None or selected) and 'unsupported event present' not in errors:
+                if (not targeted or selected) and 'unsupported event present' not in errors:
                     errors.append('unsupported event present')
                 return
-            if target is not None:
-                pid,tid,_ = target
+            if targeted:
                 v = row['values']
                 keep = False
                 if row['provider']==THREAD:
@@ -654,12 +666,12 @@ def _read_etl(path, *, maximum_events, _api=None, target=None):
                         if cpu in cpu_running and cpu_running[cpu]!=v['OldThreadId']:
                             cpu_chain_mismatches += 1
                         cpu_running[cpu]=v['NewThreadId']
-                    keep = (tid in (v.get('NewThreadId'),v.get('OldThreadId')) if row['opcode']==36
-                            else v.get('TThreadId')==tid)
+                    keep = (bool(tids & {v.get('NewThreadId'),v.get('OldThreadId')}) if row['opcode']==36
+                            else v.get('TThreadId') in tids)
                 elif row['provider']==PROCESS:
-                    keep = v.get('ProcessId')==pid
+                    keep = v.get('ProcessId') in pids
                 elif row['provider']==TCPIP:
-                    if v.get('ProcessId',v.get('Pid'))==pid:
+                    if v.get('ProcessId',v.get('Pid')) in pids:
                         if len(target_tcbs)>=64 and v['Tcb'] not in target_tcbs:
                             raise ValueError('target connection capacity')
                         target_tcbs.add(v['Tcb'])
@@ -706,7 +718,7 @@ def _read_etl(path, *, maximum_events, _api=None, target=None):
         errors.append('retention budget exceeded')
     if cpu_chain_mismatches:
         errors.append('CPU switch chain gap')
-    if target is not None:
+    if targeted:
         identifiers={keys.get(('Tcb',tcb)) for tcb in target_tcbs}
         selected=[r for r in rows if r['provider']!=TCPIP or r['values'].get('Tcb') in identifiers]
         filtered += len(rows)-len(selected)
@@ -724,6 +736,10 @@ def _read_etl(path, *, maximum_events, _api=None, target=None):
         'decode_errors':decode_errors,
         'complete':not errors,'network_semantics':'unverified; event presence is not socket readability',
         'real_event_schema_validation':'performed per descriptor; runtime SeqNo semantic validation still required'}
+    if targets:
+        result.update(schema='native-party-request-view-v1',targets=[list(t) for t in targets],
+            target_critical_gaps=critical_gaps,cpu_chain_mismatches=cpu_chain_mismatches,
+            retention_limit=100000,filtered_event_count=filtered)
     if target is not None:
         pid,tid,window = target
         starts = [r for r in rows if r['provider']==THREAD and r['opcode']==1
@@ -852,20 +868,29 @@ def control_tcp_anchor(trace, sidecar, connection):
     def unknown(reason):return {'verified':False,'reason':reason}
     if not trace.get('complete') or not sidecar.get('complete'):
         return unknown('file or stream incomplete')
-    if connection not in (0,1) or len(sidecar.get('connections',[]))!=2:
-        return unknown('connection identity unavailable')
-    conn=sidecar['connections'][connection];cp=conn.get('setup_checkpoint')
+    party_request=sidecar.get('schema')=='party-receive-map-v1'
+    if party_request:
+        if connection!=0 or sidecar.get('role') not in ('P1','P2') or not sidecar.get('connection'):
+            return unknown('Party connection identity unavailable')
+        conn=sidecar['connection']
+    else:
+        if connection not in (0,1) or len(sidecar.get('connections',[]))!=2:
+            return unknown('connection identity unavailable')
+        conn=sidecar['connections'][connection]
+    cp=conn.get('setup_checkpoint')
     if (conn.get('epoch')!=connection or conn.get('pid')!=trace.get('target_pid') or not cp
             or cp.get('operation')!='lan_setup' or cp.get('sequence')!=2
-            or cp.get('contract')!='validated-setup-reply-then-offline-request-v1'
+            or cp.get('contract')!=('validated-setup-request-before-reply-v1' if party_request else 'validated-setup-reply-then-offline-request-v1')
             or cp.get('epoch')!=connection):return unknown('setup checkpoint missing/wrong epoch')
-    n,stamp,next_send=(cp.get(k) for k in ('received_bytes','checkpoint_ns','next_send_enter_ns'))
+    n,stamp,next_send=(cp.get(k) for k in ('received_bytes','checkpoint_ns',
+        'reply_send_enter_ns' if party_request else 'next_send_enter_ns'))
     if (any(type(v) is not int for v in (n,stamp,next_send)) or not 0<n<2**31
             or not conn['registered_ns']<stamp<next_send):return unknown('checkpoint bounds ambiguous')
     if not isinstance(sidecar.get('protocol'),(tuple,list)) or len(sidecar['protocol'])!=3 or any(not isinstance(v,str) or not v for v in sidecar['protocol']):
         return unknown('public protocol identity missing')
     rows=[r for r in trace['events'] if r['provider']==TCPIP]
-    births=[r for r in rows if r['id']==1033 and r['values'].get('ProcessId')==conn['pid']
+    births=[r for r in rows if r['id']==(1017 if party_request else 1033)
+        and (not party_request or r['values'].get('Status')==0) and r['values'].get('ProcessId')==conn['pid']
         and _sockaddr(r['values'].get('LocalAddress'))==tuple(conn['local'])
         and _sockaddr(r['values'].get('RemoteAddress'))==tuple(conn['remote'])]
     if len(births)!=1:return unknown('unique connect-completed event unavailable')
@@ -874,7 +899,7 @@ def control_tcp_anchor(trace, sidecar, connection):
     process_ends=[r['time_ns'] for r in trace['events'] if r['provider']==PROCESS and r['opcode']==2 and r['values'].get('ProcessId')==conn['pid']]
     if len(starts)!=1 or len(process_ends)!=1 or not starts[0]<=birth['time_ns']<stamp<process_ends[0]:
         return unknown('unique process lifetime unavailable')
-    if sum(r['id']==1033 and r['values'].get('Tcb')==tcb for r in rows)!=1:
+    if sum(r['id'] in (1017,1033) and r['values'].get('Tcb')==tcb for r in rows)!=1:
         return unknown('TCB reused')
     metadata=[r for r in rows if r['id']!=1074 and r['values'].get('Tcb')==tcb]
     if any(_sockaddr(r['values'].get('LocalAddress'))!=tuple(conn['local'])
@@ -920,7 +945,8 @@ def control_tcp_anchor(trace, sidecar, connection):
     ends=[*process_ends,*[r['time_ns'] for r in metadata if r['id'] in (1040,1043)]]
     end_ns=min(ends) if ends else None
     if end_ns is not None and end_ns<=next_send:return unknown('connection ended before setup boundary')
-    flow=('control','P'+str(connection+1),'Client',connection,0,'receive','TCPIP1074')
+    flow=(('control','Client',sidecar['role'],0,0,'receive','TCPIP1074') if party_request else
+        ('control','P'+str(connection+1),'Client',connection,0,'receive','TCPIP1074'))
     return {'verified':True,'sequence_at_application_offset_zero':start,'flow':flow,
         'diagnostic_id':sidecar['context']['diagnostic_id'],'source_head':sidecar['context']['source_head'],
         'protocol':sidecar['protocol'],'connection':conn,'semantic_boundary':'TCPIP1074 verified data sequence',
@@ -930,6 +956,40 @@ def control_tcp_anchor(trace, sidecar, connection):
             'pre_connect_observations':redundant,'prefix_policy':'post-connect-independent-v1'},
         'packets':[{'seq':r['values']['SeqNo'],'length':r['values']['NumBytes'],'time':r['time_ns'],
                     'packet':r['event_index'],'flow':flow} for r in data]}
+
+
+def party_request_coverage(trace, sidecar, row, anchor):
+    """仅B同机分段；首字节和整帧组件覆盖分开，不能把部分首读伪装整帧已到。"""
+    unknown={'verified':False,'socket_readable':'unknown'}
+    if not anchor.get('verified'):return {**unknown,'reason':anchor.get('reason')}
+    cp=sidecar['connection']['setup_checkpoint']
+    if (len(row)!=10 or any(type(v) is not int for v in row) or row[9]!=2 or row[7]<0
+            or row[2]<=0 or row[3]!=row[1]+4+row[2] or row[1]<cp['received_bytes']
+            or not cp['reply_send_enter_ns']<row[4]<=row[5]<=row[6]):
+        return {**unknown,'reason':'validated request frame/read bounds unavailable'}
+    start=anchor['sequence_at_application_offset_zero'];packets=anchor['packets']
+    end=anchor['evidence']['connection_end_ns']
+    if row[6]>=end:return {**unknown,'reason':'request read outside connection lifetime'}
+    for p in packets:
+        offset=(p['seq']-start)%2**32
+        if offset>=2**31:return {**unknown,'reason':'sequence unwrap ambiguous'}
+        if p['time']>=end and max(offset,row[1])<min(offset+p['length'],row[3]):
+            return {**unknown,'reason':'request bytes overlap ended connection'}
+    first=byte_coverage(packets,anchor['flow'],(start+row[1])%2**32,1,trusted=True)
+    full=byte_coverage(packets,anchor['flow'],(start+row[1])%2**32,4+row[2],trusted=True)
+    a,b=first['complete_at'],full['complete_at']
+    if a is None or b is None or a>row[5] or b>row[6]:
+        return {**unknown,'reason':'component coverage/read ordering unavailable'}
+    return {'verified':True,'socket_readable':'unknown','first_component_ns':a,'full_component_ns':b,
+        'recv_enter_ns':row[4],'first_positive_return_ns':row[5],'frame_complete_ns':row[6],
+        'first_component_to_first_recv_ns':row[5]-a,'full_component_to_frame_ns':row[6]-b,
+        'full_component_to_first_recv_ns':row[5]-b if row[5]>=b else None,
+        'recv_enter_after_first_component_ns':max(0,row[4]-a),
+        'first_recv_precedes_full_coverage':row[5]<b,
+        'component_event_indices':[p['packet'] for p in packets
+            if max((p['seq']-start)%2**32,row[1])<min((p['seq']-start)%2**32+p['length'],row[3])],
+        'anchor_evidence':anchor['evidence'],
+        'note':'B local TCP component to recv return only; not NIC, socket readability or GIL proof'}
 
 
 def control_frame_coverage(trace, sidecar, identity, anchor, first_read_ns, frame_ns):

@@ -43,6 +43,17 @@ def main():
     control_prepare.add_argument('--software-review',required=True)
     for role in ('client','p1','p2'):
         control_prepare.add_argument('--'+role+'-config',type=Path,default=Path('configs/lab-'+role+'-cart-pole-demo.example.yaml'))
+    b_prepare=modes.add_parser('prepare-b-receive-file',help='B只读核验接受连接源，不采集')
+    b_prepare.add_argument('output',type=Path)
+    b_prepare.add_argument('--expected-head',required=True)
+    b_prepare.add_argument('--software-review',required=True)
+    for role in ('p1','p2'):
+        b_prepare.add_argument('--'+role+'-config',type=Path,default=Path('configs/lab-'+role+'-cart-pole-demo.example.yaml'))
+    combine=modes.add_parser('combine-b-receive-plans',help='只读组合两机独立节点计划')
+    combine.add_argument('client_plan',type=Path)
+    combine.add_argument('pair_plan',type=Path)
+    combine.add_argument('output',type=Path)
+    combine.add_argument('--diagnostic-id',required=True)
     for side in ('client','pair'):
         calibration=modes.add_parser('calibrate-'+side,help='需新的计划绑定用户批准；一次公开流量，不运行控制')
         calibration.add_argument('output',type=Path)
@@ -67,7 +78,13 @@ def main():
     analyze.add_argument('--same-host',action='store_true',help='没有实际同机spawn证明时拒绝合轴')
     analyze.add_argument('--partial',action='store_true',help='保留失败前缀/缺角色；不升级为完整证据')
     args = parser.parse_args()
-    if args.mode in ('prepare-native','prepare-file-calibration','prepare-control-file'):
+    if args.mode=='combine-b-receive-plans':
+        from secure_control.experiments.native_tail_capture import combine_receive_plans
+        result=combine_receive_plans(json.loads(args.client_plan.read_text(encoding='utf8')),
+            json.loads(args.pair_plan.read_text(encoding='utf8')),args.diagnostic_id)
+        with args.output.open('x',encoding='utf8') as stream:json.dump(result,stream,ensure_ascii=False,indent=2)
+        print('Combined preparation only; no capture started.')
+    elif args.mode in ('prepare-native','prepare-file-calibration','prepare-control-file','prepare-b-receive-file'):
         import subprocess
 
         from secure_control.experiments.native_tail_capture import prepare_native
@@ -76,16 +93,19 @@ def main():
         if head!=args.expected_head:
             parser.error('准备计划head不一致')
         file_candidate=args.mode!='prepare-native'
-        result = prepare_native(ROOT/('configs/control-tail-calibration.wprp' if file_candidate
-                                      else 'configs/control-tail-native-2000.wprp'),_file_candidate=file_candidate)
-        if args.mode=='prepare-control-file':
+        b_receive=args.mode=='prepare-b-receive-file'
+        result = prepare_native(ROOT/('configs/control-tail-b-receive.wprp' if b_receive else
+            'configs/control-tail-calibration.wprp' if file_candidate else 'configs/control-tail-native-2000.wprp'),
+            _file_candidate=file_candidate,**({'_b_receive':True} if b_receive else {}))
+        if args.mode in ('prepare-control-file','prepare-b-receive-file'):
             from secure_control.execution.lan_config import load_lan_config
             from secure_control.experiments.tail_diagnostic_runner import _config_identity
-            configs=[load_lan_config(getattr(args,r.lower()+'_config'),r) for r in ('Client','P1','P2')]
+            configs=[load_lan_config(getattr(args,r.lower()+'_config'),r) for r in (('P1','P2') if b_receive else ('Client','P1','P2'))]
             if len({c.topology.digest for c in configs})!=1:parser.error('拓扑不一致')
-            result.update(purpose='control-slow-step-v1',control_steps=2000,software_review=args.software_review,
+            result.update(purpose='control-b-receive-boundary-v1' if b_receive else 'control-slow-step-v1',control_steps=2000,software_review=args.software_review,
                 control_configurations={c.role:_config_identity(c) for c in configs},
                 topology_sha256=configs[0].topology.digest,pair_wait_s=45,pair_business_s=55,pair_total_s=100)
+            if b_receive:result['pair_total_s']=120
         elif file_candidate:
             from secure_control.experiments.tail_calibration import _config_addresses
             _,result['topology_sha256']=_config_addresses([args.config],'client')

@@ -593,6 +593,35 @@ def select_slow_steps(samples, threshold_ns=20_000_000):
     return sorted(slow),sorted(selected),neighbors
 
 
+def _party_receive_sources(manifests,records):
+    """核对B新增五份原件及每个实际Party身份；不从文件名推断角色或时钟。"""
+    pair=next(((p,m) for p,m in manifests if m.get('side')=='pair'),None)
+    if pair is None or pair[1].get('b_request_evidence',{}).get('status')!='read':return None,{},{}
+    path,manifest=pair;hashes=manifest['b_request_evidence']['files']
+    expected={'native-b.etl','request-native-events.json','request-native-view.json','P1.receive.json','P2.receive.json'}
+    if set(hashes)!=expected:raise ValueError('B request artifact set incomplete')
+    for name,digest in hashes.items():
+        target=(path.parent/name).resolve()
+        if target.parent!=path.parent.resolve() or hashlib.sha256(target.read_bytes()).hexdigest()!=digest:
+            raise ValueError('B request artifact identity/hash changed')
+    trace=json.loads((path.parent/'request-native-view.json').read_text(encoding='utf8'))
+    if (trace.get('purpose')!='control-b-receive-boundary-v1' or trace.get('source_head')!=manifest['source_head']
+            or trace.get('diagnostic_id')!=manifest['diagnostic_id'] or trace.get('etl_sha256')!=hashes['native-b.etl']
+            or sorted(trace.get('targets',[]))!=sorted([[records[r]['pid'],records[r]['main_thread_id']] for r in ('P1','P2')])):
+        raise ValueError('B request view target mismatch')
+    trace['events']=json.loads((path.parent/'request-native-events.json').read_text(encoding='utf8'))
+    streams={r:json.loads((path.parent/(r+'.receive.json')).read_text(encoding='utf8')) for r in ('P1','P2')}
+    for role,s in streams.items():
+        record=records[role];conn=s.get('connection',{})
+        if (s.get('role')!=role or s.get('schema')!='party-receive-map-v1'
+                or s.get('role_file_sha256')!=next(f['sha256'] for f in manifest['files'] if f['path']==role+'.json')
+                or any(s.get('context',{}).get(k)!=record['context'].get(k) for k in ('diagnostic_id','source_head','clock_domain_id'))
+                or s.get('protocol')!=record.get('protocol') or conn.get('pid')!=record['pid']
+                or conn.get('thread_id')!=record['main_thread_id']):
+            raise ValueError('B receive stream identity mismatch')
+    return trace,streams,hashes
+
+
 def analyze_slow_control(paths):
     """只读逐慢步证据，不跨主机减QPC；缺独立TCP零点时仍输出应用及调度。"""
     from secure_control.experiments.windows_tail_analysis import (
@@ -600,6 +629,7 @@ def analyze_slow_control(paths):
         control_tcp_anchor,
         cpu_residence,
         normalize_schedule,
+        party_request_coverage,
     )
     validated=analyze_manifests(paths,partial=True)
     manifests=[(Path(p),json.loads(Path(p).read_text(encoding='utf8'))) for p in paths]
@@ -646,6 +676,11 @@ def analyze_slow_control(paths):
                 raise ValueError('control native/stream target mismatch')
             native_reason='independent SeqNo/application-offset-zero anchor unavailable for this connection'
     normalized=(normalize_schedule({**native,'target_tid':native['target_tid']}) if native else None)
+    b_trace,b_streams,b_hashes=_party_receive_sources(manifests,records)
+    b_anchors={r:control_tcp_anchor({**b_trace,'target_pid':records[r]['pid']},s,0)
+        for r,s in b_streams.items()}
+    for anchor in b_anchors.values():
+        if anchor.get('verified'):anchor['evidence']['artifact_sha256']=b_hashes
     residence=cpu_residence(native) if native else {'verified':False,'intervals':[],
         'ready_state':'unknown','reason':native_reason}
     anchors=[control_tcp_anchor(native,stream,i) for i in (0,1)] if native and stream else []
@@ -685,6 +720,15 @@ def analyze_slow_control(paths):
             coverage=(control_frame_coverage(native,stream,step*2+party,anchors[party],
                 points['reply_read'],points['reply_frame']) if anchors else {'complete_at':None,'reason':native_reason})
             covered=coverage['complete_at']
+            b_receive={'verified':False,'reason':'missing/partial hash-bound B request evidence'}
+            if role in b_streams:
+                request_rows=[row for row in b_streams[role]['rows'] if row[7]==step and row[9]==2]
+                if (len(mapping)==1 and len(request_rows)==1 and mapping[0][1]==request_rows[0][1]
+                        and mapping[0][2]==4+request_rows[0][2] and mapping[0][3]==request_rows[0][3]):
+                    b_receive=party_request_coverage(b_trace,b_streams[role],request_rows[0],b_anchors[role])
+                    b_receive.update(validated_step=step,validated_sequence=request_rows[0][8],
+                        receive_byte_range=[request_rows[0][1],request_rows[0][3]])
+                else:b_receive={'verified':False,'reason':'A send/B request identity or byte range mismatch'}
             wait=None
             first=points['reply_read']
             if len(send)==1 and first is not None and first>=send[0]['end_ns']:
@@ -715,6 +759,7 @@ def analyze_slow_control(paths):
                 'tcp_component_complete_ns':covered,'tcp_coverage':coverage,
                 'tcp_unknown_reason':None if covered is not None else coverage.get('reason',native_reason),
                 'B_local_spans':server,'B_clock_domain_id':records.get(role,{}).get('context',{}).get('clock_domain_id'),
+                'B_receive_analysis':b_receive,
                 'cross_host_difference_ns':None})
         results.append({'diagnostic_id':(client_manifest or {}).get('diagnostic_id'),
             'source_head':(client_manifest or {}).get('source_head'),'global_step':step,'kind':'slow' if step in slow else 'normal_neighbor',
@@ -736,6 +781,8 @@ def analyze_slow_control(paths):
         'threshold_ns':20_000_000,'slow_steps':slow,'normal_neighbors':neighbors,'rows':results,
         'diagnostic_complete':validated['diagnostic_complete'],'role_sha256':sources,
         'native_sha256':native_hashes,
+        'B_request_sha256':b_hashes,
+        'B_request_anchors':{r:{k:v for k,v in a.items() if k!='packets'} for r,a in b_anchors.items()},
         'capture_source_head':(client_manifest or {}).get('source_head'),
         'analysis_source':{'head':analysis_head,'dirty':analysis_dirty,
             'module_sha256':{p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in
