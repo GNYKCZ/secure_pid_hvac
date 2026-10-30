@@ -388,3 +388,94 @@ def test_post_end_terminal_switch_is_evidence_not_window_gap(fault):
         assert result['complete'] and len(result['terminal_boundary_events'])==1
     else:
         assert not result.get('terminal_boundary_events')
+
+
+@pytest.mark.parametrize('fault',[None,'no_anchor','inside_ready','inside_unknown','double_cpu','wrong_cpu','reuse','missing_end','lost'])
+def test_window_anchor_preserves_prefix_conflicts_and_rejects_internal_gaps(tmp_path,fault):
+    """前缀running-ready冲突不能污染明确锚定的窗口，窗口内和驻留错误仍拒绝。"""
+    rows=timeline()
+    rows.insert(3,row(THREAD,50,27,TThreadId=2))  # 前缀running-ready冲突。
+    if fault=='no_anchor':window=[15,60]
+    else:window=[52,60]
+    if fault=='inside_ready':rows.insert(7,row(THREAD,50,55,TThreadId=2))
+    if fault=='inside_unknown':rows[4]['values']['OldThreadState']=3;window=[30,60]
+    if fault=='double_cpu':
+        extra=row(THREAD,36,53,NewThreadId=2,OldThreadId=0,OldThreadState=1);extra['cpu']=1;rows.insert(7,extra)
+    if fault=='wrong_cpu':rows[4]['cpu']=1
+    if fault=='reuse':rows.insert(-2,row(THREAD,1,68,ProcessId=1,TThreadId=2))
+    if fault=='missing_end':rows.pop(-2)
+    class API(CalibrationAPI):
+        def header(self):return {**super().header(),'events_lost':int(fault=='lost')}
+    path=tmp_path/'window.etl';path.write_bytes(b'mock')
+    if fault=='lost':
+        with pytest.raises(ValueError):read_calibration_etl(path,pid=1,tid=2,window_ns=window,_api=API(rows))
+        return
+    result=read_calibration_etl(path,pid=1,tid=2,window_ns=window,_api=API(rows))
+    assert result['schedule_window_complete']==(fault is None)
+    if fault is None:
+        assert result['lifetime_replay']['state']=='unknown'
+        assert result['window_replay']['anchor']['time']==50
+        assert result['window_replay']['state']=='running'
+        assert result['lifetime_replay']['issues']
+
+
+@pytest.mark.parametrize('fault',[None,'retransmit','plus_n','minus_n','hole','future_fill','unsolicited','tie',
+    'reuse','endpoint','no_birth','lost','epoch','protocol','prefix_missing','late_frame','outside_extra','end_before_checkpoint','data_after_end'])
+def test_control_setup_anchor_is_independent_of_nonzero_control_offsets(fault):
+    from secure_control.experiments.windows_tail_analysis import (
+        control_frame_coverage,
+        control_tcp_anchor,
+    )
+    start=2**32-4
+    conn={'epoch':0,'pid':1,'registered_ns':15,'local':['10.0.0.1',100],'remote':['10.0.0.2',200],
+        'setup_checkpoint':{'epoch':0,'operation':'lan_setup','sequence':2,
+          'contract':'validated-setup-reply-then-offline-request-v1','received_bytes':10,'sent_bytes':12,
+          'checkpoint_ns':50,'next_send_enter_ns':60}}
+    sidecar={'complete':True,'connections':[conn,{**conn,'epoch':1}],
+        'context':{'diagnostic_id':'run','source_head':'a'*40},'protocol':['run','session','epoch'],
+        'rows':[[0,20,12,32,10,4,18,0]]}
+    birth={'provider':TCPIP,'id':1033,'time_ns':10,'event_index':0,'values':{'ProcessId':1,'Tcb':9,
+        'LocalAddress':addr('10.0.0.1',100),'RemoteAddress':addr('10.0.0.2',200)}}
+    def packet(seq,size,t,index):return {'provider':TCPIP,'id':1074,'time_ns':t,'event_index':index,
+        'values':{'Tcb':9,'SeqNo':seq%2**32,'NumBytes':size}}
+    rows=[birth,packet(start,6,20,1),packet(start+6,4,26,2),packet(start+10,8,80,3)]
+    if fault=='retransmit':rows.insert(3,packet(start+6,4,30,4))
+    if fault=='plus_n':conn['setup_checkpoint']['received_bytes']=11
+    if fault=='minus_n':conn['setup_checkpoint']['received_bytes']=9
+    if fault=='hole':rows[2]['values']['SeqNo']+=1
+    if fault=='future_fill':rows[2]['time_ns']=55
+    if fault=='unsolicited':rows.insert(3,packet(start+10,1,55,4))
+    if fault=='tie':rows[2]['time_ns']=50
+    if fault=='reuse':rows.insert(1,{**birth,'event_index':5})
+    if fault=='endpoint':birth['values']['LocalAddress']=addr('10.0.0.9',100)
+    if fault=='no_birth':rows.pop(0)
+    if fault=='epoch':conn['setup_checkpoint']['epoch']=1
+    if fault=='protocol':sidecar['protocol']=None
+    if fault=='prefix_missing':rows.pop(1)
+    if fault=='late_frame':rows[-1]['time_ns']=91
+    if fault=='outside_extra':rows.append(packet(start+18,1,110,4))
+    if fault in ('end_before_checkpoint','data_after_end'):
+        rows.insert(3,{**birth,'id':1043,'time_ns':40 if fault=='end_before_checkpoint' else 75,'event_index':6})
+    rows.extend([{'provider':PROCESS,'opcode':1,'time_ns':5,'values':{'ProcessId':1}},
+                 {'provider':PROCESS,'opcode':2,'time_ns':120,'values':{'ProcessId':1}}])
+    trace={'complete':fault!='lost','target_pid':1,'target_window_ns':[70,100],'events':rows}
+    anchor=control_tcp_anchor(trace,sidecar,0)
+    if fault not in (None,'retransmit','late_frame','outside_extra','data_after_end'):
+        assert not anchor['verified'];return
+    assert anchor['verified'] and anchor['sequence_at_application_offset_zero']==start
+    coverage=control_frame_coverage(trace,sidecar,0,anchor,85,90)
+    assert coverage['complete_at']==(None if fault in ('late_frame','data_after_end') else 80)
+    if fault=='outside_extra':assert coverage['outside_business_events_unknown']==[4]
+
+
+
+def test_target_tcp_data_before_binding_callback_is_retained_without_renumbering(tmp_path):
+    path=tmp_path/'late-binding.etl';path.write_bytes(b'mock')
+    data=row(TCPIP,0,26,Tcb=999,NumBytes=10,SeqNo=100);data['id']=1074
+    birth=row(TCPIP,0,24,Tcb=999,ProcessId=1,LocalAddress=addr('10.0.0.1',100),RemoteAddress=addr('10.0.0.2',200));birth['id']=1033
+    rows=timeline();rows[3:3]=[data,birth]  # 回调顺序不能充当关联证据。
+    result=read_calibration_etl(path,pid=1,tid=2,window_ns=[30,60],_api=CalibrationAPI(rows))
+    tcp=[r for r in result['events'] if r['provider']==TCPIP]
+    assert [r['id'] for r in tcp]==[1074,1033]
+    assert tcp[0]['values']['Tcb']==tcp[1]['values']['Tcb']
+    assert [r['event_index'] for r in tcp]==[4,5]

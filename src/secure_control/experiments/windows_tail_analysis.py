@@ -80,6 +80,72 @@ def scheduling(evidence, pid, tid, lifetime, *, lost=0):
     return {'state':state,'ready_waits':waits}
 
 
+
+def _schedule_issues(events):
+    """线性记录严格状态规则的异常位置；保留前缀证据，不把未知区间计零。"""
+    state,ready,issues = 'unknown',False,[]
+    for e in events:
+        kind,reason=e['kind'],None
+        if kind=='start':state,ready='unknown',False
+        elif kind=='ready':
+            if state=='running' or ready:reason='ready while running/already ready'
+            state,ready='ready',True
+        elif kind=='in':
+            if state=='running':reason='duplicate in'
+            state,ready='running',False
+        elif kind=='out':
+            if state!='running':reason='out while not running'
+            if e['next'] not in ('ready','waiting'):reason='unknown switch-out state'
+            state,ready=e['next'],e['next']=='ready'
+        elif kind=='end':state,ready='ended',False
+        if reason:issues.append({'reason':reason,'event':e})
+    return issues
+
+
+def _window_schedule(evidence,pid,tid,window):
+    """唯一生命周期及CPU驻留证明后，以窗前明确切入锚定；不改变通用重放规则。"""
+    events=[e for e in evidence['events'] if e['tid']==tid]
+    starts=[e for e in events if e['kind']=='start']
+    ends=[e for e in events if e['kind']=='end']
+    lifetime={'state':'unknown','issues':_schedule_issues(events)}
+    result={'state':'unknown','range_ns':list(window),'anchor':None,'reason':'lifetime/quality unavailable'}
+    if (not evidence['complete'] or len(starts)!=1 or len(ends)!=1
+            or starts[0]['pid']!=pid or not starts[0]['time']<=window[0]<window[1]<=ends[0]['time']):
+        return lifetime,result
+    life=starts[0]['life']
+    lifetime.update(scheduling(evidence,pid,tid,life),range_ns=[starts[0]['time'],ends[0]['time']])
+    # 所有目标切换都核对驻留，前缀语义异常不能掩盖跨CPU双重运行或缺失切出。
+    cpu,previous=None,-1
+    for e in events:
+        if e['pid']!=pid or e['life']!=life or e['time']<previous:
+            result['reason']='identity/order gap';return lifetime,result
+        previous=e['time']
+        if e['kind'] in ('in','out'):
+            value=e.get('cpu')
+            if type(value) is not int or value<0:
+                result['reason']='CPU unavailable';return lifetime,result
+            if e['kind']=='in':
+                if cpu is not None:
+                    result['reason']='overlapping CPU residence';return lifetime,result
+                cpu=value
+            else:
+                if cpu!=value:
+                    result['reason']='unmatched CPU switch-out';return lifetime,result
+                cpu=None
+    anchors=[(i,e) for i,e in enumerate(events) if e['kind']=='in' and e['time']<=window[0]]
+    if not anchors:
+        result['reason']='no pre-window switch-in';return lifetime,result
+    index,anchor=anchors[-1]
+    fragment=[e for e in events[index:] if e['time']<=window[1]]
+    result.update(anchor=anchor,issues=_schedule_issues(fragment))
+    if result['issues']:
+        result['reason']='strict window replay conflict';return lifetime,result
+    # 使用真实生命周期start及明确in初始化；不借助窗内较晚事件跳过窗口开头。
+    replay=scheduling({**evidence,'events':[starts[0],*fragment]},pid,tid,life)
+    result.update(replay,reason='verified' if replay['state']!='unknown' else 'unknown window state')
+    return lifetime,result
+
+
 def byte_coverage(events, flow, anchor, length, *, trusted=False, lost=0):
     """指定系统事件边界的连续TCP数据区间；seq/长度均须外部可信锚点。"""
     unknown = {'boundary':'unknown','complete_at':None,'socket_readable':'unknown'}
@@ -513,7 +579,8 @@ def _read_etl(path, *, maximum_events, _api=None, target=None):
                         if len(target_tcbs)>=64 and v['Tcb'] not in target_tcbs:
                             raise ValueError('target connection capacity')
                         target_tcbs.add(v['Tcb'])
-                    keep = v.get('Tcb') in target_tcbs
+                    # 先有界保留元数据再关联，避免跨CPU绑定行晚于数据行导致丢前缀。
+                    keep = True
                 if not keep:
                     filtered += 1
                     return
@@ -555,6 +622,11 @@ def _read_etl(path, *, maximum_events, _api=None, target=None):
         errors.append('retention budget exceeded')
     if cpu_chain_mismatches:
         errors.append('CPU switch chain gap')
+    if target is not None:
+        identifiers={keys.get(('Tcb',tcb)) for tcb in target_tcbs}
+        selected=[r for r in rows if r['provider']!=TCPIP or r['values'].get('Tcb') in identifiers]
+        filtered += len(rows)-len(selected)
+        rows=selected
     for row in rows:
         row['time_ns'] = qpc_ns(row['ticks'],header['frequency'],header['clock'])
     def summaries(mapping):
@@ -579,14 +651,14 @@ def _read_etl(path, *, maximum_events, _api=None, target=None):
                           and r['values'].get('ProcessId')==pid and r['time_ns']<=window[0]]
         # 生命周期夹住完整应用窗口，并核查内部ready/in/out序列；不以包络或lost0单独判完整。
         normalized = normalize_schedule({**result,'target_tid':tid,'target_window_ns':list(window)})
-        lives = [e['life'] for e in normalized['events'] if e['kind']=='start' and e['tid']==tid]
-        state = scheduling(normalized,pid,tid,lives[0]) if len(lives)==1 else {'state':'unknown'}
+        lifetime_replay,window_replay = _window_schedule(normalized,pid,tid,window)
         result.update(schema='native-calibration-view-v1',target_pid=pid,target_tid=tid,
             target_window_ns=list(window),filtered_event_count=filtered,retention_limit=100000,
             target_connection_count=len(target_tcbs),target_critical_gaps=critical_gaps,
             cpu_chain_mismatches=cpu_chain_mismatches,
             schedule_window_complete=(not errors and len(starts)==len(ends)==len(process_starts)==1
-                                      and state['state']!='unknown'),
+                                      and window_replay['state']!='unknown'),
+            lifetime_replay=lifetime_replay,window_replay=window_replay,
             source_payload='excluded; target TCP metadata only',
             tcp_usable=False)  # byte/SeqNo校准仍须独立应用流锚点，事件出现不自动设为可用。
     return result
@@ -617,13 +689,14 @@ def normalize_schedule(trace):
         elif row['provider']==THREAD:
             opcode = row['opcode']
             row_index = row.get('event_index')
-            def emit(kind,tid,_stamp=stamp,_index=row_index,terminal=False,**extra):
+            row_cpu = row.get('cpu')
+            def emit(kind,tid,_stamp=stamp,_index=row_index,_cpu=row_cpu,terminal=False,**extra):
                 nonlocal unassociated
                 if trace.get('target_tid') is not None and tid!=trace['target_tid']:
                     return
                 if tid in threads:
                     pid, life = threads[tid]
-                    events.append({'kind':kind,'time':_stamp,'pid':pid,'tid':tid,'life':life,**extra})
+                    events.append({'kind':kind,'time':_stamp,'pid':pid,'tid':tid,'life':life,'cpu':_cpu,'event_index':_index,**extra})
                 elif tid:
                     # 仅明确结束后、窗口外、未复用TID的终止切出可单独保存；不隐藏窗口内未知。
                     boundary = ended.get(tid)
@@ -654,7 +727,7 @@ def normalize_schedule(trace):
                 emit('ready',value['TThreadId'])
             elif opcode==36:
                 state = {1:'ready',5:'waiting'}.get(value['OldThreadState'],'unknown')
-                emit('out',value['OldThreadId'],next=state,terminal=value['OldThreadState']==4)
+                emit('out',value['OldThreadId'],next=state,old_thread_state=value['OldThreadState'],terminal=value['OldThreadState']==4)
                 emit('in',value['NewThreadId'])
     return {'events':events,'complete':trace['complete'] and not unassociated,
         'unassociated_events':unassociated,'terminal_boundary_events':terminal_boundaries,
@@ -687,3 +760,99 @@ def correlate_frame(sidecar, identity, events, anchor=None):
         trusted=True,lost=anchor.get('lost',0))
     return {**result,'anchor_evidence':anchor['evidence'],
             'note':'caller-supplied verified anchor; software does not establish TCP/socket readiness semantics'}
+
+
+def control_tcp_anchor(trace, sidecar, connection):
+    """以已验证setup静止边界的独立字节N证明本次流零点，不用普通控制帧反推。"""
+    from .tail_calibration import _sockaddr
+    def unknown(reason):return {'verified':False,'reason':reason}
+    if not trace.get('complete') or not sidecar.get('complete'):
+        return unknown('file or stream incomplete')
+    if connection not in (0,1) or len(sidecar.get('connections',[]))!=2:
+        return unknown('connection identity unavailable')
+    conn=sidecar['connections'][connection];cp=conn.get('setup_checkpoint')
+    if (conn.get('epoch')!=connection or conn.get('pid')!=trace.get('target_pid') or not cp
+            or cp.get('operation')!='lan_setup' or cp.get('sequence')!=2
+            or cp.get('contract')!='validated-setup-reply-then-offline-request-v1'
+            or cp.get('epoch')!=connection):return unknown('setup checkpoint missing/wrong epoch')
+    n,stamp,next_send=(cp.get(k) for k in ('received_bytes','checkpoint_ns','next_send_enter_ns'))
+    if (any(type(v) is not int for v in (n,stamp,next_send)) or not 0<n<2**31
+            or not conn['registered_ns']<stamp<next_send):return unknown('checkpoint bounds ambiguous')
+    if not isinstance(sidecar.get('protocol'),(tuple,list)) or len(sidecar['protocol'])!=3 or any(not isinstance(v,str) or not v for v in sidecar['protocol']):
+        return unknown('public protocol identity missing')
+    rows=[r for r in trace['events'] if r['provider']==TCPIP]
+    births=[r for r in rows if r['id']==1033 and r['values'].get('ProcessId')==conn['pid']
+        and _sockaddr(r['values'].get('LocalAddress'))==tuple(conn['local'])
+        and _sockaddr(r['values'].get('RemoteAddress'))==tuple(conn['remote'])]
+    if len(births)!=1:return unknown('unique connect-completed event unavailable')
+    birth=births[0];tcb=birth['values']['Tcb']
+    starts=[r['time_ns'] for r in trace['events'] if r['provider']==PROCESS and r['opcode']==1 and r['values'].get('ProcessId')==conn['pid']]
+    process_ends=[r['time_ns'] for r in trace['events'] if r['provider']==PROCESS and r['opcode']==2 and r['values'].get('ProcessId')==conn['pid']]
+    if len(starts)!=1 or len(process_ends)!=1 or not starts[0]<=birth['time_ns']<stamp<process_ends[0]:
+        return unknown('unique process lifetime unavailable')
+    if sum(r['id']==1033 and r['values'].get('Tcb')==tcb for r in rows)!=1:
+        return unknown('TCB reused')
+    metadata=[r for r in rows if r['id']!=1074 and r['values'].get('Tcb')==tcb]
+    if any(_sockaddr(r['values'].get('LocalAddress'))!=tuple(conn['local'])
+           or _sockaddr(r['values'].get('RemoteAddress'))!=tuple(conn['remote'])
+           or r['values'].get('ProcessId',r['values'].get('Pid')) not in (0,conn['pid']) for r in metadata):
+        return unknown('connection lifecycle identity conflict')
+    data=[r for r in rows if r['id']==1074 and r['values']['Tcb']==tcb and r['values']['NumBytes']>0]
+    if any(r['time_ns']<birth['time_ns'] for r in data):return unknown('data precedes connection birth')
+    if any(r['time_ns'] in (stamp,next_send) for r in data):return unknown('checkpoint timestamp tie')
+    prefix=[r for r in data if r['time_ns']<stamp]
+    if not prefix:return unknown('setup prefix absent')
+    candidates=[]
+    for start in {r['values']['SeqNo'] for r in prefix}:
+        ranges=sorted(((r['values']['SeqNo']-start)%2**32,
+                       (r['values']['SeqNo']-start)%2**32+r['values']['NumBytes']) for r in prefix)
+        end=0
+        for left,right in ranges:
+            if left>end or right>n:break
+            end=max(end,right)
+        else:
+            if end==n:candidates.append(start)
+    if len(candidates)!=1:return unknown('prefix union is not uniquely exactly N bytes')
+    start=candidates[0]
+    if any((r['values']['SeqNo']-start)%2**32+r['values']['NumBytes']>n
+           for r in data if stamp<r['time_ns']<next_send):
+        return unknown('unsolicited prefix growth before next request')
+    ends=[*process_ends,*[r['time_ns'] for r in metadata if r['id'] in (1040,1043)]]
+    end_ns=min(ends) if ends else None
+    if end_ns is not None and end_ns<=next_send:return unknown('connection ended before setup boundary')
+    flow=('control','P'+str(connection+1),'Client',connection,0,'receive','TCPIP1074')
+    return {'verified':True,'sequence_at_application_offset_zero':start,'flow':flow,
+        'diagnostic_id':sidecar['context']['diagnostic_id'],'source_head':sidecar['context']['source_head'],
+        'protocol':sidecar['protocol'],'connection':conn,'semantic_boundary':'TCPIP1074 verified data sequence',
+        'evidence':{'checkpoint':cp,'birth_event_index':birth['event_index'],
+            'prefix_event_indices':[r['event_index'] for r in prefix],'prefix_union_bytes':n,'connection_end_ns':end_ns},
+        'packets':[{'seq':r['values']['SeqNo'],'length':r['values']['NumBytes'],'time':r['time_ns'],
+                    'packet':r['event_index'],'flow':flow} for r in data]}
+
+
+def control_frame_coverage(trace, sidecar, identity, anchor, first_read_ns, frame_ns):
+    """只使用内部独立锚点，逐回复验证；窗外额外字节保留unknown，不猜FIN。"""
+    unknown={'boundary':'unknown','complete_at':None,'socket_readable':'unknown'}
+    if not anchor.get('verified'):return {**unknown,'reason':anchor.get('reason')}
+    if type(first_read_ns) is not int or type(frame_ns) is not int or first_read_ns>frame_ns:
+        return {**unknown,'reason':'application read bounds unavailable'}
+    rows=[r for r in sidecar['rows'] if r[0]==identity]
+    if len(rows)!=1 or len(rows[0])!=8 or any(type(v) is not int for v in rows[0]) or rows[0][4]<anchor['evidence']['checkpoint']['received_bytes'] or rows[0][5]<=0 or rows[0][6]!=rows[0][4]+4+rows[0][5] or rows[0][3]!=rows[0][1]+rows[0][2]:
+        return {**unknown,'reason':'control frame is not after independent setup prefix'}
+    if first_read_ns<=anchor['evidence']['checkpoint']['next_send_enter_ns']:
+        return {**unknown,'reason':'control read precedes next request boundary'}
+    packets=anchor['packets']
+    if any((p['seq']-anchor['sequence_at_application_offset_zero'])%2**32>=2**31 for p in packets):
+        return {**unknown,'reason':'sequence unwrap ambiguous'}
+    end_ns=anchor['evidence'].get('connection_end_ns')
+    if end_ns is not None:
+        target_start=rows[0][4];target_end=rows[0][6]
+        for p in packets:
+            offset=(p['seq']-anchor['sequence_at_application_offset_zero'])%2**32
+            if p['time']>=end_ns and max(offset,target_start)<min(offset+p['length'],target_end):
+                return {**unknown,'reason':'target bytes overlap ended connection'}
+    result=correlate_frame(sidecar,identity,packets,anchor)
+    if result['complete_at'] is not None and result['complete_at']>frame_ns:
+        return {**unknown,'reason':'component coverage occurs after application frame read'}
+    result['outside_business_events_unknown']=[p['packet'] for p in packets if p['time']>trace['target_window_ns'][1]]
+    return result

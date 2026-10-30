@@ -576,3 +576,141 @@ def analyze_manifests(paths, *, same_host=False, partial=False):
         result['functional_outcomes'] = [{'side':m['side'],'functional_complete':m['functional_complete'],
                                         'group':m['group']} for m in loaded]
     return result
+
+
+def select_slow_steps(samples, threshold_ns=20_000_000):
+    """严格work>20ms，并加入前后最近正常步；没有慢步不得自动重跑。"""
+    work={s['global_step']:s['work_elapsed_ns'] for s in samples
+          if type(s.get('work_elapsed_ns')) is int and s['work_elapsed_ns']>=0}
+    slow={k for k,v in work.items() if v>threshold_ns};selected=set(slow);neighbors={}
+    for step in sorted(slow):
+        normal=[k for k,v in work.items() if v<=threshold_ns]
+        before=max((k for k in normal if k<step),default=None)
+        after=min((k for k in normal if k>step),default=None)
+        neighbors[step]={'before':before,'after':after}
+        selected.update(k for k in (before,after) if k is not None)
+    return sorted(slow),sorted(selected),neighbors
+
+
+def analyze_slow_control(paths):
+    """只读逐慢步证据，不跨主机减QPC；缺独立TCP零点时仍输出应用及调度。"""
+    from secure_control.experiments.windows_tail_analysis import (
+        control_frame_coverage,
+        control_tcp_anchor,
+        normalize_schedule,
+    )
+    validated=analyze_manifests(paths,partial=True)
+    manifests=[(Path(p),json.loads(Path(p).read_text(encoding='utf8'))) for p in paths]
+    control_plans=[m.get('plan',{}).get('control_plan_sha256') for _,m in manifests]
+    if any(control_plans):
+        if len(manifests)!=2 or len(set(control_plans))!=1:
+            raise ValueError('control-purpose plan mismatch between peers')
+        approvals=[m['plan'].get('control_authorization') for _,m in manifests]
+        if approvals[0]!=approvals[1] or not isinstance(approvals[0],dict):
+            raise ValueError('control-purpose approval mismatch between peers')
+    records={};sources={};samples=[];client_dir=None;client_manifest=None
+    for path,m in manifests:
+        samples.extend(m.get('control_samples',[]))
+        for entry in m['files']:
+            p=path.parent/entry['path']
+            if p.is_file():
+                r=json.loads(p.read_text(encoding='utf8'));records[r['role']]=r
+                sources[r['role']]=entry['sha256']
+        if m.get('side')=='client':client_dir=path.parent;client_manifest=m
+    decoded={r:_decode(v) for r,v in records.items()}
+    slow,chosen,neighbors=select_slow_steps(samples)
+    native=None;stream=None;native_reason='missing hash-bound control-native evidence';native_hashes={}
+    if client_dir is not None:
+        evidence=client_manifest.get('native_evidence',{})
+        if evidence.get('status')=='read':
+            native_hashes=evidence['files']
+            if set(native_hashes)!={'native-a.etl','control-native-events.json','control-native-view.json','Client.stream.json'}:
+                raise ValueError('control native artifact set incomplete')
+            for name,digest in native_hashes.items():
+                p=(client_dir/name).resolve()
+                if p.parent!=client_dir.resolve() or hashlib.sha256(p.read_bytes()).hexdigest()!=digest:
+                    raise ValueError('control native artifact identity/hash changed')
+            native=json.loads((client_dir/'control-native-view.json').read_text(encoding='utf8'))
+            stream=json.loads((client_dir/'Client.stream.json').read_text(encoding='utf8'))
+            native['events']=json.loads((client_dir/'control-native-events.json').read_text(encoding='utf8'))
+            client=records['Client']
+            if (native.get('etl_sha256')!=native_hashes['native-a.etl']
+                    or native.get('purpose')!='control-slow-step-v1'
+                    or native.get('source_head')!=client['context']['source_head']
+                    or native.get('diagnostic_id')!=client['context']['diagnostic_id']
+                    or native['target_pid']!=client['pid'] or native['target_tid']!=client['main_thread_id']
+                    or stream['context']['diagnostic_id']!=client['context']['diagnostic_id']
+                    or stream['context']['source_head']!=client['context']['source_head']):
+                raise ValueError('control native/stream target mismatch')
+            native_reason='independent SeqNo/application-offset-zero anchor unavailable for this connection'
+    normalized=(normalize_schedule({**native,'target_tid':native['target_tid']}) if native else None)
+    anchors=[control_tcp_anchor(native,stream,i) for i in (0,1)] if native and stream else []
+    for anchor in anchors:
+        if anchor.get('verified'):anchor['evidence'].update(artifact_sha256=native_hashes)
+    results=[]
+    for step in chosen:
+        sample=next(s for s in samples if s['global_step']==step)
+        start,end=sample['actual_sample_start_ns'],sample['work_completed_ns']
+        intervals=[]
+        if native and native.get('schedule_window_complete') is True:
+            anchor=native['window_replay']['anchor'];state='unknown';previous=anchor['time']
+            for e in normalized['events']:
+                if e['time']<anchor['time']:continue
+                left,right=max(start,previous),min(end,e['time'])
+                if left<right and state in ('running','ready'):
+                    intervals.append({'state':state,'start_ns':left,'end_ns':right,
+                        'boundary_event_index':e.get('event_index')})
+                if e['kind']=='in':state='running'
+                elif e['kind']=='out':state=e['next']
+                elif e['kind']=='ready':state='ready'
+                elif e['kind']=='end':state='ended'
+                previous=e['time']
+                if previous>end:break
+        parties=[]
+        for party,role in enumerate(('P1','P2')):
+            client=decoded.get('Client',{})
+            send=[s for s in client.get('spans',[]) if s['global_step']==step
+                  and s['phase']=='request_send' and s['aux']==party]
+            points={name:next((p['wall_ns'] for p in client.get('points',[])
+                if p['global_step']==step and p['phase']==name and p['aux']==party),None)
+                for name in ('reply_read','reply_frame')}
+            server=[s for s in decoded.get(role,{}).get('spans',[]) if s['global_step']==step]
+            mapping=[r for r in (stream or {}).get('rows',[]) if r[0]==step*2+party]
+            coverage=(control_frame_coverage(native,stream,step*2+party,anchors[party],
+                points['reply_read'],points['reply_frame']) if anchors else {'complete_at':None,'reason':native_reason})
+            covered=coverage['complete_at']
+            wait=None
+            first=points['reply_read']
+            if len(send)==1 and first is not None and first>=send[0]['end_ns']:
+                lo,hi=send[0]['end_ns'],first
+                ready_ns=_union([(max(lo,r['start_ns']),min(hi,r['end_ns'])) for r in intervals
+                    if r['state']=='ready' and max(lo,r['start_ns'])<min(hi,r['end_ns'])])
+                running_ns=_union([(max(lo,r['start_ns']),min(hi,r['end_ns'])) for r in intervals
+                    if r['state']=='running' and max(lo,r['start_ns'])<min(hi,r['end_ns'])])
+                verified=bool(native and native.get('schedule_window_complete'))
+                wait={'send_complete_to_first_read_ns':hi-lo,
+                    'ready_observed_ns':ready_ns if verified else None,
+                    'running_observed_ns':running_ns if verified else None,
+                    'other_scheduler_states_ns':hi-lo-ready_ns-running_ns if verified else None,
+                    'before_component_coverage_ns':None if covered is None else max(0,min(hi,covered)-lo),
+                    'after_component_coverage_ns':None if covered is None else max(0,hi-max(lo,covered)),
+                    'note':'scheduler occupancy only; waiting is not proof of network delay'}
+            parties.append({'role':role,'A_wait_analysis':wait,'A_request_send_spans':send,'A_reply_points_ns':points,
+                'A_reply_stream_row':mapping[0] if len(mapping)==1 else None,
+                'tcp_component_complete_ns':covered,'tcp_coverage':coverage,
+                'tcp_unknown_reason':None if covered is not None else coverage.get('reason',native_reason),
+                'B_local_spans':server,'B_clock_domain_id':records.get(role,{}).get('context',{}).get('clock_domain_id'),
+                'cross_host_difference_ns':None})
+        results.append({'diagnostic_id':(client_manifest or {}).get('diagnostic_id'),
+            'source_head':(client_manifest or {}).get('source_head'),'global_step':step,'kind':'slow' if step in slow else 'normal_neighbor',
+            'round_id':sample.get('round_id'),'work_ns':sample['work_elapsed_ns'],
+            'A_clock_domain_id':records.get('Client',{}).get('context',{}).get('clock_domain_id'),
+            'A_exchange_spans':[s for s in decoded.get('Client',{}).get('spans',[]) if s['global_step']==step and s['phase']=='exchange'],
+            'thread_intervals':intervals,'thread_intervals_verified':bool(native and native.get('schedule_window_complete')),
+            'parties':parties,'cause':'unresolved; observations do not establish socket readability or GIL availability'})
+    return {'schema':'control-slow-step-analysis-v1','status':'observed' if slow else 'not_reproduced' if validated['diagnostic_complete'] else 'incomplete_no_slow_observed',
+        'threshold_ns':20_000_000,'slow_steps':slow,'normal_neighbors':neighbors,'rows':results,
+        'diagnostic_complete':validated['diagnostic_complete'],'role_sha256':sources,
+        'native_sha256':native_hashes,
+        'tcp_anchors':[{k:v for k,v in a.items() if k!='packets'} for a in anchors],
+        'socket_readable':'unknown','retry':False}

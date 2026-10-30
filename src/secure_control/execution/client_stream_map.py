@@ -61,6 +61,20 @@ class ClientStreamMap:
         except Exception as error:  # noqa: BLE001 - 固定槽异常不改变发送/接收。
             self.fail(type(error).__name__)
 
+    def setup_checkpoint(self,sock):
+        """仅原owner在已校验同步setup后调用；无新增IO，每连接固定一条。"""
+        try:
+            if (not isinstance(sock,_CountedSocket) or sock.owner is not self or sock.checkpoint is not None
+                    or sock.active is not None or sock.remaining is not None or sock.header_bytes
+                    or sock.received<=0 or sock.sent<=0 or threading.get_native_id()!=sock.thread):
+                raise ValueError('setup_checkpoint_unproven')
+            sock.checkpoint={'epoch':sock.index,'operation':'lan_setup','sequence':2,
+                'contract':'validated-setup-reply-then-offline-request-v1',
+                'received_bytes':sock.received,'sent_bytes':sock.sent,
+                'checkpoint_ns':time.perf_counter_ns(),'next_send_enter_ns':None}
+        except Exception as error:  # noqa: BLE001 - 观察失败不能改变协议结果。
+            self.fail(type(error).__name__)
+
     def report(self):
         """退出才展开公开数字；round引用由原Client.json同step的身份表解释。"""
         rows = [list(_ROW.unpack_from(self.buffer,i*_ROW.size)) for i in range(self.count)]
@@ -73,7 +87,7 @@ class ClientStreamMap:
                 'step_times_two_plus_connection','send_start','send_length','send_complete',
                 'receive_start','receive_body_length','receive_complete','reserved'],
             'connections':[{'epoch':s.index,'pid':os.getpid(),'thread_id':s.thread,
-                'registered_ns':s.registered_ns,
+                'registered_ns':s.registered_ns,'setup_checkpoint':s.checkpoint,
                 'local':s.local,'remote':s.remote,'sent_bytes':s.sent,'received_bytes':s.received,
                 'anchor':'application stream from connect; TCP sequence anchor still required'} for s in self.connections],
             'scope':'counts include every successful send/recv after registration; no TCP headers/body contents; frame bytes do not prove protocol validation'}
@@ -89,6 +103,7 @@ class _CountedSocket:
         self.registered_ns = time.perf_counter_ns()
         self.sent = self.received = 0
         self.active = None
+        self.checkpoint = None
         self.header = 0
         self.header_bytes = 0
         self.remaining = None
@@ -99,6 +114,10 @@ class _CountedSocket:
         return getattr(self.sock,name)
 
     def send(self,data,*args,**kwargs):
+        if threading.get_native_id()!=self.thread or (args and args[0]) or kwargs.get('flags',0):
+            self.owner.fail('concurrent_or_flagged_io')
+        if self.checkpoint is not None and self.checkpoint['next_send_enter_ns'] is None:
+            self.checkpoint['next_send_enter_ns']=time.perf_counter_ns()
         count = self.sock.send(data,*args,**kwargs)
         try:
             if type(count) is not int or not 0 <= count <= len(data) or self.sent > _MAX-count:
@@ -117,6 +136,9 @@ class _CountedSocket:
 
     def recv(self,*args,**kwargs):
         data = self.sock.recv(*args,**kwargs)
+        if threading.get_native_id()!=self.thread or (len(args)>1 and args[1]) or kwargs.get('flags',0):
+            self.owner.fail('concurrent_or_flagged_io')
+            return data
         try:
             if self.received > _MAX-len(data):
                 raise ValueError('counter_overflow')

@@ -40,6 +40,19 @@ v5的schema_source指向公开tag，schema_sha256是固定布局契约说明的�
 
 ### TCP链路：实际enable证明和完整公开流锚点，不猜来源
 
+File候选显式设置`NonPagedMemory="true"`。WPR默认false会使用分页缓冲；
+[微软日志模式文档](https://learn.microsoft.com/en-us/windows/win32/etw/logging-mode-constants)
+说明内核provider不能写入`EVENT_TRACE_USE_PAGED_MEMORY`会话；
+[微软WSL的同GUID配置](https://github.com/microsoft/WSL/blob/afa988cfb498fb9794718683823fb38dbc96673d/diagnostics/wsl.wprp)
+也显式使用非分页内存。候选据此修正，未更换provider/事件/关键词或启用系统全局设置。
+实际QueryAllTraces的LogFileMode在开始及结束均核对，分页或模式缺失不放行。
+旧运行未保存该会话字段，不能仅凭修正宣称已唯一解释旧TCP0，更不能声称新实采已通过。
+
+只读prepare与启动前各记录带UTC/QPC时间的已启用实例快照；它们不证明自有会话启用。
+启动后仍独立核对自有logger与实际注册实例。File来源审计版本升为2，计划明确
+`native_nonpaged_buffer_bytes=12582912`：总缓冲仍12MiB，非分页分配从原系统8MiB增至12MiB。
+旧计划/旧批准不能复用；Memory历史入口保持。实际TCP产出及流/序号关联仍待新批准校准。
+
 新File入口在自有两个session创建后，以QueryAllTraces的session ID/GUID与
 EnumerateTraceGuidsEx返回的TRACE_ENABLE_INFO对应，核对本次TCPIP enable、level5、
 MatchAny/MatchAll及实例flags。PRE_ENABLE(0x2)仅表示provider注册前预启用，不能证明
@@ -83,6 +96,10 @@ TDH注册清单或profiledetails不再代替本次实际enable证据；event-ID�
 计数包含过滤前descriptor/错误/丢失；保留最多10万条目标线程/进程和其TCP元数据，其他行不保存。
 窗口外、已明确结束且未复用TID的terminal switch-out单独保存边界证据，不冒充窗口内缺口；
 窗口内/无归属/复用仍拒绝。
+校准报告分别保存`lifetime_replay`与`window_replay`。窗口验证保留全文件丢失/解码/容量、
+生命周期及CPU链门禁，只允许唯一生命周期中窗前明确切入作为Running锚点；目标CPU驻留
+必须连续且唯一。锚点至窗末的未知状态、Ready冲突或切换缺口仍拒绝；窗内较晚锚点不能
+跳过窗口开头。全生命周期的前缀异常及原事件CPU/index/旧状态仍保留供审计，通用重放规则不变。
 同时核查目标生命周期夹住窗口、内部切换/唤醒序列和全局每CPU切换链；缺前缀、内部缺口、
 unsupported或保留耗尽都不能设完整。输出JSON合计32MiB、实际进程峰值工作集目标512MiB并核对。
 输出/峰值/ETL超限判失败，不用仅增大数字掩盖原全量行内存问题。
@@ -122,6 +139,52 @@ local_checks_complete，双机校准结果必须再核对B原件。源query/启�
 并确认两端设备/配置可用。此批准不包含正式2000步控制实验。当前新实采、新流量、实际窗口
 覆盖、TCP产出及资源峰值均NOT RUN；软件/离线v5通过不能替代它们。校准任一FAIL/PARTIAL
 就报告具体阻断并停止，三项实际能力通过后才申请正式根因实验。
+
+## #153：原控制慢步诊断入口（新控制运行尚未授权）
+
+目标为逐个解释`work > 20_000_000 ns`的步骤及前后最近正常步，不以公开回显校准全绿或
+提速对比作为交付。原117步缺少的TCP事件不能事后补回；新运行只能解释新复现。
+
+`prepare-control-file`只读生成purpose=`control-slow-step-v1`的File计划，绑定三角色公开
+配置语义、拓扑、审查链接和源码。`client/pair --authorization`只接受新的
+`native-control-authorization-v1`记录，绑定同计划摘要、diagnostic_id、两端新绝对路径、
+严格整数attempts=1/steps=2000。v3回显及旧#132许可不能复用；批准无效在ledger/采集前拒绝，
+一旦尝试即由原单次ledger永久扣减，失败不退额、不重试。
+
+A沿原Client+worker/stream-map入口，原owner在spawn前启动File会话、子进程退出后收尾；
+55秒原生上限、12MiB非分页缓冲、128MiB ETL/384MiB临时目标、2GiB余量保持。B使用已有
+首request_receive观察点记录一次业务起点：等待至多45秒、业务至多55秒、总至多100秒。
+原20ms模型周期、协议/矩阵、GC和网卡设置保持；超时保留partial，不缩短2000步冒充成功。
+
+停止后唯一有界读取目标Client PID/TID/实际工作首末；保存带摘要的原生视图与目标元数据。
+离线峰值512MiB/JSON合计32MiB仍是软目标，超限失败而不重跑。没有新控制运行批准文件。
+
+下面是审查后、获批且两端固定同一SHA时的执行形式。`$runHead`和`$reviewUrl`须对应最终已审
+版本；准备生成的计划及获批后生成的批准文件须原样复制到B，输出路径必须与批准一致。
+本节命令不是现在启动控制采集的授权。
+
+```powershell
+# A只读准备
+uv run python scripts/run_control_tail_diagnostic.py prepare-control-file .tmp/d153-control-plan.json --expected-head $runHead --software-review $reviewUrl
+# B先启动
+uv run python scripts/run_control_tail_diagnostic.py pair results/tail_diagnostics/d153-control-B --diagnostic-id d153-control-once --expected-head $runHead --software-review $reviewUrl --window 2000 --steps 2000 --native-plan .tmp/d153-control-plan.json --authorization .tmp/d153-control-authorization.json
+# A紧接着启动（管理员）
+uv run python scripts/run_control_tail_diagnostic.py client results/tail_diagnostics/d153-control-A --diagnostic-id d153-control-once --expected-head $runHead --software-review $reviewUrl --window 2000 --steps 2000 --stream-map --native-plan .tmp/d153-control-plan.json --authorization .tmp/d153-control-authorization.json
+# 将B完整目录复制到A后，只读逐步分析
+uv run python scripts/run_control_tail_diagnostic.py analyze-control results/tail_diagnostics/d153-control-A/manifest.json results/tail_diagnostics/d153-control-B/manifest.json --output results/tail_diagnostics/d153-control-analysis.json
+```
+
+逐步表含run/step/round、work/exchange、A发送/首次读/收齐、线程Ready/Running区间、B本地
+处理span、原件摘要、时钟域和缺证据原因。只同机相减；Running不是Python/GIL可用证明，
+等待不是网络延迟证明。控制连接以现有已校验lan_setup回复后的静止边界证明本次独立SeqNo零点：每连接一次记录
+累计接收N/checkpoint及下一已有send进入时刻。B在该回复后仅等待offline请求，无主动推送。
+原socket从任何应用握手前注册；并发/PEEK/旁路IO使证据失效。完整新连接1033出生事件、
+PID/四元组/TCB唯一关联后，checkpoint前序号区间并集必须唯一连续且恰为N，直至下一send
+不增长；缺首部、空洞、未来补洞、TCB复用或时间相等歧义均返回具体unknown。先有界保留
+TCP元数据再关联，避免回调绑定晚于数据而丢失前缀。锚点及每帧首次覆盖证据均绑定原件摘要
+和事件索引，不复用v3序号、不把首个普通控制帧当0。业务窗外额外+1单独保留unknown，
+不猜FIN；若影响目标区间/生命周期则该帧拒绝。通过时给出A等待在组件覆盖之前/之后的
+同机时间分段；该组件仍不等同socket可读，不能承诺一次拆开B读取前和网络等待。若无慢步返回not_reproduced；不完整包无慢步另标incomplete，均不补跑。
 
 ## 维护候选与采集有效性（D132-19，软件阶段）
 
