@@ -362,7 +362,8 @@ def prepare_native(profile, *, _schemas=None, _backend=None, _file_candidate=Fal
     backend = WprBackend() if _backend is None else _backend
     background=_session_snapshot(backend.sessions())
     name = 'D21' if _b_receive else 'D20' if _file_candidate else 'D17'
-    result = backend.run(['-profiledetails',plan['profile']+'!'+name],10)
+    result = backend.run(['-profiledetails',plan['profile']+'!'+name,
+                          *(['-filemode'] if _file_candidate else [])],10)
     if result.returncode:
         raise ValueError('WPR rejected custom profile')
     result = {**plan,'schema':'native-tail-preparation-v1','window':2000,
