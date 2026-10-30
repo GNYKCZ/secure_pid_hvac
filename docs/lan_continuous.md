@@ -186,6 +186,30 @@ TCP元数据再关联，避免回调绑定晚于数据而丢失前缀。锚点�
 不猜FIN；若影响目标区间/生命周期则该帧拒绝。通过时给出A等待在组件覆盖之前/之后的
 同机时间分段；该组件仍不等同socket可读，不能承诺一次拆开B读取前和网络等待。若无慢步返回not_reproduced；不完整包无慢步另标incomplete，均不补跑。
 
+### #159：已有原件的独立重分析
+
+`analyze-control`可直接读取原有hash绑定的events/view/stream，不重新读取ETL或启动采集。
+只用1033连接完成之后、setup checkpoint之前的完整序号并集独立确定应用零点；并集
+必须恰好等于应用累计N。连接完成前的观测必须完全被这个独立前缀覆盖、处于同一进程
+生命周期且无连接身份冲突，否则仍unknown。通过时把其索引、时刻、长度和post覆盖见证
+保存在`pre_connect_observations`；这些观测不进入业务packets或提前complete_at，也不猜测
+其为SYN/FIN。连接完成同刻的数据保守拒绝，不能靠时间容差放行。
+
+新增`cpu_residence`与每步`cpu_residence_intervals`：在原全文件质量、CPU链、唯一生命周期
+和目标跨CPU唯一驻留门禁通过后，只以实际CSwitch边界证明半开Running/Not-running区间。
+窗口必须由实际切换边界夹住，不用线程结束或窗口长度补齐缺边界。Ready事件与切出状态
+2/3/7不会改变这一驻留结果；原严格Ready重放及失败状态保持。状态名见
+[Microsoft CSwitch定义](https://learn.microsoft.com/en-us/windows/win32/etw/cswitch)。
+同一原始事件的旧/新TID相同时，仅在当前已驻留同CPU、out/in同刻配对时作为连续驻留，
+保留事件索引，不生成离CPU间隙；错CPU或无匹配驻留仍拒绝。
+Not-running不等于Ready或网络等待，Running也不证明Python/GIL可用或有效计算时间。
+
+每方`A_wait_analysis`新增`residency_verified`、`running_residency_ns`、`not_running_ns`、
+`unknown_ns`；缺证据时前两项计时为null、未知时长保留，不能记零。旧Ready字段仍只在
+严格重放成功时可用。`capture_source_head`与`analysis_source`分别记录采集SHA、分析SHA、
+分析模块摘要和脏状态；原manifest的`diagnostic_complete`及旧`schedule_window_complete`
+不会改写。输出使用新文件名，保留旧分析结果，不因解析改善而自动宣称根因已查明。
+
 ## 维护候选与采集有效性（D132-19，软件阶段）
 
 按[D19设计](https://github.com/GNYKCZ/secure_pid_hvac/issues/132#issuecomment-6464649290)，

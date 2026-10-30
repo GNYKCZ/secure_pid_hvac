@@ -1035,7 +1035,7 @@ def test_control_missing_approval_fails_before_ledger_or_native(tmp_path,monkeyp
     assert not (tmp_path/'new').exists()
 
 
-@pytest.mark.parametrize('fault',[None,'hash','identity'])
+@pytest.mark.parametrize('fault',[None,'hash','identity','residence_only','residence_quality'])
 def test_slow_table_native_hash_identity_and_clipped_thread_evidence(tmp_path,monkeypatch,fault):
     """只测试新离线拼接边界；角色解码/跨机身份由已有分析器独立覆盖。"""
     import hashlib
@@ -1055,12 +1055,22 @@ def test_slow_table_native_hash_identity_and_clipped_thread_evidence(tmp_path,mo
         {'provider':THREAD,'opcode':36,'time_ns':60,'cpu':0,'event_index':2,'values':{'NewThreadId':0,'OldThreadId':2,'OldThreadState':5}},
         {'provider':THREAD,'opcode':50,'time_ns':70,'cpu':0,'event_index':3,'values':{'TThreadId':2}},
         {'provider':THREAD,'opcode':36,'time_ns':80,'cpu':0,'event_index':4,'values':{'NewThreadId':2,'OldThreadId':0,'OldThreadState':1}},
-        {'provider':THREAD,'opcode':2,'time_ns':110,'values':{'TThreadId':2,'ProcessId':1}}]
+        {'provider':THREAD,'opcode':36,'time_ns':105,'cpu':0,'event_index':5,'values':{'NewThreadId':0,'OldThreadId':2,'OldThreadState':5}},
+        {'provider':THREAD,'opcode':2,'time_ns':110,'values':{'TThreadId':2,'ProcessId':1}},
+        {'provider':PROCESS,'opcode':2,'time_ns':115,'values':{'ProcessId':1}}]
     (tmp_path/'native-a.etl').write_bytes(b'fake offline input')
     etlhash=hashlib.sha256((tmp_path/'native-a.etl').read_bytes()).hexdigest()
     view={'purpose':'control-slow-step-v1','source_head':'a'*40,'diagnostic_id':'bad' if fault=='identity' else 'x',
         'target_pid':1,'target_tid':2,'complete':True,'schedule_window_complete':True,'etl_sha256':etlhash,
         'window_replay':{'anchor':{'time':20}}}
+    view.update(header={'events_lost':0,'buffers_lost':0},errors=[],target_critical_gaps=0,
+        cpu_chain_mismatches=0,target_window_ns=[30,100])
+    if fault in ('residence_only','residence_quality'):
+        view['schedule_window_complete']=False
+        rows[3]['values']['OldThreadState']=3
+        rows[4]['time_ns']=59  # Ready先于out；不能把此事件用作CPU边界。
+        rows[3],rows[4]=rows[4],rows[3]
+    if fault=='residence_quality':view['cpu_chain_mismatches']=1
     files={'control-native-view.json':view,'control-native-events.json':rows,'Client.stream.json':{'context':ctx,'rows':[]}}
     for name,value in files.items():(tmp_path/name).write_text(json.dumps(value),encoding='utf8')
     hashes={name:hashlib.sha256((tmp_path/name).read_bytes()).hexdigest() for name in (*files,'native-a.etl')}
@@ -1070,11 +1080,20 @@ def test_slow_table_native_hash_identity_and_clipped_thread_evidence(tmp_path,mo
         'native_evidence':{'status':'read','files':hashes}}
     p=tmp_path/'manifest.json';p.write_text(json.dumps(manifest),encoding='utf8')
     if fault=='hash':(tmp_path/'native-a.etl').write_bytes(b'changed')
-    if fault:
+    if fault in ('hash','identity'):
         with pytest.raises(ValueError):a.analyze_slow_control([p])
         return
     result=a.analyze_slow_control([p]);wait=result['rows'][0]['parties'][0]['A_wait_analysis']
     assert wait['send_complete_to_first_read_ns']==50
+    if fault in ('residence_only','residence_quality'):
+        assert wait['ready_observed_ns'] is None and wait['running_observed_ns'] is None
+        assert not result['rows'][0]['thread_intervals_verified']
+        assert wait['residency_verified']==(fault=='residence_only')
+        assert wait['running_residency_ns']==(30 if fault=='residence_only' else None)
+        assert wait['not_running_ns']==(20 if fault=='residence_only' else None)
+        assert wait['unknown_ns']==(0 if fault=='residence_only' else 50)
+        assert result['original_schedule_window_complete'] is False
+        return
     assert wait['ready_observed_ns']==10 and wait['running_observed_ns']==30
     assert wait['other_scheduler_states_ns']==10
     assert result['rows'][0]['parties'][0]['tcp_component_complete_ns'] is None

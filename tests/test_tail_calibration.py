@@ -420,7 +420,9 @@ def test_window_anchor_preserves_prefix_conflicts_and_rejects_internal_gaps(tmp_
 
 
 @pytest.mark.parametrize('fault',[None,'retransmit','plus_n','minus_n','hole','future_fill','unsolicited','tie',
-    'reuse','endpoint','no_birth','lost','epoch','protocol','prefix_missing','late_frame','outside_extra','end_before_checkpoint','data_after_end'])
+    'reuse','endpoint','no_birth','lost','epoch','protocol','prefix_missing','late_frame','outside_extra','end_before_checkpoint','data_after_end',
+    'early_duplicate','early_outside','early_only','early_before_process','connect_tie',
+    'early_fills_head','early_fills_tail','early_spans_packets'])
 def test_control_setup_anchor_is_independent_of_nonzero_control_offsets(fault):
     from secure_control.experiments.windows_tail_analysis import (
         control_frame_coverage,
@@ -439,6 +441,15 @@ def test_control_setup_anchor_is_independent_of_nonzero_control_offsets(fault):
     def packet(seq,size,t,index):return {'provider':TCPIP,'id':1074,'time_ns':t,'event_index':index,
         'values':{'Tcb':9,'SeqNo':seq%2**32,'NumBytes':size}}
     rows=[birth,packet(start,6,20,1),packet(start+6,4,26,2),packet(start+10,8,80,3)]
+    if fault in ('early_duplicate','early_outside','early_only','early_before_process','connect_tie'):
+        rows.insert(0,packet(start-1 if fault=='early_outside' else start,1,
+            4 if fault=='early_before_process' else 10 if fault=='connect_tie' else 9,7))
+    if fault=='early_only':rows.pop(2)
+    if fault in ('early_fills_head','early_fills_tail','early_spans_packets'):
+        rows.insert(0,packet(start+4 if fault=='early_spans_packets' else start,
+            4 if fault=='early_spans_packets' else 10,9,7))
+    if fault=='early_fills_head':rows.pop(2)
+    if fault=='early_fills_tail':rows.pop(3)
     if fault=='retransmit':rows.insert(3,packet(start+6,4,30,4))
     if fault=='plus_n':conn['setup_checkpoint']['received_bytes']=11
     if fault=='minus_n':conn['setup_checkpoint']['received_bytes']=9
@@ -460,9 +471,15 @@ def test_control_setup_anchor_is_independent_of_nonzero_control_offsets(fault):
                  {'provider':PROCESS,'opcode':2,'time_ns':120,'values':{'ProcessId':1}}])
     trace={'complete':fault!='lost','target_pid':1,'target_window_ns':[70,100],'events':rows}
     anchor=control_tcp_anchor(trace,sidecar,0)
-    if fault not in (None,'retransmit','late_frame','outside_extra','data_after_end'):
+    if fault not in (None,'retransmit','late_frame','outside_extra','data_after_end','early_duplicate','early_spans_packets'):
         assert not anchor['verified'];return
     assert anchor['verified'] and anchor['sequence_at_application_offset_zero']==start
+    if fault in ('early_duplicate','early_spans_packets'):
+        assert anchor['evidence']['pre_connect_events_unknown']==[7]
+        assert 7 not in anchor['evidence']['prefix_event_indices']
+        assert 7 not in [p['packet'] for p in anchor['packets']]
+        witness=anchor['evidence']['pre_connect_observations'][0]
+        assert witness['post_prefix_witness_indices']==([1,2] if fault=='early_spans_packets' else [1])
     coverage=control_frame_coverage(trace,sidecar,0,anchor,85,90)
     assert coverage['complete_at']==(None if fault in ('late_frame','data_after_end') else 80)
     if fault=='outside_extra':assert coverage['outside_business_events_unknown']==[4]

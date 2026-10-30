@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import re
+import subprocess
 from pathlib import Path
 
 from secure_control.execution.diagnostic_limits import artifact_limits
@@ -597,6 +598,7 @@ def analyze_slow_control(paths):
     from secure_control.experiments.windows_tail_analysis import (
         control_frame_coverage,
         control_tcp_anchor,
+        cpu_residence,
         normalize_schedule,
     )
     validated=analyze_manifests(paths,partial=True)
@@ -644,6 +646,8 @@ def analyze_slow_control(paths):
                 raise ValueError('control native/stream target mismatch')
             native_reason='independent SeqNo/application-offset-zero anchor unavailable for this connection'
     normalized=(normalize_schedule({**native,'target_tid':native['target_tid']}) if native else None)
+    residence=cpu_residence(native) if native else {'verified':False,'intervals':[],
+        'ready_state':'unknown','reason':native_reason}
     anchors=[control_tcp_anchor(native,stream,i) for i in (0,1)] if native and stream else []
     for anchor in anchors:
         if anchor.get('verified'):anchor['evidence'].update(artifact_sha256=native_hashes)
@@ -651,6 +655,8 @@ def analyze_slow_control(paths):
     for step in chosen:
         sample=next(s for s in samples if s['global_step']==step)
         start,end=sample['actual_sample_start_ns'],sample['work_completed_ns']
+        cpu_intervals=[{**r,'start_ns':max(start,r['start_ns']),'end_ns':min(end,r['end_ns'])}
+            for r in residence['intervals'] if max(start,r['start_ns'])<min(end,r['end_ns'])]
         intervals=[]
         if native and native.get('schedule_window_complete') is True:
             anchor=native['window_replay']['anchor'];state='unknown';previous=anchor['time']
@@ -688,7 +694,16 @@ def analyze_slow_control(paths):
                 running_ns=_union([(max(lo,r['start_ns']),min(hi,r['end_ns'])) for r in intervals
                     if r['state']=='running' and max(lo,r['start_ns'])<min(hi,r['end_ns'])])
                 verified=bool(native and native.get('schedule_window_complete'))
+                on_cpu=_union([(max(lo,r['start_ns']),min(hi,r['end_ns'])) for r in cpu_intervals
+                    if r['state']=='running' and max(lo,r['start_ns'])<min(hi,r['end_ns'])])
+                off_cpu=_union([(max(lo,r['start_ns']),min(hi,r['end_ns'])) for r in cpu_intervals
+                    if r['state']=='not_running' and max(lo,r['start_ns'])<min(hi,r['end_ns'])])
+                cpu_verified=residence['verified'] and on_cpu+off_cpu==hi-lo
                 wait={'send_complete_to_first_read_ns':hi-lo,
+                    'residency_verified':cpu_verified,
+                    'running_residency_ns':on_cpu if cpu_verified else None,
+                    'not_running_ns':off_cpu if cpu_verified else None,
+                    'unknown_ns':0 if cpu_verified else hi-lo,
                     'ready_observed_ns':ready_ns if verified else None,
                     'running_observed_ns':running_ns if verified else None,
                     'other_scheduler_states_ns':hi-lo-ready_ns-running_ns if verified else None,
@@ -707,10 +722,25 @@ def analyze_slow_control(paths):
             'A_clock_domain_id':records.get('Client',{}).get('context',{}).get('clock_domain_id'),
             'A_exchange_spans':[s for s in decoded.get('Client',{}).get('spans',[]) if s['global_step']==step and s['phase']=='exchange'],
             'thread_intervals':intervals,'thread_intervals_verified':bool(native and native.get('schedule_window_complete')),
+            'cpu_residence_intervals':cpu_intervals,'residency_verified':residence['verified'],
             'parties':parties,'cause':'unresolved; observations do not establish socket readability or GIL availability'})
+    # 派生报告分别记录采集和分析源码；不得把旧manifest的失败状态改写成新成功。
+    root=Path(__file__).resolve().parents[3]
+    try:
+        analysis_head=subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip()
+        analysis_dirty=bool(subprocess.check_output(['git','status','--porcelain','--',
+            'src/secure_control/experiments/windows_tail_analysis.py',
+            'src/secure_control/experiments/tail_diagnostic_analysis.py'],cwd=root,text=True).strip())
+    except (OSError,subprocess.CalledProcessError):analysis_head,analysis_dirty=None,None
     return {'schema':'control-slow-step-analysis-v1','status':'observed' if slow else 'not_reproduced' if validated['diagnostic_complete'] else 'incomplete_no_slow_observed',
         'threshold_ns':20_000_000,'slow_steps':slow,'normal_neighbors':neighbors,'rows':results,
         'diagnostic_complete':validated['diagnostic_complete'],'role_sha256':sources,
         'native_sha256':native_hashes,
+        'capture_source_head':(client_manifest or {}).get('source_head'),
+        'analysis_source':{'head':analysis_head,'dirty':analysis_dirty,
+            'module_sha256':{p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in
+                (Path(__file__),Path(__file__).with_name('windows_tail_analysis.py'))}},
+        'cpu_residence':{k:v for k,v in residence.items() if k!='intervals'},
+        'original_schedule_window_complete':(native or {}).get('schedule_window_complete'),
         'tcp_anchors':[{k:v for k,v in a.items() if k!='packets'} for a in anchors],
         'socket_readable':'unknown','retry':False}
