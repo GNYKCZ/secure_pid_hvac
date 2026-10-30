@@ -210,6 +210,61 @@ Not-running不等于Ready或网络等待，Running也不证明Python/GIL可用�
 分析模块摘要和脏状态；原manifest的`diagnostic_complete`及旧`schedule_window_complete`
 不会改写。输出使用新文件名，保留旧分析结果，不因解析改善而自动宣称根因已查明。
 
+### #161：B组件到首读的单次验证准备
+
+新用途`control-b-receive-boundary-v1`只验证B端请求组件覆盖至首次成功recv/帧收齐的等待。
+不实现PktMon/NIC边界，也不能把组件前等待称为纯链路时延。普通入口默认关闭。
+B在accept后、任何hello字节读取前，只包装Client连接；peer连接不包装。固定8192帧、
+655360字节数字缓冲计入原每角色6MiB限额；所有setup/维护字节计数，只有请求身份校验
+通过才绑定step/sequence。失败/EOF、PEEK、旁路或并发使观察不完整，不改变原业务异常。
+首字节组件覆盖与整帧覆盖分别报告；首读早于整帧覆盖时后者到首读为null，不填零。
+
+B独立setup锚点记录已校验setup请求累计N及回复send进入时刻。A原同步请求等待这份回复
+才发下一请求，故此段是既有协议的静止边界，不增加网络消息。1017接受连接完成事件和
+1074连续前缀证明本次接收序号；1034失败和1300存在事件不能代替出生证据。
+B单个自有File会话在P1/P2创建前实际启用，停止后一次解码保留两个目标的ProcessThread
+生命周期和TCP元数据；不新增CSwitch/Ready/DPC/堆栈采集。
+
+预算候选需新批准：A保持12MiB非分页缓冲/native55秒业务上限和100秒原生收尾目标；
+B为6MiB（ProcessThread2+TCP4）、监听等待45秒、业务55秒、原生及本端总墙钟目标120秒。
+B活动/清理截至原生开始后110秒，stop最多10秒且不超120秒剩余预算；首业务开始后将
+业务截止收紧至55秒。等待45秒含本端准备开销，不承诺任意晚启动仍运行2000步，超时
+保留partial。两端各ETL128MiB、临时384MiB软目标、磁盘余量2GiB、离线峰值512MiB和
+JSON合计32MiB软目标保持。B6MiB/120秒是本阶段显式新增预算，不能套用旧批准。
+
+两机均使用管理员PowerShell。下面命令只读准备；`$runHead`及`$reviewUrl`必须对应本阶段
+最终已审版本。当前软件实现不授权真实采集。
+
+```powershell
+# A：准备本机原生节点
+uv run python scripts/run_control_tail_diagnostic.py prepare-control-file .tmp/d161-A-node.json --expected-head $runHead --software-review $reviewUrl
+# B：准备本机接收节点，实际TDH版本可与A不同
+uv run python scripts/run_control_tail_diagnostic.py prepare-b-receive-file .tmp/d161-B-node.json --expected-head $runHead --software-review $reviewUrl
+# 将B节点原样复制到A的.tmp后，在A组合不可变root
+uv run python scripts/run_control_tail_diagnostic.py combine-b-receive-plans .tmp/d161-A-node.json .tmp/d161-B-node.json .tmp/d161-root-plan.json --diagnostic-id d161-b-receive-once-01
+```
+
+root绑定两节点完整内容和摘要、各自准备机器/角色/公开配置/拓扑、相同源码SHA、review及
+run-id。新的`b-receive-authorization-v1`批准记录包含purpose、source_head、root的
+`plan_sha256`、diagnostic_id、严格整数attempts=1/steps=2000、两端新绝对输出路径和新
+`https://github.com/GNYKCZ/secure_pid_hvac/issues/161#issuecomment-...`授权记录。
+旧153授权不可复用。root与批准文件须原样复制到B；只读准备可做，运行前须另有具体批准。
+
+```powershell
+# 获批后B先启动，A紧接启动；两端root及authorization完全相同
+uv run python scripts/run_control_tail_diagnostic.py pair results/tail_diagnostics/d161-B --diagnostic-id d161-b-receive-once-01 --expected-head $runHead --software-review $reviewUrl --window 2000 --steps 2000 --native-plan .tmp/d161-root-plan.json --authorization .tmp/d161-authorization.json
+uv run python scripts/run_control_tail_diagnostic.py client results/tail_diagnostics/d161-A --diagnostic-id d161-b-receive-once-01 --expected-head $runHead --software-review $reviewUrl --window 2000 --steps 2000 --stream-map --native-plan .tmp/d161-root-plan.json --authorization .tmp/d161-authorization.json
+# B完整结果目录复制到A后，只读分析新慢步及邻步
+uv run python scripts/run_control_tail_diagnostic.py analyze-control results/tail_diagnostics/d161-A/manifest.json results/tail_diagnostics/d161-B/manifest.json --output results/tail_diagnostics/d161-analysis.json
+```
+
+B新增`P1.receive.json`、`P2.receive.json`、`native-b.etl`、`request-native-events.json`及
+`request-native-view.json`由manifest的`b_request_evidence`摘要绑定。分析逐方新增
+`B_receive_analysis`：独立匹配A发送累计区间与B已验证请求区间后，只在B本地域计算
+首字节组件→首读、整帧组件→收齐及recv进入位置，保留索引、原件hash和具体unknown。
+这能判别B组件至应用读取是否贡献长尾，不能区分栈交付/调度/GIL，更不直接跨机减QPC。
+无慢步如实报告未复现，失败不退额度、不换ID或目录补跑；不取消其他用户会话。
+
 ## 维护候选与采集有效性（D132-19，软件阶段）
 
 按[D19设计](https://github.com/GNYKCZ/secure_pid_hvac/issues/132#issuecomment-6464649290)，

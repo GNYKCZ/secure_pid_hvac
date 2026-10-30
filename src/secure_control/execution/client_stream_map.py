@@ -173,3 +173,137 @@ class _CountedSocket:
         except Exception as error:  # noqa: BLE001 - 数据仍原样交给正式解帧/校验路径。
             self.owner.fail(type(error).__name__)
         return data
+
+
+class PartyReceiveMap:
+    """单个Party的Client入流固定观察；不保留内容、不拥有协议或新增任何IO。"""
+
+    row = struct.Struct('!10q')
+    capacity = 8192
+
+    def __init__(self):
+        self.buffer=bytearray(self.capacity*self.row.size)
+        self.connection=None
+        self.count=0
+        self.error=None
+        self.checkpoint=None
+
+    def fail(self,kind):
+        """仅使观察失效，原socket异常和返回值保持。"""
+        self.error=self.error or kind
+
+    def register(self,sock):
+        """accept后、hello前只注册Client连接；peer socket不得进入。"""
+        try:
+            if self.connection is not None:raise ValueError('connection_capacity')
+            local,remote=sock.getsockname(),sock.getpeername()
+            if len(local)!=2 or len(remote)!=2:raise ValueError('IPv4_required')
+            self.connection=_PartyReceiveSocket(sock,self,local,remote)
+            return self.connection
+        except Exception as error:  # noqa: BLE001 - 观察失败不阻断控制。
+            self.fail(type(error).__name__)
+            return sock
+
+    def validate(self,sock,sequence,operation,step=-1):
+        """只由请求身份校验成功的owner调用，绑定最后完整帧的公开身份。"""
+        try:
+            if (sock is not self.connection or sock.active is not None or not self.count
+                    or threading.get_native_id()!=sock.thread or type(sequence) is not int
+                    or type(step) is not int or not -1<=step<2000
+                    or operation not in ('lan_setup','online_permit')):
+                raise ValueError('unvalidated_request_boundary')
+            offset=(self.count-1)*self.row.size
+            row=list(self.row.unpack_from(self.buffer,offset))
+            if row[9] or row[3]!=sock.received:raise ValueError('request_binding_conflict')
+            row[7:]=[step,sequence,1 if operation=='lan_setup' else 2]
+            self.row.pack_into(self.buffer,offset,*row)
+            if operation=='lan_setup':
+                if step!=-1 or sequence!=2 or self.checkpoint is not None:
+                    raise ValueError('setup_checkpoint_conflict')
+                self.checkpoint={'operation':'lan_setup','sequence':2,'epoch':0,
+                    'contract':'validated-setup-request-before-reply-v1',
+                    'received_bytes':sock.received,'checkpoint_ns':time.perf_counter_ns(),
+                    'reply_send_enter_ns':None}
+        except Exception as error:  # noqa: BLE001 - 诊断不能改变身份校验结果。
+            self.fail(type(error).__name__)
+
+    def report(self):
+        """退出时展开固定数字，未校验帧保留为未绑定；不按索引猜global_step。"""
+        sock=self.connection
+        return {'schema':'party-receive-map-v1','buffer_bytes':len(self.buffer),
+            'complete':self.error is None and sock is not None and sock.active is None
+                and self.checkpoint is not None and self.checkpoint['reply_send_enter_ns'] is not None,
+            'error_type':self.error,'rows':[list(self.row.unpack_from(self.buffer,i*self.row.size))
+                for i in range(self.count)],'row_fields':['frame_index','receive_start','body_length',
+                'receive_complete','recv_enter_ns','first_positive_return_ns','frame_complete_ns',
+                'validated_step','validated_sequence','operation_code'],
+            'connection':None if sock is None else {'epoch':0,'pid':os.getpid(),
+                'thread_id':sock.thread,'registered_ns':sock.registered_ns,'local':sock.local,
+                'remote':sock.remote,'received_bytes':sock.received,'setup_checkpoint':self.checkpoint},
+            'scope':'Client requests only; all handshake/maintenance bytes counted; no payload'}
+
+
+class _PartyReceiveSocket:
+    """逐次透传recv/send；每帧仅记录首个成功调用与最后字节返回时刻。"""
+
+    def __init__(self,sock,owner,local,remote):
+        self.sock,self.owner,self.local,self.remote=sock,owner,local,remote
+        self.thread=threading.get_native_id()
+        self.registered_ns=time.perf_counter_ns()
+        self.received=0
+        self.active=None
+        self.header=self.header_bytes=0
+        self.remaining=None
+
+    def __getattr__(self,name):
+        if name in ('sendall','recv_into','sendto','recvfrom','sendmsg','recvmsg','sendfile','makefile','detach','dup'):
+            self.owner.fail('unobserved_io_path')
+        return getattr(self.sock,name)
+
+    def send(self,data,*args,**kwargs):
+        if threading.get_native_id()!=self.thread or (args and args[0]) or kwargs.get('flags',0):
+            self.owner.fail('concurrent_or_flagged_io')
+        cp=self.owner.checkpoint
+        if cp is not None and cp['reply_send_enter_ns'] is None:
+            cp['reply_send_enter_ns']=time.perf_counter_ns()
+        return self.sock.send(data,*args,**kwargs)
+
+    def recv(self,*args,**kwargs):
+        entered=time.perf_counter_ns()
+        data=self.sock.recv(*args,**kwargs)
+        returned=time.perf_counter_ns()
+        if threading.get_native_id()!=self.thread or (len(args)>1 and args[1]) or kwargs.get('flags',0):
+            self.owner.fail('concurrent_or_flagged_io')
+            return data
+        try:
+            if not data:
+                if self.active is not None:self.owner.fail('incomplete_frame_eof')
+                return data
+            if self.received>_MAX-len(data):raise ValueError('counter_overflow')
+            base=self.received
+            self.received+=len(data)
+            offset=0
+            while offset<len(data) and self.owner.error is None:
+                if self.active is None:
+                    if self.owner.count>=self.owner.capacity:raise ValueError('frame_capacity')
+                    self.active=self.owner.count
+                    self.owner.count+=1
+                    self.owner.row.pack_into(self.owner.buffer,self.active*self.owner.row.size,
+                        self.active,base+offset,-1,-1,entered,returned,-1,-1,-1,0)
+                if self.remaining is None:
+                    self.header=(self.header<<8)|data[offset]
+                    self.header_bytes+=1;offset+=1
+                    if self.header_bytes==4:
+                        self.remaining=self.header
+                        if not 0<self.remaining<=16*1024*1024:raise ValueError('invalid_frame_length')
+                else:
+                    count=min(self.remaining,len(data)-offset)
+                    offset+=count;self.remaining-=count
+                    if self.remaining==0:
+                        row=list(self.owner.row.unpack_from(self.owner.buffer,self.active*self.owner.row.size))
+                        row[2],row[3],row[6]=self.header,base+offset,returned
+                        self.owner.row.pack_into(self.owner.buffer,self.active*self.owner.row.size,*row)
+                        self.active=None;self.header=self.header_bytes=0;self.remaining=None
+        except Exception as error:  # noqa: BLE001 - 元数据失败仍原样交付业务字节。
+            self.owner.fail(type(error).__name__)
+        return data

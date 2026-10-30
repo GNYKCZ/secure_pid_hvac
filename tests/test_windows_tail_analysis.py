@@ -147,6 +147,24 @@ def test_circular_suffix_with_zero_loss_cannot_prove_schedule_or_tcp_coverage():
 FLOW=('epoch1','B','A',34401,12345,'receive','TCPIP1074')
 
 
+@pytest.mark.parametrize('version',[0,1])
+@pytest.mark.skipif(os.name!='nt',reason='Windows TDH metadata only')
+def test_accept_1017_uses_actual_tdh_manifest_with_constructed_payload(version):
+    api=_native();event=api.record_type();event.header.size=80;event.header.flags=0x40
+    event.header.provider.data[:]=uuid.UUID(TCPIP).bytes_le
+    event.header.desc.id=1017;event.header.desc.version=version
+    local=bytes.fromhex('02008661c0a81f740000000000000000')
+    remote=bytes.fromhex('0200c778c0a81ffd0000000000000000')
+    raw=struct.pack('<I16sI16sIIIQ'+('Q' if version else ''),16,local,16,remote,0,41,0,0x1234,
+        *([98765] if version else []))
+    buffer=ctypes.create_string_buffer(raw);event.user=ctypes.cast(buffer,ctypes.c_void_p);event.length=len(raw)
+    decoded=api.event(ctypes.pointer(event))
+    assert decoded['values']=={'Tcb':0x1234,'LocalAddress':local.hex(),'RemoteAddress':remote.hex(),
+        'ProcessId':41,**({'ProcessStartKey':98765} if version else {})}
+    assert decoded['schema_sha256']
+    assert _fields((TCPIP,1017,2,0)) is None
+
+
 def packet(seq,length,time,identity,flow=FLOW,**kw):
     return dict(seq=seq,length=length,time=time,packet=identity,flow=flow,**kw)
 

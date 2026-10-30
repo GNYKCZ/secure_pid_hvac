@@ -4,6 +4,7 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import shutil
+import socket
 import struct
 import subprocess
 import time
@@ -22,6 +23,57 @@ AUTHORIZATION = 'https://github.com/GNYKCZ/secure_pid_hvac/issues/132#issuecomme
 CALIBRATION_RESOURCES = {'minimum_free_bytes':2*1024**3,'etl_limit_bytes':128*1024*1024,
     'disk_budget_bytes':384*1024*1024,'native_window_s':100,'active_window_s':55,
     'native_buffer_bytes':12*1024*1024,'native_nonpaged_buffer_bytes':12*1024*1024}
+B_RECEIVE_PURPOSE='control-b-receive-boundary-v1'
+B_RECEIVE_RESOURCES={**CALIBRATION_RESOURCES,'native_window_s':120,
+    'native_buffer_bytes':6*1024*1024,'native_nonpaged_buffer_bytes':6*1024*1024}
+
+
+def combine_receive_plans(client,pair,diagnostic_id):
+    """组合两机各自只读核验的不可变节点；不能以A清单冒充B的TDH核验。"""
+    if (client.get('purpose')!='control-slow-step-v1' or pair.get('purpose')!=B_RECEIVE_PURPOSE
+            or pair.get('schema')!='native-b-receive-preparation-v1'
+            or client.get('source_head')!=pair.get('source_head')
+            or client.get('software_review')!=pair.get('software_review')
+            or any(c!=client['control_configurations'].get(c['role']) for c in pair['control_configurations'].values())):
+        raise ValueError('receive node plans mismatch')
+    return {'schema':'b-receive-preparation-v1','purpose':B_RECEIVE_PURPOSE,
+        'source_head':client['source_head'],'software_review':client['software_review'],
+        'diagnostic_id':diagnostic_id,'control_steps':2000,'pair_wait_s':45,'pair_business_s':55,
+        'pair_total_s':120,'hosts':{'client':client,'pair':pair},
+        'node_sha256':{'client':plan_digest(client),'pair':plan_digest(pair)},
+        'control_configurations':client['control_configurations']}
+
+
+def authorize_receive(approval,plan,*,side,output,head,diagnostic_id,configurations):
+    """新用途一次批准绑定root及两节点；旧153批准不能扩展到B会话。"""
+    import re
+    if (not isinstance(approval,dict) or plan.get('schema')!='b-receive-preparation-v1'
+            or plan.get('purpose')!=B_RECEIVE_PURPOSE or plan.get('source_head')!=head
+            or approval.get('schema')!='b-receive-authorization-v1'
+            or approval.get('purpose')!=B_RECEIVE_PURPOSE or approval.get('source_head')!=head
+            or approval.get('plan_sha256')!=plan_digest(plan)
+            or plan.get('diagnostic_id')!=diagnostic_id or approval.get('diagnostic_id')!=diagnostic_id
+            or type(approval.get('attempts')) is not int or approval['attempts']!=1
+            or type(approval.get('steps')) is not int or approval['steps']!=2000
+            or plan.get('control_steps')!=2000 or plan.get('pair_wait_s')!=45
+            or plan.get('pair_business_s')!=55 or plan.get('pair_total_s')!=120
+            or side not in ('client','pair') or not isinstance(approval.get(side+'_output'),str)
+            or Path(approval[side+'_output']).resolve()!=Path(output).resolve()
+            or not re.fullmatch(r'https://github.com/GNYKCZ/secure_pid_hvac/issues/161#issuecomment-[0-9]+',str(approval.get('authorization_url','')))
+            or any(c!=plan.get('control_configurations',{}).get(c['role']) for c in configurations)):
+        raise PermissionError('new B receive root authorization required')
+    for node,resources in (('client',CALIBRATION_RESOURCES),('pair',B_RECEIVE_RESOURCES)):
+        item=plan.get('hosts',{}).get(node,{})
+        if (item.get('source_head')!=head or item.get('software_review')!=plan.get('software_review')
+                or item.get('schema')!=('native-b-receive-preparation-v1' if node=='pair' else 'native-calibration-preparation-v1')
+                or item.get('purpose')!=(B_RECEIVE_PURPOSE if node=='pair' else 'control-slow-step-v1')
+                or item.get('capture_role')!=node or not isinstance(item.get('prepared_host'),str)
+                or not item['prepared_host']
+                or plan.get('node_sha256',{}).get(node)!=plan_digest(item)
+                or any(c!=plan['control_configurations'].get(c['role']) for c in item.get('control_configurations',{}).values())
+                or any(item.get(k)!=v for k,v in resources.items())):
+            raise PermissionError('B receive node binding/resources changed')
+    return approval
 
 
 def plan_digest(plan):
@@ -57,8 +109,10 @@ def authorize_control(approval,plan,*,side,output,head,diagnostic_id,configurati
 
 
 def _exceptions_for(plan):
-    if plan.get('schema')=='native-calibration-preparation-v1':
-        return {'design':'https://github.com/GNYKCZ/secure_pid_hvac/issues/132#issuecomment-6471238272',
+    if plan.get('schema') in ('native-calibration-preparation-v1','native-b-receive-preparation-v1'):
+        return {'design':('https://github.com/GNYKCZ/secure_pid_hvac/issues/161#issuecomment-6517785399'
+            if plan.get('schema')=='native-b-receive-preparation-v1' else
+            'https://github.com/GNYKCZ/secure_pid_hvac/issues/132#issuecomment-6471238272'),
             'requested_not_approved':True,'os_abnormal_stop_hard_guarantee':False,
             'temporary_disk_hard_quota':False,'temporary_peak_verified':False}
     return resource_exceptions()
@@ -71,41 +125,42 @@ def resource_exceptions():
         'temporary_disk_hard_quota':False,'temporary_peak_verified':False}
 
 
-def profile_contract(path, schemas, *, file_candidate=False):
+def profile_contract(path, schemas, *, file_candidate=False, b_receive=False):
     """静态审计profile与本机全部被选版本字段，禁止宽关键字/raw内容旁路。"""
     path = Path(path).resolve()
     if path.stat().st_size>65536:
         raise ValueError('profile size')
     root = ET.fromstring(path.read_bytes())
+    ids=_IDS|{1017} if b_receive else _IDS
     providers = root.findall('.//EventProvider')
     profiles = root.findall('.//Profile')
     if (len(providers)!=1 or len(profiles)!=1
             or providers[0].get('Name')!=TCPIP or providers[0].get('Level')!='5'
             or file_candidate and providers[0].get('NonPagedMemory')!='true'
-            or profiles[0].get('Name')!=('D20' if file_candidate else 'D17')
+            or profiles[0].get('Name')!=('D21' if b_receive else 'D20' if file_candidate else 'D17')
             or profiles[0].get('LoggingMode')!=('File' if file_candidate else 'Memory')
             or any('Stack' in e.tag or e.tag in ('CaptureStateOnStart','CaptureStateOnSave') for e in root.iter())):
         raise ValueError('unexpected capture provider/profile')
     filters = providers[0].find('EventFilters')
     if (filters is None or filters.get('FilterIn')!='true'
-            or {int(e.get('Value')) for e in filters} != _IDS
-            or len(filters)!=len(_IDS)):
+            or {int(e.get('Value')) for e in filters} != ids
+            or len(filters)!=len(ids)):
         raise ValueError('source event-ID filter required')
     keywords = providers[0].findall('./Keywords/Keyword')
     system = root.findall('./Profiles/SystemProvider')
     if (len(keywords)!=1 or keywords[0].get('Value')!='0x600000484' or len(system)!=1
             or {e.get('Value') for e in system[0].findall('./Keywords/Keyword')}
-               != {'ProcessThread','CSwitch','ReadyThread'}):
+               != ({'ProcessThread'} if b_receive else {'ProcessThread','CSwitch','ReadyThread'})):
         raise ValueError('unexpected keyword scope')
     collectors = root.findall('.//SystemCollector')+root.findall('.//EventCollector')
     if (len(collectors)!=2 or sorted((int(e.find('BufferSize').get('Value')),
-             int(e.find('Buffers').get('Value'))) for e in collectors) != [(64,64),(64,128)]):
+             int(e.find('Buffers').get('Value'))) for e in collectors) != ([(64,32),(64,64)] if b_receive else [(64,64),(64,128)])):
         raise ValueError('native buffer budget')
     seen, descriptors = set(), set()
     for row in schemas:
         # 字段白名单并不能证明该版本会被当前level/keyword选中。
         # 只核验实际TDH descriptor，不根据事件缺失猜测或扩大keyword。
-        if (type(row['id']) is not int or row['id'] not in _IDS
+        if (type(row['id']) is not int or row['id'] not in ids
                 or row.get('provider')!=TCPIP
                 or type(row['version']) is not int or not 0<=row['version']<=255
                 or type(row.get('level')) is not int or not 0<=row['level']<=5
@@ -128,11 +183,11 @@ def profile_contract(path, schemas, *, file_candidate=False):
                     raise ValueError('address schema changed')
             elif name not in _SCALARS or _SCALARS[name]!=typ or flags:
                 raise ValueError('source field not audited; no payload fallback')
-    if seen != _IDS:
+    if seen != ids:
         raise ValueError('selected event schemas incomplete')
     return {'profile':str(path),'profile_sha256':hashlib.sha256(path.read_bytes()).hexdigest(),
-        'event_ids':sorted(_IDS),'source_schemas':schemas,'native_buffer_bytes':12*1024*1024,
-        'source_selection_audit_version':2 if file_candidate else 1,
+        'event_ids':sorted(ids),'source_schemas':schemas,'native_buffer_bytes':(6 if b_receive else 12)*1024*1024,
+        'source_selection_audit_version':3 if b_receive else 2 if file_candidate else 1,
         'source_payload':'excluded by ID allowlist and actual registered field audit',
         'runtime_semantics':('NOT RUN: actual TCP target-flow/SeqNo anchors, first-to-last scheduling coverage, '
             'thread lifetime, actual CSwitch version, QPC/loss and resource validation required; '
@@ -242,9 +297,9 @@ class WprBackend:
         """只读核对当前令牌；不弹提权窗口或变更权限。"""
         return bool(ctypes.WinDLL('shell32').IsUserAnAdmin())
 
-    def source_schemas(self):
+    def source_schemas(self, *, accept=False):
         """开始前重查实际字段，不能信任过期计划自报。"""
-        return tcp_source_schemas()
+        return tcp_source_schemas(accept=accept)
 
     def provider_enables(self):
         """只读实际provider→logger ID关联，区别于TDH注册清单。"""
@@ -255,18 +310,19 @@ class WprBackend:
         return subprocess.run([self.executable,*args],capture_output=True,timeout=timeout,check=False)
 
 
-def prepare_native(profile, *, _schemas=None, _backend=None, _file_candidate=False):
+def prepare_native(profile, *, _schemas=None, _backend=None, _file_candidate=False, _b_receive=False):
     """软件阶段唯一入口：TDH/会话查询及-profiledetails，不start/stop任何会话。"""
-    schemas = tcp_source_schemas() if _schemas is None else _schemas
-    plan = profile_contract(profile,schemas,file_candidate=_file_candidate)
+    schemas = tcp_source_schemas(accept=_b_receive) if _schemas is None else _schemas
+    plan = profile_contract(profile,schemas,file_candidate=_file_candidate,b_receive=_b_receive)
     backend = WprBackend() if _backend is None else _backend
     if any(r['name'].startswith('WPR_') or r['name']=='NT Kernel Logger' for r in backend.sessions()):
         raise ValueError('existing recording conflict; do not cancel it')
-    name = 'D20' if _file_candidate else 'D17'
+    name = 'D21' if _b_receive else 'D20' if _file_candidate else 'D17'
     result = backend.run(['-profiledetails',plan['profile']+'!'+name],10)
     if result.returncode:
         raise ValueError('WPR rejected custom profile')
     result = {**plan,'schema':'native-tail-preparation-v1','window':2000,
+        'prepared_host':socket.gethostname(),'capture_role':'pair' if _b_receive else 'client',
         'profiledetails_sha256':hashlib.sha256(result.stdout).hexdigest(),
         'prepared_not_captured':True,'real_capture_verified':False,
         'resource_exceptions':resource_exceptions(),
@@ -280,6 +336,10 @@ def prepare_native(profile, *, _schemas=None, _backend=None, _file_candidate=Fal
             'full lifecycle/coverage and measured resources require one separately authorized run')
     if _file_candidate:
         result['provider_snapshot_at_prepare'] = _provider_snapshot(backend)
+    if _b_receive:
+        result.update(schema='native-b-receive-preparation-v1',purpose=B_RECEIVE_PURPOSE,
+            capture_role='pair',**B_RECEIVE_RESOURCES)
+        result['resource_exceptions']=_exceptions_for(result)
     return result
 
 
@@ -299,12 +359,14 @@ def _nonpaged_sessions(rows):
 class NativeCapture:
     """唯一专项的会话owner；不由日常Client自动实例化，无重试或后台常驻服务。"""
 
-    def __init__(self,plan,output,*,_backend=None,_now=time.perf_counter,authorization=None):
+    def __init__(self,plan,output,*,_backend=None,_now=time.perf_counter,authorization=None,authorization_plan=None,side=None):
         self.plan,self.output = plan,Path(output).resolve()
         self.backend = WprBackend() if _backend is None else _backend
         self.now = _now
         self.authorization = authorization
-        self.file_candidate = plan.get('schema')=='native-calibration-preparation-v1'
+        self.authorization_plan,self.side=authorization_plan,side
+        self.b_receive=plan.get('schema')=='native-b-receive-preparation-v1'
+        self.file_candidate = self.b_receive or plan.get('schema')=='native-calibration-preparation-v1'
         self.instance = ('D20_' if self.file_candidate else 'D17_')+uuid4().hex
         self.owned = None
         self.started = None
@@ -314,7 +376,7 @@ class NativeCapture:
                 'query_sessions':['uv','run','python','-c',
                     ("import json,sys; from secure_control.experiments.native_tail_capture import _sessions; "
                      "print(json.dumps([r for r in _sessions() if sys.argv[1] in r['name']],indent=2))"),self.instance],
-                'save':['wpr','-stop',str(self.output.with_name('native-a-manual.etl')),
+                'save':['wpr','-stop',str(self.output.with_name(self.output.stem+'-manual.etl')),
                         '-skipPdbGen','-instancename',self.instance],
                 'condition':'先核对本instance及sessions的GUID；归属变化或无法确认时不要停止；无全局cancel'}}
 
@@ -323,23 +385,25 @@ class NativeCapture:
         if self.started is not None or self.output.exists():
             raise ValueError('native capture cannot restart/overwrite')
         profile = Path(self.plan['profile']).resolve()
-        name = 'control-tail-calibration.wprp' if self.file_candidate else 'control-tail-native-2000.wprp'
-        if (self.plan.get('schema')!=('native-calibration-preparation-v1' if self.file_candidate else 'native-tail-preparation-v1')
+        name = 'control-tail-b-receive.wprp' if self.b_receive else 'control-tail-calibration.wprp' if self.file_candidate else 'control-tail-native-2000.wprp'
+        if (self.plan.get('schema')!=('native-b-receive-preparation-v1' if self.b_receive else 'native-calibration-preparation-v1' if self.file_candidate else 'native-tail-preparation-v1')
                 or type(self.plan.get('source_selection_audit_version')) is not int
-                or self.plan['source_selection_audit_version']!=(2 if self.file_candidate else 1)
+                or self.plan['source_selection_audit_version']!=(3 if self.b_receive else 2 if self.file_candidate else 1)
                 or self.plan.get('window')!=(55 if self.file_candidate else 2000)
                 or profile != Path(__file__).resolve().parents[3]/'configs'/name
                 or hashlib.sha256(profile.read_bytes()).hexdigest()!=self.plan['profile_sha256']
                 or self.plan.get('resource_exceptions')!=_exceptions_for(self.plan)
-                or self.file_candidate and (self.plan.get('profile_name')!='D20' or self.plan.get('logging_mode')!='File')):
+                or self.file_candidate and (self.plan.get('profile_name')!=('D21' if self.b_receive else 'D20') or self.plan.get('logging_mode')!='File')):
             raise ValueError('native plan/profile mismatch')
         if not self.backend.is_admin():
-            raise PermissionError('A原生诊断需要管理员PowerShell；未启动采集')
-        actual_schemas = self.backend.source_schemas()
-        profile_contract(profile,actual_schemas,file_candidate=self.file_candidate)
+            raise PermissionError('原生诊断需要管理员PowerShell；未启动采集')
+        if self.plan.get('prepared_host',socket.gethostname())!=socket.gethostname():
+            raise ValueError('native node was prepared on another host')
+        actual_schemas = self.backend.source_schemas(accept=True) if self.b_receive else self.backend.source_schemas()
+        profile_contract(profile,actual_schemas,file_candidate=self.file_candidate,b_receive=self.b_receive)
         if actual_schemas != self.plan['source_schemas']:
             raise ValueError('native source schemas changed since preparation')
-        resources = CALIBRATION_RESOURCES if self.file_candidate else {'minimum_free_bytes':1024**3,
+        resources = B_RECEIVE_RESOURCES if self.b_receive else CALIBRATION_RESOURCES if self.file_candidate else {'minimum_free_bytes':1024**3,
                 'etl_limit_bytes':64*1024*1024,'disk_budget_bytes':256*1024*1024,
                 'native_window_s':limits_for(2000).native_s,'native_buffer_bytes':12*1024*1024}
         if any(type(self.plan.get(k)) is not int or self.plan[k]!=v for k,v in resources.items()):
@@ -360,7 +424,13 @@ class NativeCapture:
     def begin(self):
         """ledger已扣减后才运行；仍核验profile/hash/权限/冲突与磁盘。"""
         self.report['preflight'] = self.preflight()
-        if self.file_candidate:
+        if self.authorization_plan is not None:
+            root=self.authorization_plan
+            if self.side not in ('client','pair') or root.get('hosts',{}).get(self.side)!=self.plan:
+                raise PermissionError('capture node is not approved root member')
+            authorize_receive(self.authorization,root,side=self.side,output=self.output.parent,
+                head=self.plan['source_head'],diagnostic_id=root.get('diagnostic_id'),configurations=[])
+        elif self.file_candidate:
             approval = self.authorization
             if (not isinstance(approval,dict) or approval.get('schema')!=('native-control-authorization-v1' if self.plan.get('purpose')=='control-slow-step-v1' else 'native-calibration-authorization-v1')
                     or self.plan.get('purpose')=='control-slow-step-v1' and approval.get('purpose')!='control-slow-step-v1'
@@ -370,11 +440,11 @@ class NativeCapture:
                     or approval['authorization_url'] in (AUTHORIZATION,_exceptions_for(self.plan)['design'])):
                 raise PermissionError('File calibration requires a new plan-bound user authorization')
         self.started = self.now()
-        self.capture_deadline = self.started+(55 if self.file_candidate else limits_for(2000).native_s-10)
+        self.capture_deadline = self.started+(110 if self.b_receive else 55 if self.file_candidate else limits_for(2000).native_s-10)
         # start超时也可能已经创建自身会话，不能在finally中被误认成从未启动。
         self.owned = []
         try:
-            result = self.backend.run(['-start',self.plan['profile']+('!D20' if self.file_candidate else '!D17'),
+            result = self.backend.run(['-start',self.plan['profile']+('!D21' if self.b_receive else '!D20' if self.file_candidate else '!D17'),
                 *(['-filemode'] if self.file_candidate else []),'-instancename',self.instance],10)
         except Exception:
             self.finish(cancel=True)
@@ -389,7 +459,7 @@ class NativeCapture:
             rows = self.backend.sessions()
             own = [r for r in rows if self.instance in r['name']]
             if (len(own)!=2 or any(r['clock']!=1 for r in own)
-                    or sum(r['buffer_kb']*r['buffers']*1024 for r in own)>12*1024*1024):
+                    or sum(r['buffer_kb']*r['buffers']*1024 for r in own)>self.plan['native_buffer_bytes']):
                 raise ValueError('native ownership/clock/buffer proof unavailable')
             self.owned = own
             if self.file_candidate and not _nonpaged_sessions(own):
@@ -436,7 +506,7 @@ class NativeCapture:
             self.owned = None
             return self.report
         args = ['-cancel'] if cancel else ['-stop',str(self.output),'-skipPdbGen']
-        remaining = limits_for(2000).native_s-(self.now()-self.started)
+        remaining = self.plan['native_window_s']-(self.now()-self.started)
         if remaining<=0:
             self.report['status'] = 'deadline_exceeded_manual_attention'
             self.owned = None
@@ -453,7 +523,7 @@ class NativeCapture:
         self.report.update(native_buffer_bytes_at_stop=native_bytes,
             native_buffer_budget_exceeded=native_bytes>self.plan['native_buffer_bytes'])
         self.report['nonpaged_sessions_at_stop'] = _nonpaged_sessions(current) if self.file_candidate else None
-        valid = (not result.returncode and elapsed<=limits_for(2000).native_s
+        valid = (not result.returncode and elapsed<=self.plan['native_window_s']
                  and (not self.file_candidate or self.report['nonpaged_sessions_at_stop'])
                  and not any(r['events_lost'] or r['buffers_lost'] or r['clock']!=1 for r in current)
                  and native_bytes<=self.plan['native_buffer_bytes'])

@@ -29,6 +29,54 @@ def schemas():
     return result
 
 
+def test_b_receive_root_binds_two_independent_nodes_and_separate_resources(tmp_path):
+    from secure_control.experiments import native_tail_capture as m
+    rows=schemas();rows.append({**rows[0],'id':1017})
+    class BBackend(Backend):
+        def source_schemas(self,**kwargs):return rows
+        def sessions(self):
+            result=super().sessions()
+            for i,row in enumerate(result):
+                row.update(logger_id=100+i,log_file_mode=1)
+                if i==0:row['buffers']=32
+            return result
+        def provider_enables(self):
+            return [{'logger_id':101,'enabled':1,'level':5,'match_any':0x600000484,
+                'match_all':0,'instance_flags':0}] if self.live else []
+    backend=BBackend()
+    pair=m.prepare_native(PROFILE.with_name('control-tail-b-receive.wprp'),_schemas=rows,
+        _backend=backend,_file_candidate=True,_b_receive=True)
+    client=m.prepare_native(PROFILE.with_name('control-tail-calibration.wprp'),_schemas=schemas(),
+        _backend=Backend(),_file_candidate=True)
+    configs={r:{'role':r,'topology_digest':'topology'} for r in ('Client','P1','P2')}
+    for node in (client,pair):node.update(source_head='a'*40,software_review='https://example.test/review',control_configurations=configs)
+    client['purpose']='control-slow-step-v1'
+    root=m.combine_receive_plans(client,pair,'one-boundary-run')
+    assert pair['native_buffer_bytes']==6*1024*1024 and client['native_buffer_bytes']==12*1024*1024
+    assert pair['native_window_s']==120 and 1017 in pair['event_ids'] and 1017 not in client['event_ids']
+    assert [args[0] for args in backend.commands]==['-profiledetails']
+    approval={'schema':'b-receive-authorization-v1','purpose':m.B_RECEIVE_PURPOSE,
+        'source_head':'a'*40,'plan_sha256':m.plan_digest(root),'diagnostic_id':'one-boundary-run',
+        'attempts':1,'steps':2000,'client_output':str(tmp_path/'A'),'pair_output':str(tmp_path/'B'),
+        'authorization_url':'https://github.com/GNYKCZ/secure_pid_hvac/issues/161#issuecomment-9999999999'}
+    def authorize():return m.authorize_receive(approval,root,side='pair',output=tmp_path/'B',head='a'*40,
+        diagnostic_id='one-boundary-run',configurations=[configs['P1'],configs['P2']])
+    assert authorize() is approval
+    for key,value in [('purpose','control-slow-step-v1'),('attempts',True),('steps',400),
+        ('plan_sha256','wrong'),('pair_output',str(tmp_path/'other')),
+        ('authorization_url','https://github.com/GNYKCZ/secure_pid_hvac/issues/153#issuecomment-9999999999')]:
+        previous=approval[key];approval[key]=value
+        with pytest.raises(PermissionError):authorize()
+        approval[key]=previous
+    (tmp_path/'B').mkdir()
+    capture=m.NativeCapture(pair,tmp_path/'B'/'native-b.etl',_backend=backend,_now=lambda:0.,
+        authorization=approval,authorization_plan=root,side='pair')
+    capture.begin()
+    assert capture.capture_deadline==110 and backend.commands[-1][0]=='-start'
+    assert '!D21' in backend.commands[-1][1]
+    assert capture.finish()['status']=='saved'
+
+
 class Backend:
     """模拟本次唯一instance，命令列表可审计，没有subprocess调用。"""
 

@@ -496,3 +496,74 @@ def test_target_tcp_data_before_binding_callback_is_retained_without_renumbering
     assert [r['id'] for r in tcp]==[1074,1033]
     assert tcp[0]['values']['Tcb']==tcp[1]['values']['Tcb']
     assert [r['event_index'] for r in tcp]==[4,5]
+
+
+def party_request_evidence():
+    """独立构造：setup10字节、普通请求8字节，系统/应用均用B域时间。"""
+    conn={'epoch':0,'pid':1,'thread_id':2,'registered_ns':15,'local':['10.0.0.1',100],
+        'remote':['10.0.0.2',200],'setup_checkpoint':{'epoch':0,'operation':'lan_setup','sequence':2,
+            'contract':'validated-setup-request-before-reply-v1','received_bytes':10,
+            'checkpoint_ns':50,'reply_send_enter_ns':60}}
+    sidecar={'schema':'party-receive-map-v1','role':'P1','complete':True,'connection':conn,
+        'context':{'diagnostic_id':'run','source_head':'a'*40,'clock_domain_id':'B'},
+        'protocol':['run','session','epoch'],'rows':[[2,10,4,18,70,85,90,0,4,2]]}
+    birth={'provider':TCPIP,'id':1017,'time_ns':10,'event_index':1,'values':{'Tcb':9,
+        'ProcessId':1,'LocalAddress':addr('10.0.0.1',100),'RemoteAddress':addr('10.0.0.2',200)}}
+    packets=[{'provider':TCPIP,'id':1074,'time_ns':t,'event_index':i,
+        'values':{'Tcb':9,'SeqNo':seq,'NumBytes':size}} for seq,size,t,i in
+        [(100,6,20,2),(106,4,26,3),(110,8,80,4)]]
+    trace={'complete':True,'target_pid':1,'events':[
+        {'provider':PROCESS,'opcode':1,'time_ns':5,'values':{'ProcessId':1}},birth,*packets,
+        {'provider':PROCESS,'opcode':2,'time_ns':120,'values':{'ProcessId':1}}]}
+    return trace,sidecar
+
+
+@pytest.mark.parametrize('fault',[None,'split','wrong_birth','rundown','wrong_pid','lost','reuse',
+    'future','wrong_frame','before_recv','late_enter'])
+def test_party_request_anchor_and_first_byte_vs_full_frame_boundaries(fault):
+    from secure_control.experiments.windows_tail_analysis import (
+        control_tcp_anchor,
+        party_request_coverage,
+    )
+    trace,s=party_request_evidence();rows=trace['events'];r=s['rows'][0]
+    if fault=='wrong_birth':rows[1]['id']=1033
+    if fault=='rundown':rows[1]['id']=1300
+    if fault=='wrong_pid':rows[1]['values']['ProcessId']=3
+    if fault=='lost':trace['complete']=False
+    if fault=='reuse':rows.insert(2,copy.deepcopy(rows[1]))
+    if fault=='split':
+        rows[4]['values']['NumBytes']=2;rows[4]['time_ns']=75
+        rows.insert(5,{'provider':TCPIP,'id':1074,'time_ns':88,'event_index':5,
+            'values':{'Tcb':9,'SeqNo':112,'NumBytes':6}})
+    if fault=='future':rows[4]['time_ns']=95
+    if fault=='wrong_frame':r[3]=19
+    if fault=='before_recv':r[4]=59
+    if fault=='late_enter':r[4]=82
+    anchor=control_tcp_anchor(trace,s,0);result=party_request_coverage(trace,s,r,anchor)
+    if fault not in (None,'split','late_enter'):
+        assert not result['verified'];return
+    assert result['verified'] and result['first_component_ns']==(75 if fault=='split' else 80)
+    assert result['full_component_ns']==(88 if fault=='split' else 80)
+    assert result['first_component_to_first_recv_ns']==(10 if fault=='split' else 5)
+    assert result['full_component_to_first_recv_ns']==(None if fault=='split' else 5)
+    assert result['recv_enter_after_first_component_ns']==(2 if fault=='late_enter' else 0)
+
+
+def test_single_b_etl_keeps_both_party_lifetimes_and_tcp_without_cross_binding(tmp_path):
+    from secure_control.experiments.windows_tail_analysis import read_party_requests_etl
+    rows=timeline()
+    second=[row(PROCESS,1,21,ProcessId=3,UniqueProcessKey=222),
+        row(THREAD,1,22,ProcessId=3,TThreadId=4),row(THREAD,2,71,ProcessId=3,TThreadId=4),
+        row(PROCESS,2,81,ProcessId=3)]
+    rows.extend(second)
+    for pid,tcb,port in [(1,111,100),(3,333,101)]:
+        birth=row(TCPIP,0,24,Tcb=tcb,ProcessId=pid,LocalAddress=addr('10.0.0.1',port),RemoteAddress=addr('10.0.0.2',200))
+        birth['id']=1017;rows.append(birth)
+        data=row(TCPIP,0,26,Tcb=tcb,NumBytes=10,SeqNo=100);data['id']=1074;rows.append(data)
+    rows.sort(key=lambda r:r['ticks'])
+    path=tmp_path/'two-party.etl';path.write_bytes(b'mock')
+    result=read_party_requests_etl(path,targets=[(1,2),(3,4)],_api=CalibrationAPI(rows))
+    assert result['complete'] and result['targets']==[[1,2],[3,4]]
+    assert {r['values']['ProcessId'] for r in result['events'] if r['provider']==PROCESS}=={1,3}
+    accepts=[r for r in result['events'] if r['provider']==TCPIP and r['id']==1017]
+    assert len(accepts)==2 and accepts[0]['values']['Tcb']!=accepts[1]['values']['Tcb']
