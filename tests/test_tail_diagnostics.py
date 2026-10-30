@@ -41,6 +41,76 @@ def test_party_receive_record_buffer_is_decodable_and_strictly_bounded(tmp_path)
         with pytest.raises(ValueError):_decode(bad)
 
 
+@pytest.mark.parametrize('fault',[None,'input','run','derived','target','policy','memory'])
+def test_recovery_links_only_unchanged_same_run_sources(tmp_path,monkeypatch,fault):
+    import hashlib
+
+    from secure_control.experiments import tail_calibration as c
+    from secure_control.experiments import tail_diagnostic_analysis as a
+    from secure_control.experiments import windows_tail_analysis as w
+    record=TailRecorder(context(tmp_path),'Client').finish('stopped')
+    view={'errors':['event budget exceeded'],'complete':False,'source_head':'a'*40,
+          'diagnostic_id':'run','target_pid':record['pid'],'target_tid':record['main_thread_id']}
+    def save(name,value):
+        raw=value if isinstance(value,bytes) else json.dumps(value).encode()
+        (tmp_path/name).write_bytes(raw)
+        return hashlib.sha256(raw).hexdigest()
+    hashes={n:save(n,v) for n,v in [('native-a.etl',b'fake'),('control-native-events.json',[]),
+            ('control-native-view.json',view),('Client.stream.json',{})]}
+    m={'side':'client','source_head':'a'*40,'diagnostic_id':'run',
+       'native_evidence':{'status':'read','files':hashes},
+       'files':[{'path':'Client.json','sha256':save('Client.json',record)}],
+       'control_samples':[{'actual_sample_start_ns':30,'work_completed_ns':60}]}
+    save('manifest.json',m);manifest=tmp_path/'manifest.json'
+    source_hashes=a._recovery_inputs(manifest)[2]
+    out=tmp_path/'recovered';out.mkdir()
+    request={'manifest':str(manifest),'source_sha256':source_hashes,
+             'analysis_head':'b'*40,'limits':a.RECOVERY_LIMITS}
+    (out/'request.json').write_text(json.dumps(request),encoding='utf8')
+    monkeypatch.setattr(w,'read_control_recovery_etl',lambda *args,**kw:{
+        'events':[],'scan_complete':True,'complete':True,'schedule_window_complete':True,
+        'target_pid':record['pid'],'target_tid':record['main_thread_id'],
+        'maximum_events':5000000,'recovery_policy':'control-etl-recovery-v1'})
+    monkeypatch.setattr(c,'_peak_memory',lambda:a.RECOVERY_LIMITS['peak_memory_bytes']+1 if fault=='memory' else 1)
+    a._recover_control_worker(out)
+    if fault=='input':(tmp_path/'native-a.etl').write_bytes(b'changed')
+    receipt=json.loads((out/'receipt.json').read_text(encoding='utf8'))
+    if fault=='run':receipt['source_sha256']['manifest.json']='wrong'
+    if fault=='policy':receipt['limits']={}
+    if fault in ('derived','target'):
+        p=out/('events.json' if fault=='derived' else 'view.json')
+        if fault=='derived':p.write_text('[1]',encoding='utf8')
+        else:
+            v=json.loads(p.read_text());v['target_pid']+=1;p.write_text(json.dumps(v))
+            receipt['files']['view.json']=hashlib.sha256(p.read_bytes()).hexdigest()
+    (out/'receipt.json').write_text(json.dumps(receipt),encoding='utf8')
+    if fault in (None,'memory'):
+        result,_=a._load_control_recovery(out/'receipt.json',manifest)
+        assert result['complete']==(fault is None)
+    else:
+        with pytest.raises(ValueError):a._load_control_recovery(out/'receipt.json',manifest)
+
+
+def test_recovery_watchdog_has_no_retry_or_session_commands(tmp_path,monkeypatch):
+    from secure_control.experiments import tail_diagnostic_analysis as a
+    monkeypatch.setattr(a,'_recovery_inputs',lambda _:({}, {}, {'input':'hash'}))
+    monkeypatch.setattr(a.subprocess,'check_output',lambda *args,**kw:'a'*40)
+    calls=[]
+    def timeout(args,**kw):
+        calls.append((args,kw))
+        raise subprocess.TimeoutExpired(args,kw['timeout'])
+    monkeypatch.setattr(a.subprocess,'run',timeout)
+    output=tmp_path/'bounded'
+    with pytest.raises(subprocess.TimeoutExpired):
+        a.recover_control_etl(tmp_path/'manifest.json',output,expected_head='a'*40)
+    assert len(calls)==1 and calls[0][1]['timeout']==120
+    assert calls[0][0][1]=='-c' and 'wpr' not in calls[0][0]
+    assert json.loads((output/'failure.json').read_text())['retry'] is False
+    with pytest.raises(FileExistsError):
+        a.recover_control_etl(tmp_path/'manifest.json',output,expected_head='a'*40)
+    assert len(calls)==1
+
+
 def test_recorder_default_off_bounded_overflow_and_no_secret_payload(tmp_path):
     assert current() is None
     original = list(gc.callbacks)
