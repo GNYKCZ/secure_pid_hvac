@@ -13,6 +13,124 @@ from secure_control.execution.tail_diagnostics import PHASES, SPAN_PHASES
 
 _NAMES = {v:k for k,v in PHASES.items()}
 
+RECOVERY_LIMITS={'maximum_events':5000000,'wall_s':120,'retained_events':100000,
+                 'peak_memory_bytes':512*1024*1024,'output_bytes':32*1024*1024}
+
+
+def _recovery_inputs(manifest):
+    """绑定已有失败视图及原件，不接受其他run或偷偷替换输入。"""
+    manifest=Path(manifest).resolve();base=manifest.parent
+    if manifest.stat().st_size>32*1024*1024:raise ValueError('recovery manifest size')
+    m=json.loads(manifest.read_text(encoding='utf8'))
+    evidence=m.get('native_evidence',{})
+    expected={'native-a.etl','control-native-events.json','control-native-view.json','Client.stream.json'}
+    if m.get('side')!='client' or evidence.get('status')!='read' or set(evidence.get('files',{}))!=expected:
+        raise ValueError('recovery requires hash-bound A control evidence')
+    hashes={manifest.name:hashlib.sha256(manifest.read_bytes()).hexdigest()}
+    for name,digest in evidence['files'].items():
+        if (base/name).stat().st_size>(128 if name=='native-a.etl' else 32)*1024*1024:
+            raise ValueError('recovery source size')
+        if hashlib.sha256((base/name).read_bytes()).hexdigest()!=digest:
+            raise ValueError('recovery source hash mismatch')
+        hashes[name]=digest
+    entries=[e for e in m['files'] if e['path']=='Client.json']
+    if len(entries)!=1:raise ValueError('recovery Client identity missing')
+    hashes['Client.json']=hashlib.sha256((base/'Client.json').read_bytes()).hexdigest()
+    if hashes['Client.json']!=entries[0]['sha256']:raise ValueError('recovery Client hash mismatch')
+    record=json.loads((base/'Client.json').read_text(encoding='utf8'))
+    view=json.loads((base/'control-native-view.json').read_text(encoding='utf8'))
+    if (view.get('errors')!=['event budget exceeded'] or view.get('complete') is not False
+            or view.get('source_head')!=m['source_head'] or view.get('diagnostic_id')!=m['diagnostic_id']
+            or view.get('target_pid')!=record['pid'] or view.get('target_tid')!=record['main_thread_id']):
+        raise ValueError('recovery is limited to the recorded control event-budget failure')
+    _decode(record)
+    return m,record,hashes
+
+
+def recover_control_etl(manifest,output,*,expected_head):
+    """一次有界离线子进程；超时kill仅此Python，不涉及WPR/控制会话。"""
+    import sys
+    manifest=Path(manifest).resolve();output=Path(output).resolve()
+    root=Path(__file__).resolve().parents[3]
+    head=subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip()
+    if head!=expected_head:raise ValueError('recovery analysis head mismatch')
+    _,_,hashes=_recovery_inputs(manifest)
+    output.mkdir(exist_ok=False)
+    request={'schema':'control-etl-recovery-request-v1','manifest':str(manifest),
+             'source_sha256':hashes,'analysis_head':head,'limits':RECOVERY_LIMITS,
+             'analysis_module_sha256':{p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in
+                (Path(__file__),Path(__file__).with_name('windows_tail_analysis.py'))}}
+    (output/'request.json').write_text(json.dumps(request),encoding='utf8')
+    try:
+        done=subprocess.run([sys.executable,'-c',
+            'import sys; from secure_control.experiments.tail_diagnostic_analysis import _recover_control_worker; _recover_control_worker(sys.argv[1])',
+            str(output)],cwd=root,timeout=RECOVERY_LIMITS['wall_s'],check=False)
+        if done.returncode:raise RuntimeError('recovery worker failed; no retry')
+    except (subprocess.TimeoutExpired,RuntimeError) as error:
+        (output/'failure.json').write_text(json.dumps({'status':'failed','error_type':type(error).__name__,
+            'limits':RECOVERY_LIMITS,'retry':False}),encoding='utf8')
+        raise
+    receipt=json.loads((output/'receipt.json').read_text(encoding='utf8'))
+    return receipt
+
+
+def _recover_control_worker(output):
+    from secure_control.experiments.tail_calibration import _peak_memory
+    from secure_control.experiments.windows_tail_analysis import read_control_recovery_etl
+    output=Path(output);request=json.loads((output/'request.json').read_text(encoding='utf8'))
+    manifest=Path(request['manifest']);m,record,hashes=_recovery_inputs(manifest)
+    if request['limits']!=RECOVERY_LIMITS or request['source_sha256']!=hashes:
+        raise ValueError('recovery request/source changed')
+    samples=m['control_samples']
+    trace=read_control_recovery_etl(manifest.parent/'native-a.etl',pid=record['pid'],tid=record['main_thread_id'],
+        window_ns=[samples[0]['actual_sample_start_ns'],samples[-1]['work_completed_ns']])
+    trace.update(purpose='control-slow-step-v1',source_head=m['source_head'],diagnostic_id=m['diagnostic_id'],
+                 etl_sha256=hashes['native-a.etl'])
+    events=trace.pop('events')
+    files={};total=0
+    for name,value in (('events.json',events),('view.json',trace)):
+        data=json.dumps(value,separators=(',',':')).encode('utf8');total+=len(data)
+        if total>RECOVERY_LIMITS['output_bytes']:raise ValueError('recovery output budget exceeded')
+        with (output/name).open('xb') as stream:stream.write(data)
+        files[name]=hashlib.sha256(data).hexdigest()
+    peak=_peak_memory()
+    if _recovery_inputs(manifest)[2]!=hashes:raise ValueError('recovery source changed during scan')
+    receipt={'schema':'control-etl-recovery-v1','status':'complete' if trace['scan_complete'] and peak<=RECOVERY_LIMITS['peak_memory_bytes'] else 'partial',
+        'manifest':str(manifest),'source_sha256':hashes,'files':files,'limits':RECOVERY_LIMITS,
+        'capture_source_head':m['source_head'],'analysis_head':request['analysis_head'],
+        'analysis_module_sha256':request.get('analysis_module_sha256'),
+        'process_peak_working_set_bytes':peak,'output_bytes':total,'retry':False}
+    with (output/'receipt.json').open('x',encoding='utf8') as stream:json.dump(receipt,stream)
+    if sum(p.stat().st_size for p in output.iterdir() if p.is_file())>RECOVERY_LIMITS['output_bytes']:
+        raise ValueError('recovery output directory budget exceeded')
+
+
+def _load_control_recovery(receipt_path,manifest):
+    receipt_path=Path(receipt_path).resolve();base=receipt_path.parent
+    if (base/'failure.json').exists():raise ValueError('recovery worker failed')
+    receipt=json.loads(receipt_path.read_text(encoding='utf8'))
+    m,record,hashes=_recovery_inputs(manifest)
+    if (receipt.get('schema')!='control-etl-recovery-v1' or receipt.get('limits')!=RECOVERY_LIMITS
+            or receipt.get('manifest')!=str(Path(manifest).resolve()) or receipt.get('source_sha256')!=hashes
+            or receipt.get('capture_source_head')!=m['source_head']
+            or receipt.get('status') not in ('complete','partial')
+            or set(receipt.get('files',{}))!={'events.json','view.json'}):
+        raise ValueError('recovery link/source mismatch')
+    total=0
+    for name,digest in receipt['files'].items():
+        p=base/name;total+=p.stat().st_size
+        if total>RECOVERY_LIMITS['output_bytes'] or hashlib.sha256(p.read_bytes()).hexdigest()!=digest:
+            raise ValueError('recovery derived artifact mismatch/budget')
+    trace=json.loads((base/'view.json').read_text(encoding='utf8'))
+    if (trace.get('etl_sha256')!=hashes['native-a.etl'] or trace.get('source_head')!=m['source_head']
+            or trace.get('diagnostic_id')!=m['diagnostic_id'] or trace.get('target_pid')!=record['pid']
+            or trace.get('target_tid')!=record['main_thread_id'] or trace.get('maximum_events')!=5000000
+            or trace.get('recovery_policy')!='control-etl-recovery-v1'):
+        raise ValueError('recovery target/policy mismatch')
+    if receipt['status']!='complete':trace['complete']=trace['schedule_window_complete']=False
+    trace['events']=json.loads((base/'events.json').read_text(encoding='utf8'))
+    return trace,{'receipt_sha256':hashlib.sha256(receipt_path.read_bytes()).hexdigest(),**receipt}
+
 
 def _union(intervals):
     total, right = 0, None
@@ -67,8 +185,14 @@ def _decode(record):
     for field,capacity in (('event_count',record['event_capacity']),('gc_count',record['gc_capacity'])):
         if type(record.get(field)) is not int or not 0 <= record[field] <= capacity:
             raise ValueError('记录数量字段错误')
+    expected_buffer=(record['event_capacity']+record['gc_capacity'])*64+limits.identity_bytes
+    allowed_buffers={expected_buffer}
+    if (record['role'] in ('P1','P2') and limits.window==2000
+            and record.get('context',{}).get('transport')=='insecure_tcp'):
+        # Opt-in PartyReceiveMap has exactly 8192 fixed 10-int64 rows.
+        allowed_buffers.add(expected_buffer+8192*10*8)
     if (record['event_count']+record['gc_count'] != len(events)
-            or record['buffer_bytes'] != (record['event_capacity']+record['gc_capacity'])*64+limits.identity_bytes
+            or record['buffer_bytes'] not in allowed_buffers
             or type(record.get('lost_events')) is not int or record['lost_events'] < 0):
         raise ValueError('缓冲长度/数量/丢失不一致')
     spans, points, gcs, open_spans, open_gc = [], [], [], {}, {}
@@ -622,7 +746,7 @@ def _party_receive_sources(manifests,records):
     return trace,streams,hashes
 
 
-def analyze_slow_control(paths):
+def analyze_slow_control(paths, *, a_recovery=None):
     """只读逐慢步证据，不跨主机减QPC；缺独立TCP零点时仍输出应用及调度。"""
     from secure_control.experiments.windows_tail_analysis import (
         control_frame_coverage,
@@ -675,6 +799,11 @@ def analyze_slow_control(paths):
                     or stream['context']['source_head']!=client['context']['source_head']):
                 raise ValueError('control native/stream target mismatch')
             native_reason='independent SeqNo/application-offset-zero anchor unavailable for this connection'
+    recovery_link=None
+    if a_recovery is not None:
+        if client_dir is None:raise ValueError('A recovery requires client manifest')
+        client_path=next(p for p,m in manifests if m.get('side')=='client')
+        native,recovery_link=_load_control_recovery(a_recovery,client_path)
     normalized=(normalize_schedule({**native,'target_tid':native['target_tid']}) if native else None)
     b_trace,b_streams,b_hashes=_party_receive_sources(manifests,records)
     b_anchors={r:control_tcp_anchor({**b_trace,'target_pid':records[r]['pid']},s,0)
@@ -781,6 +910,7 @@ def analyze_slow_control(paths):
         'threshold_ns':20_000_000,'slow_steps':slow,'normal_neighbors':neighbors,'rows':results,
         'diagnostic_complete':validated['diagnostic_complete'],'role_sha256':sources,
         'native_sha256':native_hashes,
+        'A_recovery':recovery_link,
         'B_request_sha256':b_hashes,
         'B_request_anchors':{r:{k:v for k,v in a.items() if k!='packets'} for r,a in b_anchors.items()},
         'capture_source_head':(client_manifest or {}).get('source_head'),

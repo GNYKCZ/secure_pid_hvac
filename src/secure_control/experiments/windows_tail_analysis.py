@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import struct
+import time
 from pathlib import Path
 
 from secure_control.execution.diagnostic_limits import artifact_limits
@@ -415,6 +416,7 @@ def _native():
             status = advapi.ProcessTrace(c.byref(value),1,None,None)
             if status and not (status==1223 and self.stop_requested):
                 raise OSError(status,'ProcessTrace failed')
+            return status
 
         def stop_processing(self):
             """请求在下一缓冲边界停止离线遍历，后续不能声称完整文件已读。"""
@@ -599,6 +601,17 @@ def read_calibration_etl(path, *, pid, tid, window_ns, _api=None):
     return _read_etl(path,maximum_events=2500000,_api=_api,target=(pid,tid,window_ns))
 
 
+def read_control_recovery_etl(path, *, pid, tid, window_ns, _api=None):
+    """显式离线恢复预算；旧入口2.5M不变，不能用于新采集。"""
+    if (any(type(v) is not int or v<=0 for v in (pid,tid))
+            or not isinstance(window_ns,(tuple,list)) or len(window_ns)!=2
+            or any(type(v) is not int or v<0 for v in window_ns)
+            or not 0<window_ns[1]-window_ns[0]<=55_000_000_000):
+        raise ValueError('recovery target/window')
+    return _read_etl(path,maximum_events=5000000,_api=_api,
+                     target=(pid,tid,window_ns),_recovery=True)
+
+
 def read_party_requests_etl(path, *, targets, _api=None):
     """B单会话只解码一次，保留两个实际Party的生命周期和TCP元数据。"""
     if (not isinstance(targets,(list,tuple)) or len(targets)!=2
@@ -608,7 +621,8 @@ def read_party_requests_etl(path, *, targets, _api=None):
     return _read_etl(path,maximum_events=2500000,_api=_api,targets=targets)
 
 
-def _read_etl(path, *, maximum_events, _api=None, target=None, targets=None):
+def _read_etl(path, *, maximum_events, _api=None, target=None, targets=None,
+              _recovery=False, _now=time.monotonic):
     """两种固定预算共用唯一遍历；目标筛选不跳过descriptor/错误/截断计数。"""
     path = Path(path).resolve()
     targeted=target is not None or targets is not None
@@ -616,12 +630,15 @@ def _read_etl(path, *, maximum_events, _api=None, target=None, targets=None):
     tids={t[1] for t in targets} if targets else {target[1]} if target else set()
     if path.suffix.lower()!='.etl' or not path.is_file() or not 0<path.stat().st_size<=(128 if targeted else 64)*1024*1024:
         raise ValueError('ETL file boundary')
-    if type(maximum_events) is not int or not 1 <= maximum_events <= (2500000 if targeted else 300000):
+    if _recovery and (target is None or targets is not None):raise ValueError('recovery requires one control target')
+    if type(maximum_events) is not int or not 1 <= maximum_events <= (5000000 if _recovery else 2500000 if targeted else 300000):
         raise ValueError('event budget')
     api = _api if _api is not None else _native()
     rows, errors, keys, count = [], [], {}, 0
     descriptors, unsupported, decode_errors = {}, {}, {}
     exhausted = False
+    timed_out=False
+    started=_now()
     retention_exhausted, filtered, critical_gaps = False, 0, 0
     target_tcbs = set()
     cpu_running, cpu_chain_mismatches = {}, 0
@@ -631,14 +648,15 @@ def _read_etl(path, *, maximum_events, _api=None, target=None, targets=None):
             raise ValueError('descriptor capacity')
         mapping[key] = mapping.get(key,0)+1
     def callback(pointer):
-        nonlocal count, exhausted, retention_exhausted, filtered, critical_gaps, cpu_chain_mismatches
+        nonlocal count, exhausted, timed_out, retention_exhausted, filtered, critical_gaps, cpu_chain_mismatches
         count += 1
         try:
             descriptor = api.descriptor(pointer) if hasattr(api,'descriptor') else None
             if descriptor is not None:
                 tally(descriptors,descriptor)
-            if count>maximum_events:
-                exhausted = True
+            if count>maximum_events or _recovery and _now()-started>=120:
+                exhausted = exhausted or count>maximum_events
+                timed_out = timed_out or _recovery and _now()-started>=120
                 if hasattr(api,'stop_processing'):api.stop_processing()
                 return
             row = api.event(pointer)
@@ -707,13 +725,16 @@ def _read_etl(path, *, maximum_events, _api=None, target=None, targets=None):
         # TRACE_LOGFILE_HEADER跨WOW布局未用真实ETL验证，窄适配保守拒绝32位文件头。
         if header['pointer_size'] != 8 or not header['end'] or header['mode']&0x100:
             raise ValueError('unfinished or realtime trace header')
-        api.process(handle)
+        process_status=api.process(handle)
         header = api.header()
         qpc_ns(0,header['frequency'],header['clock'],header['events_lost']+header['buffers_lost'])
     finally:
         api.close(handle)
     if exhausted:
         errors.append('event budget exceeded')
+    if timed_out:errors.append('recovery time budget exceeded')
+    if _recovery and process_status not in (None,0):
+        errors.append('processing cancelled')
     if retention_exhausted:
         errors.append('retention budget exceeded')
     if cpu_chain_mismatches:
@@ -761,6 +782,9 @@ def _read_etl(path, *, maximum_events, _api=None, target=None, targets=None):
             lifetime_replay=lifetime_replay,window_replay=window_replay,
             source_payload='excluded; target TCP metadata only',
             tcp_usable=False)  # byte/SeqNo校准仍须独立应用流锚点，事件出现不自动设为可用。
+    if _recovery:
+        result.update(recovery_policy='control-etl-recovery-v1',scan_complete=not errors,
+                      scan_elapsed_s=_now()-started)
     return result
 
 

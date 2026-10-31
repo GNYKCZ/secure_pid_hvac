@@ -72,6 +72,11 @@ def main():
     control_analysis=modes.add_parser('analyze-control',help='只读逐work>20ms及正常邻步证据表')
     control_analysis.add_argument('manifests',type=Path,nargs='+')
     control_analysis.add_argument('--output',type=Path,required=True)
+    control_analysis.add_argument('--a-recovery',type=Path,help='显式链接独立离线恢复receipt，不修改原manifest')
+    recovery=modes.add_parser('recover-control',help='只读已有A ETL，一次5M/120s离线恢复，不启动采集')
+    recovery.add_argument('manifest',type=Path)
+    recovery.add_argument('output',type=Path)
+    recovery.add_argument('--expected-head',required=True)
     analyze = modes.add_parser('analyze',help='只读角色manifest，不运行控制')
     analyze.add_argument('manifests',type=Path,nargs='+')
     analyze.add_argument('--output',type=Path,required=True)
@@ -129,9 +134,13 @@ def main():
         _save(args.output,result)
         print(json.dumps(result,ensure_ascii=False))
         if not result['calibration_complete']:raise SystemExit(2)
+    elif args.mode=='recover-control':
+        from secure_control.experiments.tail_diagnostic_analysis import recover_control_etl
+        result=recover_control_etl(args.manifest,args.output,expected_head=args.expected_head)
+        print(json.dumps({'status':result['status'],'receipt':str(args.output/'receipt.json')}))
     elif args.mode=='analyze-control':
         from secure_control.experiments.tail_diagnostic_analysis import analyze_slow_control
-        result=analyze_slow_control(args.manifests)
+        result=analyze_slow_control(args.manifests,a_recovery=args.a_recovery)
         with args.output.open('x',encoding='utf8') as stream:json.dump(result,stream,indent=2)
         print(json.dumps({'status':result['status'],'slow_steps':result['slow_steps']}))
     elif args.mode == 'local':

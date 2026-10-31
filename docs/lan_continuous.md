@@ -210,6 +210,21 @@ Not-running不等于Ready或网络等待，Running也不证明Python/GIL可用�
 分析模块摘要和脏状态；原manifest的`diagnostic_complete`及旧`schedule_window_complete`
 不会改写。输出使用新文件名，保留旧分析结果，不因解析改善而自动宣称根因已查明。
 
+### #161：已有A ETL的显式离线恢复
+
+仅对原A视图唯一失败为`event budget exceeded`的既有控制结果启用；不启动WPR或控制。
+`recover-control <A/manifest.json> <新恢复目录> --expected-head <分析SHA>`使用独立Python进程，
+显式预算为5,000,000个全文件callback、120秒watchdog、100,000保留行、128MiB输入ETL、
+512MiB进程峰值工作集目标及32MiB派生输出。旧读取入口的2,500,000上限不变。
+超时仅结束此离线进程；不自动重试、拆片绕过累计预算或提高阈值。输出目录必须全新。
+逐事件审计所有描述符、关键错误和CPU切换链，筛选仅控制保留量；正常EOF与所有质量检查
+通过才有`scan_complete`。线程状态、CPU驻留、TCP锚点和逐帧覆盖仍各自验证。
+`request.json`、`receipt.json`记录原manifest/ETL/sidecar摘要、采集/分析SHA、策略及资源；
+原件读前读后摘要须一致。新view/events独立保存，旧manifest/view与失败状态不会改写。
+使用`analyze-control <A/manifest.json> <B/manifest.json> --a-recovery <恢复目录/receipt.json>
+--output <新分析.json>`显式消费恢复证据；拒绝跨run/变更输入/摘要或目标不符。
+恢复可验证本次A组件覆盖至读取的等待，不能仅靠两个主机时钟求两个方向单向网络延迟。
+
 ### #161：B组件到首读的单次验证准备
 
 新用途`control-b-receive-boundary-v1`只验证B端请求组件覆盖至首次成功recv/帧收齐的等待。

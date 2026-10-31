@@ -177,6 +177,44 @@ def timeline():
         row(THREAD,2,70,ProcessId=1,TThreadId=2),row(PROCESS,2,80,ProcessId=1)]
 
 
+@pytest.mark.parametrize('fault',[None,'budget','timeout','critical','decode','cpu','lifetime','cancel'])
+def test_explicit_recovery_checks_tail_and_never_upgrades_truncated_scan(tmp_path,fault):
+    rows=timeline();path=tmp_path/'recovery.etl';path.write_bytes(b'mock')
+    if fault=='cpu':rows[5]['values']['OldThreadId']=99
+    if fault=='lifetime':rows.pop(-2)
+    clock=[0.]
+    class RecoveryAPI(CalibrationAPI):
+        def event(self,item):
+            if item is rows[-1]:
+                if fault=='critical':return {'unsupported':(PROCESS,0,99,2)}
+                if fault=='decode':raise ValueError('tail decode failed')
+            return super().event(item)
+        def process(self,handle):
+            for item in self.rows:
+                if fault=='timeout' and item is rows[-1]:clock[0]=121.
+                self.callback(item)
+            return 1223 if fault=='cancel' else 0
+    result=_read_etl(path,maximum_events=5 if fault=='budget' else 20,
+        _api=RecoveryAPI(rows),target=(1,2,[30,60]),_recovery=True,_now=lambda:clock[0])
+    assert result['event_count']==len(rows)  # callback overshoot remains visible
+    assert result['scan_complete']==(fault in (None,'lifetime'))
+    assert result['schedule_window_complete']==(fault is None)
+    if fault=='budget':assert 'event budget exceeded' in result['errors']
+    if fault=='timeout':assert 'recovery time budget exceeded' in result['errors']
+    if fault=='critical':assert result['target_critical_gaps']==1
+    if fault=='decode':assert result['decode_errors']=={'ValueError':1}
+
+
+def test_recovery_budget_is_opt_in_and_old_reader_stays_at_2point5m(tmp_path,monkeypatch):
+    from secure_control.experiments import windows_tail_analysis as w
+    calls=[]
+    monkeypatch.setattr(w,'_read_etl',lambda *args,**kw:calls.append(kw))
+    w.read_calibration_etl(tmp_path/'a.etl',pid=1,tid=2,window_ns=[30,60])
+    w.read_control_recovery_etl(tmp_path/'a.etl',pid=1,tid=2,window_ns=[30,60])
+    assert calls[0]['maximum_events']==2500000 and '_recovery' not in calls[0]
+    assert calls[1]['maximum_events']==5000000 and calls[1]['_recovery'] is True
+
+
 @pytest.mark.parametrize('fault',[None,'start','middle','end','reuse','cpu','unsupported','budget'])
 def test_target_window_needs_lifetime_internal_switches_and_untruncated_read(tmp_path,fault):
     rows=timeline();path=tmp_path/'metadata.etl';path.write_bytes(b'mock')
