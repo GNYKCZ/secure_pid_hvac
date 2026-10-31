@@ -1738,3 +1738,31 @@ uv run secure-control benchmark --case cycle --mode batch --steps 10000 --delay-
 完整周期/24维护/正常STOP/材料/状态/资源/历史与退出门禁不改；少分配可能只推迟gen2，
 未覆盖Client运行期GC不等于消除停顿，退出GC不能充作控制内覆盖。原历史S13内部仍未知，
 有限本机动态结果不授完整路线/真实TLS三机/Wi-Fi/硬件资格，不自动第10次源码续接或合并关闭。
+
+## #166 共同基线的软件入口
+
+运行入口为 `uv run python -m secure_control.experiments.performance_baseline`。
+`prepare SPEC OUTPUT` 从公开配置身份、准确 source_head、八组两端绝对新路径和两机各自只读准备的 hosts 节点生成 run-0.json 到 run-7.json；仅准备，不启动控制。
+L/F 顺序固定 L-F-F-L、F-L-L-F。两者共用 samples/2000、400步分段、16材料槽、20ms非实时相对节拍，不装 TailRecorder/GC 回调/stream map。F使用既有 NativeCapture 独立实例，只保存ETL/owner，不解析逐帧TCP。
+
+每组批准格式为 schema=baseline-authorization-v1、purpose=capture-overhead-baseline-v1、source_head、plan_sha256（使用 native_tail_capture.plan_digest）、attempts=1、authorization_url（本Issue的新用户批准评论）。八组计划和逐端预算必须先经软件独审并由用户准确批准，不能复用历史control批准。
+`run pair PLAN APPROVAL OUTPUT --expected-head SHA --config P1 --config P2` 在B执行；随后A执行 `run client PLAN APPROVAL OUTPUT --expected-head SHA --config CLIENT`。输出必须等于计划该端路径，账本在开始前永久扣额，不自动重试。
+
+协调端在第一条运行命令前执行 `coordinate PLANS COORDINATION_OUTPUT`，保持窗口打开。每组提示后人工启动B/A，将两端manifest复制回协调机并输入路径；每组先领取再结算，失败/环境漂移/剩余额度不足120秒停止。批次一个本地monotonic计时，20分钟含协调等待与清理；人工输入阻塞不能硬中断用户等待，返回后如实标超额并拒绝下一组，不能宣传OS硬实时保证。
+A总上限100秒、B业务监督110秒和清理至120秒；业务55秒、B等待45秒。F仍受各节点原采集期限与资源门禁约束。开始余量4GiB；软磁盘目标不等于OS硬配额。原生F当前仅Windows可用，Linux不得悄悄降级L，跨平台共同应用计时可单独运行L；混合系统F应另制定支持范围。
+
+Client.json包含共同计时及控制终态；`metrics TIMING_REPORT OUTPUT` 只读生成>20ms比例、精确nearest-rank分位、连续预算超出、维护边界/随后两步、本步出口到下次采样间隔。Client.json内timing对象可作为TIMING_REPORT另存新文件。非实时真实deadline/lateness均null，不产生绝对节拍资格结论。数值正确性仍须结合原有控制契约与对照结果核验，单独计数一致不证明数值相等。
+
+本入口的软件完成与性能收益是不同验收项；实际8组采集未运行前报告NOT RUN，不宣称采集扰动存在或优化已生效。背景负载对照需要另一份明确计划；不停止未知logger或安全软件。
+
+### #166 返工1运行状态
+当前正式 `run` 在任何源码查询、账本、spawn或native启动之前，因在线协调尚未接入而明确拒绝。此前仅靠静态逐组批准即可运行的说明暂不可执行；不得直接调用内部装配函数绕过阻断。
+RV002新设计依据Issue166的“RV-002 / RV-004返工边界”评论：需两机共同访问、具备原子文件操作的共享邮箱，由常驻协调者进行nonce在线确认与有界监督。共享部署路径和权限尚待明确；不以复制ticket降级，不声称此项已通过验收。
+环境摘要新增实际目标路由选择、CPU拓扑和进程数量；未知字段或读取失败不可比较，进程数自然变化也保守记漂移。数值核验在退出后复用_DynamicDefinition/_DynamicReplay，对实际输入和独立物理测量进行核对，并使用既有encoded Trunc误差包络检验输出；固定2000槽记录及公开数值证据两条件相同。该oracle当前适用于本任务两测量动态倒立摆配置，其他配置不能默认当作通过。
+
+### #166 当前采用人工逐组模式（用户修订6539971819）
+本节替代上面在线共享邮箱前置要求；旧裸run仍阻断。无需SMB/SSH、账号、防火墙或远控设置。
+一次准备：`uv run python -m secure_control.experiments.performance_baseline manual-prepare SPEC BUNDLE --side client --config CLIENT_CONFIG --approvals APPROVAL_DIRECTORY`；B使用`--side pair --config P1_CONFIG --config P2_CONFIG`。工具生成本机`start-baseline.ps1`、bundle.json、inbox/outbox，不复制源码。新计划purpose为capture-overhead-manual-v1，批准schema为baseline-manual-authorization-v1，仍须准确绑定每组plan_sha256、head、attempts=1及166新批准URL；旧批准不能沿用。配置与批准包在实际软件审查后统一准备，无需用户逐组编辑。
+A首次运行固定脚本，保持窗口存活：显示批次短ID/组号/条件后，用户启动B固定脚本；B确认与A一致且A已允许本组，输入YES。随后A输入YES启动。每组只运行一次，B成功后退出并保存下一本地组号；失败永久STOP。用户将B outbox中的单个ZIP复制到A inbox后，在A按Enter；A自动匹配、核对两包完整性、Client独立数值oracle及两端环境后才显示下一组提示。下一组仍需相同人工确认。A窗口退出/重启本批STOP，不能重置20分钟起点续跑。
+ZIP使用存储模式不压缩，避免推测压缩比；原件保留，物理磁盘原件+ZIP均累计，超过2GiB目标STOP。导入流式核验白名单、成员实际长度/摘要、运行manifest关联；不解包执行、不重扫ETL。结果包是完整性证据，不是对端密码学认证。没有B的Client数值轨迹，B数值独立校验不宣称PASS；A导入时必须重核Client保存输入与原oracle。
+人工等待和拷贝计入A本地单调批次计时，确认返回后再检查剩余完整120秒组预算；输入等待期间不声称硬中断。跨机自动停止/全局硬deadline为N/A，本机单组期限/账本继续强制。操作者必须遵守A的STOP，B不会自动知道A失败。A软件检查通过、实机8组完成和性能改善分别报告；当前尚未运行实机实验。
