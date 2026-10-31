@@ -2,6 +2,22 @@
 
 import pytest
 
+
+def test_formal_prepare_cli_loads_all_definitions(tmp_path):
+    import json
+    import subprocess
+    import sys
+
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({"source_head": "a" * 40,
+        "configurations": {r: {} for r in ("Client", "P1", "P2")},
+        "outputs": [{"client": f"A{k}", "pair": f"B{k}"} for k in range(8)]}))
+    result = subprocess.run([sys.executable, "-m", "secure_control.experiments.performance_baseline",
+                             "prepare", str(spec), str(tmp_path / "plans")],
+                            capture_output=True, timeout=10, check=False)
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+    assert len(list((tmp_path / "plans").glob("run-*.json"))) == 8
+
 from secure_control.execution.cycle_timing import StepTimingObservation
 from secure_control.experiments.live_timing import (
     LiveTimingCollector,
@@ -14,8 +30,64 @@ from secure_control.experiments.performance_baseline import (
     baseline_metrics,
     baseline_plan,
     coordinate_batch,
+    environments_match,
     prepare_run_plans,
+    run_baseline_host,
+    verify_baseline_numbers,
 )
+
+
+def test_formal_run_rejects_missing_online_coordinator_before_any_io(tmp_path):
+    with pytest.raises(RuntimeError, match="online coordinator unavailable"):
+        run_baseline_host({}, {}, "client", config_paths=[], output=tmp_path / "new",
+                          expected_head="a" * 40)
+    assert not (tmp_path / "new").exists()
+
+
+def test_numeric_oracle_accepts_encoded_first_step_and_rejects_wrong_output():
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from secure_control.crypto import TwoPartySharing
+    from secure_control.execution.lan_config import load_lan_config
+    from secure_control.execution.lan_runtime import _public_reachability_digest
+    from secure_control.execution.localhost_codec import LanSegmentedSetupV2Payload
+    from secure_control.experiments.lan_continuous_profile import load_segmented_experiment
+    from secure_control.protocol import Client
+    from secure_control.scenarios.cart_pole.interactive import InteractiveSession
+    config = load_lan_config("configs/lab-client-cart-pole-demo.example.yaml", "Client")
+    prepared = load_segmented_experiment(config.experiment_config, 400, InteractiveSession())
+    context = prepared.context
+    client = Client(context, TwoPartySharing(context.modulus),
+                    security_parameter=prepared.security_parameter, modulus_evidence=prepared.evidence)
+    encoded = {k: context.encode(getattr(prepared.spec, k)) for k in ("A", "B", "C", "D", "x0")}
+    layout = client._layout_from_spec(prepared.spec)
+    verification = client._validate_range_contract(encoded, layout, prepared.contract)
+    setup = LanSegmentedSetupV2Payload(context.modulus, context.integer_bits, context.fractional_bits,
+        prepared.security_parameter, prepared.contract.state_payload_bounds,
+        prepared.contract.input_payload_bounds, prepared.contract.reachability_block_steps, 400,
+        "a" * 64, _public_reachability_digest(prepared.contract, verification), prepared.evidence)
+    value = prepared.scene.controller_input()
+    # 手工首步整数点积；不调用待测replay生成expected。
+    raw = float((encoded["C"] @ encoded["x0"] + encoded["D"] @ context.encode(value))[0]) / context.scale**2
+    snapshot = prepared.scene.advance(0, np.array([raw]))
+    record = SimpleNamespace(protocol=SimpleNamespace(global_step=0, raw_control=(raw,)), snapshot=snapshot)
+    assert verify_baseline_numbers(prepared, config, [record], np.array([value]), setup)["verified"]
+    wrong = SimpleNamespace(protocol=SimpleNamespace(global_step=0, raw_control=(raw+100,)), snapshot=snapshot)
+    with pytest.raises(ValueError):
+        verify_baseline_numbers(prepared, config, [wrong], np.array([value]), setup)
+    with pytest.raises(ValueError):
+        verify_baseline_numbers(prepared, config, [record], np.array([value])+1, setup)
+
+
+@pytest.mark.parametrize("field,value", [("routes", ["ethernet"]), ("cpu_topology", ["other"]),
+                                         ("process_count", 51), ("verified", False)])
+def test_environment_drift_or_unknown_is_not_comparable(field, value):
+    baseline = {"verified": True, "routes": ["wifi"], "cpu_topology": ["core0"], "process_count": 50}
+    assert environments_match(baseline, baseline)
+    assert not environments_match(baseline, {**baseline, field: value})
+    assert not environments_match({}, {})
 
 
 def test_manual_coordinator_preserves_failure_and_does_not_start_next(tmp_path):

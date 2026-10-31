@@ -20,6 +20,44 @@ PURPOSE = "capture-overhead-baseline-v1"
 CONDITIONS = ("L", "F", "F", "L", "F", "L", "L", "F")
 
 
+def environments_match(left, right):
+    """缺测不当作相等；进程数自然变化也保守记漂移，不据此认定因果。"""
+    required = ("routes", "cpu_topology", "process_count")
+    return (left.get("verified") is True and right.get("verified") is True
+            and all(left.get(k) is not None and right.get(k) is not None for k in required)
+            and left == right)
+
+
+def verify_baseline_numbers(prepared, config, records, inputs, setup):
+    """退出后复用既有物理重放/encoded Trunc包络，不从实测输出生成expected。"""
+    from dataclasses import asdict
+
+    import numpy as np
+
+    from secure_control.execution.localhost_codec import encode_wire_value
+    from secure_control.experiments.cart_pole_segmented_evidence import (
+        _DynamicDefinition,
+        _DynamicReplay,
+    )
+
+    definition = _DynamicDefinition({"definition": prepared.effective_config,
+        "setup": json.loads(encode_wire_value(setup)),
+        "topology_sha256": config.topology.digest, "transport": config.transport,
+        "channels": asdict(prepared.metadata)})
+    rows = []
+    for index, record in enumerate(records):
+        if record is None or record.protocol.global_step != index:
+            raise ValueError("数值记录缺步、重复或身份错位。")
+        snapshot = json.loads(json.dumps(asdict(record.snapshot), allow_nan=False))
+        if not np.array_equal(inputs[index], snapshot["local_measurement"]):
+            raise ValueError("实际分享输入与独立物理测量不一致。")
+        rows.append({"snapshot": snapshot, "protocol": {"raw_control": record.protocol.raw_control}})
+    replay = _DynamicReplay(definition)
+    replay.convert({"steps": rows}, "baseline", 0, lambda: None)
+    return {"verified": True, "steps": replay.step,
+            "oracle": "cart_pole_segmented_evidence.DynamicReplay encoded Trunc envelope + physical replay"}
+
+
 def authorize_baseline(approval, plan, *, side, output, head):
     """新用途逐组批准绑定完整计划，旧control批准不能用于对照运行。"""
     from secure_control.experiments.native_tail_capture import plan_digest
@@ -45,10 +83,52 @@ def authorize_baseline(approval, plan, *, side, output, head):
         raise PermissionError("批次配置、顺序或路径发生变化。")
 
 
-def baseline_environment():
+def baseline_environment(configs=()):
     """只读公开环境摘要；不枚举进程内容，不改变后台会话。"""
     result = {"os": platform.platform(), "python": platform.python_version(),
               "cpu_logical_count": os.cpu_count(), "machine": platform.machine()}
+    result.update(cpu_topology=None, process_count=None, routes=None, verified=False)
+    try:
+        import ipaddress
+        targets = sorted({str(ipaddress.ip_address(endpoint.host)) for config in configs
+                          for endpoint in (config.topology.p1_client, config.topology.p2_client,
+                                           config.topology.p1_peer)})
+        if not targets:
+            raise ValueError("缺少实际路由目标。")
+        if os.name == "nt":
+            script = (
+                "$ErrorActionPreference='Stop';[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new();"
+                "$targets=ConvertFrom-Json $env:BASELINE_TARGETS;"
+                "$routes=@(foreach($target in $targets){"
+                "$r=Find-NetRoute -RemoteIPAddress $target;"
+                "[pscustomobject]@{target=$target;selection=@($r | Select-Object "
+                "InterfaceIndex,InterfaceAlias,IPAddress,NextHop,DestinationPrefix)}});"
+                "[pscustomobject]@{cpu_topology=@(Get-CimInstance Win32_Processor | "
+                "Select-Object DeviceID,NumberOfCores,NumberOfLogicalProcessors);"
+                "process_count=@(Get-Process).Count;routes=$routes}|ConvertTo-Json -Depth 6 -Compress")
+            completed = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive",
+                                        "-Command", script], capture_output=True, timeout=10,
+                                       env={**os.environ, "BASELINE_TARGETS": json.dumps(targets)},
+                                       check=True)
+            facts = json.loads(completed.stdout.decode("utf-8-sig"))
+        else:
+            cpu = []
+            for path in sorted(Path("/sys/devices/system/cpu").glob("cpu[0-9]*/topology")):
+                cpu.append({"cpu": path.parent.name,
+                            "package": (path / "physical_package_id").read_text().strip(),
+                            "core": (path / "core_id").read_text().strip()})
+            routes = []
+            for target in targets:
+                raw = subprocess.check_output(["ip", "-j", "route", "get", target], timeout=5)
+                routes.append({"target": target, "selection": json.loads(raw)})
+            facts = {"cpu_topology": cpu, "process_count": sum(p.name.isdigit() for p in Path("/proc").iterdir()),
+                     "routes": routes}
+        if (not facts.get("cpu_topology") or not facts.get("routes")
+                or type(facts.get("process_count")) is not int or facts["process_count"] < 1):
+            raise ValueError("环境事实不完整。")
+        result.update(facts, verified=True)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        result["verification_error"] = type(error).__name__
     if os.name == "nt":
         from secure_control.experiments.native_tail_capture import _session_snapshot, _sessions
         result["background_sessions"] = _session_snapshot(_sessions())["stable"]
@@ -59,6 +139,13 @@ def baseline_environment():
 
 def run_baseline_host(plan, approval, side, *, config_paths, output, expected_head):
     """显式运行一组的一端，唯一账本先扣额；无自动重试或旧诊断门禁降级。"""
+    # RV-002：当前部署尚未提供在线共享邮箱，静态批准绝不能单独启动。
+    # 在新在线握手实现与复审通过前显式阻断；不把离线ticket当动态授权。
+    raise RuntimeError("baseline online coordinator unavailable: shared mailbox deployment required")
+
+
+def _run_baseline_host_approved(plan, approval, side, *, config_paths, output, expected_head):
+    """保留待在线门禁接入的装配；不是正式运行入口，不提供CLI降级开关。"""
     from secure_control.execution.lan_config import load_lan_config
     from secure_control.experiments.native_tail_capture import NativeCapture, plan_digest
     from secure_control.experiments.tail_diagnostic_runner import (
@@ -92,7 +179,7 @@ def run_baseline_host(plan, approval, side, *, config_paths, output, expected_he
         parent = parent.parent
     if shutil.disk_usage(parent).free < 4 * 1024**3:
         raise ValueError("磁盘余量不足4GiB。")
-    environment = baseline_environment()
+    environment = baseline_environment(configs)
     native = None
     if plan["condition"] == "F":
         node = plan.get("hosts", {}).get(side, {})
@@ -115,7 +202,7 @@ def run_baseline_host(plan, approval, side, *, config_paths, output, expected_he
     group = _collect_host(configs, SimpleNamespace(window=2000), 2000,
                           wall_started=started, control_file=True, b_receive_boundary=True,
                           native=native, _child=baseline_child, _baseline=True)
-    after = baseline_environment()
+    after = baseline_environment(configs)
     reports = group["roles"]
     functional = (len(reports) == len(roles) and not group["stop_reason"]
                   and not group["forced_cleanup"] and all(
@@ -126,6 +213,7 @@ def run_baseline_host(plan, approval, side, *, config_paths, output, expected_he
             outcome = report.get("outcome", {})
             functional = functional and outcome.get("confirmed_step_count") == 2000
             functional = functional and outcome.get("protocol_committed_count") == 2000
+            functional = functional and report.get("numerical_validation", {}).get("verified") is True
             try:
                 metrics = baseline_metrics(report["timing"])
                 _write_new(output / "metrics.json", metrics)
@@ -136,7 +224,7 @@ def run_baseline_host(plan, approval, side, *, config_paths, output, expected_he
               "plan_sha256": plan_digest(plan), "side": side,
               "index": plan["index"], "condition": plan["condition"],
               "functional_complete": functional, "environment_before": environment,
-              "environment_after": after, "environment_unchanged": environment == after,
+              "environment_after": after, "environment_unchanged": environments_match(environment, after),
               "capture_complete": native is None or group.get("native", {}).get("status") == "saved",
               "artifact_bytes": sum(p.stat().st_size for p in output.iterdir() if p.is_file()),
               "group": group, "files": {p.name: _sha(p) for p in output.iterdir() if p.is_file()}}
@@ -194,7 +282,7 @@ def coordinate_batch(plans, output, *, read=input, now=monotonic):
                 functional_complete=all(m.get("functional_complete") is True for m in manifests),
                 capture_complete=all(m.get("capture_complete") is True for m in manifests),
                 environment_unchanged=all(m.get("environment_unchanged") is True and
-                    m["environment_before"] == reference[m["side"]] for m in manifests))
+                    environments_match(m["environment_before"], reference[m["side"]]) for m in manifests))
             _write_new(output / f"receipt-{index}.json", receipt)
             if batch.stop_reason:
                 break
@@ -255,10 +343,6 @@ def cli():
             raise SystemExit(2)
 
 
-if __name__ == "__main__":
-    cli()
-
-
 def baseline_child(config, context, results, stop, deadline, steps, activity=None, *unused):
     """两条件唯一业务装配；不启用详细诊断、GC回调或逐步写盘。"""
     from secure_control.execution.lan_runtime import RunControl, run_party_single_step
@@ -278,6 +362,18 @@ def baseline_child(config, context, results, stop, deadline, steps, activity=Non
             collector = LiveTimingCollector("samples", sample_limit=steps)
             metadata = timing_metadata(config, prepared, non_realtime=True, mode="samples")
             attempts = 0
+            import numpy as np
+            records = [None] * steps
+            public_setup = []
+            inputs = np.empty((steps, prepared.spec.input_dimension), dtype=float)
+            original_input = prepared.scene.controller_input
+
+            def observed_input():
+                value = original_input()
+                inputs[attempts-1] = value
+                return value
+
+            prepared.scene.controller_input = observed_input
 
             def before_sample():
                 nonlocal attempts
@@ -289,16 +385,25 @@ def baseline_child(config, context, results, stop, deadline, steps, activity=Non
                 attempts += 1
 
             def on_step(record):
+                records[record.protocol.global_step] = record
                 if record.protocol.global_step + 1 >= steps:
                     control.request_stop()
 
             outcome = _run_prepared_segmented(
                 config, prepared, control=control, session=session, before_sample=before_sample,
-                on_step=on_step, non_realtime=True, timing_observer=collector, material_slots=16)
+                on_step=on_step, on_start=lambda state, setup: public_setup.append(setup),
+                non_realtime=True, timing_observer=collector, material_slots=16)
             report = collector.report()
             report.update(metadata=metadata, control_outcome=outcome,
                           export={"status": "in_memory", "path": None})
             result.update(status=outcome["status"], outcome=outcome, timing=report)
+            result["numerical_validation"] = verify_baseline_numbers(prepared, config, records, inputs, public_setup[0])
+            from dataclasses import asdict
+            result["numerical_evidence"] = {
+                "inputs": inputs.tolist(), "setup": asdict(public_setup[0]),
+                "records": [{"global_step": r.protocol.global_step,
+                             "raw_control": r.protocol.raw_control, "snapshot": asdict(r.snapshot)}
+                            for r in records]}
         else:
             def on_activity():
                 with activity.get_lock():
@@ -310,6 +415,7 @@ def baseline_child(config, context, results, stop, deadline, steps, activity=Non
                                            on_activity=on_activity)
             result.update(status=outcome["status"], outcome=outcome)
     except Exception as error:  # noqa: BLE001 - 不导出控制/密码材料异常文本
+        result["status"] = "failed"
         result["error_type"] = type(error).__name__
         stop.set()
     finally:
@@ -449,3 +555,7 @@ def baseline_metrics(report):
             "status_counts": report["status_counts"],
             "deadline_miss": None, "absolute_lateness_ns": None,
             "not_applicable_reason": "relative pacing has no absolute schedule/deadline"}
+
+
+if __name__ == "__main__":
+    cli()
