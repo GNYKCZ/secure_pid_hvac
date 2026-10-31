@@ -3,6 +3,91 @@
 import pytest
 
 
+def test_unknown_environment_rejected_before_ledger_or_collect(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import secure_control.experiments.performance_baseline as baseline
+    import secure_control.experiments.tail_diagnostic_runner as runner
+    from secure_control.execution.lan_config import load_lan_config
+    paths = ["configs/lab-p1-cart-pole-demo.example.yaml", "configs/lab-p2-cart-pole-demo.example.yaml"]
+    configs = [load_lan_config(p, r) for p, r in zip(paths, ("P1", "P2"), strict=True)]
+    plan = {"index": 0, "condition": "L", "configurations": {c.role: runner._config_identity(c) for c in configs}}
+    monkeypatch.setattr(baseline, "authorize_baseline", lambda *a, **kw: None)
+    monkeypatch.setattr(baseline.subprocess, "check_output", lambda args, **kw: "" if "status" in args else "a"*40)
+    monkeypatch.setattr(baseline.shutil, "disk_usage", lambda p: SimpleNamespace(free=10*1024**3))
+    monkeypatch.setattr(baseline, "baseline_environment", lambda c: {"verified": False})
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("must reject before ledger/native/spawn")
+    monkeypatch.setattr(runner, "_write_new", forbidden)
+    monkeypatch.setattr(runner, "_collect_host", forbidden)
+    with pytest.raises(ValueError, match="环境"):
+        baseline._run_baseline_host_approved(plan, {"authorization_url": "test"}, "pair", config_paths=paths,
+                                            output=tmp_path / "run", expected_head="a"*40)
+
+
+def pair_package_fixture(root, fault=None):
+    import hashlib
+    import json
+
+    from secure_control.experiments.baseline_package import publish_package, read_package
+    from secure_control.experiments.native_tail_capture import (
+        B_RECEIVE_RESOURCES,
+        CALIBRATION_RESOURCES,
+        plan_digest,
+    )
+    root.mkdir()
+    plan = {"index": 1, "condition": "F", "source_head": "a"*40,
+            "hosts": {"pair": B_RECEIVE_RESOURCES, "client": CALIBRATION_RESOURCES}}
+    env = {"verified": True, "routes": [1], "cpu_topology": [1], "process_count": 2}
+    owner = {"status": "saved", "stop_returncode": 0, "background_unchanged": True,
+             "elapsed_s": 50., "etl_bytes": 3, "native_buffer_bytes_at_stop": 8192,
+             "nonpaged_sessions_at_stop": True, "native_buffer_budget_exceeded": False,
+             "resource_budget_exceeded": False,
+             "final_sessions": [{"clock": 1, "events_lost": 0, "buffers_lost": 0,
+                                 "buffer_kb": 4, "buffers": 1}] * 2}
+    roles = [{"role": r, "pid": k+10, "status": "closed",
+              "outcome": {"status": "closed", "steps_committed": 2000,
+                          "final_receipt": {"cumulative_committed_count": 2000}}}
+             for k, r in enumerate(("P1", "P2"))]
+    if fault == "count":
+        roles[0]["outcome"]["steps_committed"] = 0
+    if fault == "native_partial":
+        owner["status"] = "partial"
+    group = {"roles": roles, "stop_reason": None, "forced_cleanup": [],
+             "exitcodes": [1, 1] if fault == "exit" else [0, 0], "native": owner, "wall_s": 55.}
+    files = {"plan.json": plan, "P1.json": roles[0], "P2.json": roles[1]}
+    if fault != "missing_owner":
+        files["native-owner.json"] = owner
+    for name, value in files.items():
+        (root / name).write_text(json.dumps(value))
+    if fault != "missing_etl":
+        (root / "native.etl").write_bytes(b"etl")
+    manifest = {"side": "pair", "source_head": "a"*40, "index": 1, "condition": "F",
+        "plan_sha256": plan_digest(plan), "functional_complete": True, "capture_complete": True,
+        "environment_before": env, "environment_after": env, "group": group,
+        "files": {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in root.iterdir()}}
+    (root / "manifest.json").write_text(json.dumps(manifest))
+    target = root.parent / (root.name + ".zip")
+    publish_package(root, target, {"side": "pair", "index": 1})
+    return read_package(target, {"side": "pair", "index": 1})[0], plan
+
+
+@pytest.mark.parametrize("fault", ["count", "exit", "native_partial", "missing_owner", "missing_etl"])
+def test_real_pair_package_validation_rejects_underlying_failures(tmp_path, fault):
+    from secure_control.experiments.performance_baseline import validate_manual_result
+    records, plan = pair_package_fixture(tmp_path / fault, fault)
+    with pytest.raises(ValueError):
+        validate_manual_result(records, plan, "pair", [])
+
+
+def test_real_pair_package_validation_accepts_complete_evidence(tmp_path):
+    from secure_control.experiments.performance_baseline import validate_manual_result
+    records, plan = pair_package_fixture(tmp_path / "valid")
+    assert validate_manual_result(records, plan, "pair", [])["functional_complete"]
+
+
 def test_formal_prepare_cli_loads_all_definitions(tmp_path):
     import json
     import subprocess
@@ -66,12 +151,14 @@ def test_manual_one_group_packages_and_imports_then_requires_next_confirmation(t
     calls = []
 
     def runner(plan, approval, side, *, output, **kwargs):
+        import hashlib
         baseline.authorize_baseline(approval, plan, side=side, output=output, head="a" * 40)
         calls.append(side)
         output.mkdir()
         (output / "plan.json").write_text(json.dumps(plan))
         (output / "manifest.json").write_text(json.dumps({"environment_before": {
-            "verified": True, "routes": [], "cpu_topology": [], "process_count": 2}}))
+            "verified": True, "routes": [], "cpu_topology": [], "process_count": 2},
+            "files": {"plan.json": hashlib.sha256((output / "plan.json").read_bytes()).hexdigest()}}))
 
     # 编排测试隔离纯结果校验；独立数值/环境反例由前述oracle用例覆盖。
     monkeypatch.setattr(baseline, "validate_manual_result", lambda records, *args: records["manifest.json"])
@@ -110,7 +197,7 @@ def test_package_rejects_traversal_and_wrong_identity(tmp_path):
         read_package(tmp_path / "bad.zip", {})
 
 
-def test_numeric_oracle_accepts_encoded_first_step_and_rejects_wrong_output():
+def test_numeric_oracle_accepts_encoded_first_step_and_rejects_wrong_output(tmp_path):
     from types import SimpleNamespace
 
     import numpy as np
@@ -145,6 +232,60 @@ def test_numeric_oracle_accepts_encoded_first_step_and_rejects_wrong_output():
         verify_baseline_numbers(prepared, config, [wrong], np.array([value]), setup)
     with pytest.raises(ValueError):
         verify_baseline_numbers(prepared, config, [record], np.array([value])+1, setup)
+    # 固定2000步纯本地物理/整数oracle生成完整Client包；不运行秘密协议或网络。
+    import hashlib
+    import json
+    from dataclasses import asdict
+
+    from secure_control.execution.localhost_codec import encode_wire_value
+    from secure_control.experiments.baseline_package import publish_package, read_package
+    from secure_control.experiments.native_tail_capture import plan_digest
+    from secure_control.experiments.performance_baseline import validate_manual_result
+    pair_records, plan = pair_package_fixture(tmp_path / "pair")
+    assert validate_manual_result(pair_records, plan, "pair", [])
+    numeric_rows = [record]
+    input_rows = [value.copy()]
+    nominal = encoded["x0"]
+    for k in range(2000):
+        if k:
+            value = prepared.scene.controller_input()
+            raw = float((encoded["C"] @ nominal + encoded["D"] @ context.encode(value))[0]) / context.scale**2
+            snapshot = prepared.scene.advance(k, np.array([raw]))
+            numeric_rows.append(SimpleNamespace(protocol=SimpleNamespace(global_step=k, raw_control=(raw,)),
+                                                snapshot=snapshot))
+            input_rows.append(value.copy())
+        accumulators = encoded["A"] @ nominal + encoded["B"] @ context.encode(value)
+        nominal = np.array([(int(x)+context.scale//2)//context.scale for x in accumulators], dtype=object)
+    collector = LiveTimingCollector("samples", sample_limit=2000)
+    for k in range(2000):
+        start = 1_000_000_000+k*20_000_000
+        collector.record(StepTimingObservation(attempt_seq=k, global_step=k, segment_index=k//400,
+            actual_sample_start_ns=start, control_applied_ns=start+1_000_000,
+            work_completed_ns=start+2_000_000, status="confirmed"))
+    report = collector.report()
+    report.update(metadata={"timing_mode": "non_realtime_demo"}, control_outcome={}, export={})
+    numerical = {"inputs": np.array(input_rows).tolist(), "setup": json.loads(encode_wire_value(setup)),
+        "records": [{"global_step": r.protocol.global_step, "raw_control": r.protocol.raw_control,
+                     "snapshot": asdict(r.snapshot)} for r in numeric_rows]}
+    role = {"role": "Client", "status": "stopped", "timing": report, "numerical_evidence": numerical,
+            "outcome": {"status": "stopped", "confirmed_step_count": 2000, "protocol_committed_count": 2000}}
+    source = tmp_path / "client"
+    source.mkdir()
+    owner = pair_records["native-owner.json"]
+    values = {"plan.json": plan, "Client.json": role, "metrics.json": baseline_metrics(report),
+              "native-owner.json": owner}
+    for name, item in values.items():
+        (source / name).write_text(json.dumps(item))
+    (source / "native.etl").write_bytes(b"etl")
+    manifest = {**pair_records["manifest.json"], "side": "client",
+        "plan_sha256": plan_digest(plan), "group": {"roles": [role], "exitcodes": [0],
+        "stop_reason": None, "forced_cleanup": [], "native": owner},
+        "files": {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in source.iterdir()}}
+    (source / "manifest.json").write_text(json.dumps(manifest))
+    archive = tmp_path / "client.zip"
+    publish_package(source, archive, {"side": "client", "index": 1})
+    records, _ = read_package(archive, {"side": "client", "index": 1})
+    assert validate_manual_result(records, plan, "client", ["configs/lab-client-cart-pole-demo.example.yaml"])
 
 
 @pytest.mark.parametrize("field,value", [("routes", ["ethernet"]), ("cpu_topology", ["other"]),

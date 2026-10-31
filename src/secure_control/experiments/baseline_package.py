@@ -77,7 +77,10 @@ def read_package(path, identity):
             if chunks:
                 records[name] = json.loads(b"".join(chunks))
         manifest = records.get("manifest.json", {})
+        if set(manifest.get("files", {})) != set(package["files"]) - {"manifest.json"}:
+            raise ValueError("运行manifest未完整列出包内原件。")
         for name, digest in manifest.get("files", {}).items():
             if name not in package["files"] or package["files"][name]["sha256"] != digest:
                 raise ValueError("运行manifest与包成员摘要不一致。")
+    records["_verified_inventory"] = package["files"]
     return records, sum(e["bytes"] for e in package["files"].values())

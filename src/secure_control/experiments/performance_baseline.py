@@ -183,6 +183,8 @@ def _run_baseline_host_approved(plan, approval, side, *, config_paths, output, e
     if shutil.disk_usage(parent).free < 4 * 1024**3:
         raise ValueError("磁盘余量不足4GiB。")
     environment = baseline_environment(configs)
+    if not environments_match(environment, environment):
+        raise ValueError("必要环境事实未知，未启动控制或采集。")
     native = None
     if plan["condition"] == "F":
         node = plan.get("hosts", {}).get(side, {})
@@ -211,7 +213,12 @@ def _run_baseline_host_approved(plan, approval, side, *, config_paths, output, e
     reports = group["roles"]
     functional = (len(reports) == len(roles) and not group["stop_reason"]
                   and not group["forced_cleanup"] and all(
-                      r["status"] in ("stopped", "closed") for r in reports))
+                      r["status"] in ("stopped", "closed") for r in reports)
+                  and len(group["exitcodes"]) == len(roles)
+                  and all(type(code) is int and code == 0 for code in group["exitcodes"]))
+    if side == "pair":
+        functional = functional and all(type(r.get("outcome", {}).get("steps_committed")) is int
+                                       and r["outcome"]["steps_committed"] == 2000 for r in reports)
     for report in reports:
         _write_new(output / (report["role"] + ".json"), report)
         if report["role"] == "Client":
@@ -617,21 +624,83 @@ def validate_manual_result(records, plan, side, configs):
     from secure_control.scenarios.cart_pole.interactive import InteractiveSession
 
     manifest = records["manifest.json"]
+    roles = ("Client",) if side == "client" else ("P1", "P2")
+    required = {"plan.json", "manifest.json", *(r + ".json" for r in roles)}
+    if side == "client":
+        required.add("metrics.json")
+    if plan["condition"] == "F":
+        required.update({"native.etl", "native-owner.json"})
+    inventory = records.get("_verified_inventory", {})
+    if not required <= set(inventory):
+        raise ValueError("结果包缺少本条件/角色必需原件。")
     if (records["plan.json"] != plan or manifest.get("side") != side
             or manifest.get("plan_sha256") != plan_digest(plan)
+            or manifest.get("source_head") != plan.get("source_head")
+            or type(manifest.get("index")) is not int or manifest["index"] != plan["index"]
+            or manifest.get("condition") != plan["condition"]
             or manifest.get("functional_complete") is not True or manifest.get("capture_complete") is not True
             or not environments_match(manifest["environment_before"], manifest["environment_after"])
             or manifest["group"].get("stop_reason") or manifest["group"].get("forced_cleanup")):
         raise ValueError("两端功能、采集、清理或环境未通过。")
-    for role in (("Client",) if side == "client" else ("P1", "P2")):
+    group = manifest["group"]
+    if plan["condition"] == "L" and (group.get("native") is not None
+            or {"native.etl", "native-owner.json"} & set(inventory)):
+        raise ValueError("轻量条件混入自有原生采集原件。")
+    if (len(group.get("exitcodes", [])) != len(roles)
+            or any(type(code) is not int or code != 0 for code in group["exitcodes"])
+            or group.get("launcher_error") is not None
+            or {r.get("role") for r in group.get("roles", [])} != set(roles)
+            or len(group["roles"]) != len(roles)):
+        raise ValueError("本组成员或进程退出证据失败。")
+    for role in roles:
         if records[role + ".json"].get("status") not in ("stopped", "closed"):
             raise ValueError("角色终态未通过。")
+        report = records[role + ".json"]
+        if report != next(r for r in group["roles"] if r["role"] == role):
+            raise ValueError("角色原件与组报告不一致。")
+        if side == "pair":
+            outcome = report.get("outcome", {})
+            if (outcome.get("status") != "closed" or type(outcome.get("steps_committed")) is not int
+                    or outcome["steps_committed"] != 2000
+                    or type(outcome.get("final_receipt", {}).get("cumulative_committed_count")) is not int
+                    or outcome["final_receipt"]["cumulative_committed_count"] != 2000):
+                raise ValueError("Party提交及最终回执不足。")
+    if plan["condition"] == "F":
+        owner = records["native-owner.json"]
+        limits = plan["hosts"][side]
+        etl_bytes = inventory["native.etl"]["bytes"]
+        sessions = owner.get("final_sessions", [])
+        if (group.get("native") != owner or owner.get("status") != "saved"
+                or type(owner.get("stop_returncode")) is not int or owner["stop_returncode"] != 0
+                or owner.get("background_unchanged") is not True
+                or owner.get("nonpaged_sessions_at_stop") is not True
+                or owner.get("native_buffer_budget_exceeded") is not False
+                or owner.get("resource_budget_exceeded") is not False
+                or type(owner.get("etl_bytes")) is not int or owner["etl_bytes"] != etl_bytes
+                or not 0 < etl_bytes <= limits["etl_limit_bytes"]
+                or type(owner.get("elapsed_s")) not in (int, float)
+                or not 0 <= owner["elapsed_s"] <= limits["native_window_s"]
+                or len(sessions) != 2):
+            raise ValueError("原生采集owner/ETL/资源事实未通过。")
+        for session in sessions:
+            if any(type(session.get(k)) is not int for k in
+                   ("clock", "events_lost", "buffers_lost", "buffer_kb", "buffers")) or (
+                    session["clock"] != 1 or session["events_lost"] != 0 or session["buffers_lost"] != 0
+                    or session["buffer_kb"] <= 0 or session["buffers"] <= 0):
+                raise ValueError("原生采集会话丢失、时钟或缓冲事实无效。")
+        actual_buffers = sum(s["buffer_kb"] * s["buffers"] * 1024 for s in sessions)
+        if (actual_buffers > limits["native_buffer_bytes"]
+                or owner.get("native_buffer_bytes_at_stop") != actual_buffers):
+            raise ValueError("原生采集缓冲预算不符。")
     if side == "client":
         client = records["Client.json"]
         if any(type(client["outcome"].get(k)) is not int or client["outcome"][k] != 2000
                for k in ("confirmed_step_count", "protocol_committed_count")):
             raise ValueError("Client提交/确认计数不足。")
-        baseline_metrics(client["timing"])
+        if (client["outcome"].get("status") != "stopped" or client["timing"].get("observations") != 2000
+                or client["timing"].get("status_counts", {}).get("confirmed") != 2000
+                or records["metrics.json"] != baseline_metrics(client["timing"])):
+            raise ValueError("Client计时或派生指标与原件不符。")
         evidence = client["numerical_evidence"]
         if len(evidence["records"]) != 2000 or len(evidence["inputs"]) != 2000:
             raise ValueError("数值记录容量或完整性不符。")
