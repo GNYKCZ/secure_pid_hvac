@@ -287,11 +287,13 @@ def _clear_owned(processes, deadline, *, _now=time.perf_counter, _run=subprocess
     return forced
 
 
-def _collect_host(configs, context, steps, *, wall_started=None, stream_map=False, native=None, control_file=False, b_receive_boundary=False, _mp=mp, _now=time.perf_counter):
+def _collect_host(configs, context, steps, *, wall_started=None, stream_map=False, native=None, control_file=False, b_receive_boundary=False, _mp=mp, _now=time.perf_counter, _child=None, _baseline=False):
     """按声明窗口监督实际成员；无跨机时钟或额外连接。"""
     started = _now() if wall_started is None else wall_started
     limits = limits_for(context.window if context is not None else 400)
     run_deadline = started+(110 if b_receive_boundary and configs[0].role!='Client' else 100 if control_file else limits.wall_s-3)
+    if _baseline:
+        run_deadline = started+(110 if configs[0].role != 'Client' else 90)
     spawn = _mp.get_context('spawn')
     results, stop, activity = spawn.Queue(), spawn.Event(), spawn.Value('d',0.)
     processes, reports, reason, launcher_error = [], [], None, None
@@ -305,7 +307,7 @@ def _collect_host(configs, context, steps, *, wall_started=None, stream_map=Fals
             if _now() >= run_deadline:
                 reason = 'wall_limit'
                 break
-            process = spawn.Process(target=_configured_child,
+            process = spawn.Process(target=_configured_child if _child is None else _child,
                 args=(config,context,results,stop,run_deadline,steps,activity,stream_map,
                       *([True,True] if b_receive_boundary else [True] if control_file else [])))
             processes.append(process)
@@ -341,6 +343,8 @@ def _collect_host(configs, context, steps, *, wall_started=None, stream_map=Fals
     finally:
         stop.set()
         cleanup_deadline = started+limits.wall_s-1
+        if _baseline:
+            cleanup_deadline = started+(120 if configs[0].role != 'Client' else 100)
         if native is not None and native.started is not None:
             # 原生窗口包含退出时间，不能让业务清退一直占用240秒总预算。
             cleanup_deadline = min(cleanup_deadline,native.capture_deadline)

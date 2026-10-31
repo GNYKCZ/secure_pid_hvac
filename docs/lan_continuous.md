@@ -1738,3 +1738,19 @@ uv run secure-control benchmark --case cycle --mode batch --steps 10000 --delay-
 完整周期/24维护/正常STOP/材料/状态/资源/历史与退出门禁不改；少分配可能只推迟gen2，
 未覆盖Client运行期GC不等于消除停顿，退出GC不能充作控制内覆盖。原历史S13内部仍未知，
 有限本机动态结果不授完整路线/真实TLS三机/Wi-Fi/硬件资格，不自动第10次源码续接或合并关闭。
+
+## #166 共同基线的软件入口
+
+运行入口为 `uv run python -m secure_control.experiments.performance_baseline`。
+`prepare SPEC OUTPUT` 从公开配置身份、准确 source_head、八组两端绝对新路径和两机各自只读准备的 hosts 节点生成 run-0.json 到 run-7.json；仅准备，不启动控制。
+L/F 顺序固定 L-F-F-L、F-L-L-F。两者共用 samples/2000、400步分段、16材料槽、20ms非实时相对节拍，不装 TailRecorder/GC 回调/stream map。F使用既有 NativeCapture 独立实例，只保存ETL/owner，不解析逐帧TCP。
+
+每组批准格式为 schema=baseline-authorization-v1、purpose=capture-overhead-baseline-v1、source_head、plan_sha256（使用 native_tail_capture.plan_digest）、attempts=1、authorization_url（本Issue的新用户批准评论）。八组计划和逐端预算必须先经软件独审并由用户准确批准，不能复用历史control批准。
+`run pair PLAN APPROVAL OUTPUT --expected-head SHA --config P1 --config P2` 在B执行；随后A执行 `run client PLAN APPROVAL OUTPUT --expected-head SHA --config CLIENT`。输出必须等于计划该端路径，账本在开始前永久扣额，不自动重试。
+
+协调端在第一条运行命令前执行 `coordinate PLANS COORDINATION_OUTPUT`，保持窗口打开。每组提示后人工启动B/A，将两端manifest复制回协调机并输入路径；每组先领取再结算，失败/环境漂移/剩余额度不足120秒停止。批次一个本地monotonic计时，20分钟含协调等待与清理；人工输入阻塞不能硬中断用户等待，返回后如实标超额并拒绝下一组，不能宣传OS硬实时保证。
+A总上限100秒、B业务监督110秒和清理至120秒；业务55秒、B等待45秒。F仍受各节点原采集期限与资源门禁约束。开始余量4GiB；软磁盘目标不等于OS硬配额。原生F当前仅Windows可用，Linux不得悄悄降级L，跨平台共同应用计时可单独运行L；混合系统F应另制定支持范围。
+
+Client.json包含共同计时及控制终态；`metrics TIMING_REPORT OUTPUT` 只读生成>20ms比例、精确nearest-rank分位、连续预算超出、维护边界/随后两步、本步出口到下次采样间隔。Client.json内timing对象可作为TIMING_REPORT另存新文件。非实时真实deadline/lateness均null，不产生绝对节拍资格结论。数值正确性仍须结合原有控制契约与对照结果核验，单独计数一致不证明数值相等。
+
+本入口的软件完成与性能收益是不同验收项；实际8组采集未运行前报告NOT RUN，不宣称采集扰动存在或优化已生效。背景负载对照需要另一份明确计划；不停止未知logger或安全软件。

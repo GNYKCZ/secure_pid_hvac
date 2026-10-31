@@ -1628,7 +1628,7 @@ class LanSegmentedRuntime:
 
 
 def run_party_single_step(config: LanConfig, *, batch: bool = True,
-                         wire_profile: str = "control-batch-v1") -> dict[str, object]:
+                         wire_profile: str = "control-batch-v1", on_activity=None) -> dict[str, object]:
     """P1/P2 默认只接受批量能力；旧 wire 须由双方显式选择诊断模式。"""
     if config.role not in {"P1", "P2"}:
         raise ValueError("角色命令必须是 P1 或 P2。")
@@ -1649,6 +1649,7 @@ def run_party_single_step(config: LanConfig, *, batch: bool = True,
             summary, tail = _run_party_session(
                 config, client_listener, peer_listener, tail, expected_batch=batch,
                 expected_wire_profile=wire_profile,
+                **({"on_activity": on_activity} if on_activity is not None else {}),
             )
             if tail is None:
                 return summary
@@ -1715,6 +1716,7 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
                        peer_listener: socket.socket | None,
                        tail: _PartyRunTail | _ScalarRunTail | None, *, expected_batch: bool,
                        expected_wire_profile: str = "control-batch-v1",
+                       on_activity=None,
                        ) -> tuple[dict[str, object], _PartyRunTail | _ScalarRunTail | None]:
     """旧模式与新模式共享唯一的握手、离线装配和 Protocol 3 单段计算。"""
     role = config.role
@@ -1943,12 +1945,16 @@ def _run_party_session(config: LanConfig, client_listener: socket.socket,
             "commit_sum_ns": 0, "commit_max_ns": 0, "last": None, "slowest": None}
         last_round = None
         awaiting_begin = False
+        activity_notified = False
         while True:
             # 首轮也允许等待 Client 先完成纯场景预检；每轮操作有独立总 deadline。
             if not segmented and committed == steps:
                 break
             if diagnostic is not None:
                 diagnostic.emit('request_receive',0,-1)
+            if not activity_notified and on_activity is not None:
+                on_activity()  # 仅一次公开起点通知，不传递payload或参与协议决策。
+                activity_notified = True
             online_request = receive_envelope(
                 client_socket, deadline=deadline_after(config.idle_timeout), limit=_FRAME_LIMIT
             )
