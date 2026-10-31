@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from secure_control.experiments.live_timing import validate_timing_report
 
 PURPOSE = "capture-overhead-baseline-v1"
+MANUAL_PURPOSE = "capture-overhead-manual-v1"
 CONDITIONS = ("L", "F", "F", "L", "F", "L", "L", "F")
 
 
@@ -48,7 +49,8 @@ def verify_baseline_numbers(prepared, config, records, inputs, setup):
     for index, record in enumerate(records):
         if record is None or record.protocol.global_step != index:
             raise ValueError("数值记录缺步、重复或身份错位。")
-        snapshot = json.loads(json.dumps(asdict(record.snapshot), allow_nan=False))
+        snapshot = json.loads(json.dumps(record.snapshot if isinstance(record.snapshot, dict)
+                                        else asdict(record.snapshot), allow_nan=False))
         if not np.array_equal(inputs[index], snapshot["local_measurement"]):
             raise ValueError("实际分享输入与独立物理测量不一致。")
         rows.append({"snapshot": snapshot, "protocol": {"raw_control": record.protocol.raw_control}})
@@ -62,13 +64,14 @@ def authorize_baseline(approval, plan, *, side, output, head):
     """新用途逐组批准绑定完整计划，旧control批准不能用于对照运行。"""
     from secure_control.experiments.native_tail_capture import plan_digest
     index = plan.get("index")
+    manual = plan.get("purpose") == MANUAL_PURPOSE
     if (not isinstance(approval, dict) or plan.get("schema") != "baseline-run-plan-v1"
-            or plan.get("purpose") != PURPOSE or plan.get("source_head") != head
+            or plan.get("purpose") not in (PURPOSE, MANUAL_PURPOSE) or plan.get("source_head") != head
             or type(index) is not int or not 0 <= index < 8
             or plan.get("condition") != CONDITIONS[index]
             or side not in ("client", "pair")
-            or approval.get("schema") != "baseline-authorization-v1"
-            or approval.get("purpose") != PURPOSE or approval.get("source_head") != head
+            or approval.get("schema") != ("baseline-manual-authorization-v1" if manual else "baseline-authorization-v1")
+            or approval.get("purpose") != plan["purpose"] or approval.get("source_head") != head
             or approval.get("plan_sha256") != plan_digest(plan)
             or type(approval.get("attempts")) is not int or approval["attempts"] != 1
             or type(plan.get("steps")) is not int or plan["steps"] != 2000
@@ -202,6 +205,8 @@ def _run_baseline_host_approved(plan, approval, side, *, config_paths, output, e
     group = _collect_host(configs, SimpleNamespace(window=2000), 2000,
                           wall_started=started, control_file=True, b_receive_boundary=True,
                           native=native, _child=baseline_child, _baseline=True)
+    if native is not None:
+        (output / "native-owner.json").write_text(json.dumps(native.report), encoding="utf-8")
     after = baseline_environment(configs)
     reports = group["roles"]
     functional = (len(reports) == len(roles) and not group["stop_reason"]
@@ -320,8 +325,26 @@ def cli():
     coordinate = modes.add_parser("coordinate")
     coordinate.add_argument("plans", type=Path)
     coordinate.add_argument("output", type=Path)
+    setup = modes.add_parser("manual-prepare")
+    setup.add_argument("spec", type=Path)
+    setup.add_argument("output", type=Path)
+    setup.add_argument("--side", choices=("client", "pair"), required=True)
+    setup.add_argument("--config", type=Path, action="append", required=True)
+    setup.add_argument("--approvals", type=Path, required=True)
+    manual = modes.add_parser("manual")
+    manual.add_argument("bundle", type=Path)
+    repack = modes.add_parser("repack")
+    repack.add_argument("bundle", type=Path)
+    repack.add_argument("--index", type=int, required=True)
     args = parser.parse_args()
-    if args.mode == "prepare":
+    if args.mode == "manual-prepare":
+        prepare_manual(json.loads(args.spec.read_text(encoding="utf-8-sig")), args.output,
+                       args.side, args.config, args.approvals)
+    elif args.mode == "repack":
+        print(repack_manual(args.bundle, args.index))
+    elif args.mode == "manual":
+        run_manual(args.bundle)
+    elif args.mode == "prepare":
         plans = prepare_run_plans(json.loads(args.spec.read_text(encoding="utf-8-sig")))
         args.output.mkdir(parents=True, exist_ok=False)
         for plan in plans:
@@ -399,8 +422,10 @@ def baseline_child(config, context, results, stop, deadline, steps, activity=Non
             result.update(status=outcome["status"], outcome=outcome, timing=report)
             result["numerical_validation"] = verify_baseline_numbers(prepared, config, records, inputs, public_setup[0])
             from dataclasses import asdict
+
+            from secure_control.execution.localhost_codec import encode_wire_value
             result["numerical_evidence"] = {
-                "inputs": inputs.tolist(), "setup": asdict(public_setup[0]),
+                "inputs": inputs.tolist(), "setup": json.loads(encode_wire_value(public_setup[0])),
                 "records": [{"global_step": r.protocol.global_step,
                              "raw_control": r.protocol.raw_control, "snapshot": asdict(r.snapshot)}
                             for r in records]}
@@ -555,6 +580,175 @@ def baseline_metrics(report):
             "status_counts": report["status_counts"],
             "deadline_miss": None, "absolute_lateness_ns": None,
             "not_applicable_reason": "relative pacing has no absolute schedule/deadline"}
+
+
+def prepare_manual(spec, output, side, configs, approvals):
+    """一次生成本机薄入口与冻结计划引用；准备不产生运行授权。"""
+    from secure_control.experiments.native_tail_capture import plan_digest
+    from secure_control.experiments.tail_diagnostic_runner import ROOT, _write_new
+
+    plans = prepare_run_plans(spec)
+    for plan in plans:
+        plan["purpose"] = MANUAL_PURPOSE
+    output = Path(output).resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    for name in ("inbox", "outbox"):
+        (output / name).mkdir()
+    bundle = {"schema": "baseline-manual-bundle-v1", "side": side,
+              "batch_id": plan_digest(plans), "repo": str(ROOT), "plans": plans,
+              "configs": [str(Path(p).resolve()) for p in configs],
+              "approvals": str(Path(approvals).resolve())}
+    _write_new(output / "bundle.json", bundle)
+    (output / "start-baseline.ps1").write_text(
+        "$ErrorActionPreference='Stop'\n"
+        "$bundle=Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'bundle.json') | ConvertFrom-Json\n"
+        "Set-Location -LiteralPath $bundle.repo\n"
+        "uv run python -m secure_control.experiments.performance_baseline manual $PSScriptRoot\n"
+        "if ($LASTEXITCODE -ne 0) { throw 'Baseline STOP; preserve results; do not retry.' }\n",
+        encoding="utf-8")
+
+
+def validate_manual_result(records, plan, side, configs):
+    """包完整性之外重核角色事实；Client以保存输入重跑独立数值oracle。"""
+    from secure_control.execution.lan_config import load_lan_config
+    from secure_control.execution.localhost_codec import decode_wire_value
+    from secure_control.experiments.lan_continuous_profile import load_segmented_experiment
+    from secure_control.experiments.native_tail_capture import plan_digest
+    from secure_control.scenarios.cart_pole.interactive import InteractiveSession
+
+    manifest = records["manifest.json"]
+    if (records["plan.json"] != plan or manifest.get("side") != side
+            or manifest.get("plan_sha256") != plan_digest(plan)
+            or manifest.get("functional_complete") is not True or manifest.get("capture_complete") is not True
+            or not environments_match(manifest["environment_before"], manifest["environment_after"])
+            or manifest["group"].get("stop_reason") or manifest["group"].get("forced_cleanup")):
+        raise ValueError("两端功能、采集、清理或环境未通过。")
+    for role in (("Client",) if side == "client" else ("P1", "P2")):
+        if records[role + ".json"].get("status") not in ("stopped", "closed"):
+            raise ValueError("角色终态未通过。")
+    if side == "client":
+        client = records["Client.json"]
+        if any(type(client["outcome"].get(k)) is not int or client["outcome"][k] != 2000
+               for k in ("confirmed_step_count", "protocol_committed_count")):
+            raise ValueError("Client提交/确认计数不足。")
+        baseline_metrics(client["timing"])
+        evidence = client["numerical_evidence"]
+        if len(evidence["records"]) != 2000 or len(evidence["inputs"]) != 2000:
+            raise ValueError("数值记录容量或完整性不符。")
+        config = load_lan_config(configs[0], "Client")
+        prepared = load_segmented_experiment(config.experiment_config, 400, InteractiveSession())
+        rows = [SimpleNamespace(protocol=SimpleNamespace(global_step=r["global_step"],
+                raw_control=r["raw_control"]), snapshot=r["snapshot"]) for r in evidence["records"]]
+        verify_baseline_numbers(prepared, config, rows, evidence["inputs"],
+                                decode_wire_value(json.dumps(evidence["setup"]).encode()))
+    return manifest
+
+
+def repack_manual(bundle_path, index):
+    """幂等重打包已有原件，不恢复运行额度或推进人工组号。"""
+    from secure_control.experiments.baseline_package import publish_package, read_package
+    root = Path(bundle_path).resolve()
+    bundle = json.loads((root / "bundle.json").read_text(encoding="utf-8-sig"))
+    if type(index) is not int or not 0 <= index < 8:
+        raise ValueError("重打包组号无效。")
+    side = bundle["side"]
+    identity = {"batch_id": bundle["batch_id"], "index": index, "side": side}
+    target = root / "outbox" / f"baseline-{bundle['batch_id'][:12]}-{index:02}-{side}.zip"
+    if target.exists():
+        read_package(target, identity)
+    else:
+        source = Path(bundle["plans"][index]["outputs"][side])
+        if not (source / "manifest.json").is_file():
+            raise ValueError("原件没有完整manifest，只能保留失败现场。")
+        publish_package(source, target, identity)
+    return str(target)
+
+
+def run_manual(bundle_path, *, read=input, now=monotonic, runner=None):
+    """A常驻计时、B逐组确认；跨端顺序归人工，本地次数及失败STOP由程序执行。"""
+    from secure_control.experiments.baseline_package import publish_package, read_package
+    from secure_control.experiments.tail_diagnostic_runner import _write_new
+
+    root = Path(bundle_path).resolve()
+    bundle = json.loads((root / "bundle.json").read_text(encoding="utf-8-sig"))
+    side, plans = bundle["side"], bundle["plans"]
+    if (bundle.get("schema") != "baseline-manual-bundle-v1" or side not in ("client", "pair")
+            or len(plans) != 8 or any(type(p.get("index")) is not int or p["index"] != k
+                                    for k, p in enumerate(plans))):
+        raise ValueError("人工启动包schema或顺序无效。")
+    state_path = root / "state.json"
+    state = json.loads(state_path.read_text()) if state_path.exists() else {
+        "batch_id": bundle["batch_id"], "next_index": 0, "pending": None, "stop": False}
+    if (type(state.get("next_index")) is not int or not 0 <= state["next_index"] <= 8
+            or type(state.get("stop")) is not bool
+            or state.get("batch_id") != bundle["batch_id"] or state.get("pending") is not None
+            or state.get("stop") or side == "client" and state_path.exists()):
+        raise ValueError("本机STOP、未完成attempt或A计时会话已退出，不能重启续额。")
+    lock = root / "active.lock"
+    with lock.open("x") as stream:
+        stream.write(str(os.getpid()))
+    started, total_bytes, references = now(), 0, {}
+
+    def save():
+        temporary = root / "state.partial"
+        temporary.write_text(json.dumps(state), encoding="utf-8")
+        os.replace(temporary, state_path)
+
+    try:
+        save()
+        while state["next_index"] < 8:
+            index = state["next_index"]
+            plan = plans[index]
+            if plan.get("purpose") != MANUAL_PURPOSE or plan.get("index") != index:
+                raise ValueError("需要新manual用途及顺序计划。")
+            print(f"Batch {bundle['batch_id'][:12]} group {index+1}/8 {plan['condition']} {side}")
+            if side == "client" and now()-started+120 > 1200:
+                raise TimeoutError("人工批次剩余时间不足，不启动下一组。")
+            answer = read("A: start B, then type YES; B: confirm A allowed matching group, type YES: ")
+            if answer != "YES" or side == "client" and now()-started+120 > 1200:
+                raise ValueError("未确认或人工等待超额，停止。")
+            approval = json.loads((Path(bundle["approvals"]) / f"approval-{index}.json").read_text(encoding="utf-8-sig"))
+            state["pending"] = index
+            save()  # 永久预留早于任何native或控制；失败不恢复。
+            execute = _run_baseline_host_approved if runner is None else runner
+            output = Path(plan["outputs"][side])
+            execute(plan, approval, side, config_paths=bundle["configs"], output=output,
+                    expected_head=plan["source_head"])
+            identity = {"batch_id": bundle["batch_id"], "index": index, "side": side}
+            package = root / "outbox" / f"baseline-{bundle['batch_id'][:12]}-{index:02}-{side}.zip"
+            publish_package(output, package, identity)
+            own, size = read_package(package, identity)
+            manifest = validate_manual_result(own, plan, side, bundle["configs"])
+            total_bytes += size + package.stat().st_size
+            if side == "client":
+                read("Copy B ZIP into inbox, then press Enter: ")
+                peer_identity = {**identity, "side": "pair"}
+                peer_name = package.name.replace("-client.zip", "-pair.zip")
+                peer_path = root / "inbox" / peer_name
+                peer, peer_size = read_package(peer_path, peer_identity)
+                other = validate_manual_result(peer, plan, "pair", bundle["configs"])
+                total_bytes += peer_size + peer_path.stat().st_size
+                for name, item in (("client", manifest), ("pair", other)):
+                    references.setdefault(name, item["environment_before"])
+                    if not environments_match(item["environment_before"], references[name]):
+                        raise ValueError("跨组环境漂移，停止。")
+                if total_bytes > 2 * 1024**3 or now()-started > 1200:
+                    raise ValueError("批次资源或人工时间目标超额。")
+            state.update(pending=None, next_index=index+1)
+            save()
+            print("Local result verified; next group requires A permission and human confirmation.")
+            if side == "pair":
+                break
+    except BaseException:
+        state["stop"] = True
+        save()
+        raise
+    finally:
+        _write_new(root / f"session-{time.time_ns()}.json", {
+            "state": state, "elapsed_s": now()-started, "artifact_bytes": total_bytes,
+            "local_enforcement": True, "coordination": "manual",
+            "cross_host_automatic_stop": None, "global_hard_deadline": None})
+        lock.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

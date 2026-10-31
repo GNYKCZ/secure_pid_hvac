@@ -481,7 +481,7 @@ class NativeCapture:
             root=self.authorization_plan
             if self.side not in ('client','pair') or root.get('hosts',{}).get(self.side)!=self.plan:
                 raise PermissionError('capture node is not approved root member')
-            if root.get('purpose') == 'capture-overhead-baseline-v1':
+            if root.get('purpose') in ('capture-overhead-baseline-v1', 'capture-overhead-manual-v1'):
                 from secure_control.experiments.performance_baseline import authorize_baseline
                 authorize_baseline(self.authorization, root, side=self.side,
                     output=self.output.parent, head=self.plan['source_head'])
@@ -499,7 +499,7 @@ class NativeCapture:
                 raise PermissionError('File calibration requires a new plan-bound user authorization')
         self.started = self.now()
         self.capture_deadline = self.started+(110 if self.b_receive else 55 if self.file_candidate else limits_for(2000).native_s-10)
-        if self.authorization_plan is not None and self.authorization_plan.get('purpose') == 'capture-overhead-baseline-v1':
+        if self.authorization_plan is not None and self.authorization_plan.get('purpose') in ('capture-overhead-baseline-v1', 'capture-overhead-manual-v1'):
             self.capture_deadline = self.started+self.plan['native_window_s']-10
         # start超时也可能已经创建自身会话，不能在finally中被误认成从未启动。
         self.owned = []

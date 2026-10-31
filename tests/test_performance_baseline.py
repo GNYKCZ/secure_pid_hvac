@@ -44,6 +44,72 @@ def test_formal_run_rejects_missing_online_coordinator_before_any_io(tmp_path):
     assert not (tmp_path / "new").exists()
 
 
+def test_manual_one_group_packages_and_imports_then_requires_next_confirmation(tmp_path, monkeypatch):
+    import json
+
+    import secure_control.experiments.performance_baseline as baseline
+    from secure_control.experiments.native_tail_capture import plan_digest
+    spec = {"source_head": "a" * 40,
+            "configurations": {r: {} for r in ("Client", "P1", "P2")},
+            "outputs": [{"client": str(tmp_path / f"A{k}"), "pair": str(tmp_path / f"B{k}")}
+                        for k in range(8)]}
+    approvals = tmp_path / "approvals"
+    approvals.mkdir()
+    baseline.prepare_manual(spec, tmp_path / "A", "client", [], approvals)
+    baseline.prepare_manual(spec, tmp_path / "B", "pair", [], approvals)
+    bundle = json.loads((tmp_path / "A/bundle.json").read_text())
+    plan = bundle["plans"][0]
+    approval = {"schema": "baseline-manual-authorization-v1", "purpose": baseline.MANUAL_PURPOSE,
+                "source_head": "a" * 40, "attempts": 1, "plan_sha256": plan_digest(plan),
+                "authorization_url": "https://github.com/GNYKCZ/secure_pid_hvac/issues/166#issuecomment-2"}
+    (approvals / "approval-0.json").write_text(json.dumps(approval))
+    calls = []
+
+    def runner(plan, approval, side, *, output, **kwargs):
+        baseline.authorize_baseline(approval, plan, side=side, output=output, head="a" * 40)
+        calls.append(side)
+        output.mkdir()
+        (output / "plan.json").write_text(json.dumps(plan))
+        (output / "manifest.json").write_text(json.dumps({"environment_before": {
+            "verified": True, "routes": [], "cpu_topology": [], "process_count": 2}}))
+
+    # 编排测试隔离纯结果校验；独立数值/环境反例由前述oracle用例覆盖。
+    monkeypatch.setattr(baseline, "validate_manual_result", lambda records, *args: records["manifest.json"])
+    baseline.run_manual(tmp_path / "B", read=lambda _: "YES", now=lambda: 0., runner=runner)
+    source = next((tmp_path / "B/outbox").glob("*.zip"))
+    state_before = (tmp_path / "B/state.json").read_bytes()
+    assert baseline.repack_manual(tmp_path / "B", 0) == str(source)
+    assert (tmp_path / "B/state.json").read_bytes() == state_before
+    (tmp_path / "A/inbox" / source.name).write_bytes(source.read_bytes())
+    answers = iter(["YES", "", "NO"])
+    with pytest.raises(ValueError, match="未确认"):
+        baseline.run_manual(tmp_path / "A", read=lambda _: next(answers), now=lambda: 0., runner=runner)
+    assert calls == ["pair", "client"]
+    state = json.loads((tmp_path / "A/state.json").read_text())
+    assert state["next_index"] == 1 and state["stop"]
+    with pytest.raises(ValueError):
+        baseline.run_manual(tmp_path / "A", runner=runner)
+    assert calls == ["pair", "client"]
+
+
+def test_package_rejects_traversal_and_wrong_identity(tmp_path):
+    import json
+    import zipfile
+
+    from secure_control.experiments.baseline_package import publish_package, read_package
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "manifest.json").write_text(json.dumps({"files": {}}))
+    target = tmp_path / "ok.zip"
+    publish_package(source, target, {"side": "pair"})
+    with pytest.raises(ValueError, match="身份"):
+        read_package(target, {"side": "client"})
+    with zipfile.ZipFile(tmp_path / "bad.zip", "w") as archive:
+        archive.writestr("../escape", "bad")
+    with pytest.raises(ValueError):
+        read_package(tmp_path / "bad.zip", {})
+
+
 def test_numeric_oracle_accepts_encoded_first_step_and_rejects_wrong_output():
     from types import SimpleNamespace
 
