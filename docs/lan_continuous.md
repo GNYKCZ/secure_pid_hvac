@@ -1762,6 +1762,20 @@ RV002新设计依据Issue166的“RV-002 / RV-004返工边界”评论：需两�
 
 ### #166 当前采用人工逐组模式（用户修订6539971819）
 本节替代上面在线共享邮箱前置要求；旧裸run仍阻断。无需SMB/SSH、账号、防火墙或远控设置。
+
+前瞻环境政策（用户确认采用 Design 评论6542471016）：新人工规格可显式设置
+`environment_policy=ambient-process-count-v1`，生成的每组计划及批准摘要绑定该字段。
+未设置时仍为 `strict-v1`，旧计划、旧 STOP 与已消费额度保持原样；政策更改不授权重跑或新增组。
+新政策仍要求环境必要事实可读，OS/Python、CPU拓扑、实际路由接口、既有logger等摘要一致；
+只有 `process_count` 变化不单独STOP，不设允许数量差阈值，不干预后台进程。
+manifest 保留原始前后值，`environment_unchanged` 仍表示严格相等；新增
+`environment_qualification` 保存政策、eligible、qualification、变化清单及风险标记。
+符合硬条件时标 `eligible_with_ambient_uncertainty`，进程数变化另标
+`ambient_process_count_changed`；即使进程数相同，`background_load_controlled` 仍为false。
+导入重新计算资格，A的state保存两端各组开始/结束相对首组环境的检查，防止跨组变化被掩盖。
+功能、数值、清理、采集及资源检查继续阻断失败；所有获授权样本均保留。
+结果仅作探索性run/block比较，不将背景负载写成已控制，不单凭L/F差异断言采集导致长尾。
+更换源码或政策后须另行批准准确的新计划与剩余额度，不能直接续用原八组批准。
 一次准备：`uv run python -m secure_control.experiments.performance_baseline manual-prepare SPEC BUNDLE --side client --config CLIENT_CONFIG --approvals APPROVAL_DIRECTORY`；B使用`--side pair --config P1_CONFIG --config P2_CONFIG`。工具生成本机`start-baseline.ps1`、bundle.json、inbox/outbox，不复制源码。新计划purpose为capture-overhead-manual-v1，批准schema为baseline-manual-authorization-v1，仍须准确绑定每组plan_sha256、head、attempts=1及166新批准URL；旧批准不能沿用。配置与批准包在实际软件审查后统一准备，无需用户逐组编辑。
 A首次运行固定脚本，保持窗口存活：显示批次短ID/组号/条件后，用户启动B固定脚本；B确认与A一致且A已允许本组，输入YES。随后A输入YES启动。每组只运行一次，B成功后退出并保存下一本地组号；失败永久STOP。用户将B outbox中的单个ZIP复制到A inbox后，在A按Enter；A自动匹配、核对两包完整性、Client独立数值oracle及两端环境后才显示下一组提示。下一组仍需相同人工确认。A窗口退出/重启本批STOP，不能重置20分钟起点续跑。
 ZIP使用存储模式不压缩，避免推测压缩比；原件保留，物理磁盘原件+ZIP均累计，超过2GiB目标STOP。导入流式核验白名单、成员实际长度/摘要、运行manifest关联；不解包执行、不重扫ETL。结果包是完整性证据，不是对端密码学认证。没有B的Client数值轨迹，B数值独立校验不宣称PASS；A导入时必须重核Client保存输入与原oracle。
