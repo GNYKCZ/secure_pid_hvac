@@ -27,7 +27,7 @@ def test_unknown_environment_rejected_before_ledger_or_collect(tmp_path, monkeyp
                                             output=tmp_path / "run", expected_head="a"*40)
 
 
-def pair_package_fixture(root, fault=None):
+def pair_package_fixture(root, fault=None, *, policy=None, environment_change=None):
     import hashlib
     import json
 
@@ -40,7 +40,11 @@ def pair_package_fixture(root, fault=None):
     root.mkdir()
     plan = {"index": 1, "condition": "F", "source_head": "a"*40,
             "hosts": {"pair": B_RECEIVE_RESOURCES, "client": CALIBRATION_RESOURCES}}
+    if policy is not None:
+        from secure_control.experiments.performance_baseline import MANUAL_PURPOSE
+        plan.update(purpose=MANUAL_PURPOSE, environment_policy=policy)
     env = {"verified": True, "routes": [1], "cpu_topology": [1], "process_count": 2}
+    after = {**env, **(environment_change or {})}
     owner = {"status": "saved", "stop_returncode": 0, "background_unchanged": True,
              "elapsed_s": 50., "etl_bytes": 3, "native_buffer_bytes_at_stop": 8192,
              "nonpaged_sessions_at_stop": True, "native_buffer_budget_exceeded": False,
@@ -66,8 +70,15 @@ def pair_package_fixture(root, fault=None):
         (root / "native.etl").write_bytes(b"etl")
     manifest = {"side": "pair", "source_head": "a"*40, "index": 1, "condition": "F",
         "plan_sha256": plan_digest(plan), "functional_complete": True, "capture_complete": True,
-        "environment_before": env, "environment_after": env, "group": group,
+        "environment_before": env, "environment_after": after, "group": group,
         "files": {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in root.iterdir()}}
+    if policy is not None:
+        from secure_control.experiments.performance_baseline import (
+            environment_qualification,
+            environments_match,
+        )
+        manifest.update(environment_unchanged=environments_match(env, after),
+                        environment_qualification=environment_qualification(env, after, policy=policy))
     (root / "manifest.json").write_text(json.dumps(manifest))
     target = root.parent / (root.name + ".zip")
     publish_package(root, target, {"side": "pair", "index": 1})
@@ -155,12 +166,13 @@ def test_manual_confirmation_still_rejects_decline_and_expired_wait(tmp_path, an
 
 
 @pytest.mark.parametrize("confirmation", ["YES", "yes", " Yes "])
-def test_manual_one_group_packages_and_imports_then_requires_next_confirmation(tmp_path, monkeypatch, confirmation):
+@pytest.mark.parametrize("policy", ["strict-v1", "ambient-process-count-v1"])
+def test_manual_one_group_packages_and_imports_then_requires_next_confirmation(tmp_path, monkeypatch, confirmation, policy):
     import json
 
     import secure_control.experiments.performance_baseline as baseline
     from secure_control.experiments.native_tail_capture import plan_digest
-    spec = {"source_head": "a" * 40,
+    spec = {"source_head": "a" * 40, "environment_policy": policy,
             "configurations": {r: {} for r in ("Client", "P1", "P2")},
             "outputs": [{"client": str(tmp_path / f"A{k}"), "pair": str(tmp_path / f"B{k}")}
                         for k in range(8)]}
@@ -182,8 +194,9 @@ def test_manual_one_group_packages_and_imports_then_requires_next_confirmation(t
         calls.append(side)
         output.mkdir()
         (output / "plan.json").write_text(json.dumps(plan))
-        (output / "manifest.json").write_text(json.dumps({"environment_before": {
-            "verified": True, "routes": [], "cpu_topology": [], "process_count": 2},
+        env = {"verified": True, "routes": [], "cpu_topology": [], "process_count": 2}
+        (output / "manifest.json").write_text(json.dumps({"environment_before": env,
+            "environment_after": {**env, "process_count": 3 if policy != "strict-v1" else 2},
             "files": {"plan.json": hashlib.sha256((output / "plan.json").read_bytes()).hexdigest()}}))
 
     # 编排测试隔离纯结果校验；独立数值/环境反例由前述oracle用例覆盖。
@@ -200,6 +213,9 @@ def test_manual_one_group_packages_and_imports_then_requires_next_confirmation(t
     assert calls == ["pair", "client"]
     state = json.loads((tmp_path / "A/state.json").read_text())
     assert state["next_index"] == 1 and state["stop"]
+    assert len(state["environment_checks"]) == 4
+    if policy != "strict-v1":
+        assert state["environment_checks"][1]["risk_flags"] == ["ambient_process_count_changed"]
     with pytest.raises(ValueError):
         baseline.run_manual(tmp_path / "A", runner=runner)
     assert calls == ["pair", "client"]
@@ -321,6 +337,86 @@ def test_environment_drift_or_unknown_is_not_comparable(field, value):
     assert environments_match(baseline, baseline)
     assert not environments_match(baseline, {**baseline, field: value})
     assert not environments_match({}, {})
+
+
+@pytest.mark.parametrize("policy,eligible,status", [
+    ("strict-v1", False, "ineligible"),
+    ("ambient-process-count-v1", True, "eligible_with_ambient_uncertainty"),
+])
+def test_process_count_policy_preserves_drift_and_uncertainty(policy, eligible, status):
+    from secure_control.experiments.performance_baseline import environment_qualification
+    before = {"verified": True, "routes": ["wifi"], "cpu_topology": ["core0"], "process_count": 336}
+    after = {**before, "process_count": 347}
+    result = environment_qualification(before, after, policy=policy)
+    assert result["eligible"] is eligible
+    assert result["qualification"] == status
+    assert result["changes"] == [{"field": "process_count", "before": 336, "after": 347}]
+    assert result["risk_flags"] == ["ambient_process_count_changed"]
+    assert result["background_load_controlled"] is False
+    assert not environments_match(before, after)
+
+
+@pytest.mark.parametrize("change", [
+    {"routes": ["ethernet"]}, {"cpu_topology": ["core1"]}, {"os": "other"},
+    {"python": "other"}, {"background_sessions": ["changed"]}, {"verified": False},
+    {"process_count": None}, {"process_count": True}, {"process_count": 0},
+])
+def test_ambient_policy_still_rejects_hard_drift_and_unknown(change):
+    from secure_control.experiments.performance_baseline import environment_qualification
+    before = {"verified": True, "routes": ["wifi"], "cpu_topology": ["core0"],
+              "process_count": 336, "os": "Windows", "python": "3.11", "background_sessions": []}
+    assert not environment_qualification(before, {**before, **change},
+                                        policy="ambient-process-count-v1")["eligible"]
+
+
+def test_ambient_policy_is_explicit_and_bound_to_new_manual_plan(tmp_path):
+    import json
+
+    from secure_control.experiments.native_tail_capture import plan_digest
+    from secure_control.experiments.performance_baseline import prepare_manual
+    spec = {"source_head": "a" * 40, "configurations": {r: {} for r in ("Client", "P1", "P2")},
+            "outputs": [{"client": f"A{k}", "pair": f"B{k}"} for k in range(8)]}
+    old = prepare_run_plans(spec)[0]
+    prepare_manual({**spec, "environment_policy": "ambient-process-count-v1"},
+                   tmp_path / "bundle", "pair", [], tmp_path / "approvals")
+    new = json.loads((tmp_path / "bundle/bundle.json").read_text())["plans"][0]
+    assert new["environment_policy"] == "ambient-process-count-v1"
+    assert "environment_policy" not in old
+    assert plan_digest(new) != plan_digest({k: v for k, v in new.items() if k != "environment_policy"})
+    with pytest.raises(ValueError):
+        prepare_manual({**spec, "environment_policy": "typo"},
+                       tmp_path / "bad", "pair", [], tmp_path / "approvals")
+    assert not (tmp_path / "bad").exists()
+
+
+@pytest.mark.parametrize("policy,change,accepted", [
+    ("strict-v1", {"process_count": 3}, False),
+    ("ambient-process-count-v1", {"process_count": 3}, True),
+    ("ambient-process-count-v1", {"routes": [2]}, False),
+    ("ambient-process-count-v1", {"verified": False}, False),
+])
+def test_package_validation_recomputes_environment_policy(tmp_path, policy, change, accepted):
+    from secure_control.experiments.performance_baseline import validate_manual_result
+    records, plan = pair_package_fixture(tmp_path / "package", policy=policy, environment_change=change)
+    if accepted:
+        manifest = validate_manual_result(records, plan, "pair", [])
+        assert manifest["environment_unchanged"] is False
+        assert manifest["environment_qualification"]["qualification"] == "eligible_with_ambient_uncertainty"
+        records["manifest.json"]["environment_qualification"]["changes"] = []
+        with pytest.raises(ValueError):
+            validate_manual_result(records, plan, "pair", [])
+    else:
+        with pytest.raises(ValueError):
+            validate_manual_result(records, plan, "pair", [])
+
+
+@pytest.mark.parametrize("fault", ["count", "exit", "native_partial", "missing_owner", "missing_etl"])
+def test_ambient_policy_does_not_bypass_functional_or_capture_failures(tmp_path, fault):
+    from secure_control.experiments.performance_baseline import validate_manual_result
+    records, plan = pair_package_fixture(tmp_path / fault, fault, policy="ambient-process-count-v1",
+                                         environment_change={"process_count": 3})
+    with pytest.raises(ValueError):
+        validate_manual_result(records, plan, "pair", [])
 
 
 def test_manual_coordinator_preserves_failure_and_does_not_start_next(tmp_path):

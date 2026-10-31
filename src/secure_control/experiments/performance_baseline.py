@@ -29,6 +29,35 @@ def environments_match(left, right):
             and left == right)
 
 
+def _environment_policy(plan):
+    policy = plan.get("environment_policy", "strict-v1")
+    if (policy not in ("strict-v1", "ambient-process-count-v1")
+            or policy != "strict-v1" and plan.get("purpose") != MANUAL_PURPOSE):
+        raise ValueError("未知环境政策或非人工计划；未启动运行。")
+    return policy
+
+
+def environment_qualification(left, right, *, policy="strict-v1"):
+    """保留事实变化；新计划可将进程数量变化作为探索性不确定性。"""
+    if policy not in ("strict-v1", "ambient-process-count-v1"):
+        raise ValueError("未知环境政策。")
+    changes = [{"field": k, "before": left.get(k), "after": right.get(k)}
+               for k in sorted(left.keys() | right.keys())
+               if k not in left or k not in right or left[k] != right[k]]
+    known = all(e.get("verified") is True
+                and all(e.get(k) is not None for k in ("routes", "cpu_topology", "process_count"))
+                and type(e["process_count"]) is int and e["process_count"] > 0
+                for e in (left, right))
+    eligible = known and (environments_match(left, right) if policy == "strict-v1" else
+                         all(c["field"] == "process_count" for c in changes))
+    return {"policy": policy, "eligible": eligible,
+            "qualification": "eligible_with_ambient_uncertainty" if eligible else "ineligible",
+            "changes": changes,
+            "risk_flags": ["ambient_process_count_changed"]
+                if any(c["field"] == "process_count" for c in changes) else [],
+            "background_load_controlled": False}
+
+
 def verify_baseline_numbers(prepared, config, records, inputs, setup):
     """退出后复用既有物理重放/encoded Trunc包络，不从实测输出生成expected。"""
     from dataclasses import asdict
@@ -63,6 +92,7 @@ def verify_baseline_numbers(prepared, config, records, inputs, setup):
 def authorize_baseline(approval, plan, *, side, output, head):
     """新用途逐组批准绑定完整计划，旧control批准不能用于对照运行。"""
     from secure_control.experiments.native_tail_capture import plan_digest
+    _environment_policy(plan)
     index = plan.get("index")
     manual = plan.get("purpose") == MANUAL_PURPOSE
     if (not isinstance(approval, dict) or plan.get("schema") != "baseline-run-plan-v1"
@@ -210,6 +240,7 @@ def _run_baseline_host_approved(plan, approval, side, *, config_paths, output, e
     if native is not None:
         (output / "native-owner.json").write_text(json.dumps(native.report), encoding="utf-8")
     after = baseline_environment(configs)
+    qualification = environment_qualification(environment, after, policy=_environment_policy(plan))
     reports = group["roles"]
     functional = (len(reports) == len(roles) and not group["stop_reason"]
                   and not group["forced_cleanup"] and all(
@@ -237,6 +268,7 @@ def _run_baseline_host_approved(plan, approval, side, *, config_paths, output, e
               "index": plan["index"], "condition": plan["condition"],
               "functional_complete": functional, "environment_before": environment,
               "environment_after": after, "environment_unchanged": environments_match(environment, after),
+              "environment_qualification": qualification,
               "capture_complete": native is None or group.get("native", {}).get("status") == "saved",
               "artifact_bytes": sum(p.stat().st_size for p in output.iterdir() if p.is_file()),
               "group": group, "files": {p.name: _sha(p) for p in output.iterdir() if p.is_file()}}
@@ -597,6 +629,9 @@ def prepare_manual(spec, output, side, configs, approvals):
     plans = prepare_run_plans(spec)
     for plan in plans:
         plan["purpose"] = MANUAL_PURPOSE
+        if "environment_policy" in spec:
+            plan["environment_policy"] = spec["environment_policy"]
+        _environment_policy(plan)
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=False)
     for name in ("inbox", "outbox"):
@@ -624,6 +659,14 @@ def validate_manual_result(records, plan, side, configs):
     from secure_control.scenarios.cart_pole.interactive import InteractiveSession
 
     manifest = records["manifest.json"]
+    policy = _environment_policy(plan)
+    qualification = environment_qualification(manifest["environment_before"], manifest["environment_after"],
+                                             policy=policy)
+    if policy != "strict-v1" and (
+            manifest.get("environment_qualification") != qualification
+            or manifest.get("environment_unchanged") is not environments_match(
+                manifest["environment_before"], manifest["environment_after"])):
+        raise ValueError("环境资格或变化记录与原始事实不一致。")
     roles = ("Client",) if side == "client" else ("P1", "P2")
     required = {"plan.json", "manifest.json", *(r + ".json" for r in roles)}
     if side == "client":
@@ -639,7 +682,7 @@ def validate_manual_result(records, plan, side, configs):
             or type(manifest.get("index")) is not int or manifest["index"] != plan["index"]
             or manifest.get("condition") != plan["condition"]
             or manifest.get("functional_complete") is not True or manifest.get("capture_complete") is not True
-            or not environments_match(manifest["environment_before"], manifest["environment_after"])
+            or not qualification["eligible"]
             or manifest["group"].get("stop_reason") or manifest["group"].get("forced_cleanup")):
         raise ValueError("两端功能、采集、清理或环境未通过。")
     group = manifest["group"]
@@ -745,6 +788,8 @@ def run_manual(bundle_path, *, read=input, now=monotonic, runner=None):
             or len(plans) != 8 or any(type(p.get("index")) is not int or p["index"] != k
                                     for k, p in enumerate(plans))):
         raise ValueError("人工启动包schema或顺序无效。")
+    if len({_environment_policy(p) for p in plans}) != 1:
+        raise ValueError("批次环境政策必须一致。")
     state_path = root / "state.json"
     state = json.loads(state_path.read_text()) if state_path.exists() else {
         "batch_id": bundle["batch_id"], "next_index": 0, "pending": None, "stop": False}
@@ -803,8 +848,14 @@ def run_manual(bundle_path, *, read=input, now=monotonic, runner=None):
                 total_bytes += peer_size + peer_path.stat().st_size
                 for name, item in (("client", manifest), ("pair", other)):
                     references.setdefault(name, item["environment_before"])
-                    if not environments_match(item["environment_before"], references[name]):
-                        raise ValueError("跨组环境漂移，停止。")
+                    for phase in ("environment_before", "environment_after"):
+                        check = environment_qualification(references[name], item[phase],
+                                                          policy=_environment_policy(plan))
+                        state.setdefault("environment_checks", []).append({
+                            "index": index, "side": name, "phase": phase, **check})
+                        save()
+                        if not check["eligible"]:
+                            raise ValueError("跨组环境漂移，停止。")
                 if total_bytes > 2 * 1024**3 or now()-started > 1200:
                     raise ValueError("批次资源或人工时间目标超额。")
             state.update(pending=None, next_index=index+1)
