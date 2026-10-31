@@ -773,9 +773,13 @@ def run_manual(bundle_path, *, read=input, now=monotonic, runner=None):
             print(f"Batch {bundle['batch_id'][:12]} group {index+1}/8 {plan['condition']} {side}")
             if side == "client" and now()-started+120 > 1200:
                 raise TimeoutError("人工批次剩余时间不足，不启动下一组。")
-            answer = read("A: start B, then type YES; B: confirm A allowed matching group, type YES: ")
-            if answer != "YES" or side == "client" and now()-started+120 > 1200:
-                raise ValueError("未确认或人工等待超额，停止。")
+            prompt = ("A: start matching B group, then type YES: " if side == "client" else
+                      "B: confirm A allowed matching group, type YES: ")
+            answer = read(prompt)
+            if answer.strip().casefold() != "yes":
+                raise ValueError("未确认本组，尚未启动控制或采集。")
+            if side == "client" and now()-started+120 > 1200:
+                raise TimeoutError("人工等待超额，尚未启动本组。")
             approval = json.loads((Path(bundle["approvals"]) / f"approval-{index}.json").read_text(encoding="utf-8-sig"))
             state["pending"] = index
             save()  # 永久预留早于任何native或控制；失败不恢复。

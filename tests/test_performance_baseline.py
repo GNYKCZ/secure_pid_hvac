@@ -129,7 +129,33 @@ def test_formal_run_rejects_missing_online_coordinator_before_any_io(tmp_path):
     assert not (tmp_path / "new").exists()
 
 
-def test_manual_one_group_packages_and_imports_then_requires_next_confirmation(tmp_path, monkeypatch):
+@pytest.mark.parametrize("answer,elapsed,error", [("", 0., ValueError), ("no", 0., ValueError),
+                                               ("yes", 1081., TimeoutError)])
+def test_manual_confirmation_still_rejects_decline_and_expired_wait(tmp_path, answer, elapsed, error):
+    import json
+
+    import secure_control.experiments.performance_baseline as baseline
+    spec = {"source_head": "a" * 40,
+            "configurations": {r: {} for r in ("Client", "P1", "P2")},
+            "outputs": [{"client": str(tmp_path / f"A{k}"), "pair": str(tmp_path / f"B{k}")}
+                        for k in range(8)]}
+    baseline.prepare_manual(spec, tmp_path / "A", "client", [], tmp_path / "approvals")
+    clock = [0.]
+
+    def read(_):
+        clock[0] = elapsed
+        return answer
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("rejected confirmation must not execute a run")
+    with pytest.raises(error):
+        baseline.run_manual(tmp_path / "A", read=read, now=lambda: clock[0], runner=forbidden)
+    state = json.loads((tmp_path / "A/state.json").read_text())
+    assert state["stop"] is True and state["pending"] is None and state["next_index"] == 0
+
+
+@pytest.mark.parametrize("confirmation", ["YES", "yes", " Yes "])
+def test_manual_one_group_packages_and_imports_then_requires_next_confirmation(tmp_path, monkeypatch, confirmation):
     import json
 
     import secure_control.experiments.performance_baseline as baseline
@@ -162,13 +188,13 @@ def test_manual_one_group_packages_and_imports_then_requires_next_confirmation(t
 
     # 编排测试隔离纯结果校验；独立数值/环境反例由前述oracle用例覆盖。
     monkeypatch.setattr(baseline, "validate_manual_result", lambda records, *args: records["manifest.json"])
-    baseline.run_manual(tmp_path / "B", read=lambda _: "YES", now=lambda: 0., runner=runner)
+    baseline.run_manual(tmp_path / "B", read=lambda _: confirmation, now=lambda: 0., runner=runner)
     source = next((tmp_path / "B/outbox").glob("*.zip"))
     state_before = (tmp_path / "B/state.json").read_bytes()
     assert baseline.repack_manual(tmp_path / "B", 0) == str(source)
     assert (tmp_path / "B/state.json").read_bytes() == state_before
     (tmp_path / "A/inbox" / source.name).write_bytes(source.read_bytes())
-    answers = iter(["YES", "", "NO"])
+    answers = iter([confirmation, "", "NO"])
     with pytest.raises(ValueError, match="未确认"):
         baseline.run_manual(tmp_path / "A", read=lambda _: next(answers), now=lambda: 0., runner=runner)
     assert calls == ["pair", "client"]
