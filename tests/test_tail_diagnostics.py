@@ -772,6 +772,88 @@ def test_two_host_supervision_fake_clock_no_retry_and_only_owned_pid_cleanup(mon
         assert partial['owned_pids']==[] and not partial['roles']
 
 
+def test_completed_reports_allow_shared_bounded_natural_exit(monkeypatch):
+    """报告已返回但feeder退出稍迟；应等待收尾，不能立即发出taskkill。"""
+    from secure_control.experiments import tail_diagnostic_runner as runner
+    clock, processes, commands = [0.], [], []
+
+    class Process:
+        def __init__(self, **kwargs):
+            self.pid, self.exitcode = 100 + len(processes), None
+            processes.append(self)
+        def start(self):
+            pass
+        def join(self, timeout):
+            clock[0] += min(timeout, max(0., .4-clock[0]))
+            if clock[0] >= .4:
+                self.exitcode = 0
+        def is_alive(self):
+            return self.exitcode is None
+        def terminate(self):
+            self.exitcode = -1
+
+    class Queue:
+        def __init__(self):
+            self.index = 0
+        def get(self, timeout):
+            role = ('P1','P2')[self.index]
+            self.index += 1
+            return {'role':role,'status':'closed'}
+        def close(self):
+            pass
+        def cancel_join_thread(self):
+            pass
+    spawn = SimpleNamespace(Queue=Queue, Event=lambda:SimpleNamespace(set=lambda:None),
+                            Value=lambda *args:SimpleNamespace(value=0.), Process=Process)
+    def kill(args, **kwargs):
+        commands.append(args)
+        return SimpleNamespace(returncode=128)
+    original = runner._clear_owned
+    monkeypatch.setattr(runner, '_clear_owned', lambda ps, d, **kw: original(ps, d, _run=kill, **kw))
+    group = runner._collect_host([SimpleNamespace(role='P1'),SimpleNamespace(role='P2')],None,400,
+        _mp=SimpleNamespace(get_context=lambda _:spawn),_now=lambda:clock[0])
+    assert commands == [] and group['forced_cleanup'] == []
+    assert group['exitcodes'] == [0,0] and group['wall_s'] <= 1.
+
+
+@pytest.mark.parametrize('mode',['race','timeout','incomplete','nonzero','expired'])
+def test_cleanup_facts_do_not_upgrade_failed_or_unknown_attempts(mode):
+    """非零taskkill即使随后exit0也不当自然退出；剩余时间为零不发超时调用。"""
+    from secure_control.experiments import tail_diagnostic_runner as runner
+    clock, calls, details = [0.], [], []
+    class Process:
+        pid = 200
+        exitcode = 4 if mode=='nonzero' else None
+        def join(self, timeout):
+            assert timeout >= 0
+            clock[0] += timeout
+        def is_alive(self):
+            return self.exitcode is None
+        def terminate(self):
+            calls.append('terminate')
+            if mode!='incomplete':self.exitcode=-1
+    process = Process()
+    def kill(args, **kwargs):
+        calls.append('taskkill')
+        assert 0 < kwargs['timeout'] <= .5
+        if mode=='timeout':raise runner.subprocess.TimeoutExpired(args,kwargs['timeout'])
+        if mode=='race':process.exitcode=0
+        return SimpleNamespace(returncode=128)
+    forced = runner._clear_owned([process],0. if mode=='expired' else 2.,
+        _now=lambda:clock[0],_run=kill,_grace_s=1.,_details=details)
+    assert details[0]['natural_exit_verified'] is False
+    if mode=='nonzero':
+        assert calls==[] and forced==[] and details[0]['exitcode']==4
+    else:
+        assert forced
+    if mode=='race':
+        assert calls==['taskkill'] and details[0]['exitcode']==0
+        assert details[0]['force_attempted'] and not details[0]['terminate_issued']
+    if mode in ('incomplete','expired'):
+        assert details[0]['cleanup_incomplete'] is True
+    if mode=='expired':assert calls==[] and clock[0]==0.
+
+
 def test_configured_client_attempt_400_stops_without_401_and_first_failure_no_retry(tmp_path,monkeypatch):
     """原runner替身只驱动真实装配回调；成功400次与首失败均只调用一次runner。"""
     from secure_control.execution.lan_config import load_lan_config

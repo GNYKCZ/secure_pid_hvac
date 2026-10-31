@@ -266,24 +266,47 @@ def run_local(output, *, expected_head, software_review, steps=400):
     return manifest
 
 
-def _clear_owned(processes, deadline, *, _now=time.perf_counter, _run=subprocess.run):
-    """仅清退本次spawn取得的PID树；预留退出时间，不扫描或杀其他Python。"""
+def _clear_owned(processes, deadline, *, _now=time.perf_counter, _run=subprocess.run,
+                 _grace_s=.1, _details=None):
+    """只处理自有PID；共享有界正常退出宽限，强退尝试与实际退出事实分别保留。"""
     forced = []
+    began = _now()
+    # 所有成员共用一个宽限，仍预留一秒用于强退；不延长调用者给出的截止。
+    grace_deadline = min(began+_grace_s, max(began,deadline-1.))
     for process in processes:
         if process.pid is None:
             continue
-        process.join(timeout=max(0,min(.1,deadline-_now())))
+        detail = {'pid':process.pid,'force_attempted':False,'terminate_issued':False}
+        process.join(timeout=max(0,grace_deadline-_now()))
         if not process.is_alive():
+            detail.update(exitcode=process.exitcode,alive_after=False,
+                          natural_exit_verified=process.exitcode==0)
+            if _details is not None:_details.append(detail)
             continue
+        remaining = deadline-_now()
+        if remaining<=0:
+            detail.update(exitcode=process.exitcode,alive_after=True,natural_exit_verified=False,
+                          cleanup_incomplete=True)
+            forced.append({'pid':process.pid,'cleanup_incomplete':True,'reason':'deadline_exhausted'})
+            if _details is not None:_details.append(detail)
+            continue
+        detail['force_attempted']=True
         try:
             killed = _run(['taskkill','/PID',str(process.pid),'/T','/F'],
-                          capture_output=True,timeout=max(.01,min(.5,deadline-_now())),check=False)
+                          capture_output=True,timeout=min(.5,remaining),check=False)
+            detail['taskkill_returncode']=killed.returncode
             forced.append({'pid':process.pid,'returncode':killed.returncode})
         except (OSError,subprocess.TimeoutExpired) as error:
+            detail['taskkill_error_type']=type(error).__name__
             forced.append({'pid':process.pid,'error_type':type(error).__name__})
-        if process.is_alive():
+        if process.is_alive() and _now()<deadline:
             process.terminate()
+            detail['terminate_issued']=True
         process.join(timeout=max(0,min(.1,deadline-_now())))
+        detail.update(exitcode=process.exitcode,alive_after=process.is_alive(),
+                      natural_exit_verified=False)
+        detail['cleanup_incomplete']=detail['alive_after'] or detail['exitcode'] is None
+        if _details is not None:_details.append(detail)
     return forced
 
 
@@ -348,7 +371,10 @@ def _collect_host(configs, context, steps, *, wall_started=None, stream_map=Fals
         if native is not None and native.started is not None:
             # 原生窗口包含退出时间，不能让业务清退一直占用240秒总预算。
             cleanup_deadline = min(cleanup_deadline,native.capture_deadline)
-        forced = _clear_owned(processes,cleanup_deadline,_now=_now)
+        cleanup_details = []
+        forced = _clear_owned(processes,cleanup_deadline,_now=_now,
+            _grace_s=1. if reason is None and len(reports)==len(processes) else .1,
+            _details=cleanup_details)
         if native is not None:
             try:
                 native_report = native.finish()
@@ -357,6 +383,7 @@ def _collect_host(configs, context, steps, *, wall_started=None, stream_map=Fals
         results.close()
         results.cancel_join_thread()
     return {'wall_s':_now()-started,'roles':reports,'forced_cleanup':forced,
+        'cleanup_details':cleanup_details,
         'owned_pids':[p.pid for p in processes],'exitcodes':[p.exitcode for p in processes],
         'members':{c.role:{'pid':p.pid} for c,p in zip(configs,processes,strict=False)},
         'stop_reason':reason,'launcher_error':launcher_error,'activity_start':activity.value or None,
